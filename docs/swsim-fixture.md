@@ -246,6 +246,43 @@ response carries no trailing data, which is the property P2 = 0x0C actually
 promises. Hard-coding "90 00" everywhere would make it a test of the
 simulator's mood.
 
+### The FCP tag numbering swICC uses is NOT the ISO/IEC 7816-4 table
+
+This one cost a CI run too, and every later issue that reads a file
+capabilities template will meet it.
+
+ISO/IEC 7816-4 table 42 gives **0x82 = file size** and **0x83 = file
+descriptor**. swICC's own FCP builder says something different, in
+**src/3gpp.c**:
+
+~~~c
+0x80, /* '62': File size,        'A5': UICC characteristics. */
+0x81, /* '62': Total file size,  'A5': App power consumption. */
+0x82, /* '62': File descriptor,  'A5': Min app clock frequency. */
+0x83, /* '62': File ID,          'A5': Available memory. */
+~~~
+
+So inside an FCP template swSIM puts the **file size in 0x80**, the file
+descriptor in **0x82**, and the **file ID in 0x83**. [V], read in swSIM source
+at the pinned commit.
+
+Two FCPs as the card actually sent them:
+
+~~~
+SELECT MF     -> 62 31 82 02 38 21 83 02 3F 00 A5 09 80 01 70 83 04 FF FF FE 31 ...
+SELECT EF.IMSI -> 62 1B 82 02 09 21 83 02 2F E2 A5 00 8A 01 05 8C 08 7F 00 00 00 00 00 00 00 80 02 00 0A 90 00
+~~~
+
+Reading the EF.IMSI one against the ISO table gives a "file size" of
+`0x0921` = 2337, which is nonsense and was the first failure of the
+last leg. Reading it as swICC says gives **0x80 = 0x000A = 10**, and 10 is
+precisely the length of the EF.IMSI contents in data/usim.json
+(`98 88 12 01 00 00 50 01 80 F4`). The MF's FCP carries no 0x80 at
+all, which also fits: a master file has no size.
+
+**A real card may follow the ISO table instead.** This mapping is the
+simulator's, recorded here so nobody re-derives it, not a claim about cards.
+
 ### Why P2 = 0x0C on the SELECT
 
 ISO/IEC 7816-4 clause 7.5.1 sets bit b4 of P2 to mean "return no response

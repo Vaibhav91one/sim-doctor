@@ -97,6 +97,22 @@ Consequence for the rule model: **`StatusWord::is_success` returning false for
 acceptable is issue #5's job, one layer up, because it needs to know what
 command was sent.
 
+Two more, found the same way. Both are simulator behaviour, not card
+behaviour, and are flagged as such so nobody generalises them.
+
+- **Draining a proactive command changes the NEXT command's answer.** On
+  swSIM, the first SELECT MF answers `91 80`, FETCH (`80 12 00 00 <length>`)
+  returns the 128-byte proactive command and clears it, and the next SELECT MF
+  answers a plain `90 00`. An issue that issues commands without draining
+  proactive commands will see `91 xx` where it expected `90 00` and must not
+  read that as failure.
+- **swICC's FCP tag numbering is NOT ISO/IEC 7816-4 table 42.** Inside an FCP
+  template swICC puts the file size in `0x80`, the file descriptor in `0x82`
+  and the file ID in `0x83`, where the ISO table says `82` is the file size
+  (`swICC/src/3gpp.c`, the FCP builder's own tag table). Reading an swSIM FCP
+  as if it were the ISO table yields a nonsense size. A real card may follow
+  the ISO table, so issue #11 must not hard-code either mapping.
+
 ### Never commit card secrets
 
 `.gitignore` blocks `*.key`, `*.der`, `*.crt`, `*.pem`, `*.pvk`, `profile.json`,

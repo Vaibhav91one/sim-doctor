@@ -69,10 +69,22 @@ const READ_BINARY_PREFIX: [u8; 4] = [0x00, 0xB0, 0x00, 0x00];
 
 /// BER-TLV tags the test needs out of a file capabilities template.
 ///
-/// ISO/IEC 7816-4 clause 9.1.2 and table 42: 0x82 is "File size" and 0x83 is
-/// "File descriptor", whose first two octets are the file identifier.
-const TAG_FILE_SIZE: u8 = 0x82;
-const TAG_FILE_DESCRIPTOR: u8 = 0x83;
+/// **These are swICC's numbers, not ISO/IEC 7816-4's.** swICC documents its
+/// own mapping in its FCP builder, src/3gpp.c:
+///
+///     0x80, /* '62': File size,        'A5': UICC characteristics. */
+///     0x81, /* '62': Total file size,  'A5': App power consumption. */
+///     0x82, /* '62': File descriptor,  'A5': Min app clock frequency. */
+///     0x83, /* '62': File ID,          ... */
+///
+/// ISO/IEC 7816-4 table 42 uses 0x82 for the file size and 0x83 for the file
+/// descriptor, so the two disagree on 0x82 and 0x83. Reading an swSIM FCP as
+/// if it were the ISO table yields a nonsense file size, which is exactly what
+/// happened the first time this test ran. [V] for swSIM, read at the pinned
+/// commit. A real card may follow the ISO table instead, so this mapping is
+/// the simulator's, not the protocol's.
+const TAG_FILE_SIZE: u8 = 0x80;
+const TAG_FILE_ID: u8 = 0x83;
 
 /// Finds a two-octet BER-TLV value carrying `tag` inside a template.
 ///
@@ -305,9 +317,10 @@ fn drives_a_real_card_through_the_pcsc_transport() {
     let response = exchange(&mut session, &get_response, "GET RESPONSE (FCP)");
     assert_body_then_normal_processing("GET RESPONSE (FCP)", &response, usize::from(fcp_len));
     let fcp = &response[..usize::from(fcp_len)];
-    assert!(
-        fcp.windows(2).any(|pair| pair == [0x3F, 0x00]),
-        "the FCP should carry the selected file ID 3F00, got {}",
+    assert_eq!(
+        find_two_octet_tlv(fcp, TAG_FILE_ID),
+        Some([0x3F, 0x00]),
+        "the FCP file ID should be 3F00, FCP was {}",
         hex(fcp)
     );
 
@@ -344,29 +357,30 @@ fn drives_a_real_card_through_the_pcsc_transport() {
     );
     let fcp = &response[..usize::from(fcp_len)];
     assert_eq!(
-        find_two_octet_tlv(fcp, TAG_FILE_DESCRIPTOR),
+        find_two_octet_tlv(fcp, TAG_FILE_ID),
         Some([0x2F, 0xE2]),
-        "the FCP file descriptor should be 2FE2, FCP was {}",
+        "the FCP file ID should be 2FE2, FCP was {}",
         hex(fcp)
     );
     let size = find_two_octet_tlv(fcp, TAG_FILE_SIZE)
         .map(u16::from_be_bytes)
         .unwrap_or_else(|| panic!("the FCP has no two-octet file size tag: {}", hex(fcp)));
-    assert!(
-        size > 0 && size <= u8::MAX as u16,
-        "EF.IMSI size {size} cannot be asked for in one short read"
-    );
-    println!("EF.IMSI reports a size of {size} bytes");
+    // The read length comes from the card, not from a guess, and a short APDU
+    // data field cannot carry more than 255 bytes, so cap rather than fail if
+    // a future profile has a larger EF.
+    let read_len = usize::from(u8::try_from(size).unwrap_or(u8::MAX));
+    assert!(read_len > 0, "EF.IMSI reports a size of zero");
+    println!("EF.IMSI reports a size of {size} bytes, reading {read_len}");
 
     let mut read = READ_BINARY_PREFIX.to_vec();
-    read.push(size as u8);
+    read.push(read_len as u8);
     let response = exchange(
         &mut session,
         &read,
-        &format!("READ BINARY EF.IMSI, {size} bytes"),
+        &format!("READ BINARY EF.IMSI, {read_len} bytes"),
     );
-    assert_body_then_normal_processing("READ BINARY EF.IMSI", &response, usize::from(size));
-    let contents = &response[..usize::from(size)];
+    assert_body_then_normal_processing("READ BINARY EF.IMSI", &response, read_len);
+    let contents = &response[..read_len];
     // A fill pattern would mean the card sent padding rather than content.
     assert!(
         contents.iter().any(|byte| *byte != 0x00 && *byte != 0xFF),
