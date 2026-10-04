@@ -143,12 +143,12 @@ cd swsim
 ### 5. Confirm the card is visible, independently of this crate
 
 ~~~sh
-pcsc-scan
+pcsc_scan
 ~~~
 
 Expect a reader whose name contains **swICC**, with **Card present** and an
 ATR. This step matters because it does not depend on this crate compiling:
-if pcsc-scan sees a card and the Rust test does not, the fixture is fine and
+if pcsc_scan sees a card and the Rust test does not, the fixture is fine and
 the bug is ours.
 
 ### 6. Run the card-backed test
@@ -253,8 +253,8 @@ defence. See AGENTS.md, "Never commit card secrets".
 |---|---|
 | make fails on a missing header under lib/ | Cloned without submodules. Delete and re-clone with --recurse-submodules. |
 | "build/swsim" exists but is a directory | It is the object directory. The binary is build/swsim.elf. |
-| pcscd runs, pcsc-scan shows no reader | swicc-pcsc was built but not installed. Run sudo make install. |
-| pcsc-scan shows the reader, but "Card state: Card removed" | swSIM is not running, or was started before pcscd. Reverse them. |
-| pcsc-scan shows the reader and a card, the Rust test still fails | The fixture is fine and the bug is in this crate. |
+| pcscd runs, pcsc_scan shows no reader | swicc-pcsc was built but not installed. Run sudo make install. |
+| pcsc_scan shows the reader, but "Card state: Card removed" | swSIM is not running, or was started before pcscd. Reverse them. |
+| pcsc_scan shows the reader and a card, the Rust test still fails | The fixture is fine and the bug is in this crate. |
 | The Rust test fails with "no matching PC/SC reader" | pcscd is not running, or is running without the driver module. |
 | The Rust test fails listing a reader with no swICC in its name | A real reader is attached. Only one card is supported at a time. |

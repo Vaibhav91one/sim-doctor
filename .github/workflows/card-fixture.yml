@@ -71,7 +71,7 @@ jobs:
       - name: Cache cargo registry and target directory
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      # pcscd is the daemon. pcsc-tools supplies pcsc-scan, which proves a card
+      # pcscd is the daemon. pcsc-tools supplies pcsc_scan, which proves a card
       # is visible WITHOUT depending on this crate compiling, so a later
       # failure is ours rather than the fixture's. libpcsclite-dev is needed by
       # pcsc-sys's build script, which calls exit(1) when pkg-config cannot
@@ -87,16 +87,24 @@ jobs:
           set -euo pipefail
           rustc --version
           cargo --version
-          # Neither daemon nor tool is asked for a version. pcsc-scan has no
+          # Neither daemon nor tool is asked for a version. pcsc_scan has no
           # --version flag and prints usage before exiting 64; pcscd --version
           # prints the pcsc-lite banner and exits non-zero. Both would fail this
           # step under set -e for no useful reason. What matters here is that
           # the binaries are present and that no daemon is already running.
+          #
+          # The Debian and Ubuntu package installs this tool as pcsc_scan,
+          # with an UNDERSCORE. Asking for the hyphenated pcsc-scan instead
+          # looks exactly like the package failed to install at all.
           command -v pcscd
-          command -v pcsc-scan
+          command -v pcsc_scan
           # The package install may have started pcscd through systemd, and a
           # socket-activated pcscd would hold /run/pcscd/pcscd.comm against the
-          # foreground daemon this job starts.
+          # foreground daemon this job starts. stop and disable only make it
+          # harder to start again; mask makes a restart impossible, so the
+          # assertion below is about this step's cleanup and not about systemd
+          # racing back.
+          sudo systemctl mask pcscd.socket pcscd.service 2>/dev/null || true
           sudo systemctl stop pcscd.socket pcscd.service 2>/dev/null || true
           sudo systemctl disable pcscd 2>/dev/null || true
           pkill -x pcscd || true
@@ -207,7 +215,7 @@ jobs:
           ready=0
           scan=""
           for _ in $(seq 1 90); do
-            scan="$(pcsc-scan 2>&1 || true)"
+            scan="$(pcsc_scan 2>&1 || true)"
             if printf '%s' "$scan" | grep -qi swicc &&
                printf '%s' "$scan" | grep -qi 'Card present'; then
               ready=1
