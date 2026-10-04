@@ -122,18 +122,47 @@ Keep `der` for actual DER, i.e. certificates.
 
 `aes 0.9.0`, `der 0.8.0`, `crossterm 0.28.0` [V]. Pin 0.9.3 / 0.8.2 / 0.29.0.
 
-### 4.4 `rand_core` alignment is UNRESOLVED
+### 4.4 `rand_core` alignment - RESOLVED, do not downgrade
 
-`rand 0.10.3` alongside `p256 0.14` / `ecdsa 0.17` - trait-stack alignment is unconfirmed [U].
-The crates.io dependency endpoint was unreachable during research, so this could not be
-settled by reading. **Settle it empirically before writing ECC code:**
+`rand 0.10.3` alongside `p256 0.14` / `ecdsa 0.17` **works as pinned** [V]. The alignment
+question is closed, and it was closed by compiling, not by reading:
 
 ```
-cargo add p256@0.14 ecdsa@0.17 rand@0.10
-cargo tree -d      # look for duplicate rand_core / digest versions
+cargo generate-lockfile && cargo tree -d
+cargo build          # full stack compiles in ~26s
 ```
 
-If two `rand_core` versions appear, drop to whichever `p256` accepts.
+Observed results:
+
+- `rand_core` resolves to a **single** version, `0.10.1`. No drop needed.
+- The only duplicated crates are `hashbrown` 0.16/0.17 and `syn` 2.0/3.0. Both benign.
+- The lockfile pins 284 packages.
+
+The old instruction to "drop to whichever `p256` accepts" is withdrawn. There is nothing to
+drop. Do not downgrade `rand` to make a trait error go away; if you ever see one, it is a
+real incompatibility introduced by a later dependency change, not this original problem.
+
+### 4.5 `der` / `oid` pairing with p256 / ecdsa - RESOLVED
+
+`der` resolves to a **single** version, `0.8.2`, and it is the *same instance* that `p256`
+`0.14`, `ecdsa` `0.17`, `spki` `0.8` and `sec1` `0.8` all consume [V]:
+
+```
+cargo tree -i der
+# der v0.8.2
+# |- ecdsa v0.17.0 -> p256 v0.14.0
+# |- pkcs8 v0.11.0 -> elliptic-curve v0.14.1
+# |- sec1 v0.8.1, spki v0.8.0
+# '- sim-doctor v0.1.0
+```
+
+So the direct `der = "0.8.2"` dependency and the one reached through the ECC stack are the
+same crate. Signature DER encoding interoperates with `ecdsa` without an adapter, and the
+`oid` version pairs with it cleanly.
+
+This does **not** weaken section 4.2. `der` is still strict DER and still will not parse
+BER-TLV from real SIM files or SGP.22 BPP payloads. Resolving the version pairing fixed a
+dependency-compatibility question, not a format question.
 
 ---
 
@@ -294,12 +323,12 @@ Do not treat any of these as settled.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | `rand_core` alignment: `rand 0.10.3` vs `p256 0.14` / `ecdsa 0.17` | `[U]` settle with `cargo tree -d` |
-| 2 | GSMA SGP.22 spec text | **GATED** - 404 on public URLs, needs GSMA member login |
+| 1 | ~~`rand_core` alignment~~ | **RESOLVED** [V] single `rand_core 0.10.1`, no drop needed. See 4.4 |
+| 2 | GSMA SGP.22 spec text | **GATED, CONFIRMED UNAVAILABLE** - owner has no member access. Both public PDF paths 404 under a browser UA. Do not retry with curl |
 | 3 | ES10a's actual responsibility | `[U]` traces to blocker 2 |
 | 4 | HandleNotification / CancelSession section numbers | `[U]` traces to blocker 2 |
-| 5 | GSMA TS.48 conformance test profiles | **UNINVESTIGATED** - no coverage anywhere |
-| 6 | `der` / `oid` pairing with p256 / ecdsa DER versions | `[U]` same cause as 1 |
+| 5 | GSMA TS.48 conformance test profiles | **KNOWN-BLOCKED** - profile CONTENT is behind the same GSMA login as blocker 2. The RUNNER is in scope (#25); authoring profiles is not, until access exists |
+| 6 | ~~`der` / `oid` pairing~~ | **RESOLVED** [V] single `der 0.8.2`, shared with p256/ecdsa/spki. See 4.5 |
 
 ### On blocker 2
 
@@ -312,11 +341,25 @@ comments, not from the spec. That is decent provenance - the repo cites section 
 consistently and matches at pinned SHA - but it is not primary. If member access becomes
 available, verify 5.6 and 5.7 before shipping the eUICC half.
 
-### On blocker 5
+### On blocker 5 - TS.48 scope decision
 
-TS.48 was in the original scope and has **zero** coverage. It is conformance test profiles,
-not a tool feature, so it likely wants to be its own workstream and probably reorders the
-milestone plan. Do not quietly drop it.
+**Decided by the owner: TS.48 is in scope as a RUNNER, not as transcribed profiles.**
+
+TS.48 *is* the conformance test profile definitions, so it sits behind the same GSMA member
+login as blocker 2. Transcribing profiles we cannot read was never available. What is
+available, and what we are building, is the **executor**: a runner that consumes profile files
+supplied by an operator who does have access, runs them against a card, and reports per-test
+verdicts through the standard JSON contract. That is issue #25.
+
+Two consequences to keep straight:
+
+- The runner's own conformance to TS.48 is **unverifiable** without the spec. Document it as
+  such. Do not let "TS.48 support" in the README imply a conformance claim we cannot back.
+- Self-authoring a few smoke profiles from SIMTester behaviour is **rejected**, not deferred.
+  They would be tagged `[U]` and would manufacture a false impression of conformance coverage.
+
+Profile authoring stays tracked as issue #26, open and blocked, with its unblock condition
+written down. It is not dropped.
 
 ---
 
