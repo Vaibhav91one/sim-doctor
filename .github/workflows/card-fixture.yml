@@ -88,7 +88,9 @@ jobs:
           rustc --version
           cargo --version
           pcscd --version
-          pcsc_scan --version
+          # pcsc-scan has no --version flag: it prints its usage and exits 64.
+          # Check it is on PATH instead of asking it for a version.
+          command -v pcsc-scan
           # The package install may have started pcscd through systemd, and a
           # socket-activated pcscd would hold /run/pcscd/pcscd.comm against the
           # foreground daemon this job starts.
