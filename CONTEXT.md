@@ -60,6 +60,11 @@ heredocs inside template literals.
 | `iso7816-tlv` over `der` for BER-TLV | `der` is strict DER and rejects real SIM BER lengths |
 | Development loop uses swSIM + swicc-pcsc | No hardware prerequisite for the test suite |
 | JSON envelope modelled on `lpac` | Best existing agent-friendly contract found |
+| **TS.48 in scope as a RUNNER, not transcribed profiles** | Owner decision. The profile definitions sit behind the same GSMA member login as SGP.22, so we build the executor that consumes operator-supplied profile files and stop there. Progress without pretending to spec access |
+| **No GSMA member access** | Owner decision. Every SGP.22 / TS.48 section number is provenance-backed from `euicc-rsp` source comments, never primary. Label accordingly, permanently |
+| **swSIM only, no physical reader for now** | Owner decision. Real-reader testing stays available later as a second fixture, not a redesign |
+| **Autonomous PR merging** | Owner decision. A subagent may implement, test, self-review and open a PR; it may **not** merge. An orchestrator verifies then merges |
+| **Serial, dependency-ordered delivery** | Owner decision. M1 is a strict chain, so parallel agents would collide on the contract and drift from it. Fan-out is deliberately rejected |
 
 ---
 
@@ -104,16 +109,18 @@ By value-per-effort:
 
 ## 5. Open questions
 
-**Does TS.48 belong in scope?** It was in the original brief and has zero coverage. It is
-conformance test profiles rather than a tool feature, so it likely wants its own workstream
-and would reorder M3. This needs a decision before M3 planning.
+**Does TS.48 belong in scope?** ANSWERED - yes, as a runner. See section 3.
 
-**Is GSMA member access available?** Blocks primary verification of SGP.22 section numbers.
-Without it, build against euicc-rsp source comments and treat 5.6 / 5.7 in AGENTS.md as
-provenance-backed but not primary.
+**Is GSMA member access available?** ANSWERED - no. See section 3.
 
-**Hardware in the loop or not?** M1 is designed for software-only. If real-reader testing
-matters, it is a second fixture, not a redesign.
+**Hardware in the loop or not?** ANSWERED - swSIM only for now. See section 3.
+
+These were the three questions this section used to carry. They are now decisions, and
+the answers are recorded above. The one question that remains genuinely open is a scope
+question for the end of M3: whether the TS.48 runner should also attempt to self-derive a
+small set of smoke profiles from SIMTester behaviour, or stay strictly operator-supplied.
+The current answer is strictly operator-supplied, because self-derived profiles would be
+tagged `[U]` and would create a false impression of conformance coverage.
 
 ---
 
@@ -121,7 +128,32 @@ matters, it is a second fixture, not a redesign.
 
 ```
 cd sim-doctor
-cargo build                       # settles rand_core alignment
+cargo build                       # DONE - settled rand_core, see section 7
 # stand up swSIM + swicc-pcsc, then:
 sim-doctor scan --json             # M1 acceptance test
 ```
+
+---
+
+## 7. Delivery loop
+
+Work is tracked as GitHub issues and delivered one at a time, in dependency order.
+
+| Stage | What | Gate |
+|---|---|---|
+| Phase 0 | CI, crate skeleton, resolved-fact docs, swSIM fixture | CI green on `main` |
+| Phase 1 | transport, APDU, TLV, walker, contract, CLI | M1 acceptance passes |
+| Phase 2 | rule model, severity/score, baseline/diff, TUI | contract stable |
+| Phase 3 | the six feature modules, fuzzer last | each module emits findings through the contract |
+| Phase 4 | TS.48 runner | runner executes an operator-supplied profile |
+
+Per issue, one subagent: branch, implement, verify locally, self-review the diff, open a PR,
+watch CI. Then the orchestrator verifies independently and merges. A subagent never merges.
+
+Process rules the loop depends on:
+
+- CI runs `--locked`, so any dependency change must commit `Cargo.lock` in the same commit.
+- Do not trust `gh pr view --json files` mid-run; its merge base can be stale. Use `git diff`.
+- A subagent that runs long gets re-dispatched in the background. Foreground dispatch has a
+  hard 600s ceiling and will truncate work that was nearly finished.
+- Blocked items stay open with their unblock path written down. They are never silently dropped.
