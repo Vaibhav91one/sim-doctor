@@ -53,6 +53,66 @@ The primary dev loop is a software SIM behind a software PC/SC reader:
 
 Never make hardware a prerequisite for running the test suite.
 
+**This is standing up, in issue #4.** Both projects are pinned by SHA, built and
+installed in a separate CI workflow, and the card-backed test runs against
+[src/transport/pcsc.rs](src/transport/pcsc.rs), the real `pcsc` implementation of
+[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs).
+
+The gate keeping the default suite hardware-free is the **`card-fixture` cargo
+feature**, which is off by default; the test additionally carries `#[ignore]`.
+Three commands to check the gate holds:
+
+```
+cargo test --locked                                   # no reader, no daemon, no card
+cargo test --locked --all-features                     # still green; the card test is ignored
+cargo test --locked --features card-fixture -- --ignored --nocapture   # needs the fixture
+```
+
+Local reproduction steps, the pinned commits, the BSD-3 notice and a
+troubleshooting table are in [docs/swsim-fixture.md](docs/swsim-fixture.md).
+The fixture cannot be run on macOS: there is no pcscd, and swicc-pcsc is a
+pcsc-lite IFD handler with no macOS port. Only the crate builds and tests
+there, which is exactly why the default suite has to stay hardware-free.
+
+### Status words the fixture proved [V]
+
+Two facts about real cards that the swSIM fixture established by exchanging
+APDUs, not by reading a spec. Both will bite every later issue that parses a
+status word, so they are recorded here rather than only in the fixture doc.
+Source citations and the full transcript are in
+[docs/swsim-fixture.md](docs/swsim-fixture.md).
+
+- **SW1 `91`..`9F` is NOT failure.** `9F` is ISO/IEC 7816-4 "normal
+  processing, proactive command available"; `91`, `92` and `93` are the 3GPP
+  variants and carry the pending command's length in SW2. swSIM rewrites a
+  successful command's `90 00` into `91 <length>` whenever a proactive command is
+  pending (`src/apduh.c:sim_apduh_demux`, at the end of every command). A scanner
+  that treats `91 xx` as an error reports every healthy card as broken.
+- **A 9x SW2 is not always a length.** `61 xx` is a response-data length, 9x may
+  be a proactive-command length, and `6C xx` is a corrected length. Three
+  different numbers sharing a byte.
+
+Consequence for the rule model: **`StatusWord::is_success` returning false for
+`91 xx` is correct and must not be "fixed".** Deciding that a 9x status is
+acceptable is issue #5's job, one layer up, because it needs to know what
+command was sent.
+
+Two more, found the same way. Both are simulator behaviour, not card
+behaviour, and are flagged as such so nobody generalises them.
+
+- **Draining a proactive command changes the NEXT command's answer.** On
+  swSIM, the first SELECT MF answers `91 80`, FETCH (`80 12 00 00 <length>`)
+  returns the 128-byte proactive command and clears it, and the next SELECT MF
+  answers a plain `90 00`. An issue that issues commands without draining
+  proactive commands will see `91 xx` where it expected `90 00` and must not
+  read that as failure.
+- **swICC's FCP tag numbering is NOT ISO/IEC 7816-4 table 42.** Inside an FCP
+  template swICC puts the file size in `0x80`, the file descriptor in `0x82`
+  and the file ID in `0x83`, where the ISO table says `82` is the file size
+  (`swICC/src/3gpp.c`, the FCP builder's own tag table). Reading an swSIM FCP
+  as if it were the ISO table yields a nonsense size. A real card may follow
+  the ISO table, so issue #11 must not hard-code either mapping.
+
 ### Never commit card secrets
 
 `.gitignore` blocks `*.key`, `*.der`, `*.crt`, `*.pem`, `*.pvk`, `profile.json`,

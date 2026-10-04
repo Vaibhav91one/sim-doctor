@@ -65,3 +65,15 @@ optional = true
 [features]
 default = []
 remote  = ["dep:tokio"]   # only for remote-SIM / ATC-UICCS; pure PC/SC is sync
+
+# Opt-in gate for the software-card fixture added by issue #4. OFF by default,
+# so a plain `cargo test` needs no reader, no pcscd and no swSIM: with this
+# feature off, tests/card_fixture.rs compiles to nothing at all.
+#
+# Turn it on to run the card-backed test against a live swSIM card:
+#     cargo test --features card-fixture --test card_fixture -- --ignored --nocapture
+#
+# The test is additionally marked `#[ignore]` so that even
+# `cargo test --all-features` stays green on a laptop with no reader. See
+# docs/swsim-fixture.md for the full fixture and local reproduction steps.
+card-fixture = []

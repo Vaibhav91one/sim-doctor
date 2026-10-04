@@ -83,8 +83,12 @@ Steps:
 
 1. `cargo build` to settle the `rand_core` question (AGENTS.md 4.4). Do this first - it is
    a 30-second check that determines whether ECC deps need adjusting.
-2. Stand up swSIM + swicc-pcsc + pcscd as the test fixture.
-3. Implement reader discovery, connect, SELECT MF, DF walk, EF enumeration.
+2. Stand up swSIM + swicc-pcsc + pcscd as the test fixture. **DONE in issue #4** -
+   pinned SHAs, separate CI workflow, card-backed test behind the `card-fixture`
+   feature. See [docs/swsim-fixture.md](docs/swsim-fixture.md).
+3. Implement reader discovery, connect, SELECT MF, DF walk, EF enumeration. Reader
+   discovery, connect and SELECT MF are **proved against a live card** by that
+   fixture; the DF walk and EF enumeration are the remaining part.
 4. Emit the JSON envelope. Exit 0 on success.
 
 Do **not** start with a feature module. This slice has to come first.
@@ -129,7 +133,9 @@ tagged `[U]` and would create a false impression of conformance coverage.
 ```
 cd sim-doctor
 cargo build                       # DONE - settled rand_core, see section 7
-# stand up swSIM + swicc-pcsc, then:
+cargo test                        # DONE - 63 tests, no reader and no daemon needed
+# the swSIM fixture exists but is opt-in and Linux-only; see
+# docs/swsim-fixture.md for how to bring it up locally.
 sim-doctor scan --json             # M1 acceptance test
 ```
 

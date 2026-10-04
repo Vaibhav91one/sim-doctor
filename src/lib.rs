@@ -41,8 +41,12 @@
 //! - byte-level APDU encode and decode, command chaining, and GET RESPONSE
 //!   following (#5). [`apdu`] has the header and the status word and nothing
 //!   that turns either into bytes,
-//! - the `pcsc`-backed transport (#10). [`transport`] is traits and a loopback
-//!   double; nothing here opens a reader,
+//! - the `pcsc`-backed transport beyond opening a reader and moving bytes
+//!   (#10). [`transport::pcsc`] does establish a context, list readers,
+//!   connect and exchange APDUs, which is what issue #4's fixture needs. What
+//!   is still missing is the typed encode/decode, chaining and GET RESPONSE
+//!   following that make a session useful for scanning (#5), and the
+//!   human-facing session facade (#10).
 //! - BER-TLV stream decoding (#11). [`tlv`] decodes one atom and reports its
 //!   length; walking a whole file body is not written,
 //! - filesystem walking (#7). [`fs`] can address a file and read one identifier

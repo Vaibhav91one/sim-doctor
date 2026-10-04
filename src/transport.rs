@@ -12,15 +12,20 @@
 //! transport; it belongs in a session facade that composes the two modules,
 //! not in a `transport` that depends on `apdu`.
 //!
-//! **Lands here later.** Issue #10 adds a `pcsc`-backed implementation of
-//! [`ReaderProvider`] and [`CardSession`]. Nothing in this file performs I/O
-//! yet, which is what lets the test suite run with no reader and no card.
+//! **Lands here now.** [`pcsc`] implements both traits against the real
+//! PC/SC layer, added by issue #4 so the swSIM fixture can prove this crate
+//! drives a real card. It lives in a submodule rather than in this file
+//! because it is the one part of the transport that performs I/O, and keeping
+//! it separate is what lets the tests in this file stay runnable with no
+//! reader, no daemon and no card.
 
 /// This module's name, as recorded in [`crate::MODULES`].
 ///
 /// Referenced by value rather than re-spelt as a literal so that the module
 /// table cannot name a module that does not exist.
 pub const NAME: &str = "transport";
+
+pub mod pcsc;
 
 use std::fmt;
 
@@ -108,7 +113,9 @@ pub trait CardSession {
 
 /// Everything that can go wrong at or below [`crate::fs`].
 ///
-/// `#[non_exhaustive]` because issue #10 adds PC/SC error mapping, and
+/// `#[non_exhaustive]` because the PC/SC layer has dozens of documented
+/// failure codes and this enum models the handful an operator can act on.
+/// Issue #4 added the mapping in [@@BT@@pcsc@@BT@@]; issue #10 extends it, and
 /// downstream matches should not have to be rewritten when it does.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -143,6 +150,33 @@ pub enum Error {
         reader: ReaderName,
         /// The driver's own diagnostic text.
         detail: String,
+    },
+
+    /// The PC/SC layer refused an operation for a reason that is not one of
+    /// the conditions modelled above.
+    ///
+    /// The catch-all exists so that an unmodelled refusal is reported as what
+    /// it is instead of being flattened into a neighbouring variant. It is
+    /// also where the driver's own words are kept, because that text is the
+    /// only thing that tells an operator which of the dozens of PC/SC codes
+    /// they hit.
+    #[error("reader `{reader}` refused the PC/SC operation: {detail}")]
+    Driver {
+        /// The reader the operation was aimed at.
+        reader: ReaderName,
+        /// The driver's own diagnostic text.
+        detail: String,
+    },
+
+    /// The session was already released, so there is nothing left to talk to.
+    ///
+    /// Distinct from `Error::CardGone` because nothing went wrong with a card:
+    /// the caller asked a closed session to do one more thing, and saying
+    /// "the card was removed" would send them looking at the hardware.
+    #[error("the session with reader `{reader}` has already been disconnected")]
+    Disconnected {
+        /// The reader the closed session was bound to.
+        reader: ReaderName,
     },
 
     /// The reader name could not be used as given.
