@@ -246,9 +246,13 @@ jobs:
           ready=0
           scan=""
 
+          # pcsc_scan 1.7.x says "Card state: Card inserted," and then
+          # prints the ATR. Matching on the ATR rather than on that wording is
+          # what makes this survive a version change: the tool only prints an
+          # ATR for a card that actually answered.
           see_the_card() {
             printf '%s' "$1" | grep -qi swicc &&
-              printf '%s' "$1" | grep -qi 'Card present'
+              printf '%s' "$1" | grep -qi 'ATR:'
           }
 
           # pcsc_scan does not exit on its own once it has a context: with
