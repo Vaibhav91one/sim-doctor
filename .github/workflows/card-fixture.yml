@@ -176,79 +176,42 @@ jobs:
           echo "reader.conf.d/libswicc-pcsc:"
           cat /etc/reader.conf.d/libswicc-pcsc
 
-      # pcsc-lite 2.x checks every PC/SC client against a polkit action before
-      # it will serve it. The action id is "access_pcsc" - the id the daemon
-      # logs verbatim, not the older org.debian.pcsc-lite.scantoken spelling.
-      #
-      # A GitHub runner has no active session and no polkit agent to authorize
-      # against, so with the stock policy every client is refused:
+      # pcsc-lite 2.x authorizes every PC/SC client against the polkit action
+      # "access_pcsc" before it will serve it, and a GitHub runner has no
+      # polkit authority to ask. With polkit compiled in and no authority
+      # reachable, the check errors and the client is refused:
       #   auth.c IsClientAuthorized() ... is NOT authorized for action: access_pcsc
       #   winscard_svc.c ContextThread() Rejected unauthorized PC/SC client
-      # and SCardEstablishContext returns "Access denied". That looks exactly
-      # like a fixture that is not working: the card connects, the driver
-      # loads, every slot reports empty, and nothing is ever served.
+      # and SCardEstablishContext answers "Access denied". That reads exactly
+      # like a broken fixture: the card connects, the driver loads, every slot
+      # reports empty, and nothing is ever served.
       #
-      # Granting the action is safe here precisely because this is a
-      # throwaway runner and the daemon is one this job started. On a
-      # developer desktop the stock policy already works, because an
-      # interactive session is itself an authorized session.
-      - name: Let this job client connect to the PC/SC daemon
-        run: |
-          set -uo pipefail
-          set -x
-          id
-          sudo -n id || echo "SUDO UNAVAILABLE"
-          set +x
-
-          # One privileged operation, not two. install -D creates the parent
-          # directories as part of the copy, so there is no separate mkdir to
-          # fail on. The privileged call's own output is captured, so a future
-          # failure says WHY instead of leaving a bare exit 1 in the log.
-          printf '%s\n' \
-            'polkit.addRule(function (action, subject) {' \
-            '    if (action.id === "access_pcsc") {' \
-            '        return polkit.Result.YES;' \
-            '    }' \
-            '});' > "$RUNNER_TEMP/pcsc-access.rule"
-
-          set -e
-          sudo install -D -m 0644 "$RUNNER_TEMP/pcsc-access.rule" \
-            /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules 2>&1 | tee "$RUNNER_TEMP/install.log"
-          test -f /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
-          echo "polkit rule in place:"
-          cat /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
-
-          # Whether a polkit authority is running decides whether the rule can
-          # possibly take effect, and the two situations need opposite fixes.
-          # Say which one this is rather than leaving it to be inferred from a
-          # later "Access denied".
-          if systemctl is-active --quiet polkit || systemctl is-active --quiet polkitd; then
-            echo "polkit authority: already running"
-          else
-            echo "polkit authority: not running, starting it"
-            sudo systemctl start polkit 2>&1 | tee "$RUNNER_TEMP/polkit-start.log" || true
-            sleep 1
-            if systemctl is-active --quiet polkit || systemctl is-active --quiet polkitd; then
-              echo "polkit authority: started"
-            else
-              echo "polkit authority: STILL NOT RUNNING. A rules.d file cannot"
-              echo "take effect without one, and every client will be refused."
-              sudo systemctl status polkit --no-pager 2>&1 | head -10 || true
-              exit 1
-            fi
-          fi
-          sudo systemctl restart polkit 2>/dev/null || true
-
+      # Two ways out, and this job uses both because they are cheap and
+      # independent. Turn the authorization off if this pcscd build supports
+      # it, and run the client as root otherwise, since uid 0 is the one
+      # identity pcsc-lite serves without asking. Neither is needed on a
+      # developer desktop, where an interactive session is itself authorized.
       - name: Start pcscd, then start swSIM against it
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/fixture"
 
+          # Only pass --disable-polkit to a daemon that actually has it. The
+          # flag has moved around across pcsc-lite releases, and handing an
+          # unknown option to a daemon makes it exit without a word.
+          pcscd_flags=()
+          if pcscd --help 2>&1 | grep -q -- '--disable-polkit'; then
+            pcscd_flags+=(--disable-polkit)
+            echo "pcscd supports --disable-polkit; polkit authorization is off"
+          else
+            echo "pcscd has no --disable-polkit flag; the client will run as root"
+          fi
+
           # Order is fixed and backwards is a silent time sink. The swicc-pcsc
           # IFD handler is the LISTENER: IFDHCreateChannel creates the server
           # socket. swSIM is the client that connects to it. Starting swSIM
           # first gives a card nobody is listening for.
-          sudo pcscd --foreground --debug > "$RUNNER_TEMP/pcscd.log" 2>&1 &
+          sudo pcscd --foreground --debug "${pcscd_flags[@]}" > "$RUNNER_TEMP/pcscd.log" 2>&1 &
           sleep 2
           if ! pgrep -x pcscd; then
             echo "pcscd exited immediately:"
@@ -272,33 +235,85 @@ jobs:
             exit 1
           fi
 
+      # pcsc_scan proves the card is visible WITHOUT depending on this crate
+      # compiling, so if it succeeds and the Rust test fails, the fixture is
+      # fine and the bug is ours. That diagnostic split is only worth anything
+      # if the tool can reach the daemon, so ask unprivileged first and say
+      # plainly when polkit refuses.
       - name: Wait for the swICC reader to present the card
         run: |
           set -euo pipefail
           ready=0
           scan=""
-          for _ in $(seq 1 90); do
+
+          see_the_card() {
+            printf '%s' "$1" | grep -qi swicc &&
+              printf '%s' "$1" | grep -qi 'Card present'
+          }
+
+          # Ask as the normal user first. If polkit refuses the context, say so
+          # and ask again as root, which pcsc-lite always serves. Keeping both
+          # attempts visible matters: "refused" and "no card" are completely
+          # different failures and only one of them is the fixture's.
+          for _ in $(seq 1 30); do
             scan="$(pcsc_scan 2>&1 || true)"
-            if printf '%s' "$scan" | grep -qi swicc &&
-               printf '%s' "$scan" | grep -qi 'Card present'; then
+            if see_the_card "$scan"; then
               ready=1
+              break
+            fi
+            if printf '%s' "$scan" | grep -qi 'access denied'; then
+              echo "pcsc_scan was refused a PC/SC context: that is the polkit"
+              echo "authorization layer, not the fixture. Retrying as root."
               break
             fi
             sleep 1
           done
+
+          if [ "$ready" -ne 1 ]; then
+            for _ in $(seq 1 30); do
+              scan="$(sudo pcsc_scan 2>&1 || true)"
+              if see_the_card "$scan"; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+          fi
+
           printf '%s\n' "$scan"
           if [ "$ready" -ne 1 ]; then
-            echo "::error::no swICC reader with a card appeared within 90s"
+            echo "::error::no swICC reader with a card appeared"
             exit 1
           fi
+          echo "the swICC reader is presenting the card"
 
       - name: Drive the card through this crate's PC/SC transport
         run: |
           set -euo pipefail
+
+          # Build as the normal user, then execute the harness binary as root.
+          # pcsc-lite authorizes every client against polkit, and this runner
+          # has no authority to ask, so an unprivileged client gets
+          # SCardEstablishContext: Access denied before it can list a reader.
+          # uid 0 is the identity pcsc-lite serves without asking. Building
+          # first keeps the workspace and the toolchain out of root's hands;
+          # only the client needs the privilege.
+          cargo test --locked --no-run --features card-fixture --test card_fixture 2>&1 |
+            tee "$RUNNER_TEMP/card-build.log"
+
+          bin="$(find target/debug/deps -maxdepth 1 -type f \
+            -name 'card_fixture-*' ! -name '*.d' -print -quit)"
+          if [ -z "$bin" ]; then
+            echo "::error::the card_fixture test binary was not built"
+            exit 1
+          fi
+          echo "running $bin as root"
+          test -x "$bin"
+
           log="$RUNNER_TEMP/card-test.log"
-          cargo test --locked --features card-fixture --test card_fixture -- \
-            --ignored --exact drives_a_real_card_through_the_pcsc_transport --nocapture \
-            2>&1 | tee "$log"
+          sudo "$PWD/$bin" \
+            --ignored --exact drives_a_real_card_through_the_pcsc_transport \
+            --nocapture 2>&1 | tee "$log"
 
           # --ignored against a renamed or deleted test would run nothing and
           # still exit 0. Assert that the test really ran, and that it really
