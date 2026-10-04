@@ -56,7 +56,7 @@ heredocs inside template literals.
 | Name: **sim-doctor** | "doctor" mirrors React Doctor's diagnostic framing |
 | Agent-first CLI, TUI secondary | The stated goal was agentic UX; TUI is a view over the same data |
 | Rust | Requested; also the right fit for a static binary with strong crypto ecosystem |
-| GPL-3.0-or-later | SIMTester's license; keeps research use open |
+| MIT | Chosen by owner - maximum reuse, including closed-source and commercial |
 | `iso7816-tlv` over `der` for BER-TLV | `der` is strict DER and rejects real SIM BER lengths |
 | Development loop uses swSIM + swicc-pcsc | No hardware prerequisite for the test suite |
 | JSON envelope modelled on `lpac` | Best existing agent-friendly contract found |

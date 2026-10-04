@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "CLI-first SIM security testing tool"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [dependencies]
 # --- Smartcard transport ---

@@ -21,6 +21,10 @@ dependency manifest. No working binary yet. See [CONTEXT.md](CONTEXT.md) for the
 | [docs/research-report.md](docs/research-report.md) | Full source-verified research findings |
 | [Cargo.toml](Cargo.toml) | Dependency manifest, versions verified against crates.io |
 
+## License
+
+[MIT](LICENSE) - chosen by the project owner.
+
 ## Design principles
 
 1. **Agent-first, not agent-optional.** Every command has a headless mode with a stable
