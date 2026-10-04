@@ -195,15 +195,32 @@ jobs:
       - name: Let this job client connect to the PC/SC daemon
         run: |
           set -euo pipefail
-          sudo tee /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules > /dev/null <<'POLKIT'
-          polkit.addRule(function (action, subject) {
-              if (action.id === "access_pcsc") {
-                  return polkit.Result.YES;
-              }
-          });
-          POLKIT
+          echo "writing the polkit rule"
+          sudo mkdir -p /etc/polkit-1/rules.d
+          printf '%s\n' \
+            'polkit.addRule(function (action, subject) {' \
+            '    if (action.id === "access_pcsc") {' \
+            '        return polkit.Result.YES;' \
+            '    }' \
+            '});' > "$RUNNER_TEMP/pcsc-access.rule"
+          sudo install -m 0644 "$RUNNER_TEMP/pcsc-access.rule" \
+            /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
           test -f /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
+          echo "polkit rule in place:"
           cat /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
+          # polkitd rereads rules.d on change, but restart it anyway so the
+          # rule is definitely live, and say out loud whether a polkit
+          # authority is even running. If none is, the rule cannot take effect
+          # and every client will still be refused.
+          sudo systemctl restart polkit 2>/dev/null || true
+          if systemctl is-active --quiet polkit; then
+            echo "polkit daemon: active"
+          elif systemctl is-active --quiet polkitd; then
+            echo "polkit daemon: active (polkitd unit)"
+          else
+            echo "polkit daemon: NOT ACTIVE - clients will still be refused"
+            systemctl status polkit --no-pager 2>&1 | head -5 || true
+          fi
 
       - name: Start pcscd, then start swSIM against it
         run: |
