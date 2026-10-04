@@ -50,12 +50,42 @@ const GET_RESPONSE_PREFIX: [u8; 4] = [0xA0, 0xC0, 0x00, 0x00];
 /// file system rather than just answering the first thing it is asked.
 const SELECT_DF_GSM: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x7F, 0x20];
 
-/// SELECT EF.DIR (2F00) under the MF, no FCP.
+/// SELECT EF.IMSI (2FE2) under the MF, asking for the FCP so the test can
+/// learn the file's real size instead of assuming one.
+///
+/// 2FE2 is the one child of the MF in the swSIM USIM profile that is both
+/// transparent and has real content. EF.DIR (2F00) is record-structured, and
+/// READ BINARY on a record-structured EF is not a command a card may accept,
+/// which step 6e asserts rather than works around.
+const SELECT_EF_IMSI_WITH_FCP: [u8; 7] = [0x00, 0xA4, 0x00, 0x04, 0x02, 0x2F, 0xE2];
+
+/// SELECT EF.DIR (2F00) under the MF, no FCP. 2F00 is a child of the MF and a
+/// RECORD-structured EF, which is what makes the READ BINARY in step 6e a
+/// real protocol assertion rather than a happy path.
 const SELECT_EF_DIR: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x2F, 0x00];
 
-/// READ BINARY, offset 0, 15 bytes. EF.DIR's first record in the swSIM USIM
-/// profile is exactly that long.
-const READ_EF_DIR: [u8; 5] = [0x00, 0xB0, 0x00, 0x00, 0x0F];
+/// READ BINARY, offset 0, with Le filled in at run time.
+const READ_BINARY_PREFIX: [u8; 4] = [0x00, 0xB0, 0x00, 0x00];
+
+/// BER-TLV tags the test needs out of a file capabilities template.
+///
+/// ISO/IEC 7816-4 clause 9.1.2 and table 42: 0x82 is "File size" and 0x83 is
+/// "File descriptor", whose first two octets are the file identifier.
+const TAG_FILE_SIZE: u8 = 0x82;
+const TAG_FILE_DESCRIPTOR: u8 = 0x83;
+
+/// Finds a two-octet BER-TLV value carrying `tag` inside a template.
+///
+/// Deliberately minimal and deliberately explained. The crate can decode one
+/// TLV atom but cannot walk a whole FCP template yet (issue #11), and all this
+/// needs is the file size and the file identifier, both of which are two-octet
+/// values on a SIM. Every match is checked against an expected value by the
+/// caller, so a coincidental hit cannot pass.
+fn find_two_octet_tlv(body: &[u8], tag: u8) -> Option<[u8; 2]> {
+    body.windows(4)
+        .find(|window| window[0] == tag && window[1] == 0x02)
+        .map(|window| [window[2], window[3]])
+}
 
 /// Renders bytes as spaced uppercase hex, the form every reader of this repo's
 /// logs already expects.
@@ -282,27 +312,84 @@ fn drives_a_real_card_through_the_pcsc_transport() {
     );
 
     // 5. Walk one level down, so the exchange is not just answering the first
-    //    command it is given.
+    //    command it is given, then come back up. 2F00 and 2FE2 are children of
+    //    the MF, not of DF GSM.
     let response = exchange(&mut session, &SELECT_DF_GSM, "SELECT DF GSM (7F20)");
     assert_normal_processing("SELECT DF GSM (7F20)", &response);
+    let response = exchange(&mut session, &SELECT_MF, "SELECT MF (3F00) again");
+    assert_normal_processing("SELECT MF (3F00) again", &response);
 
-    // 6. Select a file and read its bytes. This is the assertion that cannot
-    //    pass with a stub or an absent card: the payload has to be the
-    //    profile's own application template.
+    // 6. Read a real file. The length is taken from the FCP rather than
+    //    assumed, because the point of the FCP is that the card tells you the
+    //    size.
+    let response = exchange(
+        &mut session,
+        &SELECT_EF_IMSI_WITH_FCP,
+        "SELECT EF.IMSI (2FE2) with FCP",
+    );
+    assert_eq!(
+        response[0],
+        0x61,
+        "SELECT EF.IMSI with FCP: {}",
+        hex(&response)
+    );
+    let fcp_len = sw2(&response);
+    let mut get_response = GET_RESPONSE_PREFIX.to_vec();
+    get_response.push(fcp_len);
+    let response = exchange(&mut session, &get_response, "GET RESPONSE (FCP of EF.IMSI)");
+    assert_body_then_normal_processing(
+        "GET RESPONSE (FCP of EF.IMSI)",
+        &response,
+        usize::from(fcp_len),
+    );
+    let fcp = &response[..usize::from(fcp_len)];
+    assert_eq!(
+        find_two_octet_tlv(fcp, TAG_FILE_DESCRIPTOR),
+        Some([0x2F, 0xE2]),
+        "the FCP file descriptor should be 2FE2, FCP was {}",
+        hex(fcp)
+    );
+    let size = find_two_octet_tlv(fcp, TAG_FILE_SIZE)
+        .map(u16::from_be_bytes)
+        .unwrap_or_else(|| panic!("the FCP has no two-octet file size tag: {}", hex(fcp)));
+    assert!(
+        size > 0 && size <= u8::MAX as u16,
+        "EF.IMSI size {size} cannot be asked for in one short read"
+    );
+    println!("EF.IMSI reports a size of {size} bytes");
+
+    let mut read = READ_BINARY_PREFIX.to_vec();
+    read.push(size as u8);
+    let response = exchange(
+        &mut session,
+        &read,
+        &format!("READ BINARY EF.IMSI, {size} bytes"),
+    );
+    assert_body_then_normal_processing("READ BINARY EF.IMSI", &response, usize::from(size));
+    let contents = &response[..usize::from(size)];
+    // A fill pattern would mean the card sent padding rather than content.
+    assert!(
+        contents.iter().any(|byte| *byte != 0x00 && *byte != 0xFF),
+        "EF.IMSI came back as a fill pattern, which is not content: {}",
+        hex(contents)
+    );
+
+    // 6e. READ BINARY must NOT succeed on a record-structured EF. EF.DIR is
+    //     linear-fixed in the profile, and swICC refuses it:
+    //     lib/swicc/src/apduh.c:apduh_bin_read falls through to
+    //     SWICC_APDU_SW1_CHER_CMD with SW2 0x81, "Command incompatible with
+    //     file structure". Asserting the CLASS keeps the rule in the test and
+    //     the simulator's particular choice of code out of it.
     let response = exchange(&mut session, &SELECT_EF_DIR, "SELECT EF.DIR (2F00)");
     assert_normal_processing("SELECT EF.DIR (2F00)", &response);
-    let response = exchange(&mut session, &READ_EF_DIR, "READ BINARY EF.DIR, 15 bytes");
-    assert_body_then_normal_processing(
-        "READ BINARY EF.DIR",
-        &response,
-        usize::from(READ_EF_DIR[4]),
-    );
-    let contents = &response[..usize::from(READ_EF_DIR[4])];
-    assert_eq!(
-        contents[0],
-        0x61,
-        "EF.DIR should open with the 61 application template, got {}",
-        hex(contents)
+    let mut read_dir = READ_BINARY_PREFIX.to_vec();
+    read_dir.push(0x0F);
+    let response = exchange(&mut session, &read_dir, "READ BINARY EF.DIR, 15 bytes");
+    assert_no_response_data("READ BINARY on EF.DIR", &response);
+    assert!(
+        (0x60..=0x6F).contains(&response[0]),
+        "READ BINARY on a record-structured EF should be refused with a 6X status, got {}",
+        hex(&response)
     );
 
     // 7. Give the card back, then prove releasing twice is the no-op the trait

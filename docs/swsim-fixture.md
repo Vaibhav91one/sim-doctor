@@ -178,12 +178,21 @@ Not "a reader was listed". In order:
    the advertised number of bytes followed by a normal processing status word,
    with the MF file capabilities template in the body carrying the file ID
    3F00.
-5. **SELECT DF GSM (7F20)** returns normal processing, so selection walks the
-   file system rather than only answering the first command.
-6. **SELECT EF.DIR (2F00)** then **READ BINARY** of 15 bytes returns the
-   profile's real application template, tag **61**, followed by a normal
-   processing status word.
-7. Disconnect, then disconnect again, which the trait specifies as a no-op.
+5. **SELECT DF GSM (7F20)** returns normal processing, so selection walks
+   the file system rather than only answering the first command, then
+   **SELECT MF** again because 2F00 and 2FE2 hang off the MF and not off
+   DF GSM.
+6. **SELECT EF.IMSI (2FE2)** with FCP returns **61 xx**; the **GET RESPONSE**
+   body must carry the tag **83** file descriptor with the value **2F E2**,
+   proving which file was actually selected, and the tag **82** file size,
+   which is then used as the Le of the read rather than a guessed number.
+7. **READ BINARY** of exactly that many bytes returns exactly that many bytes
+   of non-fill content followed by a normal processing status word.
+8. **READ BINARY on EF.DIR (2F00)** must be **refused** with a 6X status.
+   EF.DIR is linear-fixed, i.e. record-structured, and READ BINARY does not
+   apply to it. Asserting that the card refuses is the point: a stub that
+   answered everything would fail here.
+9. Disconnect, then disconnect again, which the trait specifies as a no-op.
 
 ### Why the assertions say "normal processing class" and not "90 00"
 
@@ -245,6 +254,37 @@ RESPONSE queue and answers 61 xx, while P2 = 0x0C answers immediately with no
 body. Both are conformant. The "no data" form is what lets the test assert
 that nothing came back at all, which is why step 3 uses it and step 4 uses the
 other form deliberately, to prove a real body comes back.
+
+### Why READ BINARY is asserted to FAIL on EF.DIR
+
+An early version of the test read EF.DIR (2F00) and the card answered **69 81**.
+That was the test's bug, not the card's, and the reason is worth recording
+because it is the kind of thing a scanner will hit on a real card too.
+
+In data/usim.json, EF.DIR is a **`file_ef_linear-fixed`**: record-structured,
+with `rcrd_size` 43. ISO/IEC 7816-4 clause 11.3.2 defines READ BINARY for
+transparent (binary) EFs only; a record-structured EF is read with READ RECORD.
+swICC says so plainly, at **lib/swicc/src/apduh.c:740**:
+
+~~~c
+res->sw1 = SWICC_APDU_SW1_CHER_CMD;
+res->sw2 = 0x81; /* "Command incompatible with file structure" */
+~~~
+
+So **69 81** is the right answer and ISO/IEC 7816-4 clause 9.1.2 and table 42
+give its meaning. The test now asserts the 6X class rather than the literal, so
+it states the rule and not one simulator's choice of code, and it reads its
+content from EF.IMSI (2FE2), which is transparent in the same profile.
+
+Two habits this changed in the test, both worth keeping:
+
+- **Prove which file was selected before reading it.** The FCP's tag **83**
+  carries the file identifier, so the test asserts it equals **2F E2** before
+  issuing the read. A SELECT that answers 9000 has told you it resolved
+  something, not which.
+- **Take the length from the FCP, not from a guess.** Tag **82** is the file
+  size; asking for a hardcoded 15 because EF.DIR looked about that long is
+  exactly the kind of assertion that rots silently.
 
 ### Why GET RESPONSE uses CLA 0xA0
 
