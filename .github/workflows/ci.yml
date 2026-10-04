@@ -1,0 +1,134 @@
+# CI gate for sim-doctor.
+#
+# Linux only, deliberately. The pcsc crate resolves its system library per OS
+# (libpcsclite via pkg-config on Linux, the PCSC framework on macOS, winscard on
+# Windows), so every additional OS would need its own setup step and none of them
+# are exercised yet. Adding them now would be untested configuration.
+#
+# Actions are pinned to commit SHAs rather than floating tags. dtolnay/rust-toolchain
+# still tracks the stable Rust channel through its toolchain input, so the
+# toolchain stays current while the action code itself is immutable.
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per ref; supersede stale runs instead of queueing them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Nothing in this workflow pushes; do not leave a token in the checkout.
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable, rustfmt)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # A broken toolchain install must fail this job loudly instead of letting
+      # the gate below it pass for the wrong reason.
+      - name: Verify toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable, clippy)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # pcsc-sys runs pkg-config for libpcsclite in its build script and calls
+      # exit(1) when it is missing, so without this the crate will not compile
+      # here and clippy can never run. Headers and client library only: this
+      # installs no pcscd daemon, no reader and no card, which is what issue 2
+      # requires. Card fixture work is a separate issue.
+      - name: Install libpcsclite build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends pkg-config libpcsclite-dev
+
+      - name: Verify toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      # --locked keeps the committed Cargo.lock authoritative, so CI cannot
+      # silently resolve different dependency versions than a local run does.
+      # --all-targets lints test and bench code too, not just the bin target.
+      - name: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # See the clippy job for why this is required.
+      - name: Install libpcsclite build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends pkg-config libpcsclite-dev
+
+      - name: Verify toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: cargo test --locked
+        run: cargo test --locked
