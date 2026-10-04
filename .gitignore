@@ -17,3 +17,6 @@ profile.json
 profiles.json
 secrets.toml
 captures/
+
+# Issue drafting scratch (the issues themselves live on GitHub)
+.issues/
