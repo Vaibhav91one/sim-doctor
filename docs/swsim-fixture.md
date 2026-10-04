@@ -168,26 +168,83 @@ Not "a reader was listed". In order:
 
 1. A PC/SC context enumerates readers, and one of them is the swICC reader.
 2. A session connects to it and returns a non-empty ATR.
-3. **SELECT MF (3F00)**, sent as **00 A4 00 0C 02 3F 00**, returns exactly
-   **90 00** with no response data.
+3. **SELECT MF (3F00)**, sent as **00 A4 00 0C 02 3F 00**, returns a bare
+   status word in the **normal processing class** (SW1 90..9F) with no
+   response data. If the card has a proactive command pending it answers
+   **91 <length>**, so the test fetches that command and repeats the SELECT
+   until it gets a literal **90 00**, which it then asserts exactly.
 4. **SELECT MF (3F00)** with FCP, sent as **00 A4 00 04 02 3F 00**, returns
    **61 xx**, and a **GET RESPONSE** (**A0 C0 00 00 xx**) then returns exactly
-   the advertised number of bytes, ending 90 00, with the MF file capabilities
-   template in the body carrying the file ID 3F00.
-5. **SELECT DF GSM (7F20)** returns 90 00, so selection walks the file system
-   rather than only answering the first command.
+   the advertised number of bytes followed by a normal processing status word,
+   with the MF file capabilities template in the body carrying the file ID
+   3F00.
+5. **SELECT DF GSM (7F20)** returns normal processing, so selection walks the
+   file system rather than only answering the first command.
 6. **SELECT EF.DIR (2F00)** then **READ BINARY** of 15 bytes returns the
-   profile's real application template, tag **61**, ending 90 00.
+   profile's real application template, tag **61**, followed by a normal
+   processing status word.
 7. Disconnect, then disconnect again, which the trait specifies as a no-op.
+
+### Why the assertions say "normal processing class" and not "90 00"
+
+This is the single most useful thing the fixture found, and it cost a CI run
+to learn, so it is recorded rather than smoothed over.
+
+swSIM's own success is **90 00**: lib/swicc/include/swicc/apdu.h:43 defines
+`SWICC_APDU_SW1_NORM_NONE = 0x90` with the comment "Success, 9000". A
+SELECT MF does return it.
+
+What swSIM then does, at the end of **every** command in
+**src/apduh.c:sim_apduh_demux**, is:
+
+~~~c
+proactive_step(&sim_state->proactive);
+if (ret == SWICC_RET_SUCCESS)
+{
+    if (res->sw1 == SWICC_APDU_SW1_NORM_NONE && res->sw2 == 0)
+    {
+        if (sim_state->proactive.command_length > 0)
+        {
+            res->sw1 = 0x91;
+            res->sw2 = (uint8_t)sim_state->proactive.command_length;
+        }
+    }
+}
+~~~
+
+So **a successful command's 90 00 is rewritten to 91 <length>** whenever a
+proactive command is waiting. On the USIM profile in data/usim.json the first
+SELECT MF therefore comes back **91 80**: the select worked, and there is a
+128-byte proactive SIM command for the terminal to fetch. [V], read in swSIM
+source at the pinned commit.
+
+Three consequences worth keeping:
+
+- **SW1 0x91 is not failure.** ISO/IEC 7816-4 defines 0x9F as "normal
+  processing, proactive command available"; 0x91, 0x92 and 0x93 are the 3GPP
+  variants, which put the pending command's length in SW2. A scanner that
+  treats 91 xx as an error would report every healthy card as broken.
+- **A 9x SW2 is not always a length.** 61 xx is a response length, 9x may be a
+  proactive command length, and 6C xx is a corrected length. They are three
+  different numbers that happen to share a byte.
+- **Chasing a 90 00 needs a FETCH first.** FETCH is **80 12 00 00 <length>**;
+  src/apduh.c:apduh_etsi_cat_fetch requires Le to equal the pending length
+  exactly and clears it. Only once nothing is pending does a command answer a
+  plain 90 00.
+
+This is why the test asserts the class, and separately asserts that the
+response carries no trailing data, which is the property P2 = 0x0C actually
+promises. Hard-coding "90 00" everywhere would make it a test of the
+simulator's mood.
 
 ### Why P2 = 0x0C on the SELECT
 
 ISO/IEC 7816-4 clause 7.5.1 sets bit b4 of P2 to mean "return no response
 data". swSIM implements both forms: P2 = 0x00 leaves the FCP in the GET
-RESPONSE queue and answers 61 xx, while P2 = 0x0C answers 90 00 directly.
-Both are conformant. The "no data" form is what gives a clean 90 00 to assert,
-which is why step 3 uses it and step 4 uses the other form deliberately, to
-prove a real body comes back.
+RESPONSE queue and answers 61 xx, while P2 = 0x0C answers immediately with no
+body. Both are conformant. The "no data" form is what lets the test assert
+that nothing came back at all, which is why step 3 uses it and step 4 uses the
+other form deliberately, to prove a real body comes back.
 
 ### Why GET RESPONSE uses CLA 0xA0
 

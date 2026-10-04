@@ -74,6 +74,29 @@ The fixture cannot be run on macOS: there is no pcscd, and swicc-pcsc is a
 pcsc-lite IFD handler with no macOS port. Only the crate builds and tests
 there, which is exactly why the default suite has to stay hardware-free.
 
+### Status words the fixture proved [V]
+
+Two facts about real cards that the swSIM fixture established by exchanging
+APDUs, not by reading a spec. Both will bite every later issue that parses a
+status word, so they are recorded here rather than only in the fixture doc.
+Source citations and the full transcript are in
+[docs/swsim-fixture.md](docs/swsim-fixture.md).
+
+- **SW1 `91`..`9F` is NOT failure.** `9F` is ISO/IEC 7816-4 "normal
+  processing, proactive command available"; `91`, `92` and `93` are the 3GPP
+  variants and carry the pending command's length in SW2. swSIM rewrites a
+  successful command's `90 00` into `91 <length>` whenever a proactive command is
+  pending (`src/apduh.c:sim_apduh_demux`, at the end of every command). A scanner
+  that treats `91 xx` as an error reports every healthy card as broken.
+- **A 9x SW2 is not always a length.** `61 xx` is a response-data length, 9x may
+  be a proactive-command length, and `6C xx` is a corrected length. Three
+  different numbers sharing a byte.
+
+Consequence for the rule model: **`StatusWord::is_success` returning false for
+`91 xx` is correct and must not be "fixed".** Deciding that a 9x status is
+acceptable is issue #5's job, one layer up, because it needs to know what
+command was sent.
+
 ### Never commit card secrets
 
 `.gitignore` blocks `*.key`, `*.der`, `*.crt`, `*.pem`, `*.pvk`, `profile.json`,
