@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# SIM/eUICC artifacts and secrets - NEVER commit
+*.key
+*.der
+*.crt
+*.pem
+*.pvk
+profile.json
+profiles.json
+secrets.toml
+captures/

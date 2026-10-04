@@ -1,0 +1,67 @@
+[package]
+name = "sim-doctor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "CLI-first SIM security testing tool"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# --- Smartcard transport ---
+pcsc    = "2.9.0"   # PC/SC reader bindings (SCard* API). STALE: last publish 2024-12-14
+iso7816 = "0.2.1"   # APDU types. 0.x - unstable API
+
+# --- SIM crypto ---
+milenage = "0.3.1"  # MIL-ENAGE KDF, f1-f5/f5*, auth responses
+
+# --- Symmetric / hash primitives ---
+aes  = "0.9.3"      # 0.9.0 is YANKED
+des  = "0.9.0"      # DES/3DES for legacy GSM
+cbc  = "0.2.1"
+cmac = "0.8.0"      # AES-CMAC / DES-CMAC (SCP03, GSM auth)
+sha2 = "0.11.0"
+hmac = "0.13.0"
+sha3 = "0.12.0"
+
+# --- ECC (SGP.22 SCP03t) ---
+p256  = "0.14.0"    # NIST P-256, otPK/otSK .ECKA
+ecdsa = "0.17.0"    # RFC 6979 deterministic signing
+
+# --- ASN.1 ---
+# WARNING: der is STRICT DER only and will NOT parse BER-TLV BPP payloads.
+# Use iso7816-tlv for BER-TLV. Keep der for certificates only.
+der = "0.8.2"       # 0.8.0 is YANKED
+oid = "0.3.0"
+
+# --- BER-TLV (SIM/UICC files + SGP.22 BPP) ---
+iso7816-tlv = "0.4.4"  # ISO/IEC 7816-4 TLV handling - primary choice
+flexiber     = "0.2.0"  # ISO 7816-4 BER-TLV encode/decode - alternative
+
+# --- CLI / TUI ---
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+ratatui = "0.30.2"
+crossterm = "0.29.0"   # 0.28.0 is YANKED
+owo-colors = "4.4.0"   # zero-alloc, best fit with ratatui
+
+# --- Serialization / errors ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+
+# --- Logging / util ---
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+hex = "0.4.3"
+bytes = "1.12.1"
+rand = "0.10.3"      # MAJOR LINE JUMP 0.8->0.9->0.10 - see AGENTS.md warning
+chrono = "0.4.45"
+
+[dependencies.tokio]
+version = "1.53.2"
+optional = true
+
+[features]
+default = []
+remote  = ["dep:tokio"]   # only for remote-SIM / ATC-UICCS; pure PC/SC is sync
