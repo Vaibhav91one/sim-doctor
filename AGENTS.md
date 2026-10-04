@@ -147,14 +147,11 @@ real incompatibility introduced by a later dependency change, not this original 
 `der` resolves to a **single** version, `0.8.2`, and it is the *same instance* that `p256`
 `0.14`, `ecdsa` `0.17`, `spki` `0.8` and `sec1` `0.8` all consume [V]:
 
-```
-cargo tree -i der
-# der v0.8.2
-# |- ecdsa v0.17.0 -> p256 v0.14.0
-# |- pkcs8 v0.11.0 -> elliptic-curve v0.14.1
-# |- sec1 v0.8.1, spki v0.8.0
-# '- sim-doctor v0.1.0
-```
+Run `cargo tree -i der` to see it. The command reports one `der` node at `0.8.2`, with
+`sim-doctor` as a direct dependent and these as the other dependents, all at the same version:
+`ecdsa 0.17.0` (which reaches `p256 0.14.0`), `pkcs8 0.11.0`, `sec1 0.8.1` and `spki 0.8.0`.
+(Summarised from the real output rather than pasted, so the point is the single version, not
+the exact tree shape - re-run the command for that.)
 
 So the direct `der = "0.8.2"` dependency and the one reached through the ECC stack are the
 same crate. Signature DER encoding interoperates with `ecdsa` without an adapter, and the
