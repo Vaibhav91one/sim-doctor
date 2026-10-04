@@ -1,0 +1,245 @@
+# Software-card fixture for issue #4.
+#
+# This is deliberately a separate workflow, not extra jobs inside ci.yml. The
+# fmt / clippy / test gate must stay fast and must never need a card, and this
+# job builds two C projects from source and installs a system daemon. Folding
+# them together would mean a swSIM build failure could make the crate look
+# broken when it is not.
+#
+# What it actually proves, and why "swSIM started" is not enough:
+#
+#   pcscd is running, the swicc-pcsc driver module is loaded by it, the swSIM
+#   card is presented as a reader, and THIS PROJECT's pcsc transport
+#   (src/transport/pcsc.rs) enumerates that reader, connects, and completes
+#   real APDU round trips: SELECT MF (3F00) returning 90 00, a GET RESPONSE
+#   that returns the MF file capabilities template, and a READ BINARY of
+#   EF.DIR that returns the profile's actual bytes.
+#
+# Every step sets "set -o pipefail". Both C projects build with -Werror, and a
+# step written as "make ... 2>&1 | tail -40" reports the exit status of tail,
+# so a build that produced no binary at all would look like a pass. Every step
+# also asserts its artifact exists with test -f rather than trusting the
+# step's own success.
+#
+# swSIM and swicc-pcsc are BSD-3 licensed. See docs/swsim-fixture.md for the
+# pinned commits and the licence notice.
+name: card-fixture
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# Least privilege: nothing here writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # Pinned superproject commits. A moving upstream head must not be able to
+  # change our fixture silently, so these are full SHAs, never a branch.
+  SWSIM_SHA: 281da8c63398ece9a5126cad969674f4f413ab63
+  SWICC_PCSC_SHA: 0496740fc96ffc777cbcf1dc758892e2ff487973
+
+  # The swicc-pcsc driver hard-codes this as the endpoint it listens on and
+  # swSIM connects to. Changing it needs both sides.
+  FIXTURE_PORT: "37324"
+  FIXTURE_IP: "127.0.0.1"
+
+jobs:
+  swsim-card:
+    name: swSIM card (PC/SC transport round trip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # pcscd is the daemon. pcsc-tools supplies pcsc-scan, which proves a card
+      # is visible WITHOUT depending on this crate compiling, so a later
+      # failure is ours rather than the fixture's. libpcsclite-dev is needed by
+      # pcsc-sys's build script, which calls exit(1) when pkg-config cannot
+      # find it. cmake is needed by swicc-pcsc's lib/swicc submodule.
+      - name: Install the PC/SC stack and the fixture build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends             gcc make cmake pkg-config             libpcsclite1 libpcsclite-dev             pcscd pcsc-tools
+
+      - name: Verify the toolchain and that pcscd is not already running
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          pcscd --version
+          pcsc_scan --version
+          # The package install may have started pcscd through systemd, and a
+          # socket-activated pcscd would hold /run/pcscd/pcscd.comm against the
+          # foreground daemon this job starts.
+          sudo systemctl stop pcscd.socket pcscd.service 2>/dev/null || true
+          sudo systemctl disable pcscd 2>/dev/null || true
+          pkill -x pcscd || true
+          sleep 1
+          if pgrep -x pcscd; then echo "pcscd is still running"; exit 1; fi
+
+      - name: Build swSIM at the pinned commit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fixture"
+          cd "$RUNNER_TEMP/fixture"
+          rm -rf swsim
+
+          # --recurse-submodules is not optional. swsim has three submodules
+          # (lib/make-pal, lib/swicc, lib/tau); after a plain clone every lib/
+          # directory is EMPTY and make fails much later with a confusing
+          # error about a missing header.
+          git init -q swsim
+          cd swsim
+          git remote add origin https://github.com/tomasz-lisowski/swsim.git
+          git fetch --depth 1 origin "$SWSIM_SHA"
+          git checkout -q --detach FETCH_HEAD
+          # Full (not shallow) submodule fetch: a pinned submodule commit is not
+          # necessarily the tip of any branch, so --shallow-submodules can fail
+          # to resolve it.
+          git submodule update --init --recursive
+          echo "swsim at $(git rev-parse HEAD)"
+          test -f lib/swicc/src/apduh.c
+          test -f lib/tau/Makefile
+
+          make main-dbg -j"$(nproc)"
+
+          # The binary is build/swsim.elf. build/swsim is the OBJECT DIRECTORY,
+          # so locating it with "ls build/swsim" reports a directory and looks
+          # exactly like a missing binary.
+          test -f build/swsim.elf
+          ./build/swsim.elf --version
+
+      - name: Build and install the swicc-pcsc driver at the pinned commit
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/fixture"
+          rm -rf swicc-pcsc
+
+          # swicc-pcsc has two submodules (lib/make-pal, lib/swicc). Same
+          # reasoning as above.
+          git init -q swicc-pcsc
+          cd swicc-pcsc
+          git remote add origin https://github.com/tomasz-lisowski/swicc-pcsc.git
+          git fetch --depth 1 origin "$SWICC_PCSC_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git submodule update --init --recursive
+          echo "swicc-pcsc at $(git rev-parse HEAD)"
+          test -f lib/swicc/src/apdu.c
+
+          make main-dbg -j"$(nproc)"
+
+          # This project builds NO executable. It builds a pcscd driver module
+          # that has to be installed where pcscd will dlopen it.
+          test -f build/libswicc-pcsc.so.1.2.0
+
+          # install copies TWO files, and the daemon needs both:
+          #   build/reader.conf        -> /etc/reader.conf.d/libswicc-pcsc
+          #   build/libswicc-pcsc.so   -> /usr/lib/pcsc/drivers/serial/
+          # Building the .so and skipping the install gives a pcscd that never
+          # registers a reader, which reads like a driver bug.
+          sudo make install
+          test -f /etc/reader.conf.d/libswicc-pcsc
+          test -f /usr/lib/pcsc/drivers/serial/libswicc-pcsc.so.1.2.0
+          echo "reader.conf.d/libswicc-pcsc:"
+          cat /etc/reader.conf.d/libswicc-pcsc
+
+      - name: Start pcscd, then start swSIM against it
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fixture"
+
+          # Order is fixed and backwards is a silent time sink. The swicc-pcsc
+          # IFD handler is the LISTENER: IFDHCreateChannel creates the server
+          # socket. swSIM is the client that connects to it. Starting swSIM
+          # first gives a card nobody is listening for.
+          sudo pcscd --foreground --debug > "$RUNNER_TEMP/pcscd.log" 2>&1 &
+          sleep 2
+          if ! pgrep -x pcscd; then
+            echo "pcscd exited immediately:"
+            cat "$RUNNER_TEMP/pcscd.log"
+            exit 1
+          fi
+
+          # --fs-gen builds a fresh USIM filesystem from the checked-in JSON
+          # profile. That is where the card key material comes from: it is
+          # generated at run time in the runner temp directory and never
+          # written into this repository. See AGENTS.md, never commit card keys.
+          "$RUNNER_TEMP/fixture/swsim/build/swsim.elf" \
+            --ip "$FIXTURE_IP" --port "$FIXTURE_PORT" \
+            --fs "$RUNNER_TEMP/fixture/filesystem.swiccfs" \
+            --fs-gen "$RUNNER_TEMP/fixture/swsim/data/usim.json" \
+            > "$RUNNER_TEMP/swsim.log" 2>&1 &
+          sleep 2
+          if ! pgrep -f swsim.elf; then
+            echo "swSIM exited immediately:"
+            cat "$RUNNER_TEMP/swsim.log"
+            exit 1
+          fi
+
+      - name: Wait for the swICC reader to present the card
+        run: |
+          set -euo pipefail
+          ready=0
+          scan=""
+          for _ in $(seq 1 90); do
+            scan="$(pcsc-scan 2>&1 || true)"
+            if printf '%s' "$scan" | grep -qi swicc &&
+               printf '%s' "$scan" | grep -qi 'Card present'; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          printf '%s\n' "$scan"
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::no swICC reader with a card appeared within 90s"
+            exit 1
+          fi
+
+      - name: Drive the card through this crate's PC/SC transport
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/card-test.log"
+          cargo test --locked --features card-fixture --test card_fixture -- \
+            --ignored --exact drives_a_real_card_through_the_pcsc_transport --nocapture \
+            2>&1 | tee "$log"
+
+          # --ignored against a renamed or deleted test would run nothing and
+          # still exit 0. Assert that the test really ran, and that it really
+          # got as far as the SELECT MF and READ BINARY round trips, rather
+          # than trusting the exit code alone.
+          grep -q '1 passed' "$log"
+          grep -q 'SELECT MF (3F00), no FCP' "$log"
+          grep -q 'READ BINARY EF.DIR' "$log"
+
+      - name: Dump the fixture logs
+        # Always, including after a failure: the daemon log says why a reader
+        # did or did not appear, and the card log says whether the card
+        # answered at all.
+        if: always()
+        run: |
+          echo "=== pcscd.log (tail) ==="
+          tail -80 "$RUNNER_TEMP/pcscd.log" 2>/dev/null || echo "(no pcscd log)"
+          echo "=== swsim.log (tail) ==="
+          tail -40 "$RUNNER_TEMP/swsim.log" 2>/dev/null || echo "(no swSIM log)"

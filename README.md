@@ -21,6 +21,7 @@ dependency manifest. No working binary yet. See [CONTEXT.md](CONTEXT.md) for the
 | [CLAUDE.md](CLAUDE.md) | Pointer to AGENTS.md |
 | [CONTEXT.md](CONTEXT.md) | Project decisions, open questions, milestone plan |
 | [docs/research-report.md](docs/research-report.md) | Full source-verified research findings |
+| [docs/swsim-fixture.md](docs/swsim-fixture.md) | Software-card fixture: how to run swSIM behind pcscd locally |
 | [Cargo.toml](Cargo.toml) | Dependency manifest, versions verified against crates.io |
 
 ## License
@@ -34,4 +35,7 @@ dependency manifest. No working binary yet. See [CONTEXT.md](CONTEXT.md) for the
 2. **Verified facts only.** Claims carry a [V] verified or [U] unverified tag so nobody
    builds on a guess. See AGENTS.md.
 3. **Testable without hardware.** The primary dev loop runs against a software SIM behind
-   a software PC/SC reader.
+   a software PC/SC reader. `cargo test` needs no reader at all; the card-backed
+   test is behind the `card-fixture` feature and runs in a separate CI job that
+   builds swSIM and swicc-pcsc at pinned commits. See
+   [docs/swsim-fixture.md](docs/swsim-fixture.md).

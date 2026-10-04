@@ -53,6 +53,27 @@ The primary dev loop is a software SIM behind a software PC/SC reader:
 
 Never make hardware a prerequisite for running the test suite.
 
+**This is standing up, in issue #4.** Both projects are pinned by SHA, built and
+installed in a separate CI workflow, and the card-backed test runs against
+[src/transport/pcsc.rs](src/transport/pcsc.rs), the real `pcsc` implementation of
+[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs).
+
+The gate keeping the default suite hardware-free is the **`card-fixture` cargo
+feature**, which is off by default; the test additionally carries `#[ignore]`.
+Three commands to check the gate holds:
+
+```
+cargo test --locked                                   # no reader, no daemon, no card
+cargo test --locked --all-features                     # still green; the card test is ignored
+cargo test --locked --features card-fixture -- --ignored --nocapture   # needs the fixture
+```
+
+Local reproduction steps, the pinned commits, the BSD-3 notice and a
+troubleshooting table are in [docs/swsim-fixture.md](docs/swsim-fixture.md).
+The fixture cannot be run on macOS: there is no pcscd, and swicc-pcsc is a
+pcsc-lite IFD handler with no macOS port. Only the crate builds and tests
+there, which is exactly why the default suite has to stay hardware-free.
+
 ### Never commit card secrets
 
 `.gitignore` blocks `*.key`, `*.der`, `*.crt`, `*.pem`, `*.pvk`, `profile.json`,
