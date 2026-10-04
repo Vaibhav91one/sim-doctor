@@ -194,33 +194,50 @@ jobs:
       # interactive session is itself an authorized session.
       - name: Let this job client connect to the PC/SC daemon
         run: |
-          set -euo pipefail
-          echo "writing the polkit rule"
-          sudo mkdir -p /etc/polkit-1/rules.d
+          set -uo pipefail
+          set -x
+          id
+          sudo -n id || echo "SUDO UNAVAILABLE"
+          set +x
+
+          # One privileged operation, not two. install -D creates the parent
+          # directories as part of the copy, so there is no separate mkdir to
+          # fail on. The privileged call's own output is captured, so a future
+          # failure says WHY instead of leaving a bare exit 1 in the log.
           printf '%s\n' \
             'polkit.addRule(function (action, subject) {' \
             '    if (action.id === "access_pcsc") {' \
             '        return polkit.Result.YES;' \
             '    }' \
             '});' > "$RUNNER_TEMP/pcsc-access.rule"
-          sudo install -m 0644 "$RUNNER_TEMP/pcsc-access.rule" \
-            /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
+
+          set -e
+          sudo install -D -m 0644 "$RUNNER_TEMP/pcsc-access.rule" \
+            /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules 2>&1 | tee "$RUNNER_TEMP/install.log"
           test -f /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
           echo "polkit rule in place:"
           cat /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
-          # polkitd rereads rules.d on change, but restart it anyway so the
-          # rule is definitely live, and say out loud whether a polkit
-          # authority is even running. If none is, the rule cannot take effect
-          # and every client will still be refused.
-          sudo systemctl restart polkit 2>/dev/null || true
-          if systemctl is-active --quiet polkit; then
-            echo "polkit daemon: active"
-          elif systemctl is-active --quiet polkitd; then
-            echo "polkit daemon: active (polkitd unit)"
+
+          # Whether a polkit authority is running decides whether the rule can
+          # possibly take effect, and the two situations need opposite fixes.
+          # Say which one this is rather than leaving it to be inferred from a
+          # later "Access denied".
+          if systemctl is-active --quiet polkit || systemctl is-active --quiet polkitd; then
+            echo "polkit authority: already running"
           else
-            echo "polkit daemon: NOT ACTIVE - clients will still be refused"
-            systemctl status polkit --no-pager 2>&1 | head -5 || true
+            echo "polkit authority: not running, starting it"
+            sudo systemctl start polkit 2>&1 | tee "$RUNNER_TEMP/polkit-start.log" || true
+            sleep 1
+            if systemctl is-active --quiet polkit || systemctl is-active --quiet polkitd; then
+              echo "polkit authority: started"
+            else
+              echo "polkit authority: STILL NOT RUNNING. A rules.d file cannot"
+              echo "take effect without one, and every client will be refused."
+              sudo systemctl status polkit --no-pager 2>&1 | head -10 || true
+              exit 1
+            fi
           fi
+          sudo systemctl restart polkit 2>/dev/null || true
 
       - name: Start pcscd, then start swSIM against it
         run: |
