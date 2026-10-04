@@ -1,5 +1,7 @@
 # sim-doctor
 
+[![CI](https://github.com/Vaibhav91one/sim-doctor/actions/workflows/ci.yml/badge.svg)](https://github.com/Vaibhav91one/sim-doctor/actions/workflows/ci.yml)
+
 CLI-first SIM security testing tool in Rust.
 
 Examines SIM/UICC/eUICC cards over PC/SC and reports findings through both a human
