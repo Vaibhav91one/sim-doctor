@@ -176,6 +176,35 @@ jobs:
           echo "reader.conf.d/libswicc-pcsc:"
           cat /etc/reader.conf.d/libswicc-pcsc
 
+      # pcsc-lite 2.x checks every PC/SC client against a polkit action before
+      # it will serve it. The action id is "access_pcsc" - the id the daemon
+      # logs verbatim, not the older org.debian.pcsc-lite.scantoken spelling.
+      #
+      # A GitHub runner has no active session and no polkit agent to authorize
+      # against, so with the stock policy every client is refused:
+      #   auth.c IsClientAuthorized() ... is NOT authorized for action: access_pcsc
+      #   winscard_svc.c ContextThread() Rejected unauthorized PC/SC client
+      # and SCardEstablishContext returns "Access denied". That looks exactly
+      # like a fixture that is not working: the card connects, the driver
+      # loads, every slot reports empty, and nothing is ever served.
+      #
+      # Granting the action is safe here precisely because this is a
+      # throwaway runner and the daemon is one this job started. On a
+      # developer desktop the stock policy already works, because an
+      # interactive session is itself an authorized session.
+      - name: Let this job client connect to the PC/SC daemon
+        run: |
+          set -euo pipefail
+          sudo tee /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules > /dev/null <<'POLKIT'
+          polkit.addRule(function (action, subject) {
+              if (action.id === "access_pcsc") {
+                  return polkit.Result.YES;
+              }
+          });
+          POLKIT
+          test -f /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
+          cat /etc/polkit-1/rules.d/99-sim-doctor-pcsc.rules
+
       - name: Start pcscd, then start swSIM against it
         run: |
           set -euo pipefail
