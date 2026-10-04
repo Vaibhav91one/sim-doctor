@@ -251,12 +251,16 @@ jobs:
               printf '%s' "$1" | grep -qi 'Card present'
           }
 
+          # pcsc_scan does not exit on its own once it has a context: with
+          # no -t it polls for card events until interrupted. Bound it with -t
+          # and with timeout, or the first successful scan hangs the job.
+          #
           # Ask as the normal user first. If polkit refuses the context, say so
           # and ask again as root, which pcsc-lite always serves. Keeping both
           # attempts visible matters: "refused" and "no card" are completely
           # different failures and only one of them is the fixture's.
-          for _ in $(seq 1 30); do
-            scan="$(pcsc_scan 2>&1 || true)"
+          for _ in $(seq 1 20); do
+            scan="$(timeout 20 pcsc_scan -t 3 2>&1 || true)"
             if see_the_card "$scan"; then
               ready=1
               break
@@ -270,8 +274,8 @@ jobs:
           done
 
           if [ "$ready" -ne 1 ]; then
-            for _ in $(seq 1 30); do
-              scan="$(sudo pcsc_scan 2>&1 || true)"
+            for _ in $(seq 1 20); do
+              scan="$(sudo timeout 20 pcsc_scan -t 3 2>&1 || true)"
               if see_the_card "$scan"; then
                 ready=1
                 break
