@@ -513,9 +513,16 @@ fn walks_the_file_system_of_a_real_card() {
         candidates: sim_doctor::walk::Candidates::SimFamilies,
         ..sim_doctor::walk::Options::default()
     };
+    // The count is generated here, not typed in and not read from a capacity
+    // hint. This line is output a machine reads: reporting a candidate count
+    // the walk did not use would be the same class of defect as reading a
+    // status word with the wrong meaning.
+    let (candidates, truncated) = options.candidates.clone().identifiers(usize::MAX);
     println!(
-        "walking the card with {} candidate identifiers per directory, under the {:?} tag table",
-        sim_doctor::walk::DEFAULT_MAX_CHILDREN,
+        "walking the card with {} candidate identifiers per directory (bound {}{}), under the {:?} tag table",
+        candidates.len(),
+        options.limits.max_children,
+        if truncated { ", truncated" } else { "" },
         dialect.name()
     );
 

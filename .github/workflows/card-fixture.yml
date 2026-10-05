@@ -353,11 +353,21 @@ jobs:
 
           # Issue #7's test walked the tree. These greps are what make a green
           # job mean the walker ran against a card rather than being skipped.
-          grep -q 'walking the card with 1280 candidate identifiers' "$log"
+          #
+          # Nothing here matches on a COUNT. An earlier version grepped for the
+          # candidate count, which couples the gate to a default that is a
+          # tuning knob: change DEFAULT_MAX_CHILDREN or the candidate set and CI
+          # fails on a number rather than on behaviour. What is checked instead
+          # is the shape of the answer - it walked, it found the master file,
+          # it found a directory and an elementary file, and it reported its
+          # counts and its bounds.
+          grep -q 'walking the card with .* candidate identifiers per directory' "$log"
           grep -q 'SELECTED  3F00$' "$log"
           grep -q 'SELECTED  3F00/7F20$' "$log"
           grep -q 'SELECTED  3F00/2FE2$' "$log"
-          grep -q 'report:' "$log"
+          grep -q 'report: .* selected, .* absent, 0 forbidden' "$log"
+          grep -q 'bounds the walk hit: \[' "$log"
+          grep -q 'deepest file the card actually holds is' "$log"
 
       - name: Dump the fixture logs
         # Always, including after a failure: the daemon log says why a reader
