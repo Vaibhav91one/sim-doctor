@@ -286,6 +286,20 @@ impl<'a> Context<'a> {
 pub const NO_RULES_WARNING: &str =
     "rules_run is 0: no rule has been implemented yet, so nothing on this card was checked. This score is 100 because there is nothing to subtract, NOT because the card is clean";
 
+/// The warning a score carries when a rule ran but gathered no evidence.
+///
+/// **This is the case `--tar off` produces, and it is not the same as the one
+/// above.** A rule is registered, so `rules_run` is 1, and the rule looked -
+/// but the TAR audit probed nothing, so it had nothing to look at. A score of
+/// 100 from that is not a verdict either: it says the MSL 0 check did not run.
+///
+/// The default is `off` because an ENVELOPE probe leaves swicc-pcsc unable to
+/// start a transaction for any later process. Turning the audit on is an
+/// explicit operator decision, and while it is off this sentence is the honest
+/// description of what the number means.
+pub const NO_TAR_EVIDENCE_WARNING: &str =
+    "the TAR audit probed nothing, so the MSL 0 check did not run: this score is 100 because no TAR was probed, NOT because the card refuses TAR 0. Run with --tar focused to check";
+
 // ---------------------------------------------------------------------------
 // What a scan concluded
 // ---------------------------------------------------------------------------
@@ -642,7 +656,21 @@ impl Verdict {
                     // no rule having looked is not. A scan that somehow ran
                     // zero rules still gets the sentence, so the constant
                     // stays live rather than becoming dead code.
-                    "warning": (self.rules_run == 0).then_some(NO_RULES_WARNING),
+                    // THREE ways this 100 is not a verdict, not one. No rule
+                    // has been implemented; a rule ran but the TAR audit probed
+                    // nothing, which is the default because an ENVELOPE leaves
+                    // swicc-pcsc unable to start a transaction; or a scan that
+                    // somehow ran zero rules. Each gets its own sentence, because
+                    // "nothing was checked" and "checked, found nothing" are
+                    // different claims and an operator has to be able to tell
+                    // them apart.
+                    "warning": if self.rules_run == 0 {
+                        Some(NO_RULES_WARNING)
+                    } else if self.tar.probes.is_empty() {
+                        Some(NO_TAR_EVIDENCE_WARNING)
+                    } else {
+                        None
+                    },
                 }),
             );
         }
@@ -2411,10 +2439,32 @@ mod tests {
             score["warning"]
         );
 
-        // A 100 from a scan that RAN rules is a different claim, and it does
-        // not carry the warning - otherwise the warning stops meaning
-        // anything.
-        let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2).scored(true);
+        // A 100 from a scan that RAN rules is a different claim - but only
+        // if it also had EVIDENCE to look at. `Verdict::new` attaches
+        // `tar::Audit::not_run`, so rules having run is not on its own enough
+        // to call this a verdict: a rule that ran against a TAR audit that
+        // probed nothing looked at nothing. That gets its own sentence.
+        let ran_no_evidence = Verdict::new(rules::Findings::complete(Vec::new()), 2).scored(true);
+        let ran_no_evidence = rendered(&ran_no_evidence)["score"].clone();
+        assert_eq!(ran_no_evidence["rules_run"], json!(2));
+        assert_eq!(ran_no_evidence["warning"], json!(NO_TAR_EVIDENCE_WARNING));
+
+        // With an audit that actually probed, it IS a verdict and the
+        // warning goes null - which is the whole point of the field.
+        let probed = tar::Audit {
+            selection: tar::Selection::focused(),
+            probes: vec![tar::Probe {
+                tar: 0,
+                verdict: tar::Verdict::Refused { status: None },
+            }],
+            baseline: tar::Baseline::of(&[]),
+            exhausted: true,
+            stopped: None,
+            exchanges: 2,
+        };
+        let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2)
+            .scored(true)
+            .tar_audit(probed);
         let ran = rendered(&ran)["score"].clone();
         assert_eq!(ran["value"], json!(rules::SCORE_MAX));
         assert_eq!(ran["rules_run"], json!(2));
@@ -2582,7 +2632,12 @@ mod tests {
             "a card that refused every TAR found nothing"
         );
 
-        let verdict = Verdict::new(found, rules_run()).scored(true);
+        // The audit has to be attached, not merely used above: without it
+        // the verdict reports no evidence and carries the no-evidence warning,
+        // which is the correct thing to say about a 100 with nothing behind it.
+        let verdict = Verdict::new(found, rules_run())
+            .scored(true)
+            .tar_audit(audit);
         let block = verdict.fields();
         let score = &block["score"];
         assert_eq!(score["rules_run"], serde_json::json!(1));

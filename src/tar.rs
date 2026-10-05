@@ -680,9 +680,43 @@ pub struct Selection {
 }
 
 impl Default for Selection {
-    /// The focused set at the ETSI class, which is what makes a scan check for
-    /// MSL=0 without an operator having to ask for it.
+    /// **Off, and the reason is not convenience.**
+    ///
+    /// A TAR probe is an ENVELOPE, and against swicc-pcsc an ENVELOPE leaves
+    /// the reader unable to start a transaction afterwards. Every later
+    /// exchange in the same process, and every later process, answers
+    /// "An attempt was made to end a non-existent transaction" - including
+    /// exchanges that have nothing to do with this module, and tests this
+    /// issue never touched. It was first seen on the CI card job: a scan that
+    /// ran a full 656-probe audit exited 0, and the three tests that followed
+    /// it could not get into the card at all.
+    ///
+    /// **So the probe is opt in.** A scanner whose default leaves the reader
+    /// poisoned for the next process is worse than one that does not check,
+    /// and worse here means the operator next command fails for reasons that
+    /// have nothing to do with the card. The whole feature is here and is
+    /// tested without hardware; what is deliberately absent is the claim that
+    /// it is safe to point at swicc-pcsc without asking. When a transport
+    /// exists that survives it, this default moves back to `Mode::Focused` and
+    /// the change is one line with this comment to undo.
     fn default() -> Self {
+        Self {
+            mode: Mode::Off,
+            class: Class::Etsi,
+        }
+    }
+}
+
+impl Selection {
+    /// The focused set at the ETSI class, asked for by name.
+    ///
+    /// [`Default`] is [`Mode::Off`] and should stay that way while an
+    /// ENVELOPE leaves swicc-pcsc unable to start a transaction afterwards.
+    /// This constructor is how a caller opts IN - it is what `--tar focused`
+    /// selects, and what the no-evidence score warning tells an operator to
+    /// reach for.
+    #[must_use]
+    pub const fn focused() -> Self {
         Self {
             mode: Mode::Focused,
             class: Class::Etsi,
@@ -2154,7 +2188,7 @@ mod tests {
     }
     #[test]
     fn the_focused_default_is_inside_the_probe_bound() {
-        let (tars, exhausted) = candidates(&Selection::default(), MAX_PROBES);
+        let (tars, exhausted) = candidates(&Selection::focused(), MAX_PROBES);
         assert_eq!(tars.len(), FOCUSED_PROBES);
         assert!(exhausted);
         assert!(
@@ -2359,7 +2393,7 @@ mod tests {
         let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut never,
         )
@@ -2421,7 +2455,7 @@ mod tests {
         let mut calls = 0usize;
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut || {
                 calls += 1;
@@ -2444,7 +2478,7 @@ mod tests {
         let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x60]]);
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut never,
         )
@@ -2469,7 +2503,7 @@ mod tests {
         let mut card = Broken::new();
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut never,
         )
@@ -2492,7 +2526,7 @@ mod tests {
         let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut never,
         )
@@ -2520,7 +2554,7 @@ mod tests {
         let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut never,
         )
@@ -2693,7 +2727,7 @@ mod tests {
         };
         let audit = audit(
             &mut card,
-            &Selection::default(),
+            &Selection::focused(),
             &Policy::default(),
             &mut never,
         )
