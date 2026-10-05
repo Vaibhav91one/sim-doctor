@@ -66,27 +66,27 @@
 //!   is still missing is the typed encode/decode that makes a session useful
 //!   for scanning (#5, landed in [`apdu`]), and the human-facing session
 //!   facade (#10, on top of [`session`]).
-//! - turning findings into an exit code (#13). Issue #6 landed the
-//!   command: `sim-doctor scan` walks a card and reports it, and it exits 0
-//!   whenever the walk finished, because there is nothing to threshold yet.
-//!   What is still missing is the half that reads a scan's findings and picks
-//!   between 0 and 1, which needs rules that produce findings. Until then
-//!   `--score`, `--severity`, `--baseline` and `--diff` exist on the surface
-//!   and refuse with an honest `"implemented": false` rather than pretending,
-//!   which is the AGENTS.md section 3 contract taken literally,
-//! - saving a run and comparing it against a later one (#9). [`scan::Deferred`]
-//!   is where both halves refuse today,
+//! - turning findings into an exit code for a PLAIN scan (#13, re-opened).
+//!   Issue #6 landed the command: `sim-doctor scan` walks a card and reports
+//!   it, and it exits 0 whenever the walk finished. Issue #13 gave the
+//!   vocabulary, issue #24 the first rule, issue #14 `--score` and
+//!   `--severity`, and issue #12 `--baseline` and `--diff`. **A `--diff` that
+//!   regresses does exit 1** - see `FINDINGS_FAIL_A_SCAN` in `src/main.rs` for
+//!   why that is a different decision from the one still open here, which is
+//!   whether a plain scan that *produced* findings should. It does not, and the
+//!   reasons are on that constant,
 //! - asking [`scan`] for a candidate set other than the default. The report
 //!   states the default's coverage in three places because it can MISS a file,
 //!   but `--candidates` does not exist yet, so an operator who needs
 //!   certainty has no way to ask for it from the command line. Recorded on
 //!   `--max-children` rather than left to be discovered;
-//! - a rule that finds anything (#13 delivered the vocabulary, not the rules).
-//!   [`rules`] has the identifiers, the severity ladder, what a finding is,
-//!   and the registry that binds an ID to the code that produces it; it has no
-//!   rule, and no command yet runs one. Wiring the first rule into `scan` is
-//!   what turns findings into an exit code, and the half of #13 that is still
-//!   open.
+//! - rules beyond the first. [`rules`] has the identifiers, the severity
+//!   ladder, what a finding is, and the registry that binds an ID to the code
+//!   that produces it, and it now has **one** rule, `gsma/msl-zero-allowed`,
+//!   registered by [`scan`]. What is still missing is a `sim-doctor rules`
+//!   command that lists the registry, which is what `Registry::ids` is shaped
+//!   for, and the rule that would make a filesystem finding - the vocabulary is
+//!   ready and nothing produces one yet.
 //! - anything on the non-TLV side of the crypto stack. Issue #11 landed the
 //!   BER-TLV stream decoder ([`tlv::Stream`]), the caller-supplied file
 //!   capabilities tag table and the file metadata read through it ([`fcp`]),

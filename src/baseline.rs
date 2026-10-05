@@ -13,7 +13,7 @@
 //! # A rule ID is the address, and a rename has to look like a rename
 //!
 //! A finding is matched across runs by its rule ID together with the thing it
-//! is about - [`matching_key`]. A rule ID a baseline holds and this run does
+//! is about. A rule ID a baseline holds and this run does
 //! not know is **not** reported as fixed, and one this run knows and the
 //! baseline does not is **not** reported as new. Both go under `diff.rules`
 //! with their findings attached and a sentence saying why. See [`Diff`].
@@ -39,12 +39,12 @@
 //!
 //! | Axis | Why |
 //! |---|---|
-//! | [`RunFacts::complete`] | a truncated walk did not see the whole card, so a finding absent from it may simply be below where it stopped |
-//! | [`RunFacts::rules`] | a rule this run runs and the baseline did not can raise anything; its findings are a first check, not a regression |
-//! | [`RunFacts::evidence`] | a rule that ran with **nothing to look at** cannot have found nothing; `--tar off` is the default, and a baseline made by such a run knows nothing about MSL 0 |
-//! | [`RunFacts::severity`] | the two runs filtered different sets out, so a finding the baseline never held is not new |
-//! | [`RunFacts::dialect`] | the FCP tag table decides what a file size means; two runs that disagree read the same bytes differently |
-//! | [`RunFacts::tar_selection`] | the TAR rule answers about the TARs it probed, and two runs probed different ones |
+//! | walk completeness | a truncated walk did not see the whole card, so a finding absent from it may simply be below where it stopped |
+//! | the rule list | a rule this run runs and the baseline did not can raise anything; its findings are a first check, not a regression |
+//! | per-rule **evidence** | a rule that ran with **nothing to look at** cannot have found nothing; `--tar off` is the default, and a baseline made by such a run knows nothing about MSL 0 |
+//! | the severity threshold | the two runs filtered different sets out, so a finding the baseline never held is not new |
+//! | the FCP dialect | the FCP tag table decides what a file size means; two runs that disagree read the same bytes differently |
+//! | the TAR selection | the TAR rule answers about the TARs it probed, and two runs probed different ones |
 //!
 //! **Refusal is a refusal, not a diff.** Every one of these ends in the same
 //! shape as "no reader attached" - `data.error`, exit 1, no `data.findings`
@@ -375,7 +375,7 @@ impl Baseline {
     /// run's reported set; holding the unfiltered findings as well would let a
     /// comparison use a set the report never showed and count a finding an
     /// operator was never shown. The filter in force is recorded in
-    /// [`RunFacts::severity`] and refusing a mismatch is what keeps the two
+    /// the severity threshold and refusing a mismatch is what keeps the two
     /// comparable.
     ///
     /// **Stamped with the current time**, which is the only part of a baseline
@@ -429,7 +429,7 @@ impl Baseline {
     /// baseline file has been through a text editor and possibly through nothing
     /// at all, so every value is checked before it becomes a typed object:
     ///
-    /// 1. [`bounded`] walks the whole [`Value`] and refuses any string over
+    /// 1. a walk over the whole [`Value`] refuses any string over
     ///    [`MAX_TEXT_CHARS`] or any array over [`MAX_RECORDS`]. It runs on the
     ///    raw value rather than the typed one so that it covers every string in
     ///    the document - including the ones a future field adds - without this
@@ -870,14 +870,14 @@ impl RuleDrift {
 /// **The three lists are disjoint, and that is the contract.** Every finding
 /// in exactly one run is in exactly one of `new` or `fixed`; every finding in
 /// both is in `persisting`; and a finding whose rule only one run knows is in
-/// neither, but is in [`Diff::rules`] so that it is still printed. Nothing is
-/// counted twice and nothing disappears, which is what a regression gate is
-/// read by.
+/// neither, but is listed under `diff.rules` in the rendered report so that it
+/// is still printed. Nothing is counted twice and nothing disappears, which is
+/// what a regression gate is read by.
 ///
 /// **A multiset, not a set.** Two findings of the same rule at the same
 /// location are two findings - a rule may legitimately fire once per TAR or
-/// once per file - so [`matching_key`] collisions are matched off in order and
-/// the surplus on either side is new or fixed.
+/// once per file - so findings are matched off by rule ID and location in order,
+/// and the surplus on either side is new or fixed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diff {
     baseline_created: String,
