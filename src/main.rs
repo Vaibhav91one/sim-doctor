@@ -978,6 +978,10 @@ fn exit_with_clap_error(err: clap::Error) -> process::ExitCode {
     let _ = err.print();
     exit(code)
 }
+/// Converts a contract exit code into the exit status of this process.
+fn exit(code: contract::ExitCode) -> process::ExitCode {
+    process::ExitCode::from(code.process_code())
+}
 
 #[cfg(test)]
 mod tests {
@@ -994,8 +998,15 @@ mod tests {
     /// signal and not a surprise.
     #[test]
     fn findings_do_not_fail_a_scan_yet() {
+        // Bound to a local first, on purpose. clippy is right that the
+        // condition is a constant: that is the whole point of this test, and
+        // the failure it produces is the message below rather than a line
+        // number. A `const { assert! }` block would say the same thing at
+        // compile time, but it would also stop the binary building at all, and
+        // a contract decision is not worth taking the tool away over.
+        let findings_fail_a_scan: bool = FINDINGS_FAIL_A_SCAN;
         assert!(
-            !FINDINGS_FAIL_A_SCAN,
+            !findings_fail_a_scan,
             concat!(
                 "a scan that produced findings now exits 1. That IS a contract change:\n",
                 "AGENTS.md section 3 allows it, but it needs the scan --help \n",
@@ -1043,8 +1054,4 @@ mod tests {
         assert!(alone.score, "the flag is still on the surface");
         assert_eq!(alone.severity, Some(rules::Severity::High));
     }
-}
-/// Converts a contract exit code into the exit status of this process.
-fn exit(code: contract::ExitCode) -> process::ExitCode {
-    process::ExitCode::from(code.process_code())
 }

@@ -2276,7 +2276,7 @@ mod tests {
             &context,
             &Verdict::new(rules::Findings::complete(Vec::new()), 0).scored(true),
         );
-        assert!(scored.contains(&rules::SCORE_FORMULA), "{scored}");
+        assert!(scored.contains(rules::SCORE_FORMULA), "{scored}");
         assert!(scored.contains("SCORE 100/100"), "{scored}");
         assert!(scored.contains(NO_RULES_WARNING), "{scored}");
 
