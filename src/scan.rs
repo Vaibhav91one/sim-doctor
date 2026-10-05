@@ -443,9 +443,23 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
                  accepts any command under any TAR with no cryptographic verification",
             ),
             msl_zero_allowed,
+            msl_zero_evidence,
         )
         .expect("the TAR rule ID is unique in this registry");
     registry
+}
+
+/// Whether the MSL 0 rule had a TAR audit to decide from.
+///
+/// **False on the default `--tar off`, and that is the whole point.** The rule
+/// is registered on every scan and evaluates on every scan; with no probes
+/// there is nothing for it to compare a response against, so it is not a rule
+/// that looked and found nothing, it is a rule that could not look. A baseline
+/// written from such a run records `evidence: false` beside this rule's ID, and
+/// a later `--diff` refuses rather than reporting the first real MSL 0 finding
+/// as a regression. See [`crate::rules::HadEvidence`].
+fn msl_zero_evidence(subject: &Subject<'_>) -> bool {
+    !subject.tar.probes.is_empty()
 }
 
 /// How many rules a scan evaluates over one card.

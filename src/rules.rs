@@ -1613,6 +1613,29 @@ impl fmt::Display for Score {
 /// this module a leaf while the binding lives in it.
 pub type Producer<S> = fn(&S) -> Vec<Finding>;
 
+/// Decides whether a rule had anything to look at.
+///
+/// **A rule that ran is not the same as a rule that could have answered.**
+/// `gsma/msl-zero-allowed` is registered on every scan, and with the default
+/// `--tar off` the TAR audit probes nothing, so the rule evaluates and has no
+/// evidence to evaluate against. Nothing in its findings says so - there are
+/// none - so the only way a caller can tell "this rule looked and found
+/// nothing" from "this rule had nothing to look at" is to ask the rule.
+///
+/// That question exists because issue #12's baseline has to answer it. A
+/// baseline written by a run where this rule had no evidence cannot say
+/// anything about MSL 0, so a finding from a later run is not a regression
+/// against it - it is the first check ever made. A baseline that records only
+/// the rule's ID would call that a new finding and the gate would fail a card
+/// for passing a check it had never been given.
+///
+/// Declared per rule and **required**, rather than defaulted, so a rule added
+/// later cannot reach a registry without answering. The type is a bare
+/// function pointer over the same `S` as [`Producer`], for the same reason:
+/// nothing about a card's file system or APDU log is visible here, which is
+/// what keeps this module a leaf.
+pub type HadEvidence<S> = fn(&S) -> bool;
+
 /// What a rule is, apart from the code that runs it.
 ///
 /// The declaration is the part an agent can read without running anything: the
@@ -1672,16 +1695,28 @@ impl RuleSpec {
     }
 }
 
-/// One registered rule: a declaration and the code that runs it.
+/// One registered rule: a declaration, the code that runs it, and what
+/// counts as evidence for it.
 pub struct Rule<S> {
     spec: RuleSpec,
     producer: Producer<S>,
+    evidence: HadEvidence<S>,
 }
 
 impl<S> Rule<S> {
-    /// Binds a declaration to the code that produces its findings.
-    pub const fn new(spec: RuleSpec, producer: Producer<S>) -> Self {
-        Self { spec, producer }
+    /// Binds a declaration, a producer and an evidence predicate together.
+    ///
+    /// All three are required. A producer without an evidence predicate is the
+    /// case [`HadEvidence`] is about: a rule that ran with nothing to look at
+    /// is indistinguishable from a rule that looked and found nothing, and a
+    /// baseline that cannot tell them apart would report a first check as a
+    /// regression.
+    pub const fn new(spec: RuleSpec, producer: Producer<S>, evidence: HadEvidence<S>) -> Self {
+        Self {
+            spec,
+            producer,
+            evidence,
+        }
     }
 
     /// What the rule is called.
@@ -1707,6 +1742,16 @@ impl<S> Rule<S> {
     /// returned findings are then no more trustworthy than the producer is.
     pub fn run(&self, subject: &S) -> Vec<Finding> {
         (self.producer)(subject)
+    }
+
+    /// Whether this rule had anything to look at on this run.
+    ///
+    /// A property of the **run**, not of the rule: the same rule has evidence
+    /// on a card whose TAR audit probed and none on a card scanned with
+    /// `--tar off`. See [`HadEvidence`] for why the difference is worth
+    /// keeping.
+    pub fn had_evidence(&self, subject: &S) -> bool {
+        (self.evidence)(subject)
     }
 }
 
@@ -1754,6 +1799,10 @@ impl<S> Registry<S> {
 
     /// Registers a rule, or refuses because its ID is taken.
     ///
+    /// `evidence` is required rather than defaulted; see [`HadEvidence`] for
+    /// what it is for and [`RuleRun`] for what a caller gets back from
+    /// [`Registry::runs`].
+    ///
     /// # Errors
     ///
     /// [`RegistryError::DuplicateRule`] when `spec.id` is already
@@ -1763,6 +1812,7 @@ impl<S> Registry<S> {
         &mut self,
         spec: RuleSpec,
         producer: Producer<S>,
+        evidence: HadEvidence<S>,
     ) -> Result<&Rule<S>, RegistryError> {
         if let Some(existing) = self.get(spec.id()) {
             return Err(RegistryError::DuplicateRule {
@@ -1770,7 +1820,7 @@ impl<S> Registry<S> {
                 existing: existing.spec().summary().to_owned(),
             });
         }
-        self.rules.push(Rule::new(spec, producer));
+        self.rules.push(Rule::new(spec, producer, evidence));
         // The push is the only fallible-looking line above and cannot fail.
         Ok(self.rules.last().expect("just pushed"))
     }
@@ -1808,6 +1858,26 @@ impl<S> Registry<S> {
         self.rules.iter().map(Rule::id).collect()
     }
 
+    /// Which rules ran on this subject, and which of them had evidence.
+    ///
+    /// **The pair, not the count.** `rules_run` already exists in every score
+    /// block and it cannot tell a rule that looked from a rule that had nothing
+    /// to look at, because both are one. A saved baseline needs both halves:
+    /// the ID is the address, and the boolean is what says whether an absence
+    /// of findings from that rule means "clean" or "not checked".
+    ///
+    /// In registration order, so two runs of the same build produce the same
+    /// list in the same order and a baseline file does not churn.
+    pub fn runs(&self, subject: &S) -> Vec<RuleRun> {
+        self.rules
+            .iter()
+            .map(|rule| RuleRun {
+                id: rule.id().clone(),
+                evidence: rule.had_evidence(subject),
+            })
+            .collect()
+    }
+
     /// Runs every rule over one subject and collects the findings.
     ///
     /// In registration order, which is the order a report should read in and
@@ -1834,6 +1904,57 @@ impl<S> Registry<S> {
             }
         }
         Ok(findings)
+    }
+}
+
+/// One rule, as it ran on one scan: the address, and whether it had
+/// anything to look at.
+///
+/// **Serializable, and revalidated rather than trusted.** This is what goes
+/// into a baseline file, which is untrusted input on the way back in: `id` is
+/// a [`RuleId`] and so runs through `RuleId::new` again on the way in, which is
+/// what stops a hand-edited baseline naming a rule no registry could have
+/// produced. The record count is capped where the file is read rather than
+/// here. See [`HadEvidence`] for why the second field exists at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleRun {
+    id: RuleId,
+    evidence: bool,
+}
+
+impl RuleRun {
+    /// Records that `id` ran, and whether it had evidence.
+    pub const fn new(id: RuleId, evidence: bool) -> Self {
+        Self { id, evidence }
+    }
+
+    /// The rule this is about.
+    pub const fn id(&self) -> &RuleId {
+        &self.id
+    }
+
+    /// Whether it had anything to look at.
+    pub const fn had_evidence(&self) -> bool {
+        self.evidence
+    }
+
+    /// As the object a baseline file carries.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id.as_str(),
+            "evidence": self.evidence,
+        })
+    }
+}
+
+impl fmt::Display for RuleRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.id)?;
+        if !self.evidence {
+            f.write_str(" (no evidence on this run)")?;
+        }
+        Ok(())
     }
 }
 
@@ -2333,13 +2454,18 @@ mod finding_tests {
         assert!(registry.is_empty());
 
         registry
-            .register(spec("filesystem/unreadable-ef"), produce_one)
+            .register(
+                spec("filesystem/unreadable-ef"),
+                produce_one,
+                |_: &NoSubject| true,
+            )
             .expect("first registration");
 
         let error = registry
             .register(
                 spec("filesystem/unreadable-ef").with_remediation("a different rule entirely"),
                 |_: &NoSubject| Vec::new(),
+                |_: &NoSubject| true,
             )
             .expect_err("the second rule claims an ID that is taken");
 
@@ -2360,7 +2486,11 @@ mod finding_tests {
 
         // A different plugin namespace is a different ID and does register.
         registry
-            .register(spec("auth/unreadable-ef"), |_: &NoSubject| Vec::new())
+            .register(
+                spec("auth/unreadable-ef"),
+                |_: &NoSubject| Vec::new(),
+                |_: &NoSubject| true,
+            )
             .expect("a different namespace is a different rule");
         assert_eq!(registry.len(), 2);
         assert_eq!(
@@ -2379,15 +2509,19 @@ mod finding_tests {
         // last point before it is written to a file an agent will diff.
         let mut registry: Registry<NoSubject> = Registry::new();
         registry
-            .register(spec("auth/scp03-missing-mac"), |_: &NoSubject| {
-                vec![Finding::new(
-                    RuleId::new("gsma/msl-zero-allowed").unwrap(),
-                    Severity::High,
-                    "borrowed somebody elses ID",
-                    Location::Card,
-                    Evidence::None,
-                )]
-            })
+            .register(
+                spec("auth/scp03-missing-mac"),
+                |_: &NoSubject| {
+                    vec![Finding::new(
+                        RuleId::new("gsma/msl-zero-allowed").unwrap(),
+                        Severity::High,
+                        "borrowed somebody elses ID",
+                        Location::Card,
+                        Evidence::None,
+                    )]
+                },
+                |_: &NoSubject| true,
+            )
             .expect("registration is fine; the producer is not");
 
         let error = registry
@@ -2400,39 +2534,114 @@ mod finding_tests {
         assert!(matches!(error, RegistryError::MisattributedFinding { .. }));
     }
 
+    /// A run reports each rule and whether it had evidence, and the two are
+    /// different things.
+    ///
+    /// **This is the property issue #12's baseline rests on.** A rule that ran
+    /// and produced nothing is clean; a rule that ran with nothing to look at is
+    /// unchecked, and a gate that cannot tell them apart either fails a card for
+    /// passing a check it was never given, or passes one that was never made.
+    #[test]
+    fn a_run_reports_which_rules_had_evidence_and_which_did_not() {
+        let mut registry: Registry<NoSubject> = Registry::new();
+        registry
+            .register(
+                spec("gsma/msl-zero-allowed"),
+                |_: &NoSubject| Vec::new(),
+                |_: &NoSubject| true,
+            )
+            .expect("registers");
+        registry
+            .register(
+                spec("fs/unreadable-ef"),
+                |_: &NoSubject| Vec::new(),
+                |_: &NoSubject| false,
+            )
+            .expect("registers");
+
+        let runs = registry.runs(&NoSubject);
+
+        // The count matches the registry, so rules_run and the list cannot
+        // disagree about how many rules ran.
+        assert_eq!(runs.len(), registry.len());
+        assert_eq!(runs[0].id(), &RuleId::new("gsma/msl-zero-allowed").unwrap());
+        assert!(runs[0].had_evidence());
+        assert_eq!(runs[1].id(), &RuleId::new("fs/unreadable-ef").unwrap());
+        assert!(
+            !runs[1].had_evidence(),
+            "a rule with nothing to look at is not a rule that found nothing"
+        );
+
+        // Registration order, so two runs of the same build write the same
+        // list in the same order and a baseline file does not churn.
+        assert_eq!(runs[0].id(), registry.ids()[0]);
+        assert_eq!(runs[1].id(), registry.ids()[1]);
+
+        // And it is a JSON object that round-trips, because it is what goes in
+        // a file. The ID re-validates on the way back in.
+        assert_eq!(
+            runs[0].to_json(),
+            serde_json::json!({ "id": "gsma/msl-zero-allowed", "evidence": true })
+        );
+        let parsed: RuleRun =
+            serde_json::from_value(runs[1].to_json()).expect("a rule run round-trips");
+        assert_eq!(parsed, runs[1]);
+    }
+
+    /// A rule run read back from a hand-edited file still re-validates its ID.
+    ///
+    /// The same deliberate re-validation a baseline's findings get, on the
+    /// field that says which rules were involved. A file naming a rule no
+    /// registry could have produced is refused rather than compared against.
+    #[test]
+    fn a_rule_run_read_back_from_a_hand_edited_file_still_revalidates_its_id() {
+        let forged = serde_json::json!({ "id": "GSMA/msl-zero-allowed", "evidence": true });
+        assert!(serde_json::from_value::<RuleRun>(forged).is_err());
+
+        let missing = serde_json::json!({ "id": "gsma", "evidence": true });
+        assert!(serde_json::from_value::<RuleRun>(missing).is_err());
+    }
     #[test]
     fn registered_rules_run_in_order_and_keep_their_own_ids() {
         let mut registry: Registry<NoSubject> = Registry::new();
         registry
-            .register(spec("fs/first"), |_: &NoSubject| {
-                vec![
-                    Finding::new(
-                        RuleId::new("fs/first").unwrap(),
-                        Severity::Low,
-                        "first, twice",
-                        Location::tar(1),
-                        Evidence::None,
-                    ),
-                    Finding::new(
-                        RuleId::new("fs/first").unwrap(),
-                        Severity::High,
-                        "first, again",
-                        Location::tar(2),
-                        Evidence::None,
-                    ),
-                ]
-            })
+            .register(
+                spec("fs/first"),
+                |_: &NoSubject| {
+                    vec![
+                        Finding::new(
+                            RuleId::new("fs/first").unwrap(),
+                            Severity::Low,
+                            "first, twice",
+                            Location::tar(1),
+                            Evidence::None,
+                        ),
+                        Finding::new(
+                            RuleId::new("fs/first").unwrap(),
+                            Severity::High,
+                            "first, again",
+                            Location::tar(2),
+                            Evidence::None,
+                        ),
+                    ]
+                },
+                |_: &NoSubject| true,
+            )
             .expect("registers");
         registry
-            .register(spec("fs/second"), |_: &NoSubject| {
-                vec![Finding::new(
-                    RuleId::new("fs/second").unwrap(),
-                    Severity::Medium,
-                    "second",
-                    Location::Card,
-                    Evidence::None,
-                )]
-            })
+            .register(
+                spec("fs/second"),
+                |_: &NoSubject| {
+                    vec![Finding::new(
+                        RuleId::new("fs/second").unwrap(),
+                        Severity::Medium,
+                        "second",
+                        Location::Card,
+                        Evidence::None,
+                    )]
+                },
+                |_: &NoSubject| true,
+            )
             .expect("registers");
 
         let findings = registry
