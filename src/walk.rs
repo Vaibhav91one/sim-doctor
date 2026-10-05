@@ -58,8 +58,23 @@
 //! other than `00` `[V]`, swicc `src/apduh.c:apduh_res_get` at swicc commit
 //! `421c8cdd`, while the 3GPP directory read is GET RESPONSE with P1 `81`. A
 //! walker that used it would find nothing on the fixture and would look like a
-//! broken walker rather than an unsupported strategy, so enumeration is by
-//! probing and this note is why.
+//! broken walker rather than an unsupported strategy.
+//!
+//! **The cost of probing is deliberate, and here is the reason.** 1280
+//! exchanges per directory against about twenty files that exist is a very poor
+//! ratio, and the next person to read this will assume it is a mistake. It is
+//! not. A directory's listing is a list the card chooses, and a file the card
+//! holds but does not advertise is precisely the kind of hidden file a
+//! security scan exists to find. Reading the listing is the *scanner*; probing
+//! is the *audit*, and this is the audit. Anyone who wants the cheap path
+//! builds it on top of [`Tree`] as a second [`Candidates`] strategy, next to
+//! this one, rather than replacing it.
+//!
+//! **The cost is bounded in time as well as memory.** Every probe creates
+//! exactly one node, so [`Limits::max_nodes`] is a bound on the total number of
+//! exchanges a walk can issue, not only on the size of what it returns. There is
+//! no configuration of [`Candidates`] that makes a walk longer than that, and a
+//! test asserts it.
 
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "walk";
@@ -874,6 +889,15 @@ pub struct WalkReport {
     pub repeated_ancestors: usize,
 
     /// The first bound that stopped the walk, if one did.
+    ///
+    /// **A caller that reports a tree has to report this.** A walk that stopped
+    /// early did not see the whole card, and a file list an agent reads as a
+    /// card's complete contents hides every file below the point where the walk
+    /// stopped. That is a silent under-report of the attack surface, which is
+    /// worse for this tool than refusing to produce a result at all, so the
+    /// reason cannot be dropped on the way out: [`Tree::is_complete`] is false
+    /// whenever this is `Some`, and the JSON envelope in issue #8 has to carry
+    /// both.
     pub truncated_by: Option<Limit>,
 }
 
@@ -905,6 +929,24 @@ impl Tree {
     /// The master file, which every walk starts at.
     pub fn root(&self) -> NodeId {
         NodeId(0)
+    }
+
+    /// Whether this is the whole card, or the part of it the walk reached.
+    ///
+    /// **Checked before this tree is reported, never after.** A truncated walk
+    /// is a finding about the walk, not a footnote: a caller that shows a file
+    /// list without saying it stopped has told an agent the card holds fewer
+    /// files than it does. See [`WalkReport::truncated_by`].
+    pub const fn is_complete(&self) -> bool {
+        self.report.truncated_by.is_none()
+    }
+
+    /// The first bound that stopped the walk, if one did.
+    ///
+    /// Shorthand for [`Tree::report`]'s field of the same name, named because a
+    /// caller reporting this tree should have to type the word *truncated*.
+    pub const fn truncated_by(&self) -> Option<Limit> {
+        self.report.truncated_by
     }
 
     /// One node by handle.
@@ -3111,6 +3153,146 @@ mod tests {
             "SELECT by path from the master file"
         );
         assert_eq!(NodeId(7).to_string(), "#7");
+    }
+
+    #[test]
+    fn a_truncated_walk_is_distinguishable_from_a_complete_one() {
+        let mut complete_card = FakeCard::default()
+            .with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None))
+            .with(
+                "3F00/2FE2",
+                fcp(id("2FE2"), TRANSPARENT_DESCRIPTOR, Some(1)),
+            );
+        let complete = walk(&mut complete_card, &dialect(), &options_for(&["2FE2"])).unwrap();
+        assert!(complete.is_complete());
+        assert_eq!(complete.truncated_by(), None);
+        assert!(!complete.report().is_truncated());
+
+        let mut deep_card =
+            FakeCard::default().with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None));
+        for level in 1..=6u8 {
+            let path = "3F00".to_owned() + &"/5F01".repeat(usize::from(level));
+            deep_card = deep_card.with(&path, fcp(id("5F01"), DIRECTORY_DESCRIPTOR, None));
+        }
+        let truncated = walk(
+            &mut deep_card,
+            &dialect(),
+            &Options {
+                candidates: Candidates::List(vec![id("5F01")]),
+                limits: Limits {
+                    max_depth: 3,
+                    ..Limits::default()
+                },
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        // The two trees are not distinguishable by their contents, only by
+        // this. A caller that reports the files without it is under-reporting.
+        assert!(!truncated.is_complete());
+        assert_eq!(truncated.truncated_by(), Some(Limit::Depth));
+        assert!(truncated.report().is_truncated());
+
+        // And the reason is on a node, not only in the report, so a caller that
+        // renders one node can still say why that node has no children.
+        let stopped = truncated
+            .nodes()
+            .iter()
+            .find(|node| {
+                node.notes().contains(&Note::Limit {
+                    limit: Limit::Depth,
+                })
+            })
+            .expect("the node the walk stopped at carries the reason");
+        assert_eq!(stopped.path().depth(), 4);
+        assert!(stopped.children().is_empty());
+
+        // The two are not equal as values, so a baseline or a diff built on
+        // Tree cannot confuse one for the other either.
+        assert_ne!(complete, truncated);
+    }
+
+    #[test]
+    fn the_number_of_exchanges_a_walk_issues_is_bounded_by_its_node_bound() {
+        // A card that answers every single probe with a directory. Every probe
+        // creates a node, so the node bound is also the exchange bound and a
+        // hostile card cannot make a scan long in time as well as in memory.
+        let mut card =
+            FakeCard::default().with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None));
+        for high in [0x2Fu8, 0x4F, 0x5F, 0x6F, 0x7F] {
+            for low in 0..=0xFFu16 {
+                let id = FileId::from_bytes([high, low as u8]);
+                let mut path = Vec::from(FileId::MASTER_FILE.to_bytes());
+                path.extend(id.to_bytes());
+                card.files.insert(
+                    path,
+                    Held {
+                        fcp: fcp(id, DIRECTORY_DESCRIPTOR, None),
+                        refusal: None,
+                    },
+                );
+            }
+        }
+
+        let limits = Limits {
+            max_nodes: 64,
+            max_directories: 64,
+            max_depth: 64,
+            ..Limits::default()
+        };
+        let options = Options {
+            candidates: Candidates::SimFamilies,
+            limits,
+            ..Options::default()
+        };
+        let tree = walk(&mut card, &dialect(), &options).unwrap();
+
+        let selects = card.with_instruction(0xA4).len();
+        assert!(
+            selects <= limits.max_nodes,
+            "{selects} SELECTs against a node bound of {}",
+            limits.max_nodes
+        );
+        assert!(selects <= limits.max_nodes + limits.max_directories);
+        assert!(!tree.is_complete());
+        assert!(tree.truncated_by().is_some());
+    }
+
+    #[test]
+    fn a_repeated_identifier_is_recorded_and_still_descended() {
+        // The case the fixture card actually presents: SELECT resolves
+        // 3F00/7F20/7F20 to DF.GSM itself. The walk must record the repeat, keep
+        // the file in the tree, and rely on the depth bound to stop.
+        let directory = fcp(id("7F20"), DIRECTORY_DESCRIPTOR, None);
+        let mut card = FakeCard::default()
+            .with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None))
+            .with("3F00/7F20", directory.clone())
+            .with("3F00/7F20/7F20", directory);
+        let options = Options {
+            candidates: Candidates::List(vec![id("7F20")]),
+            limits: Limits {
+                max_depth: 2,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        let tree = walk(&mut card, &dialect(), &options).unwrap();
+
+        let repeat = tree.at(&path_of("3F00/7F20/7F20")).unwrap();
+        assert!(repeat.state().is_selected(), "it is a real file here");
+        assert!(repeat.notes().contains(&Note::RepeatedAncestor {
+            id: id("7F20"),
+            ancestor: path_of("3F00/7F20"),
+        }));
+        assert_eq!(tree.report().repeated_ancestors, 1);
+        assert!(
+            repeat.children().is_empty(),
+            "and the depth bound is what stopped it, not the repeat"
+        );
+        assert!(repeat.notes().contains(&Note::Limit {
+            limit: Limit::Depth
+        }));
     }
 
     #[test]

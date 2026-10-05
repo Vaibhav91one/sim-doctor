@@ -532,9 +532,23 @@ fn walks_the_file_system_of_a_real_card() {
         }
     }
 
-    // 1. It terminates, and it says so if it did not. A walk that ran to a
-    //    bound has not seen the whole card and must not be reported as if it
-    //    had.
+    // 1. It terminates. On this card it terminates by hitting a bound, and
+    //    that is not a defect in the walk - it is the defect in the card.
+    //
+    //    swSIM's "select by path from the MF" walks the path one segment at a
+    //    time with `swicc_disk_file_foreach`, and that iterator runs its
+    //    callback on the starting file itself before its children
+    //    \\[[V], swicc \`src/fs/disk.c\`, the function's own comment says
+    //    "including the file itself". So asking for 3F00/7F20/7F20 searches
+    //    the children of 7F20 for 7F20, matches 7F20 itself on the very first
+    //    callback, and succeeds. Every further identical segment does the
+    //    same, so the card describes an unbounded tree of DF.GSM.
+    //
+    //    This is the exact case `walk::Note::RepeatedAncestor` and
+    //    `Limits::max_depth` exist for, and it is why the walk does not treat
+    //    a repeated identifier as a cycle: a file identifier repeats legally
+    //    across directories, so refusing to descend would hide files, and the
+    //    only sound stopper is a bound.
     let report = tree.report();
     println!(
         "report: {} selected, {} absent, {} forbidden, {} refused, {} directories, {} repeated identifiers, truncated by {:?}",
@@ -547,9 +561,62 @@ fn walks_the_file_system_of_a_real_card() {
         report.truncated_by
     );
     assert!(
-        !report.is_truncated(),
-        "the whole card should fit inside the default bounds: {:?}",
-        report.truncated_by
+        report.repeated_ancestors > 0,
+        "a card that answers SELECT for 3F00/7F20/7F20 must be reported as \
+         repeating an ancestor rather than silently absorbed"
+    );
+    // A bound that stopped the walk is always recorded on a node, so a caller
+    // reporting this tree cannot mistake "stopped here" for "that is all".
+    if let Some(limit) = report.truncated_by {
+        assert!(
+            tree.nodes().iter().any(|node| node
+                .notes()
+                .contains(&sim_doctor::walk::Note::Limit { limit })),
+            "the walk stopped at {limit} and said so on the node it stopped at"
+        );
+    }
+    // 1b. The bound is not hiding anything real. The USIM profile in
+    //     data/usim.json is two levels deep under the master file, and every
+    //     selected file the walk reports past depth 2 is one of the 7F20
+    //     repeats the card's path resolver answers for itself. If a real file
+    //     ever turns up below the bound, this fails and says which.
+    let real_depth = tree
+        .nodes()
+        .iter()
+        .filter(|node| node.state().is_selected())
+        .filter(|node| {
+            !node
+                .notes()
+                .iter()
+                .any(|note| matches!(note, sim_doctor::walk::Note::RepeatedAncestor { .. }))
+        })
+        .map(|node| node.path().depth())
+        .max()
+        .unwrap_or(0);
+    println!("the deepest file the card actually holds is {real_depth} levels below 3F00");
+    assert_eq!(
+        real_depth, 2,
+        "a real USIM profile is two levels below the master file; anything \
+         deeper that is not a repeated-ancestor artifact means the depth bound \
+         is hiding a real file"
+    );
+    assert!(
+        real_depth < options.limits.max_depth,
+        "the default depth bound must leave room for a real card"
+    );
+
+    // And the bounds themselves held.
+    assert!(
+        report.nodes <= options.limits.max_nodes,
+        "{} nodes is past the bound of {}",
+        report.nodes,
+        options.limits.max_nodes
+    );
+    assert!(
+        report.directories <= options.limits.max_directories,
+        "{} directories is past the bound of {}",
+        report.directories,
+        options.limits.max_directories
     );
 
     // 2. It found the master file, and it knows it is the master file.
@@ -754,6 +821,13 @@ fn walks_the_file_system_of_a_real_card() {
             "{} is deeper than the bound",
             node.path()
         );
+        if node.path().depth() == options.limits.max_depth {
+            assert!(
+                node.children().is_empty(),
+                "{} is at the depth bound and must not have been descended",
+                node.path()
+            );
+        }
     }
 
     traced.inner.disconnect().expect("disconnect failed");

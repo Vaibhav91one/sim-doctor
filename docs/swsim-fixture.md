@@ -453,6 +453,30 @@ folder's carries a `C6` PIN status template, which `TagSet::swicc()` has no tag
 for. Both are things the walk reports rather than guesses at: the size as
 `Reported::NotReported`, and the tag in `Capabilities::unknown_tags`.
 
+### This card describes an infinite tree, and that cost issue #7 a CI run
+
+`swicc_disk_file_foreach` runs its callback on the starting file **itself**
+before its children; the function's own comment says "including the file
+itself" \\[V], swicc `src/fs/disk.c` at `421c8cdd`. `va_select_file_path` uses
+it to walk a SELECT-by-path one segment at a time. So asking for
+`3F00/7F20/7F20` searches the children of `7F20` for `7F20`, matches `7F20`
+itself on the very first callback, and **succeeds**. Every further identical
+segment does the same, so the card will select `3F00/7F20/7F20/7F20/...` forever.
+
+This is not a bug the walker can detect by looking at identifiers, because it
+is not a bug in the card's *file system* - it is a bug in the card's *path
+resolver*. A real SIM file identifier repeats legally across directories, so a
+walker that refused to descend on a repeat would hide files. What stops this
+card is a bound: `walk` hit `Limits::max_depth` at sixteen levels and reported
+`Note::Limit { limit: Depth }` on the node it did not descend.
+
+**The first run of `walks_the_file_system_of_a_real_card` failed on exactly
+this**, and the assertion it failed was "the whole card should fit inside the
+default bounds". That assertion was wrong: the card does not fit, and saying
+so is the correct behaviour. It is replaced by assertions that the truncation is
+**reported on a node** rather than silently applied, and that the repeated
+identifiers are recorded as `Note::RepeatedAncestor`.
+
 ## Both card-backed tests must run serially
 
 A card has one current directory and one response queue. swSIM clears the
