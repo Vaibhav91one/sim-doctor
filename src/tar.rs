@@ -736,6 +736,24 @@ impl fmt::Display for Selection {
     }
 }
 
+impl Selection {
+    /// The whole selection, including the class byte, as one comparable word.
+    ///
+    /// **[`fmt::Display`] is nearly this and is not enough.** It renders the
+    /// mode with its band, so two different ranges never collide - but it says
+    /// nothing about [`Class`], and the same TAR sent at a different class byte
+    /// is a different exchange to the card. Issue #12's `--diff` refuses when
+    /// two runs probed different TARs, and a selection saved without its class
+    /// would let it compare two runs that did.
+    ///
+    /// The class is appended with `@` and two hexadecimal digits rather than
+    /// folded into the mode, so a reader of a refusal sees the value they
+    /// would have typed and then one more thing.
+    pub fn fingerprint(&self) -> String {
+        format!("{}@{}", self, self.class.id())
+    }
+}
+
 impl std::str::FromStr for Selection {
     type Err = UnknownSelection;
 

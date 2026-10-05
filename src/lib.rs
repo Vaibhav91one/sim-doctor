@@ -27,6 +27,8 @@
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
+//! layer 1  baseline     a saved run, and the rules for comparing a later
+//!                one against it honestly
 //! layer 1  scan        a card turned into a report that admits what it missed
 //! ```
 //!
@@ -95,6 +97,7 @@
 #![deny(missing_docs)]
 
 pub mod apdu;
+pub mod baseline;
 pub mod contract;
 pub mod der;
 pub mod fcp;
@@ -190,9 +193,23 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fcp::NAME, fs::NAME, session::NAME],
     },
     ModuleInfo {
+        name: baseline::NAME,
+        owns: "A saved run, what it actually did, and the rules for refusing a comparison two runs cannot honestly support.",
+        depends_on: &[rules::NAME],
+    },
+    ModuleInfo {
         name: scan::NAME,
-        owns: "A card rendered as JSON or prose, carrying the dialect it ran under, every bound it hit, the TAR audit, the rules and the score.",
-        depends_on: &[tlv::NAME, apdu::NAME, fcp::NAME, fs::NAME, rules::NAME, tar::NAME, walk::NAME],
+        owns: "A card rendered as JSON or prose, carrying the dialect it ran under, every bound it hit, the TAR audit, the rules, the score and the diff.",
+        depends_on: &[
+            tlv::NAME,
+            apdu::NAME,
+            fcp::NAME,
+            fs::NAME,
+            rules::NAME,
+            tar::NAME,
+            walk::NAME,
+            baseline::NAME,
+        ],
     },
 ];
 

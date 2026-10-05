@@ -1,0 +1,1305 @@
+//! Saving a run and comparing a later one against it: the baseline format,
+//! the comparability rules, and the diff.
+//!
+//! **Owns.** Everything that is true of a *pair* of runs rather than of one.
+//! [`crate::scan`] turns a card into a report and knows nothing about what a
+//! report looked like last week; this module is the half that needs both.
+//!
+//! **Does not own.** A scan ([`crate::scan`]), a finding ([`crate::rules`]), or
+//! the envelope ([`crate::contract`]). It reads and writes a file, compares two
+//! sets of findings, and renders the comparison as a [`serde_json::Value`] the
+//! caller splices into the report it already has.
+//!
+//! # A rule ID is the address, and a rename has to look like a rename
+//!
+//! A finding is matched across runs by its rule ID together with the thing it
+//! is about - [`matching_key`]. A rule ID a baseline holds and this run does
+//! not know is **not** reported as fixed, and one this run knows and the
+//! baseline does not is **not** reported as new. Both go under `diff.rules`
+//! with their findings attached and a sentence saying why. See [`Diff`].
+//!
+//! AGENTS.md section 3 says an ID "must never be renamed casually" precisely
+//! because a baseline outlives the release that wrote it. This is where that
+//! rule gets enforced: rename the rule and the diff says so, rather than
+//! reporting a fix that never happened alongside a new finding that was always
+//! there.
+//!
+//! # A diff is only as good as its baseline
+//!
+//! **The central hazard, and the whole reason this module refuses rather than
+//! reports.** If the baseline was written by a truncated scan, or by one that
+//! ran fewer rules, then almost everything reads as new, nothing reads as
+//! fixed, and neither word means anything. A gate wired to that output does not
+//! fail; it fails *randomly*, which is worse.
+//!
+//! So [`RunFacts`] records what the run that wrote a baseline actually did,
+//! and [`Diff::compare`] refuses to compare against a baseline it cannot
+//! honestly compare with. Six axes, each one a way two runs can ask different
+//! questions of the same card:
+//!
+//! | Axis | Why |
+//! |---|---|
+//! | [`RunFacts::complete`] | a truncated walk did not see the whole card, so a finding absent from it may simply be below where it stopped |
+//! | [`RunFacts::rules`] | a rule this run runs and the baseline did not can raise anything; its findings are a first check, not a regression |
+//! | [`RunFacts::evidence`] | a rule that ran with **nothing to look at** cannot have found nothing; `--tar off` is the default, and a baseline made by such a run knows nothing about MSL 0 |
+//! | [`RunFacts::severity`] | the two runs filtered different sets out, so a finding the baseline never held is not new |
+//! | [`RunFacts::dialect`] | the FCP tag table decides what a file size means; two runs that disagree read the same bytes differently |
+//! | [`RunFacts::tar_selection`] | the TAR rule answers about the TARs it probed, and two runs probed different ones |
+//!
+//! **Refusal is a refusal, not a diff.** Every one of these ends in the same
+//! shape as "no reader attached" - `data.error`, exit 1, no `data.findings`
+//! and no `data.diff` - so the rule AGENTS.md section 3 leans on survives
+//! intact: `code == 1` carrying an `error` is a check that could not run, and
+//! `code == 1` carrying a `diff` is a check that ran and the card regressed.
+//!
+//! # Evidence is bounded on the way IN as well as out
+//!
+//! **A baseline file is untrusted input.** [`rules::Evidence`] is bounded by
+//! its types because a rule must not be able to fill a terminal - but a
+//! hand-edited baseline does not go through those constructors, and a finding
+//! `message` is an unbounded [`String`] everywhere. [`Baseline::parse`] walks
+//! the whole document and refuses any single string over [`MAX_TEXT_CHARS`],
+//! any array over [`MAX_RECORDS`], and any file over [`MAX_BASELINE_BYTES`] -
+//! before the typed parse, so the refusal happens on the raw value and names
+//! where it found it. [`Baseline::save`] applies the same limit going out and
+//! **refuses** rather than truncating: a baseline that cannot be reloaded is
+//! not a baseline, and silently writing a shortened message would make the
+//! diff compare text the file does not contain.
+//!
+//! [`rules::RuleId`] re-validates itself on the way in, which is issue #13's
+//! deliberate choice and the reason reading one back is safe at all; this
+//! module relies on it rather than re-implementing it.
+//!
+//! # What a baseline does and does not contain
+//!
+//! **Findings, and the facts needed to decide whether they can be compared.
+//! Nothing else.** Not the ATR, not the file tree, not the notes, not the APDU
+//! log. A baseline is a local artifact that lands in a CI workspace and is read
+//! back by an agent, and the narrower it is the less of the card it carries
+//! around. A test asserts the key set, so a field cannot be added by accident.
+//!
+//! Unknown JSON fields are **ignored**, not refused: a baseline written by a
+//! later version has to stay readable by this one. The strictness goes on the
+//! forward path - the values are bounded and re-validated - not the backward
+//! one. CONTEXT.md section 3 records that rule from issue #13 and this module
+//! does not reopen it.
+
+/// This module's name, as recorded in [`crate::MODULES`].
+pub const NAME: &str = "baseline";
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::rules;
+
+/// The version written into every baseline this build produces.
+///
+/// Bumped when the *meaning* of a field changes, never when one is added.
+/// [`Baseline::parse`] refuses a file whose number is not this one rather than
+/// guessing, because a diff computed against a shape it is guessing at is
+/// exactly the kind of plausible-looking number AGENTS.md section 3 forbids:
+/// it would report new and fixed findings and mean something else entirely.
+pub const VERSION: u32 = 1;
+
+/// The most octets this tool will read out of one baseline file.
+///
+/// A megabyte is far more than any real scan produces - a finding is bounded
+/// at 64 octets of evidence and the record count is capped below too - and it
+/// is here so that a hostile or accidental file cannot make the process read
+/// its way to the end of the disk. Read through a [`Read::take`], never with
+/// `fs::read`, so the ceiling is enforced while reading rather than after.
+pub const MAX_BASELINE_BYTES: usize = 1024 * 1024;
+
+/// The most findings one baseline may carry, and the most items in any one
+/// array inside it.
+///
+/// **Output-boundedness, which is the reason the number exists.** The rules in
+/// this crate bound what a rule can *produce*; nothing bounds what a hand-edited
+/// file can *assert*. Without this, a 64 KB message repeated a hundred thousand
+/// times would be a hundred thousand findings rendered into a CI log by a
+///! command whose whole promise is that it is safe to script. A card this tool
+/// can walk does not produce 4096 findings, and if one ever does the refusal
+/// will say so in words rather than truncate.
+pub const MAX_RECORDS: usize = 4096;
+
+/// The most characters in any one string inside a baseline file.
+///
+/// Covers the finding `message`, the coverage `reason`, every path a location
+/// carries and every short string in [`RunFacts`] - one limit for all of them,
+/// checked by walking the parsed document rather than by listing the fields,
+/// so a field added later cannot arrive unbounded.
+///
+/// 1024 characters is several times longer than the sentence a rule is expected
+/// to produce, and short enough that 4096 of them cannot fill a terminal.
+pub const MAX_TEXT_CHARS: usize = 1024;
+
+/// How a finding is matched to a finding in the baseline.
+///
+/// **The rule ID alone is not enough, and neither is the message.** A rule can
+/// legitimately fire many times in one scan - once per TAR, once per file - and
+///! [`crate::rules::Finding::to_json`] says in as many words that it is an array
+///! and not a map keyed by ID for exactly that reason. Keying on the ID alone
+///! would call a tenth unreadable EF a duplicate of the first.
+///
+/// [`rules::Location`]`s [`fmt::Display`] is the discriminator, and it is used
+///! rather than a re-render of the JSON because it is the spelling the human
+///! report already prints (`tar:00000000`, `file:3F00/6F07 selected 9804`) and so
+///! is one string a person can read in the refusal when two runs disagree.
+fn matching_key(finding: &rules::Finding) -> String {
+    format!("{} at {}", finding.rule(), finding.location())
+}
+
+// ---------------------------------------------------------------------------
+// What the run that wrote a baseline actually did
+// ---------------------------------------------------------------------------
+
+/// Everything about a run that decides whether its findings can be compared
+/// to another run's.
+///
+/// **Not a score, not a card description, and deliberately small.** Each field
+/// exists because leaving it out makes a diff lie in a specific way, and the
+/// six axes are listed in the module documentation. A field that answers no
+/// comparison question does not belong here: a test asserts the key set, so
+/// one cannot be added by accident.
+///
+/// The same type describes both sides. A baseline stores one; the current run
+/// builds one before it is compared. Neither is privileged, which is what stops
+/// the comparison from being "the old file versus whatever happened today".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFacts {
+    reader: String,
+    dialect: String,
+    candidates: String,
+    severity: Option<rules::Severity>,
+    tar_selection: String,
+    complete: bool,
+    truncated_by: Option<String>,
+    limits_hit: Vec<String>,
+    rules: Vec<rules::RuleRun>,
+}
+
+impl RunFacts {
+    /// Builds the facts for one scan, from what that scan did.
+    ///
+    /// Every argument is a fact the report already publishes, so a reader of a
+    /// baseline can check each one against the scan it came from: the reader
+    /// name, the dialect, the candidate set and the TAR selection are printed
+    /// by `scan`, and `complete` / `truncated_by` / `limits_hit` are the walk's
+    /// own words. Nothing here is a judgement this module makes about the card.
+    #[must_use]
+    pub fn new(
+        reader: impl Into<String>,
+        dialect: impl Into<String>,
+        candidates: impl Into<String>,
+        severity: Option<rules::Severity>,
+        tar_selection: impl Into<String>,
+        complete: bool,
+        truncated_by: Option<String>,
+        limits_hit: Vec<String>,
+        rules: Vec<rules::RuleRun>,
+    ) -> Self {
+        Self {
+            reader: reader.into(),
+            dialect: dialect.into(),
+            candidates: candidates.into(),
+            severity,
+            tar_selection: tar_selection.into(),
+            complete,
+            truncated_by,
+            limits_hit,
+            rules,
+        }
+    }
+
+    /// Which PC/SC reader was used. Recorded, and **not** a refusal axis.
+    ///
+    /// Moving a card to a different reader is an ordinary thing for an operator
+    /// to do and says nothing about what the card holds. It is in the file
+    /// because a diff that suddenly changed is helped by knowing the reader
+    /// changed too, and it is not compared because that would make a gate fail
+    /// on a machine upgrade.
+    pub fn reader(&self) -> &str {
+        &self.reader
+    }
+
+    /// The FCP tag table the walk ran under.
+    pub fn dialect(&self) -> &str {
+        &self.dialect
+    }
+
+    /// Which identifier set the walk probed.
+    pub fn candidates(&self) -> &str {
+        &self.candidates
+    }
+
+    /// The `--severity` level in force, or `None` when nothing was filtered.
+    pub const fn severity(&self) -> Option<rules::Severity> {
+        self.severity
+    }
+
+    /// The whole `--tar` selection including its class byte.
+    pub fn tar_selection(&self) -> &str {
+        &self.tar_selection
+    }
+
+    /// Whether the walk finished on its own terms.
+    pub const fn complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Which bound fired first, when one did.
+    pub fn truncated_by(&self) -> Option<&str> {
+        self.truncated_by.as_deref()
+    }
+
+    /// Every bound that fired.
+    pub fn limits_hit(&self) -> &[String] {
+        &self.limits_hit
+    }
+
+    /// Which bounds fired, in words, for a refusal to quote.
+    ///
+    /// **All of them rather than the first**, for the reason the scan report
+    /// lists the full set: reporting only `truncated_by` understates how much
+    /// of the card was missed, and a refusal that understates it sends an
+    /// operator to raise one bound and straight into another. An empty list is
+    /// not a lie either - a walk can be cut short by something that is not a
+    /// bound - so it says so rather than implying nothing fired.
+    pub fn bounds_summary(&self) -> String {
+        if !self.limits_hit.is_empty() {
+            return self.limits_hit.join(", ");
+        }
+        match self.truncated_by.as_deref() {
+            Some(by) => by.to_owned(),
+            None => "no bound was recorded".to_owned(),
+        }
+    }
+
+    /// Every rule that ran, and whether it had anything to look at.
+    pub fn rule_runs(&self) -> &[rules::RuleRun] {
+        &self.rules
+    }
+
+    /// How many rules ran.
+    pub fn rules_run(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// The evidence flag recorded for one rule, if it ran.
+    pub fn evidence_of(&self, id: &rules::RuleId) -> Option<bool> {
+        self.rules
+            .iter()
+            .find(|run| run.id() == id)
+            .map(rules::RuleRun::had_evidence)
+    }
+
+    /// A one-line summary for a human reading a refusal.
+    pub fn describe(&self) -> String {
+        let mut out = format!(
+            "the walk was {} on reader {:?} under the {} tag table, ",
+            if self.complete {
+                "complete"
+            } else {
+                "TRUNCATED"
+            },
+            self.reader,
+            self.dialect,
+        );
+        out.push_str(&format!(
+            "probing the {} candidate set, --tar {}, --severity {}, {} rule(s) run",
+            self.candidates,
+            self.tar_selection,
+            self.severity
+                .map_or_else(|| "none".to_owned(), |level| level.id().to_owned()),
+            self.rules.len(),
+        ));
+        out
+    }
+
+    /// As the object a baseline file carries.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "reader": self.reader,
+            "dialect": self.dialect,
+            "candidates": self.candidates,
+            "severity_threshold": self.severity.map(rules::Severity::id),
+            "tar_selection": self.tar_selection,
+            "complete": self.complete,
+            "truncated_by": self.truncated_by,
+            "limits_hit": self.limits_hit,
+            "rules_run": self.rules_run(),
+            "rules": self
+                .rules
+                .iter()
+                .map(rules::RuleRun::to_json)
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The file
+// ---------------------------------------------------------------------------
+
+/// A saved run: when it happened, what it did, and what it found.
+///
+/// **The finding objects are the same ones the report carries**, not a
+/// projection of them, which is what makes the round trip lossless and keeps
+///! one definition of what a finding is. The bounds on the way back in are in
+///! [`Baseline::parse`], not here, because a value that arrived from a file was
+///! never constructed through [`rules::Finding::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Baseline {
+    sim_doctor_baseline: u32,
+    created: String,
+    run: RunFacts,
+    findings: Vec<rules::Finding>,
+}
+
+impl Baseline {
+    /// Builds a baseline from a finished scan.
+    ///
+    /// **The findings are the reported set**, after `--severity`. A baseline
+    /// of what a run *said* is the only one a diff can compare against a later
+    /// run's reported set; holding the unfiltered findings as well would let a
+    /// comparison use a set the report never showed and count a finding an
+    /// operator was never shown. The filter in force is recorded in
+    /// [`RunFacts::severity`] and refusing a mismatch is what keeps the two
+    /// comparable.
+    ///
+    /// **Stamped with the current time**, which is the only part of a baseline
+    /// that is not a property of the card. Nothing reads a clock during a scan,
+    ///! so the file is the one place time enters, and it enters here where a
+    ///! reader looking for it will find it.
+    #[must_use]
+    pub fn new(run: RunFacts, findings: &[rules::Finding]) -> Self {
+        Self {
+            sim_doctor_baseline: VERSION,
+            created: timestamp(),
+            run,
+            findings: findings.to_vec(),
+        }
+    }
+
+    /// When the saved run happened, as an RFC 3339 instant.
+    pub fn created(&self) -> &str {
+        &self.created
+    }
+
+    /// What that run did.
+    pub const fn run(&self) -> &RunFacts {
+        &self.run
+    }
+
+    /// What that run found, after any severity filter.
+    pub fn findings(&self) -> &[rules::Finding] {
+        &self.findings
+    }
+
+    /// The document, as JSON.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            // Doubles as the version marker and as the answer to "is this
+            // file a sim-doctor baseline at all": a random JSON document
+            // handed to --diff is refused on this key rather than failing
+            // somewhere less legible.
+            "sim_doctor_baseline": self.sim_doctor_baseline,
+            "created": self.created,
+            "run": self.run.to_json(),
+            "findings": self.findings,
+        })
+    }
+
+    /// Reads a baseline out of a document, refusing anything it cannot read
+    /// honestly.
+    ///
+    /// **Untrusted input, and this is where the limits are applied.** A
+    /// baseline file has been through a text editor and possibly through nothing
+    /// at all, so every value is checked before it becomes a typed object:
+    ///
+    /// 1. [`bounded`] walks the whole [`Value`] and refuses any string over
+    ///    [`MAX_TEXT_CHARS`] or any array over [`MAX_RECORDS`]. It runs on the
+    ///    raw value rather than the typed one so that it covers every string in
+    ///    the document - including the ones a future field adds - without this
+    ///    function having to know what they are called,
+    /// 2. the typed parse, which re-validates every [`rules::RuleId`] through
+    ///    `RuleId::new` (issue #13, deliberate), every status word as four hex
+    ///    digits and every evidence string against its own bound,
+    /// 3. the version, which must be this build's,
+    /// 4. the finding count, separately, because it is the one array whose
+    ///    length is a contract question rather than a sanity check.
+    ///
+    /// Unknown fields are **ignored**. A baseline written by a later version
+    /// has to stay readable by this one; the strictness above is on the values,
+    /// not on the key set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] when the bytes are not JSON or not shaped like a
+    /// baseline, [`Error::Version`] when the format version is another one, and
+    /// the two bound errors when a value is over its limit.
+    pub fn parse(text: &str) -> Result<Self, Error> {
+        if text.len() > MAX_BASELINE_BYTES {
+            return Err(Error::TooLarge {
+                size: text.len(),
+                limit: MAX_BASELINE_BYTES,
+            });
+        }
+
+        let value: Value =
+            serde_json::from_str(text).map_err(|error| Error::Malformed(error.to_string()))?;
+        bounded(&value)?;
+
+        let baseline: Self =
+            serde_json::from_value(value).map_err(|error| Error::Malformed(error.to_string()))?;
+
+        if baseline.sim_doctor_baseline != VERSION {
+            return Err(Error::Version {
+                found: baseline.sim_doctor_baseline,
+                expected: VERSION,
+            });
+        }
+        if baseline.findings.len() > MAX_RECORDS {
+            return Err(Error::TooManyRecords {
+                found: baseline.findings.len(),
+                limit: MAX_RECORDS,
+            });
+        }
+        Ok(baseline)
+    }
+
+    /// Reads a baseline from a path, refusing a file over [`MAX_BASELINE_BYTES`].
+    ///
+    /// **Through a `take`, not `fs::read`.** The ceiling has to be enforced
+    /// while reading, because the whole point of having one is that a hostile
+    /// file cannot make this process allocate its way to the end of the disk;
+    /// checking the length afterwards means the allocation already happened.
+    /// One extra byte is read past the limit so that a file of exactly
+    /// [`MAX_BASELINE_BYTES`] is accepted rather than refused for being one
+    /// byte short of the next.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unreadable`] when the file cannot be opened or read, and
+    /// everything [`Baseline::parse`] returns.
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let file = fs::File::open(path)
+            .map_err(|error| Error::Unreadable(format!("{}: {error}", path.display())))?;
+        let mut text = String::new();
+        let read = file
+            .take(u64::try_from(MAX_BASELINE_BYTES).expect("a megabyte fits in u64") + 1)
+            .read_to_string(&mut text)
+            .map_err(|error| Error::Unreadable(format!("{}: {error}", path.display())))?;
+        if read > MAX_BASELINE_BYTES {
+            return Err(Error::TooLarge {
+                size: read,
+                limit: MAX_BASELINE_BYTES,
+            });
+        }
+        Self::parse(&text)
+    }
+
+    /// Writes this baseline to a path, atomically.
+    ///
+    /// **Through a temporary file and a rename**, because the failure this
+    /// avoids is a baseline half-written by a machine that lost power between
+    /// the write and the rename. That file would parse, or would not, and
+    ///! whichever it did it would be a baseline no run chose. The rename is
+    ///! atomic on the platforms this crate runs on - it talks to PC/SC - so a
+    ///! reader either sees the old baseline or the new one.
+    ///
+    /// **Refuses rather than truncating a long message.** Every string this
+    /// writes is bounded by [`MAX_TEXT_CHARS`] so that what goes in is what
+    /// [`Baseline::parse`] will accept; a finding over the limit is a refusal
+    /// naming the rule, because a baseline holding a shortened message would
+    /// compare against text the file does not contain.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MessageTooLong`] when a finding cannot be recorded within the
+    /// limits, [`Error::Unwritable`] when the file cannot be created or
+    /// renamed, and [`Error::Render`] when the document cannot be serialised,
+    /// which in practice cannot happen.
+    pub fn save(&self, path: &Path) -> Result<(), Error> {
+        for finding in &self.findings {
+            let length = finding.message().chars().count();
+            if length > MAX_TEXT_CHARS {
+                return Err(Error::MessageTooLong {
+                    rule: finding.rule().to_string(),
+                    length,
+                    limit: MAX_TEXT_CHARS,
+                });
+            }
+        }
+
+        let text = serde_json::to_string_pretty(&self.to_json())
+            .map_err(|error| Error::Render(error.to_string()))?;
+
+        // The temporary name carries this process id so that two runs writing
+        // the same baseline path concurrently cannot share a scratch file and
+        // rename each other's half-written document over each other.
+        let temporary = temporary_path(path);
+        let write = || -> std::io::Result<()> {
+            fs::write(&temporary, text.as_bytes())?;
+            fs::rename(&temporary, path)
+        };
+        if let Err(error) = write() {
+            // Best effort: the scratch file is not the operator's document and
+            // leaving one behind on every failure would be its own litter.
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::Unwritable(format!("{}: {error}", path.display())));
+        }
+        Ok(())
+    }
+}
+
+/// The scratch path a save writes through, beside the real one.
+///
+/// Beside rather than in the system temporary directory because a rename
+/// across filesystems is not atomic, and the atomicity is the whole point of
+/// the two-step write.
+fn temporary_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map_or_else(|| "baseline".as_ref(), std::ffi::OsStr::new)
+        .to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Refuses a document holding a value over this module's limits.
+///
+/// **A walk over the raw [`Value`], not over typed fields, and that is the
+/// point.** A finding's `message` is an unbounded [`String`] in the wire type,
+/// a location carries three of them, and a field added to a finding next year
+/// would arrive unbounded without anyone editing this function. Walking the
+/// parsed document means one rule covers every string in the file, present and
+/// future, and that the path in the error is the one an operator can find in
+/// their editor.
+///
+/// Numbers are left to the typed parse: a JSON number too large for `u32` is
+/// refused there, with serde's own message, which is better than a second
+/// spelling of the same check here.
+fn bounded(value: &Value) -> Result<(), Error> {
+    match value {
+        Value::String(text) => {
+            let length = text.chars().count();
+            if length > MAX_TEXT_CHARS {
+                return Err(Error::TextTooLong { length });
+            }
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_RECORDS {
+                return Err(Error::TooManyRecords {
+                    found: items.len(),
+                    limit: MAX_RECORDS,
+                });
+            }
+            for item in items {
+                bounded(item)?;
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                bounded(item)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+/// The instant a baseline was written, as RFC 3339 in UTC.
+///
+/// **The only clock a scan reads.** The score in the same report is an integer
+/// chosen so that nothing reads a clock, a hash order or an environment
+/// variable, and that property is worth more than the timestamp; keeping the
+/// clock to this one line preserves it. A fixed fallback rather than a panic,
+/// because a baseline with no timestamp is still a usable baseline and losing
+/// one is not a reason to fail a run.
+fn timestamp() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+// ---------------------------------------------------------------------------
+// Why a baseline cannot be compared against
+// ---------------------------------------------------------------------------
+
+/// A baseline this run refuses to be compared against, and why.
+///
+/// **One shape, seven causes, and all of them are refusals.** Every variant ends
+/// a run the same way - `data.error`, exit 1, no `data.findings` and no
+/// `data.diff` - because a comparison this tool cannot make honestly is a
+/// check that could not run, and AGENTS.md section 3 already has a shape for
+/// that. What each variant adds is a sentence naming the specific mismatch,
+/// because "incomparable baseline" sends an operator looking through a file
+/// when the answer is on the command line.
+///
+/// The order [`Diff::compare`] checks them is the order an operator can act on:
+/// was either run whole, then did both ask the same question, then did they ask
+/// it with the same evidence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Incomparable {
+    /// The baseline was written by a walk that did not finish.
+    ///
+    /// **The first check, and the one most likely to fire on a real machine.**
+    /// `--max-depth 1` is the documented way to see what a truncated report
+    /// looks like, so a truncated scan is something an operator will save. Its
+    /// findings may all be true; what it cannot say is that the card holds no
+    /// others, so nearly everything this run finds reads as new and nothing
+    /// reads as fixed.
+    #[error("this baseline was written by a scan whose walk did not finish ({by}); a walk that stopped at a bound did not see the whole card, so almost every finding this run raises would read as new and none as fixed. Save a baseline from a complete scan")]
+    BaselineTruncated {
+        /// Which bounds fired, in words.
+        by: String,
+    },
+
+    /// This run's walk did not finish.
+    ///
+    /// **The mirror of the above, and the one that matters most.** Everything
+    /// the baseline found and this run does not have would read as fixed, and
+    /// the reason it is missing is that the walk never got there. A diff that
+    /// reported improvements against a walk that stopped early is worse than no
+    /// diff at all: it tells an operator a card got better.
+    #[error("this scan's walk did not finish ({by}), so a finding the baseline recorded and this run does not have would read as fixed when it is only unvisited. Raise the bound, or diff a scan whose complete field is true")]
+    ThisRunTruncated {
+        /// Which bounds fired, in words.
+        by: String,
+    },
+
+    /// The two runs filtered at different severities.
+    ///
+    /// **Both directions are lies, which is why it is a refusal and not a
+    /// warning.** A baseline saved at `--severity high` has never heard of the
+    /// low findings, so every one this run reports is new; and this run at
+    /// `--severity high` has filtered out every low finding the baseline
+    /// holds, so every one of them reads as fixed. Neither list is wrong and
+    /// the numbers are both wrong, which is the specific thing a diff must not
+    /// do.
+    #[error("the baseline was saved at --severity {baseline} and this run is at --severity {this_run}; the two runs reported different sets, so a finding one of them never held is not new and one the other filtered out is not fixed. Save the baseline at the same level")]
+    Severity {
+        /// The level in force when the baseline was written.
+        baseline: String,
+        /// The level in force now.
+        this_run: String,
+    },
+
+    /// The two walks read the same FCP bytes through different tag tables.
+    ///
+    /// **A different question, not a different answer.** swICC puts a file
+    /// size in tag `80` where ISO/IEC 7816-4 table 42 puts it in `82`, and a
+    /// walk under the wrong table reports a 10-octet EF.ICCID as 2337 octets.
+    /// Every finding either run makes about that file is about a different
+    /// number, so a diff across the two compares answers to two questions.
+    #[error("the baseline was taken under the {baseline} FCP tag table and this run under {this_run}; the two read the same bytes differently, so the findings are not about the same things. Re-scan with the same --dialect")]
+    Dialect {
+        /// The tag table the baseline ran under.
+        baseline: String,
+        /// The tag table this run uses.
+        this_run: String,
+    },
+
+    /// The two walks probed different identifier sets.
+    ///
+    /// **This one fires for a reason a caller cannot see from the flag alone.**
+    /// `--max-children` changes how many identifiers are probed out of the
+    /// chosen set, so two runs can pass different numbers and both still be in
+    /// `sim-families`; the one that probed fewer will find less, and what it
+    /// does not find reads as fixed. The report publishes how many were
+    /// probed and whether the set was exhaustive, and those two together are
+    /// what a comparison needs.
+    #[error("the baseline probed {baseline} and this run probed {this_run}; a file one of them never probed cannot be called new, and one the other never probed cannot be called fixed. Use the same identifier set and the same --max-children")]
+    Candidates {
+        /// The candidate set and budget the baseline used.
+        baseline: String,
+        /// The candidate set and budget this run uses.
+        this_run: String,
+    },
+
+    /// The two runs probed different TARs.
+    ///
+    /// **The MSL 0 rule answers about the TARs it probed.** A selection is
+    /// compared whole - band and class byte both - because
+    /// `range:000000-000FFF` and `range:3F0000-3F003F` contain different TARs
+    /// and a card can accept one and not the other, and because the same TAR at
+    /// a different class byte is a different exchange to the card.
+    #[error("the baseline probed --tar {baseline} and this run probed --tar {this_run}; the MSL 0 rule answers about the TARs it probed, so these are two answers to two questions. Use the same --tar")]
+    TarSelection {
+        /// The selection the baseline probed.
+        baseline: String,
+        /// The selection this run probes.
+        this_run: String,
+    },
+
+    /// A rule had evidence on one run and none on the other.
+    ///
+    /// **The default case, and the reason this module exists.** `--tar off` is
+    /// the default because an ENVELOPE probe leaves swicc-pcsc unable to start
+    /// a transaction. So the common baseline is one where
+    /// `gsma/msl-zero-allowed` ran with nothing to look at, and the first scan
+    /// run with `--tar focused` finds a critical finding on a card that has
+    /// been at MSL 0 the whole time. A baseline that recorded only the rule ID
+    /// would report that as a regression and fail a build over a check that had
+    /// never been made.
+    ///
+    /// Both directions are refusals: without evidence this run cannot claim a
+    /// fix the baseline held, and with evidence where the baseline had none
+    /// this run cannot claim a regression.
+    #[error("rule {rule} had {baseline_evidence} on this baseline and {this_evidence} on this run; a rule with nothing to look at cannot have found nothing, so a finding from it is a first check rather than a change. Re-take the baseline with the same evidence")]
+    Evidence {
+        /// The rule whose evidence differed.
+        rule: rules::RuleId,
+        /// Whether the baseline's run had evidence for it.
+        baseline_evidence: bool,
+        /// Whether this run has evidence for it.
+        this_evidence: bool,
+    },
+}
+
+impl Incomparable {
+    /// The machine-readable tag, beside `data.error.kind` in the refusal.
+    ///
+    /// One word per cause so an agent can branch on the reason without parsing
+    /// a sentence, and a different word per cause so that "your baseline is
+    /// truncated" and "your baseline asked a different question" are not the
+    /// same failure to a script.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::BaselineTruncated { .. } => "baseline-truncated",
+            Self::ThisRunTruncated { .. } => "run-truncated",
+            Self::Severity { .. } => "severity-mismatch",
+            Self::Dialect { .. } => "dialect-mismatch",
+            Self::Candidates { .. } => "candidate-mismatch",
+            Self::TarSelection { .. } => "tar-selection-mismatch",
+            Self::Evidence { .. } => "evidence-mismatch",
+        }
+    }
+
+    /// Both sides in one sentence, so a refusal says what each run actually was.
+    pub fn explain(&self, baseline: &Baseline, this_run: &RunFacts) -> String {
+        format!(
+            "{self}. The baseline ran as: {}. This run ran as: {}.",
+            baseline.run.describe(),
+            this_run.describe(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The comparison
+// ---------------------------------------------------------------------------
+
+/// One rule this run and the baseline disagree about, and the findings it
+/// cost.
+///
+/// **This is what a rename looks like, and it is deliberately not two other
+/// things.** A rule ID that disappears reads as a fix and one that appears
+/// reads as a regression; together they are a claim the file cannot support and
+/// that AGENTS.md section 3 exists to prevent, because an ID must never be
+/// renamed casually. So an ID in exactly one of the two runs is reported here,
+/// with the findings it carried attached, and counted as neither new nor
+/// fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleDrift {
+    id: rules::RuleId,
+    direction: Direction,
+    findings: Vec<rules::Finding>,
+}
+
+/// Which run knew about the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// The baseline ran it; this run does not know it.
+    ///
+    /// A rename, or a rule that was withdrawn. Nothing else can tell those
+    /// apart, and the sentence in `diff.rules.warning` says so rather than
+    /// picking one.
+    Retired,
+
+    /// This run runs it; the baseline never did.
+    ///
+    /// A rename, or a rule added since the baseline was taken. Its findings are
+    /// a first check, not a regression: the card may have had this problem
+    /// since the day it was provisioned and the baseline simply could not see
+    /// it.
+    Added,
+}
+
+impl RuleDrift {
+    /// The rule in question.
+    pub const fn id(&self) -> &rules::RuleId {
+        &self.id
+    }
+
+    /// Which run knew it.
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    /// The findings it carried, so nothing is silently dropped.
+    pub fn findings(&self) -> &[rules::Finding] {
+        &self.findings
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id.as_str(),
+            "direction": self.direction,
+            "findings": self.findings,
+        })
+    }
+}
+
+/// Two runs, compared: what appeared, what went away, what stayed, and what
+/// the two runs could not be asked the same question about.
+///
+/// **The three lists are disjoint, and that is the contract.** Every finding
+/// in exactly one run is in exactly one of `new` or `fixed`; every finding in
+/// both is in `persisting`; and a finding whose rule only one run knows is in
+/// neither, but is in [`Diff::rules`] so that it is still printed. Nothing is
+/// counted twice and nothing disappears, which is what a regression gate is
+/// read by.
+///
+/// **A multiset, not a set.** Two findings of the same rule at the same
+/// location are two findings - a rule may legitimately fire once per TAR or
+/// once per file - so [`matching_key`] collisions are matched off in order and
+/// the surplus on either side is new or fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diff {
+    baseline_created: String,
+    baseline_findings: usize,
+    current_findings: usize,
+    threshold: Option<rules::Severity>,
+    new: Vec<rules::Finding>,
+    fixed: Vec<rules::Finding>,
+    persisting: Vec<rules::Finding>,
+    rules: Vec<RuleDrift>,
+}
+
+impl Diff {
+    /// Compares a saved run against this one, or refuses to.
+    ///
+    /// **Every refusal is checked before any finding is classified**, and that
+    /// order matters: a partial classification computed and then thrown away is
+    /// a diff that exists for a moment, and a diff that exists for a moment is
+    /// a diff somebody could read.
+    ///
+    /// # Errors
+    ///
+    /// [`Incomparable`], naming the axis the two runs disagree on. Checked in
+    /// this order: either walk truncated, severity, dialect, identifier set, TAR
+    /// selection, then evidence rule by rule.
+    pub fn compare(
+        baseline: &Baseline,
+        this_run: &RunFacts,
+        current: &[rules::Finding],
+    ) -> Result<Self, Incomparable> {
+        if !baseline.run.complete {
+            return Err(Incomparable::BaselineTruncated {
+                by: baseline.run.bounds_summary(),
+            });
+        }
+        if !this_run.complete {
+            return Err(Incomparable::ThisRunTruncated {
+                by: this_run.bounds_summary(),
+            });
+        }
+
+        if baseline.run.severity != this_run.severity {
+            return Err(Incomparable::Severity {
+                baseline: severity_name(baseline.run.severity),
+                this_run: severity_name(this_run.severity),
+            });
+        }
+        if baseline.run.dialect != this_run.dialect {
+            return Err(Incomparable::Dialect {
+                baseline: baseline.run.dialect.clone(),
+                this_run: this_run.dialect.clone(),
+            });
+        }
+        if baseline.run.candidates != this_run.candidates {
+            return Err(Incomparable::Candidates {
+                baseline: baseline.run.candidates.clone(),
+                this_run: this_run.candidates.clone(),
+            });
+        }
+        if baseline.run.tar_selection != this_run.tar_selection {
+            return Err(Incomparable::TarSelection {
+                baseline: baseline.run.tar_selection.clone(),
+                this_run: this_run.tar_selection.clone(),
+            });
+        }
+        // Per rule rather than one flag for the run: a baseline that gave one
+        // rule evidence and another none cannot speak about the one it gave
+        // none, whatever the first one did.
+        for run in this_run.rule_runs() {
+            let here = this_run.evidence_of(run.id()).unwrap_or(false);
+            if let Some(was) = baseline.run.evidence_of(run.id()) {
+                if was != here {
+                    return Err(Incomparable::Evidence {
+                        rule: run.id().clone(),
+                        baseline_evidence: was,
+                        this_evidence: here,
+                    });
+                }
+            }
+        }
+
+        Ok(Self::classify(baseline, this_run, current))
+    }
+
+    /// The classification itself, run once the two runs are comparable.
+    fn classify(baseline: &Baseline, this_run: &RunFacts, current: &[rules::Finding]) -> Self {
+        let drift = rule_drift(baseline, this_run);
+        let withheld: Vec<&rules::RuleId> = drift.iter().map(|d| &d.id).collect();
+
+        let was = index(baseline.findings());
+        let now = index(current);
+        let mut new = Vec::new();
+        let mut fixed = Vec::new();
+        let mut persisting = Vec::new();
+
+        // Keys are sorted by construction (BTreeMap), so the three lists come
+        // out in a stable order on every run and `diff` is byte-identical for
+        // the same card and the same baseline. "JSON-stable across runs" is one
+        // of issue #12's acceptance criteria and it is a property of this map,
+        // not of the order a rule happened to fire in.
+        for (key, then) in &was {
+            if withheld.contains(&then[0].rule()) {
+                continue;
+            }
+            let here = now.get(key).map(Vec::as_slice).unwrap_or(&[]);
+            let pairs = then.len().min(here.len());
+            persisting.extend(here[..pairs].iter().cloned());
+            fixed.extend(then[pairs..].iter().cloned());
+        }
+        for (key, here) in &now {
+            if was.contains_key(key) || withheld.contains(&here[0].rule()) {
+                continue;
+            }
+            new.extend(here.iter().cloned());
+        }
+
+        Self {
+            baseline_created: baseline.created().to_owned(),
+            baseline_findings: baseline.findings().len(),
+            current_findings: current.len(),
+            threshold: this_run.severity(),
+            new,
+            fixed,
+            persisting,
+            rules: drift,
+        }
+    }
+
+    /// Whether this run is worse than the baseline.
+    ///
+    /// **New findings only.** A fix is not a regression, and a gate that exited
+    /// non-zero because a card improved would be a gate nobody turns on. The
+    /// list compared is the one `--severity` already filtered, so the threshold
+    /// is the operator's own rather than a second knob.
+    pub fn regressed(&self) -> bool {
+        !self.new.is_empty()
+    }
+
+    /// Findings this run has that the baseline did not.
+    pub fn new(&self) -> &[rules::Finding] {
+        &self.new
+    }
+
+    /// Findings the baseline had that this run does not.
+    pub fn fixed(&self) -> &[rules::Finding] {
+        &self.fixed
+    }
+
+    /// Findings both runs have.
+    pub fn persisting(&self) -> &[rules::Finding] {
+        &self.persisting
+    }
+
+    /// Rules one run knew and the other did not.
+    pub fn rule_drift(&self) -> &[RuleDrift] {
+        &self.rules
+    }
+
+    /// The `--severity` level in force for both runs, which is the gate.
+    pub const fn threshold(&self) -> Option<rules::Severity> {
+        self.threshold
+    }
+
+    /// The sentence under `diff.rules.warning`, when there is something to say.
+    ///
+    /// **Names the rename rather than resolving it.** One ID leaving and one
+    /// arriving is what a renamed rule looks like and what a withdrawn rule plus
+    /// an unrelated new one looks like, and nothing in two files can tell those
+    /// apart. The diff says both are possible and asks the reader, rather than
+    /// guessing and reporting a fix that never happened.
+    pub fn rules_warning(&self) -> Option<String> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        let retired: Vec<&str> = self
+            .rules
+            .iter()
+            .filter(|d| d.direction == Direction::Retired)
+            .map(|d| d.id.as_str())
+            .collect();
+        let added: Vec<&str> = self
+            .rules
+            .iter()
+            .filter(|d| d.direction == Direction::Added)
+            .map(|d| d.id.as_str())
+            .collect();
+        Some(format!(
+            concat!(
+                "{} rule ID(s) are in one run and not the other, and their findings are counted 
+                 as neither new nor fixed. An ID that leaves and one that arrives together is 
+                 what a RENAME looks like, and what withdrawing a rule and adding an unrelated 
+                 one looks like; two files cannot tell those apart, so neither is claimed here. 
+                 AGENTS.md section 3 says a rule ID must never be renamed casually, and this 
+                 is where that bites. Retired: [{}]. New in this scan: [{}]."
+            ),
+            self.rules.len(),
+            retired.join(", "),
+            added.join(", "),
+        ))
+    }
+
+    /// The diff as the JSON block `payload.data.diff` carries.
+    ///
+    /// **Sorted keys inside `serde_json`, and sorted lists here**, so two runs
+    /// of the same card against the same baseline produce the same bytes. A
+    /// regression gate whose own output reorders itself between runs cannot be
+    /// compared by a human reading two CI logs, and that is the failure this
+    /// ordering exists to prevent.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "baseline": {
+                "created": self.baseline_created,
+                "findings": self.baseline_findings,
+            },
+            "current": {
+                "findings": self.current_findings,
+            },
+            // The threshold the gate used, beside the answer, so a reader never
+            // has to infer which level produced this verdict.
+            "threshold": self.threshold.map(rules::Severity::id),
+            "regressed": self.regressed(),
+            "counts": {
+                "new": self.new.len(),
+                "fixed": self.fixed.len(),
+                "persisting": self.persisting.len(),
+            },
+            "new": self.new,
+            "fixed": self.fixed,
+            "persisting": self.persisting,
+            "rules": {
+                "changed": self.rules.iter().map(RuleDrift::to_json).collect::<Vec<_>>(),
+                "warning": self.rules_warning(),
+            },
+        })
+    }
+
+    /// The diff as a person reads it, for the human mode.
+    ///
+    /// **Printed after the scan report, not before it**, for the reason the TAR
+    /// block is printed before the findings there: a comparison whose inputs are
+    /// somewhere else on the page is a claim rather than a reading. `scan`
+    /// prints the run's own facts first and this block last, so the new and
+    /// fixed lists are read against the numbers that produced them.
+    #[must_use]
+    pub fn to_human(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "DIFF against the baseline taken {}\n",
+            self.baseline_created
+        ));
+        out.push_str(&format!(
+            "  NEW        {} (the baseline held {}, this run holds {})\n",
+            self.new.len(),
+            self.baseline_findings,
+            self.current_findings,
+        ));
+        out.push_str(&format!("  FIXED      {}\n", self.fixed.len()));
+        out.push_str(&format!("  PERSISTING {}\n", self.persisting.len()));
+        match self.threshold {
+            Some(level) => out.push_str(&format!("  threshold: {level}\n")),
+            None => out.push_str("  threshold: none (every finding counts)\n"),
+        }
+        for finding in &self.new {
+            out.push_str(&format!("  + {finding}\n"));
+        }
+        for finding in &self.fixed {
+            out.push_str(&format!("  - {finding}\n"));
+        }
+        if let Some(warning) = self.rules_warning() {
+            out.push_str(&format!("  WARNING: {warning}\n"));
+        }
+        out
+    }
+}
+
+/// The severity a run filtered at, as the word an operator typed.
+fn severity_name(level: Option<rules::Severity>) -> String {
+    level.map_or_else(|| "none".to_owned(), |level| level.id().to_owned())
+}
+
+/// Findings grouped by [`matching_key`], each group in report order.
+///
+/// A [`BTreeMap`] rather than a [`std::collections::HashMap`] because the
+/// iteration order is the output order, and a hash order would make the diff
+/// reorder itself between runs.
+fn index(findings: &[rules::Finding]) -> BTreeMap<String, Vec<rules::Finding>> {
+    let mut grouped: BTreeMap<String, Vec<rules::Finding>> = BTreeMap::new();
+    for finding in findings {
+        grouped
+            .entry(matching_key(finding))
+            .or_default()
+            .push(finding.clone());
+    }
+    grouped
+}
+
+/// Rules one run ran and the other did not, with the findings they carried.
+///
+/// **Only from the baseline, or from this run, never both**, and that asymmetry
+/// is the whole design. A rule in both is comparable; a rule in exactly one is
+/// not, and its findings are withheld from `new` and `fixed` rather than
+/// guessed at. The `Added` arm carries no findings of its own - it describes
+/// this run, and this run's findings are already in `new` and `persisting` -
+/// but it is listed because an ID nobody recognises is exactly what an
+/// operator has to be told about.
+fn rule_drift(baseline: &Baseline, this_run: &RunFacts) -> Vec<RuleDrift> {
+    let mut drift: Vec<RuleDrift> = Vec::new();
+
+    for run in baseline.run.rule_runs() {
+        if this_run.evidence_of(run.id()).is_none() {
+            drift.push(RuleDrift {
+                id: run.id().clone(),
+                direction: Direction::Retired,
+                findings: findings_of(baseline.findings(), run.id()),
+            });
+        }
+    }
+    for run in this_run.rule_runs() {
+        if baseline.run.evidence_of(run.id()).is_none() {
+            drift.push(RuleDrift {
+                id: run.id().clone(),
+                direction: Direction::Added,
+                findings: Vec::new(),
+            });
+        }
+    }
+    drift
+}
+
+/// Every finding a saved run holds under one rule, in report order.
+fn findings_of(findings: &[rules::Finding], id: &rules::RuleId) -> Vec<rules::Finding> {
+    findings
+        .iter()
+        .filter(|finding| finding.rule() == id)
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Everything that can go wrong reading or writing the file
+// ---------------------------------------------------------------------------
+
+/// Why a baseline could not be read or written.
+///
+/// **Every one of these is a refusal**, never a warning and never an empty
+/// baseline. A baseline this tool cannot read is not a card with no findings;
+/// treating it as one would report a clean build over a file that was not
+/// there.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// The file could not be opened or read.
+    #[error("the baseline file could not be read: {0}")]
+    Unreadable(String),
+
+    /// The file is over [`MAX_BASELINE_BYTES`].
+    #[error("the baseline file is over the {limit}-octet ceiling this tool will read (it had morethan {limit}); a baseline is a list of rule IDs and bounded findings, and a filelarger than that is not one")]
+    TooLarge {
+        /// How many octets were read, when the count is known.
+        size: usize,
+        /// The ceiling.
+        limit: usize,
+    },
+
+    /// The bytes are not JSON, or not shaped like a baseline.
+    #[error("this is not a readable sim-doctor baseline: {0}")]
+    Malformed(String),
+
+    /// The file was written by a different format version.
+    #[error("this baseline is format version {found} and this build reads version {expected}; abaseline outlives the release that wrote it, so the two are compared rather thanguessed at. Re-take the baseline with this build")]
+    Version {
+        /// The version in the file.
+        found: u32,
+        /// The version this build reads.
+        expected: u32,
+    },
+
+    /// One string in the file is over [`MAX_TEXT_CHARS`].
+    #[error("this baseline holds a {length}-character string and the ceiling is {MAX_TEXT_CHARS};evidence is bounded so that a scan cannot fill a terminal, and the bound applies to abaseline read back as much as to one a rule produces")]
+    TextTooLong {
+        /// How many characters it had.
+        length: usize,
+    },
+
+    /// One array in the file is over [`MAX_RECORDS`].
+    #[error("this baseline holds an array of {found} items and the ceiling is {limit}; a card thistool can walk does not produce that many findings")]
+    TooManyRecords {
+        /// How many items it held.
+        found: usize,
+        /// The ceiling.
+        limit: usize,
+    },
+
+    /// A finding is too long to be recorded within the limits.
+    #[error("finding {rule} carries a {length}-character message and the ceiling is {limit}; abaseline that cannot be reloaded is not a baseline, and shortening the message herewould make the diff compare text the file does not contain")]
+    MessageTooLong {
+        /// The rule that produced it.
+        rule: String,
+        /// How many characters the message had.
+        length: usize,
+        /// The ceiling.
+        limit: usize,
+    },
+
+    /// The file could not be created or renamed into place.
+    #[error("the baseline could not be written: {0}")]
+    Unwritable(String),
+
+    /// The document could not be serialised.
+    #[error("the baseline could not be rendered: {0}")]
+    Render(String),
+}
+
+impl Error {
+    /// The machine-readable tag, beside `data.error.kind` in the refusal.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Unreadable(_) => "baseline-unreadable",
+            Self::TooLarge { .. } => "baseline-too-large",
+            Self::Malformed(_) => "baseline-malformed",
+            Self::Version { .. } => "baseline-version",
+            Self::TextTooLong { .. } => "baseline-text-too-long",
+            Self::TooManyRecords { .. } => "baseline-too-many-records",
+            Self::MessageTooLong { .. } => "finding-message-too-long",
+            Self::Unwritable(_) => "baseline-unwritable",
+            Self::Render(_) => "baseline-render-failed",
+        }
+    }
+}
