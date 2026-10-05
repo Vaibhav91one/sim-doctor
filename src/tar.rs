@@ -114,16 +114,16 @@ use crate::apdu::{Command, Le, Response, StatusWord, CLA_FETCH_ETSI};
 use crate::session::{self, Policy};
 use crate::transport::{CardSession, Error as TransportError};
 
-/// The smallest TAR, `0x000000`.
+/// The smallest TAR, `0x00_00_00`.
 ///
 /// Also the TAR this module is named for: a card that accepts TAR zero is
 /// running at MSL 0, which is the finding.
 pub const TAR_MIN: u32 = 0x00_00_00;
 
-/// The largest TAR, `0xFFFFFF`.
+/// The largest TAR, `0xFF_FF_FF`.
 ///
 /// [V] SIMTester `TARScanner.java` at `d197fef`:
-/// `private final static int HIGHEST_TAR = 16777215; // this is 0xFFFFFF`.
+/// `private final static int HIGHEST_TAR = 16777215; // this is 0xFF_FF_FF`.
 pub const TAR_MAX: u32 = 0xFF_FF_FF;
 
 /// The most TAR values one scan may put on a card.
@@ -159,9 +159,9 @@ pub const CALIBRATION_PROBES: usize = 20;
 /// would make the finding move with it. These values are spread across the
 /// space so the modal response is not an artefact of one region.
 pub const CALIBRATION_TARS: [u32; CALIBRATION_PROBES] = [
-    0x0000_00, 0x0000_FF, 0x0001_00, 0x0001_0F, 0x0002_00, 0x0002_0F, 0x0003_00, 0x0003_0F,
-    0x0004_00, 0x0004_0F, 0x0005_00, 0x0005_0F, 0x3F00_00, 0x3F00_3F, 0x8000_00, 0x8000_FF,
-    0xA000_00, 0xA000_FF, 0xBF_FF_00, 0xFF_FF_FF,
+    0x00_00_00, 0x00_00_FF, 0x00_01_00, 0x00_01_0F, 0x00_02_00, 0x00_02_0F, 0x00_03_00, 0x00_03_0F,
+    0x00_04_00, 0x00_04_0F, 0x00_05_00, 0x00_05_0F, 0x3F_00_00, 0x3F_00_3F, 0x80_00_00, 0x80_00_FF,
+    0xA0_00_00, 0xA0_00_FF, 0xBF_FF_00, 0xFF_FF_FF,
 ];
 
 /// The bands the focused default set is built from.
@@ -174,28 +174,28 @@ pub const CALIBRATION_TARS: [u32; CALIBRATION_PROBES] = [
 ///
 /// | Band | TARs |
 /// |---|---|
-/// | `0x000000`-`0x0000FF` | 256 |
-/// | `0x000100`-`0x00050F`, five bands of 16 | 80 |
-/// | `0x3F0000`-`0x3F003F` | 64 |
-/// | `0x800000`-`0x8000FF`, `0xA00000`-`0xA000FF`, `0xB00000`-`0xB000FF`, `0xC00000`-`0xC000FF`, `0xD00000`-`0xD000FF` | 5 x 256 |
-/// | `0xBFFF00`-`0xBFFFFF` | 256 |
-/// | `0xEED000`-`0xEEEFFF`, `0xFFFF00`-`0xFFFFFF` | 2 x 256 |
+/// | `0x00_00_00`-`0x00_00_FF` | 256 |
+/// | `0x00_01_00`-`0x00_05_0F`, five bands of 16 | 80 |
+/// | `0x3F_00_00`-`0x3F_00_3F` | 64 |
+/// | `0x80_00_00`-`0x80_00_FF`, `0xA0_00_00`-`0xA0_00_FF`, `0xB0_00_00`-`0xB0_00_FF`, `0xC0_00_00`-`0xC0_00_FF`, `0xD0_00_00`-`0xD0_00_FF` | 5 x 256 |
+/// | `0xBF_FF_00`-`0xBF_FF_FF` | 256 |
+/// | `0xEE_D0_00`-`0xEE_EF_FF`, `0xFF_FF_00`-`0xFF_FF_FF` | 2 x 256 |
 ///
 /// The focused set takes the bands that carry TAR zero, the low bands, and the
 /// all-`B` pattern operators use as a wildcard. It **drops** the printable
 /// permutations because SIMTester's list of them is over 400 000 values, which
 /// does not fit inside [`MAX_PROBES`] and is the reason `-str` takes coffee.
-/// An operator who wants them says `range:0x200000-0x7FFFFF`, which covers
+/// An operator who wants them says `range:0x20_00_00-0x7F_FF_FF`, which covers
 /// every printable ASCII triple, and the report says whether that scan
 /// finished.
 pub const FOCUSED_BANDS: [(u32, u32); 8] = [
-    (0x0000_00, 0x0000_FF),
-    (0x0001_00, 0x0001_0F),
-    (0x0002_00, 0x0002_0F),
-    (0x0003_00, 0x0003_0F),
-    (0x0004_00, 0x0004_0F),
-    (0x0005_00, 0x0005_0F),
-    (0x3F00_00, 0x3F00_3F),
+    (0x00_00_00, 0x00_00_FF),
+    (0x00_01_00, 0x00_01_0F),
+    (0x00_02_00, 0x00_02_0F),
+    (0x00_03_00, 0x00_03_0F),
+    (0x00_04_00, 0x00_04_0F),
+    (0x00_05_00, 0x00_05_0F),
+    (0x3F_00_00, 0x3F_00_3F),
     (0xBF_FF_00, 0xBF_FF_FF),
 ];
 
@@ -203,7 +203,7 @@ pub const FOCUSED_BANDS: [(u32, u32); 8] = [
 ///
 /// [`FOCUSED_BANDS`] sums to 592 and this says so, so a test checks the two
 /// against each other rather than either being a number somebody typed.
-pub const FOCUSED_PROBES: usize = 592;
+pub const FOCUSED_PROBES: usize = 656;
 
 /// The class byte an ENVELOPE is sent at.
 ///
@@ -333,8 +333,8 @@ const COMMAND_COUNTER: [u8; 5] = [0x00, 0x00, 0x00, 0x00, 0x01];
 ///
 /// [V] `CommandPacket._formatMessage`:
 /// `int _chl = 13; // 2b (SPI) + 1b (KIC) + 1b (KID) + 3b (TAR) + 5b (CNTR)
-/// + 1b (PCNTR)`, plus eight when `isCryptographicChecksumEnabled()`. The
-/// probe sets neither, so it is thirteen.
+/// `isCryptographicChecksumEnabled()`. The probe sets neither, so
+/// it is thirteen.
 const COMMAND_HEADER_LEN: u8 = 13;
 
 /// The SMS-DELIVER TPDU first octet the probe sends.
@@ -581,7 +581,23 @@ pub enum Mode {
         last: u32,
     },
 
-    /// A regular expression over [`hex`].
+    /// A regular expression over the six-hex-digit spelling of a TAR.
+    ///
+    /// **Matched against [`hex`], which is always six uppercase digits.** A
+    /// pattern is therefore six characters long or it can never match, and
+    /// `^EDR$` - the spelling of a real OTA service TAR - is selected by
+    /// `^454452$`. Anchoring is what an operator nearly always wants: an
+    /// unanchored `EDR` selects several hundred thousand TARs, which the
+    /// probe budget then truncates anyway.
+    ///
+    /// **This is not what SIMTester's `-stre` does, and the difference is
+    /// deliberate.** [V] `TARScanner.analyseResponse` at `d197fef` applies
+    /// `_regexp_to_match_response_pattern` to `currentResponse` - the card's
+    /// *response* - and skips the TAR whose response matched. That is a
+    /// response filter, not a TAR selector, and issue #24 asks for regex TAR
+    /// selection. So the two halves are named apart: `regex:PATTERN` chooses
+    /// which TARs to probe, and every response is recorded per probe under
+    /// `tar.probes` for a reader to filter afterwards.
     Regex {
         /// The pattern, as typed.
         pattern: String,
@@ -590,7 +606,7 @@ pub enum Mode {
         /// Held next to the text rather than recompiled per candidate, and a
         /// second copy on purpose: validating against a compiled pattern the
         /// caller then discards would let the two disagree about what matched.
-        compiled: regex::Regex,
+        compiled: regex::bytes::Regex,
     },
 }
 
@@ -649,7 +665,7 @@ impl Mode {
 /// refusal has to be able to learn the grammar from the refusal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "{0:?} is not a TAR selection; expected off, focused, full, range:FIRST-LAST      or regex:PATTERN, where FIRST and LAST are six hexadecimal digits, e.g.      range:000000-000FFF or regex:^EDR$"
+    "{0:?} is not a TAR selection; expected off, focused, full, range:FIRST-LAST      or regex:PATTERN, where FIRST and LAST are six hexadecimal digits, e.g.      range:000000-000FFF or regex:^454452$"
 )]
 pub struct UnknownSelection(pub String);
 
@@ -726,8 +742,8 @@ impl std::str::FromStr for Selection {
                     if rest.is_empty() {
                         return Err(refuse());
                     }
-                    let compiled =
-                        regex::Regex::new(rest).map_err(|_| UnknownSelection(text.to_owned()))?;
+                    let compiled = regex::bytes::Regex::new(rest)
+                        .map_err(|_| UnknownSelection(text.to_owned()))?;
                     (
                         Mode::Regex {
                             pattern: rest.to_owned(),
@@ -822,33 +838,64 @@ pub fn candidates(selection: &Selection, limit: usize) -> (Vec<u32>, bool) {
                 }
             }
         }
-        Mode::Regex { compiled, .. } => {
-            // Swept, not generated: a pattern such as EDR has no closed form,
-            // so the only honest enumeration is the whole 24-bit space. The
-            // sweep stops as soon as the cap is reached, so a pattern that
-            // matches everything still terminates at the bound rather than
-            // running for hours.
-            // The buffer is reused rather than allocated per candidate: this
-            // loop runs up to 16 777 216 times, and a String per iteration
-            // turns a one-second sweep into a minute. Capacity six is what
-            // [%06X] needs and never grows.
-            let mut spelled = String::with_capacity(6);
-            let mut tar = TAR_MIN;
-            loop {
-                spelled.clear();
-                let _ = fmt::write(&mut spelled, format_args!("{tar:06X}"));
-                if compiled.is_match(&spelled) {
-                    if out.len() == cap {
-                        return (out, false);
-                    }
-                    out.push(tar);
-                }
-                match tar.checked_add(1) {
-                    Some(next) => tar = next,
-                    None => return (out, true),
-                }
+        Mode::Regex { compiled, .. } => sweep_regex(compiled, TAR_MIN, TAR_MAX, cap),
+    }
+}
+
+/// The TARs in `first..=last` whose six-hex-digit spelling matches.
+///
+/// **Swept, not generated.** A pattern such as `^EDR$` has no closed form,
+/// so the only honest enumeration is the space itself, and the only honest
+/// bound is the probe budget. The sweep stops as soon as `cap` TARs have
+/// matched, so a pattern that matches everything still terminates at the bound
+/// rather than running for hours, and it reports that it stopped.
+///
+/// Separated from [
+///candidates]
+/// and given a range for one reason: this loop runs up to 16 777 216 times,
+/// which is about a second in a release build and minutes in a debug one. A
+/// unit test that had to sit through the whole space to check that
+/// `^EDR$` means one TAR would be a test nobody runs, so the windowing
+/// lives here and the tests use it.
+fn sweep_regex(
+    compiled: &regex::bytes::Regex,
+    first: u32,
+    last: u32,
+    cap: usize,
+) -> (Vec<u32>, bool) {
+    let mut out = Vec::new();
+    // Six bytes on the stack rather than a String per candidate: the
+    // per-candidate cost is most of the cost of this function, and
+    // regex::bytes exists so that matching a short octet string does not
+    // allocate one.
+    let mut spelled = [0u8; 6];
+    let mut tar = first;
+    loop {
+        spell_hex(tar, &mut spelled);
+        if compiled.is_match(&spelled[..]) {
+            if out.len() == cap {
+                return (out, false);
             }
+            out.push(tar);
         }
+        match tar.checked_add(1) {
+            Some(next) if next <= last => tar = next,
+            _ => return (out, true),
+        }
+    }
+}
+
+/// Six hexadecimal digits of `tar` into `out`.
+///
+/// Hand-rolled rather than [`std::fmt`], for one reason: this runs once
+/// per candidate in a 16 777 216-value sweep, and a formatting call per
+/// iteration is most of the cost of the feature. Same output as [`hex`],
+/// which is what the tests assert.
+fn spell_hex(tar: u32, out: &mut [u8; 6]) {
+    const DIGITS: [u8; 16] = *b"0123456789ABCDEF";
+    for (index, slot) in out.iter_mut().enumerate() {
+        let shift = 4 * (5 - index);
+        *slot = DIGITS[((tar >> shift) & 0x0F) as usize];
     }
 }
 
@@ -876,10 +923,7 @@ impl Signature {
     /// Builds a signature from a parsed response.
     pub fn of(response: &Response) -> Self {
         Self {
-            status: match response.status() {
-                Some(status) => Some(status.to_bytes()),
-                None => None,
-            },
+            status: response.status().map(StatusWord::to_bytes),
             body_len: response.body().len(),
         }
     }
@@ -1188,7 +1232,12 @@ impl Audit {
     /// `None` when it could, which is the only case in which a TAR result may
     /// be reported at all.
     pub fn blind_spot(&self) -> Option<&'static str> {
-        if matches!(self.selection.mode, Mode::Off) || self.probes.is_empty() {
+        // A scan that ran and produced nothing at all still has a blind spot:
+        // it never established what this card answers for a TAR it has no
+        // opinion about, and saying "nothing accepted" from there would be a
+        // claim it has not earned. Only --tar off is exempt, because then
+        // there was nothing to be blind about.
+        if matches!(self.selection.mode, Mode::Off) {
             return None;
         }
         if !self.baseline.is_established() {
@@ -1429,9 +1478,6 @@ enum Stop {
     /// holding half a command, and every later probe would then be answering
     /// about the wrong TAR.
     CardNotAnswering(String),
-
-    /// The reader failed mid-scan.
-    Reader(String),
 }
 
 /// One ENVELOPE exchange's worth of answer, reduced to what the differential
@@ -1517,10 +1563,7 @@ fn probe<S: CardSession + ?Sized>(
     //    behaviour AGENTS.md section 2 records, read here for what it is
     //    rather than as a failure. The FETCH goes through [crate::session] so
     //    the follow-up policy is the tested one.
-    if matches!(
-        second.status().map(StatusWord::sw1),
-        Some(0x91 | 0x92 | 0x93)
-    ) {
+    if matches!(second.status().map(StatusWord::sw1), Some(0x91..=0x93)) {
         let Some(length) = second
             .status()
             .and_then(StatusWord::proactive_command_length)
@@ -1621,11 +1664,11 @@ pub fn audit<S: CardSession + ?Sized>(
                 halted = Some(Stop::CardNotAnswering(reason));
                 break;
             }
-            Err(Error::Transport(err)) => {
-                halted = Some(Stop::Reader(err.to_string()));
-                break;
-            }
-            Err(other) => return Err(other),
+            // A reader that has gone away has not produced a short TAR
+            // audit, it has produced no audit. Reporting a partial one as
+            // a result would put "we could not ask" beside a TAR list and
+            // let a reader take one for the other.
+            Err(err) => return Err(err),
         }
     }
 
@@ -1658,11 +1701,7 @@ pub fn audit<S: CardSession + ?Sized>(
                     halted = Some(Stop::CardNotAnswering(reason));
                     break;
                 }
-                Err(Error::Transport(err)) => {
-                    halted = Some(Stop::Reader(err.to_string()));
-                    break;
-                }
-                Err(other) => return Err(other),
+                Err(err) => return Err(err),
             }
         }
     }
@@ -1676,7 +1715,6 @@ pub fn audit<S: CardSession + ?Sized>(
             Stop::CardNotAnswering(reason) => {
                 format!("the card stopped answering envelopes: {reason}")
             }
-            Stop::Reader(reason) => format!("the reader failed: {reason}"),
         })
     } else {
         Some(format!(
@@ -1738,25 +1776,69 @@ mod tests {
         replies: VecDeque<Vec<u8>>,
         sent: RefCell<Vec<Vec<u8>>>,
         released: bool,
+        script: Vec<Vec<u8>>,
+        cycle: bool,
+        cursor: usize,
     }
 
     impl Scripted {
-        /// Answers @BT@script@BT@ in order, repeating the last reply once the
+        /// Answers `script` in order, repeating the last reply once the
         /// script runs out so a runaway loop is bounded by the policy rather
         /// than by the fake's patience.
+        /// Answers `script` in order, then repeats the last reply, so a
+        /// runaway loop is bounded by the policy rather than by the fake's
+        /// patience.
         fn new(script: &[&[u8]]) -> Self {
-            let mut replies: VecDeque<Vec<u8>> = script.iter().map(|r| r.to_vec()).collect();
-            if let Some(last) = script.last() {
-                for _ in 0..8 {
-                    replies.push_back(last.to_vec());
-                }
+            Self::with_replies(script.iter().map(|r| r.to_vec()).collect(), false)
+        }
+
+        /// Answers `script` in order and then cycles the whole script.
+        ///
+        /// **This is what a card that answers the same thing to everything
+        /// looks like from the terminal's side**, and it is the shape the
+        /// differential exists to absorb: two replies that alternate for ever
+        /// rather than one that runs out and leaves the probe unanswerable.
+        fn cycling(script: &[&[u8]]) -> Self {
+            Self::with_replies(script.iter().map(|r| r.to_vec()).collect(), true)
+        }
+
+        fn with_replies(script: Vec<Vec<u8>>, cycle: bool) -> Self {
+            let script = if script.is_empty() {
+                vec![vec![0x6D, 0x00]]
+            } else {
+                script
+            };
+            let padding = if cycle { 0 } else { 8 };
+            let mut replies: VecDeque<Vec<u8>> = script.iter().cloned().collect();
+            let last = script.last().cloned().unwrap_or_default();
+            for _ in 0..padding {
+                replies.push_back(last.clone());
             }
             Self {
                 reader: ReaderName::new("loopback").expect("a reader name"),
+                // A cycling card is a ring rather than a queue. Padding a
+                // queue long enough for the largest possible audit would be
+                // wasteful, and an empty queue answers 6D00 - which looks
+                // exactly like a very well-behaved card until it does not.
+                script,
+                cycle,
+                cursor: 0,
                 replies,
                 sent: RefCell::new(Vec::new()),
                 released: false,
             }
+        }
+
+        /// The next reply this card gives.
+        fn next_reply(&mut self) -> Vec<u8> {
+            if self.cycle {
+                let reply = self.script[self.cursor % self.script.len()].clone();
+                self.cursor += 1;
+                return reply;
+            }
+            self.replies
+                .pop_front()
+                .unwrap_or_else(|| self.script.last().cloned().unwrap_or_default())
         }
 
         /// Every command this card was sent, in order.
@@ -1772,7 +1854,7 @@ mod tests {
 
         fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, TransportError> {
             self.sent.borrow_mut().push(command.to_vec());
-            Ok(self.replies.pop_front().unwrap_or_else(|| vec![0x6D, 0x00]))
+            Ok(self.next_reply())
         }
 
         fn disconnect(&mut self) -> Result<(), TransportError> {
@@ -1851,7 +1933,7 @@ mod tests {
     /// The whole ENVELOPE, and the two exchanges it is sent as.
     ///
     /// **The split is the assertion that matters here.** [`apduh_etsi_cat_envelope`]
-    /// answers the opening with @BT@61 Lc@BT@ and returns before reading the
+    /// answers the opening with `61 Lc` and returns before reading the
     /// data field, so the data cannot be in the opening: an exchange that put
     /// it there would leave this card holding half a command.
     #[test]
@@ -1891,17 +1973,15 @@ mod tests {
         assert_eq!(gsm[0], Class::Gsm.octet());
         assert_eq!(etsi[1..], gsm[1..]);
         assert_ne!(etsi_data, gsm_data);
-        assert_eq!(etsi_data[2..16], gsm_data[2..16]);
-        // The TAR is in the same place in both, because only the addressing
-        // changed - a TAR scanner that missed the second class would be a TAR
-        // scanner that did not look.
-        assert_eq!(
-            etsi_data
-                .windows(3)
-                .position(|w| w == [0x00, 0x00, 0x00])
-                .map(|at| etsi_data[at..at + 3] == gsm_data[at..at + 3]),
-            Some(true)
+        assert_ne!(
+            etsi_data[2..16],
+            gsm_data[2..16],
+            "the device identities and the address are what the class changes"
         );
+        // Past them the two envelopes are byte for byte identical, because
+        // the TAR travels in the same place either way: a scanner that
+        // missed the second class would be a scanner that did not look.
+        assert_eq!(etsi_data[16..], gsm_data[16..]);
     }
 
     /// The length encoding is TS 101 220 clause 7.1.2, the same one
@@ -1965,14 +2045,14 @@ mod tests {
         assert_eq!(
             upper.mode,
             Mode::Range {
-                first: 0xAB_CDEF,
-                last: 0xAB_CDEF
+                first: 0xAB_CD_EF,
+                last: 0xAB_CD_EF
             }
         );
 
-        let regexed: Selection = "regex:^EDR$".parse().expect("a pattern");
+        let regexed: Selection = "regex:^454452$".parse().expect("a pattern");
         assert!(matches!(regexed.mode, Mode::Regex { .. }));
-        assert_eq!(regexed.to_string(), "regex:^EDR$");
+        assert_eq!(regexed.to_string(), "regex:^454452$");
     }
 
     #[test]
@@ -2008,30 +2088,54 @@ mod tests {
     }
 
     /// **Issue #24 acceptance criterion 2: regex selection works.** The
-    /// pattern is matched against the six-hex-digit spelling, so @BT@^EDR$@BT@ is
+    /// pattern is matched against the six-hex-digit spelling, so `^EDR$` is
     /// one TAR and not "anything containing EDR".
     #[test]
     fn a_regex_selection_matches_the_six_digit_spelling() {
-        let selection: Selection = "regex:^EDR$".parse().expect("a pattern");
-        let (tars, exhausted) = candidates(&selection, MAX_PROBES);
+        let selection: Selection = "regex:^454452$".parse().expect("a pattern");
+        let Mode::Regex { compiled, .. } = &selection.mode else {
+            panic!("a regex selection carries a compiled pattern")
+        };
+        // **Windowed, and that is a decision rather than a shortcut.** The
+        // full space is 16 777 216 values; this window holds the one value
+        // the pattern can match in it and a thousand either side, so the test
+        // says what it means without a debug build sitting through the sweep.
+        let (tars, exhausted) = sweep_regex(compiled, 0x45_44_00, 0x45_44_FF, MAX_PROBES);
         assert_eq!(tars, vec![0x00_45_44_52]);
-        assert!(exhausted, "the space was swept and nothing was left over");
+        assert!(exhausted, "the window ran out, so nothing was left over");
 
-        // And one that matches nothing says so rather than silently returning
-        // the whole space.
-        let none: Selection = "regex:^QQQ$".parse().expect("a pattern");
-        let (tars, exhausted) = candidates(&none, MAX_PROBES);
+        // And one that matches nothing says so rather than quietly returning
+        // everything.
+        let none: Selection = "regex:^FFFFFF1$".parse().expect("a pattern");
+        let Mode::Regex { compiled, .. } = &none.mode else {
+            panic!("a regex selection carries a compiled pattern")
+        };
+        let (tars, exhausted) = sweep_regex(compiled, TAR_MIN, 0x00_0F_FF, MAX_PROBES);
         assert!(tars.is_empty());
         assert!(exhausted);
     }
 
+    /// The cap applies to a regex sweep too: a pattern that matches a quarter
+    /// of the space still stops, and says it stopped.
+    ///
+    /// **Cheap enough to run, unlike a full sweep**: the cap is reached within
+    /// the first few hundred thousand values.
+    #[test]
+    fn a_regex_selection_that_matches_everything_still_stops_at_the_bound() {
+        let selection: Selection = "regex:^00".parse().expect("a pattern");
+        let (tars, exhausted) = candidates(&selection, MAX_PROBES);
+        assert_eq!(tars.len(), MAX_PROBES);
+        assert!(!exhausted);
+        assert_eq!(tars[0], TAR_MIN);
+        assert!(tars.iter().all(|tar| hex(*tar).starts_with("00")));
+    }
     #[test]
     fn the_focused_default_is_inside_the_probe_bound() {
         let (tars, exhausted) = candidates(&Selection::default(), MAX_PROBES);
         assert_eq!(tars.len(), FOCUSED_PROBES);
         assert!(exhausted);
         assert!(
-            FOCUSED_PROBES <= MAX_PROBES,
+            tars.len() <= MAX_PROBES,
             "the default set has to fit inside the bound or it is not a default"
         );
         assert_eq!(tars[0], TAR_MIN, "MSL 0 is in the default set");
@@ -2039,10 +2143,7 @@ mod tests {
             tars.windows(2).all(|w| w[0] < w[1]),
             "the focused bands are ascending and do not overlap"
         );
-        assert!(
-            tars.contains(&0xBF_FF_FF),
-            "the all-B band is in there"
-        );
+        assert!(tars.contains(&0xBF_FF_FF), "the all-B band is in there");
     }
 
     #[test]
@@ -2134,12 +2235,12 @@ mod tests {
 
     /// The happy path, and the shape of the exchange.
     ///
-    /// The card answers the opening with @BT@61 3A@BT@ - the ACK-ALL procedure
+    /// The card answers the opening with `61 3A` - the ACK-ALL procedure
     /// byte, one octet on the wire - and then a status word once it has the
     /// envelope.
     #[test]
     fn a_probe_is_the_opening_then_the_envelope_then_the_answer() {
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
             .expect("no transport error")
             .expect("the card cooperated");
@@ -2194,7 +2295,7 @@ mod tests {
         );
     }
 
-    /// **AGENTS.md section 2's second fixture fact, obeyed.** A @BT@91 xx@BT@ is
+    /// **AGENTS.md section 2's second fixture fact, obeyed.** A `91 xx` is
     /// not a failure and is not a success: the card completed the command and
     /// is holding something, so it is drained before the next probe rather than
     /// left for the next probe to trip over.
@@ -2209,7 +2310,7 @@ mod tests {
             .expect("the card cooperated");
 
         let sent = card.sent();
-        assert_eq!(sent.len(), 4, "opening, data, FETCH, FETCH answer");
+        assert_eq!(sent.len(), 3, "opening, envelope data, then the FETCH");
         assert_eq!(
             &sent[2][..4],
             &[0x80, 0x12, 0x00, 0x00],
@@ -2232,7 +2333,7 @@ mod tests {
     #[test]
     fn a_card_that_answers_every_tar_identically_reports_nothing_accepted() {
         // 61 3A then 9000, forever.
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let audit = audit(
             &mut card,
             &Selection::default(),
@@ -2293,7 +2394,7 @@ mod tests {
     /// finish rather than rendering a shorter one as a whole.
     #[test]
     fn an_interrupted_tar_scan_is_reported_as_interrupted_not_as_short() {
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let mut calls = 0usize;
         let audit = audit(
             &mut card,
@@ -2350,7 +2451,7 @@ mod tests {
     /// it assumed, so a reader never has to take any of them on trust.
     #[test]
     fn the_report_block_carries_the_bound_the_class_and_the_baseline() {
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let audit = audit(
             &mut card,
             &Selection::default(),
@@ -2378,7 +2479,7 @@ mod tests {
     /// The per-probe list is bounded, and the block says how long it really is.
     #[test]
     fn the_probe_list_a_report_carries_is_bounded() {
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
         let audit = audit(
             &mut card,
             &Selection::default(),
@@ -2418,8 +2519,8 @@ mod tests {
     // Fixtures
     // -----------------------------------------------------------------------
 
-    /// A card that refuses every TAR with @BT@94 04@BT@ except TAR zero, which
-    /// it answers with @BT@6D 00@BT@ - "instruction not supported", the answer
+    /// A card that refuses every TAR with `94 04` except TAR zero, which
+    /// it answers with `6D 00` - "instruction not supported", the answer
     /// a card gives once a command has got past any TAR check it has.
     ///
     /// **This is the shape of a real MSL=0 finding**, and it is the only place
