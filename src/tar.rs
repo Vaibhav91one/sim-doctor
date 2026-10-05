@@ -10,7 +10,7 @@
 //! This module knows nothing about the finding vocabulary; it produces
 //! measurements and the rule turns them into findings.
 //!
-//! # How a TAR reaches a card at all [V]
+//! # How a TAR reaches a card at all \[V]
 //!
 //! There is no TAR in a bare command header. A TAR is three octets inside a
 //! 3GPP TS 23.040 SMS-DELIVER TPDU, inside an ISO/IEC 7816-4 SMS-PP-DOWNLOAD
@@ -29,7 +29,7 @@
 //! bottom pin the result.
 //!
 //! **The swSIM fixture receives ENVELOPE at `80 C2 00 00` and nowhere else.**
-//! [V] swSIM `src/apduh.c`, `sim_apduh_demux`: `case 0xC2: /* ENVELOPE */`
+//! \[V] swSIM `src/apduh.c`, `sim_apduh_demux`: `case 0xC2: /* ENVELOPE */`
 //! is dispatched only when `cmd->hdr->cla.raw == 0x80`, which is the
 //! three-generation form SIMTester's `Envelope.getAPDU` builds. So
 //! [`Class::Etsi`] is the default, and [`CLASS_ASSUMPTION`] says in the
@@ -39,7 +39,7 @@
 //! # Why this module never moves on while the card is mid-command
 //!
 //! **A TAR probe is an ENVELOPE, and swSIM answers `61 Lc` to every one
-//! before it reads a single byte of it.** [V] swSIM `src/apduh.c`,
+//! before it reads a single byte of it.** \[V] swSIM `src/apduh.c`,
 //! `apduh_etsi_cat_envelope`: when `procedure_count == 0` and
 //! `*cmd->p3 > 0` it sets `SWICC_APDU_SW1_PROC_ACK_ALL`, copies nothing out
 //! of `cmd->data`, and returns. The data field therefore arrives on a
@@ -50,7 +50,7 @@
 //! this one's continuation, and every probe after that is answering about the
 //! wrong TAR. That is worse than not probing at all.
 //!
-//! So [`probe`] sends the opening `CLA INS P1 P2 Lc`, waits for the card to
+//! So the probe sends the opening `CLA INS P1 P2 Lc`, waits for the card to
 //! ask for the data, sends exactly that many octets, and **abandons the whole
 //! scan rather than continue** if the card asks for anything else. The
 //! invariant is the one that matters: the card is never left mid-command, even
@@ -69,7 +69,7 @@
 //! manufacture findings, and the swSIM fixture proves why.
 //!
 //! swSIM's proactive application recognises exactly one envelope root tag,
-//! `D3`, Menu Selection [V] (swSIM `src/proactive.c`,
+//! `D3`, Menu Selection \[V] (swSIM `src/proactive.c`,
 //! `proactive_app_default__envelope`: `root_tag = {0xD3}`). It has no notion
 //! of `D1`, no notion of a TAR, and **no notion of an MSL at all** -
 //! grepping swSIM for a TAR allow-list finds nothing. So every
@@ -90,7 +90,7 @@
 //! because it cannot cite one. AGENTS.md blocker 2 records that no 3GPP TS
 //! 31.111 text has been read here, and the one card this project has talked to
 //! actively contradicts the obvious guess: swSIM answers GSM SELECT of a
-//! missing file with `94 04` [V] (swSIM `src/apduh.c`,
+//! missing file with `94 04` \[V] (swSIM `src/apduh.c`,
 //! `apduh_gsm_select`: `res->sw1 = 0x94; res->sw2 = 0x04; /* "File ID not
 //! found" */`). On the only card this project can test, `94 04`
 //! demonstrably does **not** mean "the TAR was refused". Treating it as though
@@ -122,7 +122,7 @@ pub const TAR_MIN: u32 = 0x00_00_00;
 
 /// The largest TAR, `0xFF_FF_FF`.
 ///
-/// [V] SIMTester `TARScanner.java` at `d197fef`:
+/// \[V] SIMTester `TARScanner.java` at `d197fef`:
 /// `private final static int HIGHEST_TAR = 16777215; // this is 0xFF_FF_FF`.
 pub const TAR_MAX: u32 = 0xFF_FF_FF;
 
@@ -145,7 +145,7 @@ pub const MAX_PROBES: usize = 4096;
 
 /// How many TARs the calibration pass probes to establish the baseline.
 ///
-/// [V] SIMTester `TARScanner.java`: `private final static int _smart_count =
+/// \[V] SIMTester `TARScanner.java`: `private final static int _smart_count =
 /// 20;`.
 pub const CALIBRATION_PROBES: usize = 20;
 
@@ -166,7 +166,7 @@ pub const CALIBRATION_TARS: [u32; CALIBRATION_PROBES] = [
 
 /// The bands the focused default set is built from.
 ///
-/// **SIMTester's own band list, narrowed on purpose.** [V]
+/// **SIMTester's own band list, narrowed on purpose.** \[V]
 /// `TARScanner.prepareTARlist` at `d197fef` builds `-str` from two
 /// families: every three-character permutation of printable ASCII - which is
 /// where real OTA service TARs come from, since a TAR is chosen to look like an
@@ -213,14 +213,14 @@ pub const FOCUSED_PROBES: usize = 656;
 pub enum Class {
     /// CLA `0x80`, ETSI TS 102 221 clause 10.1.2. The default.
     ///
-    /// [V] swSIM `src/apduh.c`, `sim_apduh_demux`, dispatches INS `0xC2`
+    /// \[V] swSIM `src/apduh.c`, `sim_apduh_demux`, dispatches INS `0xC2`
     /// at this class and at no other proprietary class.
     #[default]
     Etsi,
 
     /// CLA `0xA0`, GSM 11.11.
     ///
-    /// [V] SIMTester `Envelope.getAPDU`: the `A0` form is what it builds
+    /// \[V] SIMTester `Envelope.getAPDU`: the `A0` form is what it builds
     /// when `third_gen_apdu` is false, i.e. for a 2G SIM.
     Gsm,
 }
@@ -263,7 +263,7 @@ pub const CLASS_ASSUMPTION: &str = "the ENVELOPE was sent at CLA 80 (etsi), the 
 
 /// INS of the ENVELOPE command.
 ///
-/// [V] two independent sources agree: SIMTester `Envelope.getAPDU` builds
+/// \[V] two independent sources agree: SIMTester `Envelope.getAPDU` builds
 /// `(byte) 0xC2`, and swSIM `src/apduh.c`, `sim_apduh_demux`, has
 /// `case 0xC2: /* ENVELOPE */`. ISO/IEC 7816-4 numbers the same command
 /// `CA`; the two disagree, and this crate follows the two implementations
@@ -272,7 +272,7 @@ pub const INS_ENVELOPE: u8 = 0xC2;
 
 /// BER-TLV tag of an SMS-PP-DOWNLOAD envelope payload.
 ///
-/// [V] SIMTester `EnvelopeSMSPPDownload`:
+/// \[V] SIMTester `EnvelopeSMSPPDownload`:
 /// `InnerTLV.getInnerTLV((byte) 0xD1, smspp_data)`, whose own comment cites
 /// TS 101 220 clause 7.1.2 for the length encoding reproduced by
 /// [`inner_tlv`].
@@ -281,7 +281,7 @@ pub const TAG_SMS_PP_DOWNLOAD: u8 = 0xD1;
 /// The user data the TAR probe carries.
 ///
 /// `A0 A4 00 00 02 3F 00`, which is SIMTester's SELECT of the master file
-/// ([V] `TARScanner.testTAR`:
+/// (\[V] `TARScanner.testTAR`:
 /// `cp.setUserData(HexToolkit.fromString("A0A40000023F00"))`).
 ///
 /// **Nothing depends on the card understanding it.** The probe asks "will you
@@ -293,21 +293,21 @@ pub const PROBE_USER_DATA: [u8; 7] = [0xA0, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00];
 
 /// The 3GPP TS 03.48 Command Packet Header SIMTester writes.
 ///
-/// [V] `CommandPacket.CPH = {0x02, 0x70, 0x00}`. The third octet is the
+/// \[V] `CommandPacket.CPH = {0x02, 0x70, 0x00}`. The third octet is the
 /// version and flags byte, written `00` for a CP whose integrity is not
 /// cryptographically protected.
 const COMMAND_PACKET_HEADER: [u8; 3] = [0x02, 0x70, 0x00];
 
 /// The SPI1 octet of the probe's Command Packet.
 ///
-/// [V] `TARScanner.testTAR` sets only `setCounterManegement(CNTR_NO_CNTR_AVAILABLE)`,
+/// \[V] `TARScanner.testTAR` sets only `setCounterManegement(CNTR_NO_CNTR_AVAILABLE)`,
 /// which writes `SPI1 |= 0`; the field starts at `0x00`. No ciphering, no
 /// cryptographic checksum.
 const SPI1_PLAIN: u8 = 0x00;
 
 /// The SPI2 octet of the probe's Command Packet.
 ///
-/// [V] `TARScanner.testTAR` sets, in order: `setPoR(true)` gives
+/// \[V] `TARScanner.testTAR` sets, in order: `setPoR(true)` gives
 /// `SPI2 |= 0x01`; `setPoRSecurity(POR_SECURITY_CC)` with
 /// `POR_SECURITY_CC = 0x2` gives `SPI2 |= (2 << 2) & 0x0C = 0x08`;
 /// `setPoRMode(POR_MODE_SMS_SUBMIT)` with `POR_MODE_SMS_SUBMIT = 0x1` gives
@@ -316,14 +316,14 @@ const SPI2_PROBE: u8 = 0x29;
 
 /// The key set the probe's KIC and KID name.
 ///
-/// [V] `CommandPacket.setKeyset(0)` writes `KIC |= 0 << 4` and
+/// \[V] `CommandPacket.setKeyset(0)` writes `KIC |= 0 << 4` and
 /// `KID |= 0 << 4`, so both stay `0x00`. The low nibble is the algorithm
 /// selector, and `0x00` is `KIC_ALGO_IMPLICIT`.
 const KEY_SET: u8 = 0x00;
 
 /// The counter the probe's Command Packet carries.
 ///
-/// [V] `TARScanner.testTAR` calls `setCounter(1)`, and
+/// \[V] `TARScanner.testTAR` calls `setCounter(1)`, and
 /// `CommandPacket.setCounter` writes `CNTR[4 - i] = (byte)(counter >>>
 /// (i * 8))`, so one is `00 00 00 00 01` big-endian.
 const COMMAND_COUNTER: [u8; 5] = [0x00, 0x00, 0x00, 0x00, 0x01];
@@ -331,7 +331,7 @@ const COMMAND_COUNTER: [u8; 5] = [0x00, 0x00, 0x00, 0x00, 0x01];
 /// The command header length of a Command Packet with no cryptographic
 /// checksum.
 ///
-/// [V] `CommandPacket._formatMessage`:
+/// \[V] `CommandPacket._formatMessage`:
 /// `int _chl = 13; // 2b (SPI) + 1b (KIC) + 1b (KID) + 3b (TAR) + 5b (CNTR)
 /// `isCryptographicChecksumEnabled()`. The probe sets neither, so
 /// it is thirteen.
@@ -339,7 +339,7 @@ const COMMAND_HEADER_LEN: u8 = 13;
 
 /// The SMS-DELIVER TPDU first octet the probe sends.
 ///
-/// [V] `SMSDeliverTPDU.getFirstOctet` ORs six masked fields. The `OTASMS`
+/// \[V] `SMSDeliverTPDU.getFirstOctet` ORs six masked fields. The `OTASMS`
 /// constructor calls `setTPUDHI(true)`, which is bit 6; `TPMMS` defaults to
 /// `0x4`, which is bit 2; the rest default to zero. `0x40 | 0x04 = 0x44`.
 ///
@@ -356,30 +356,30 @@ const SMS_DELIVER_FIRST_OCTET: u8 = 0x44;
 
 /// TP-Originating-Address the probe sends.
 ///
-/// [V] `SMSDeliverTPDU.TPOA = {0x05, 0x00, 0x21, 0x43, 0xF5}`.
+/// \[V] `SMSDeliverTPDU.TPOA = {0x05, 0x00, 0x21, 0x43, 0xF5}`.
 const SMS_DELIVER_TPOA: [u8; 5] = [0x05, 0x00, 0x21, 0x43, 0xF5];
 
 /// TP-Protocol-Identifier the probe sends: `1111111`, "(U)SIM Data download".
 ///
-/// [V] `SMSDeliverTPDU.TPPID = (byte) 0x7F`, whose own comment reads
+/// \[V] `SMSDeliverTPDU.TPPID = (byte) 0x7F`, whose own comment reads
 /// `111111 (U)SIM Data download`.
 const SMS_DELIVER_TPPID: u8 = 0x7F;
 
 /// TP-Data-Coding-Scheme the probe sends.
 ///
-/// [V] `SMSDeliverTPDU.TPDCS = (byte) 0xF6`.
+/// \[V] `SMSDeliverTPDU.TPDCS = (byte) 0xF6`.
 const SMS_DELIVER_TPDCS: u8 = 0xF6;
 
 /// The 7-octet TP-Service-Centre-Time-Stamp: all zero.
 ///
-/// [V] `SMSDeliverTPDU.TPSCTS = new byte[7]` and no setter is called by
+/// \[V] `SMSDeliverTPDU.TPSCTS = new byte[7]` and no setter is called by
 /// `OTASMS`. The card cannot route on a timestamp that says 1970, which is
 /// fine: the probe is not an SMS, it is a TAR request.
 const SMS_DELIVER_SCTS: [u8; 7] = [0, 0, 0, 0, 0, 0, 0];
 
 /// Device identities of a 3G SMS-PP-DOWNLOAD envelope.
 ///
-/// [V] SIMTester `OTASMS.send`, 3G branch:
+/// \[V] SIMTester `OTASMS.send`, 3G branch:
 /// `new DeviceIdentities(TYPE_3G, DI_NETWORK, DI_UICC)`, and
 /// `DeviceIdentities.getBytes` writes type, length `0x02`, source,
 /// destination, with `TYPE_3G = 0x82`, `DI_NETWORK = 0x83`,
@@ -388,12 +388,12 @@ const DEVICE_IDENTITIES_3G: [u8; 4] = [0x82, 0x02, 0x83, 0x81];
 
 /// Device identities of a GSM SMS-PP-DOWNLOAD envelope.
 ///
-/// [V] SIMTester `OTASMS.send`, 2G branch, with `TYPE_GSM = 0x02`.
+/// \[V] SIMTester `OTASMS.send`, 2G branch, with `TYPE_GSM = 0x02`.
 const DEVICE_IDENTITIES_GSM: [u8; 4] = [0x02, 0x02, 0x83, 0x81];
 
 /// The originating address SIMTester puts in a 3G envelope.
 ///
-/// [V] `OTASMS.send`, 3G branch:
+/// \[V] `OTASMS.send`, 3G branch:
 /// `new Address(HexToolkit.fromString("86050021436587"))`, and
 /// `Address.getBytes` writes tag, length, TON/NPI, then the dialing string:
 /// tag `0x86` (TYPE_3G), length `0x08`, TON/NPI `0x91`.
@@ -401,7 +401,7 @@ const ADDRESS_3G: [u8; 10] = [0x86, 0x08, 0x91, 0x86, 0x50, 0x02, 0x14, 0x36, 0x
 
 /// The originating address SIMTester puts in a GSM envelope.
 ///
-/// [V] `OTASMS.send`, 2G branch:
+/// \[V] `OTASMS.send`, 2G branch:
 /// `new Address(HexToolkit.fromString("06050021436587"))`, with
 /// `TYPE_GSM = 0x06`.
 const ADDRESS_GSM: [u8; 10] = [0x06, 0x08, 0x91, 0x06, 0x50, 0x02, 0x14, 0x36, 0x58, 0x7F];
@@ -409,7 +409,7 @@ const ADDRESS_GSM: [u8; 10] = [0x06, 0x08, 0x91, 0x06, 0x50, 0x02, 0x14, 0x36, 0
 /// A TAR as six uppercase hexadecimal digits.
 ///
 /// **Six digits, always.** That is SIMTester's `-str` spelling
-/// ([V] `setStartingTAR`: `!startingTAR.matches("[0-9A-F]+") ||
+/// (\[V] `setStartingTAR`: `!startingTAR.matches("[0-9A-F]+") ||
 /// startingTAR.length() != 6`) and it is what a regular expression is matched
 /// against, so `^ABC$` means one TAR rather than "anything containing ABC".
 pub fn hex(tar: u32) -> String {
@@ -418,7 +418,7 @@ pub fn hex(tar: u32) -> String {
 
 /// BER-TLV with the TS 101 220 clause 7.1.2 length encoding.
 ///
-/// [V] SIMTester `InnerTLV.getInnerTLV`: short form below `128`, `81 xx`
+/// \[V] SIMTester `InnerTLV.getInnerTLV`: short form below `128`, `81 xx`
 /// to `255`, `82 xx xx`, `83 xx xx xx`. This crate's [`crate::tlv`] makes
 /// the same choice for the same reasons, so the two cannot drift about what
 /// they accept.
@@ -450,7 +450,7 @@ pub fn inner_tlv(tag: u8, data: &[u8]) -> Option<Vec<u8>> {
 
 /// The 3GPP TS 03.48 Command Packet carrying `tar`.
 ///
-/// [V] `CommandPacket._formatMessage` at `d197fef`: `CPH || CPL || CHL ||
+/// \[V] `CommandPacket._formatMessage` at `d197fef`: `CPH || CPL || CHL ||
 /// SPI1 SPI2 KIC KID TAR CNTR PCNTR || UD`, with `CPL` big-endian over
 /// `1 + CHL + len(UD)`.
 ///
@@ -481,7 +481,7 @@ pub fn command_packet(tar: u32) -> Vec<u8> {
 
 /// The SMS-DELIVER TPDU carrying `user_data`.
 ///
-/// [V] `SMSDeliverTPDU.getBytes` at `d197fef`: first octet, TP-OA, TP-PID,
+/// \[V] `SMSDeliverTPDU.getBytes` at `d197fef`: first octet, TP-OA, TP-PID,
 /// TP-DCS, TP-SCTS, TP-UDL, TP-UD - in that order, with TP-UDL set by
 /// `setTPUD` to `userData.length`.
 ///
@@ -504,7 +504,7 @@ pub fn sms_deliver_tpdu(user_data: &[u8]) -> Option<Vec<u8>> {
 
 /// The ENVELOPE data field that puts `tar` on the card.
 ///
-/// [V] `OTASMS.send` to `EnvelopeSMSPPDownload` to
+/// \[V] `OTASMS.send` to `EnvelopeSMSPPDownload` to
 /// `InnerTLV.getInnerTLV(0xD1, device_identities || address || tpdu)`.
 pub fn envelope_data(tar: u32, class: Class) -> Option<Vec<u8>> {
     let tpdu = sms_deliver_tpdu(&command_packet(tar))?;
@@ -544,7 +544,7 @@ pub fn envelope_exchange(tar: u32, class: Class) -> Option<(Vec<u8>, Vec<u8>)> {
 
 /// Which TARs a scan probes.
 ///
-/// The three shapes mirror SIMTester's `-st` modes [V] (AGENTS.md 5.2 records
+/// The three shapes mirror SIMTester's `-st` modes \[V] (AGENTS.md 5.2 records
 /// `-st full`, `-str`, `-stbs`, `-stre`):
 ///
 /// | This crate | SIMTester | Meaning |
@@ -583,7 +583,7 @@ pub enum Mode {
 
     /// A regular expression over the six-hex-digit spelling of a TAR.
     ///
-    /// **Matched against [`hex`], which is always six uppercase digits.** A
+    /// **Matched against `hex()`, which is always six uppercase digits.** A
     /// pattern is therefore six characters long or it can never match, and
     /// `^EDR$` - the spelling of a real OTA service TAR - is selected by
     /// `^454452$`. Anchoring is what an operator nearly always wants: an
@@ -591,7 +591,7 @@ pub enum Mode {
     /// probe budget then truncates anyway.
     ///
     /// **This is not what SIMTester's `-stre` does, and the difference is
-    /// deliberate.** [V] `TARScanner.analyseResponse` at `d197fef` applies
+    /// deliberate.** \[V] `TARScanner.analyseResponse` at `d197fef` applies
     /// `_regexp_to_match_response_pattern` to `currentResponse` - the card's
     /// *response* - and skips the TAR whose response matched. That is a
     /// response filter, not a TAR selector, and issue #24 asks for regex TAR
@@ -908,7 +908,7 @@ fn spell_hex(tar: u32, out: &mut [u8; 6]) {
 /// **The response body is not part of the comparison, and that is the
 /// conservative choice.** A card that accepts a TAR answers with a 3GPP TS
 /// 03.48 Response Packet, and a Response Packet *carries the TAR back*
-/// ([V] `ResponsePacket.parse`: `System.arraycopy(data, 6, TAR, 0, 3)`). So
+/// (\[V] `ResponsePacket.parse`: `System.arraycopy(data, 6, TAR, 0, 3)`). So
 /// comparing whole responses byte for byte would make every TAR look different
 /// from every other one on exactly the cards the tool is looking for, and a
 /// critical finding would be raised for each. Only the body *length* is kept,
@@ -1595,7 +1595,7 @@ fn probe<S: CardSession + ?Sized>(
 ///
 /// **Only SW1 `61` counts.** That is ISO/IEC 7816-4 clause 9.1.1's ACK-ALL
 /// form, and it is what swSIM's ENVELOPE handler emits
-/// (`SWICC_APDU_SW1_PROC_ACK_ALL`, [V] swSIM `src/apduh.c`,
+/// (`SWICC_APDU_SW1_PROC_ACK_ALL`, \[V] swSIM `src/apduh.c`,
 /// `apduh_etsi_cat_envelope`). A `9x` is deliberately not counted: on this
 /// card a `9x` means a proactive command is pending, and answering one with
 /// an envelope's worth of bytes would be a different exchange entirely.
@@ -1735,7 +1735,7 @@ pub fn audit<S: CardSession + ?Sized>(
 /// Both halves of one probe's APDU, as a person reads them.
 ///
 /// Exists so a report can name what was sent and a test can prove the wire
-/// sequence without a card. Not a shortcut around [probe], which is the only
+/// sequence without a card. Not a shortcut around the probe, which is the only
 /// thing that puts bytes on a wire.
 pub fn describe_exchange(tar: u32, class: Class) -> String {
     match envelope_exchange(tar, class) {
