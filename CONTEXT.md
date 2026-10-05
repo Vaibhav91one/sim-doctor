@@ -57,7 +57,7 @@ heredocs inside template literals.
 | Agent-first CLI, TUI secondary | The stated goal was agentic UX; TUI is a view over the same data |
 | Rust | Requested; also the right fit for a static binary with strong crypto ecosystem |
 | MIT | Chosen by owner - maximum reuse, including closed-source and commercial |
-| `iso7816-tlv` over `der` for BER-TLV | `der` is strict DER and rejects real SIM BER lengths |
+| ~~`iso7816-tlv` over `der` for BER-TLV~~ **SUPERSEDED by issue #11** | The premise was right - `der` is strict DER and rejects real SIM BER lengths - and the conclusion was wrong. See the three rows below |
 | Development loop uses swSIM + swicc-pcsc | No hardware prerequisite for the test suite |
 | JSON envelope modelled on `lpac` | Best existing agent-friendly contract found |
 | **TS.48 in scope as a RUNNER, not transcribed profiles** | Owner decision. The profile definitions sit behind the same GSMA member login as SGP.22, so we build the executor that consumes operator-supplied profile files and stop there. Progress without pretending to spec access |
@@ -65,6 +65,11 @@ heredocs inside template literals.
 | **swSIM only, no physical reader for now** | Owner decision. Real-reader testing stays available later as a second fixture, not a redesign |
 | **Autonomous PR merging** | Owner decision. A subagent may implement, test, self-review and open a PR; it may **not** merge. An orchestrator verifies then merges |
 | **Serial, dependency-ordered delivery** | Owner decision. M1 is a strict chain, so parallel agents would collide on the contract and drift from it. Fan-out is deliberately rejected |
+| Hand-roll APDU types rather than wrap `iso7816` 0.x | `iso7816 0.2.1` is 0.x with an unstable API, and wrapping it would put an upstream breaking change inside our own contract surface. `src/apdu.rs` now defines `Header`, `StatusWord`, `Le`, `Command` and `Response` directly |
+| `iso7816` left declared but UNUSED in Cargo.toml | Deliberate, and a known loose end rather than an oversight. Issue #5's agent hand-rolled instead of wrapping, and removing an unused dependency mid-phase would force a Cargo.lock change for no functional gain. It must be wrapped or removed before this is called done - tracked, not forgotten |
+| **Hand-roll BER-TLV; `iso7816-tlv` 0.4.4 and `flexiber` 0.2.0 both removed** | Issue #11 read both at these versions. `iso7816-tlv` reads an indefinite length as zero instead of rejecting it, copies every value into nested `Vec`s, rejects a single-octet tag ending `1F`, and encodes 127 non-minimally. `flexiber`'s length rules match ours exactly, but it discards the length *form* that `tlv::Length` exists to keep, and it is BER-only so it could not have been the strict half either. Decisive: the acceptance criterion is that the non-minimal tolerance be tested in *this* repository, and delegating the decoder delegates the property. Full reasoning in AGENTS.md 4.2.1 |
+| **The FCP tag table is a caller-supplied value, not a default** | swSIM and ISO/IEC 7816-4 table 42 disagree on which tag means what, and reading one card with the other table's numbers reported a 10-octet EF as 2337 octets. `fcp::TagSet` has no `Default` and no constructor that invents tags, so `Template::parse` cannot be reached until somebody names the dialect; every `TagSet` carries its name so a scan reports the assumption it ran under. An enum with two built-in variants would have re-encoded the bug as a type |
+| **Strict DER is a separate module and a separate type, not a mode** | AGENTS.md 4.2. `der::Der` and `tlv::Tlv` share no code, no `From`, and no module; `der` is layer 0 with no dependencies in `MODULES`. Three `compile_fail` doctests in `src/der.rs` assert that the separation, so `cargo test` fails if a conversion is ever added. A `strict: bool` would have made the choice a runtime flag, which is how a BER parser ends up being pointed at a certificate |
 
 ---
 
