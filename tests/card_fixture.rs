@@ -1417,7 +1417,7 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         block["value"], block["penalty"], block["scored_findings"], block["rules_run"]
     );
     println!(
-        "severity/score: 100 with rules_run 1, so it is earned rather than the absence of a check"
+        "severity/score: rules_run is 1 but the audit probed nothing, so the 100 carries the no-evidence warning rather than the earned-100 null"
     );
 
     let penalties = block["penalties"]
