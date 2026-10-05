@@ -335,14 +335,16 @@ struct ScanArgs {
 
     /// Save this run to <file>, so a later scan can be compared against it.
     ///
-    /// Implemented (issue #12). The file holds the findings the report carries
-    /// - after --severity, because that is the set this run actually said - and
-    /// a record of what the run DID: whether the walk finished and which bounds
+    /// Implemented (issue #12). The file holds the findings the report carries,
+    /// after --severity because that is the set this run actually said, plus a
+    /// record of what the run DID: whether the walk finished and which bounds
     /// fired, the FCP dialect and the identifier set it used, the --severity
     /// level, the whole --tar selection, and every rule that ran together with
-    /// whether that rule had anything to look at. It does not hold the ATR, the
-    /// file tree or any key material; a baseline is a local artifact and the
-    /// narrower it is the less of the card it carries around.
+    /// whether that rule had anything to look at.
+    ///
+    /// It does NOT hold the ATR, the file tree or any key material. A baseline
+    /// is a local artifact that lands in a CI workspace, and the narrower it is
+    /// the less of the card it carries around.
     ///
     /// SAVING IS NOT A GATE: --baseline on its own exits 0 whatever it found,
     /// because a baseline has to be takeable from a dirty card - that is the
@@ -389,6 +391,12 @@ struct ScanArgs {
     /// with its findings attached and a warning saying so. Reporting it as a fix
     /// plus a new finding would be the failure AGENTS.md section 3 forbids when
     /// it says a rule ID must never be renamed casually.
+    ///
+    /// A HAND-EDITED OR HOSTILE BASELINE IS REFUSED, not believed. Every string
+    /// in the file is bounded before it is parsed, the whole file is size-capped
+    /// while it is read, and every rule ID re-validates on the way in, so a
+    /// file cannot produce unbounded output or name a rule no registry could
+    /// have produced.
     ///
     /// Requires --baseline, so --diff on its own is exit 129 rather than a
     /// silent no-op.
@@ -454,25 +462,26 @@ struct ScanArgs {
 /// already checked the two runs are entitled to be compared on.
 ///
 /// **Is that a seventh meaning smeared across the exit code? No, and here is
-/// the test that says so.** Reason 3's objection was never "code 1 is shared"
-/// - AGENTS.md says in so many words that it is, deliberately, because a gate
-/// cares whether the card passed and not why it did not. The objection was that
-/// sharing it would give one code two *mutually exclusive document schemas*, so
-/// an agent branching on the status would have to read the body to pick one. A
-/// regressed diff is not a second schema:
+/// the test that says so.** Reason 3's objection was never that code 1 is
+/// shared: AGENTS.md says in so many words that it is, deliberately, because a
+/// gate cares whether the card passed and not why it did not. The objection was
+/// that sharing it would give one code two *mutually exclusive document
+/// schemas*, so an agent branching on the status would have to read the body to
+/// pick one. A regressed diff is not a second schema, and the three documents
+/// are mutually exclusive:
 ///
 /// - a **refusal** carries `data.error` and no `data.diff`,
 /// - a **regressed diff** carries `data.diff` and no `data.error`,
 /// - a **clean scan** carries neither and exits 0.
 ///
-/// So `data.error` stays the refusal marker - the field AGENTS.md tells an
-/// agent to read - and code 1 keeps meaning "the thing you asked for was not
-/// delivered", which is what it already meant for "a check failed". A diff
-/// that reports a regression did not deliver what was asked for. The honest
-/// cost, stated rather than hidden: an agent that reads `data.error.message`
-/// on code 1 without checking the key first now has to check. That is one extra
-/// key read against a contract that was going to need one the moment a gate
-/// existed at all.
+/// So `data.error` stays the refusal marker, which is the field AGENTS.md
+/// tells an agent to read, and code 1 keeps meaning "the thing you asked for
+/// was not delivered", which is what it already meant for a check that failed.
+/// A diff that reports a regression did not deliver what was asked for. The
+/// honest cost, stated rather than hidden: an agent that reads
+/// `data.error.message` on code 1 without checking the key first now has to
+/// check. That is one extra key read against a contract that was going to need
+/// one the moment a gate existed at all.
 ///
 /// **A plain scan with findings still exits 0, and reasons 2 and 3 still hold
 /// for it.** Nothing here gives code 1 a meaning to an operator who did not ask
@@ -977,7 +986,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
                 eprintln!(
                     "sim-doctor: compared against the baseline taken {}: {} new, {} fixed, {} persisting",
                     saved.created(),
-                    diff.new().len(),
+                    diff.new_findings().len(),
                     diff.fixed().len(),
                     diff.persisting().len(),
                 );

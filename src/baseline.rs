@@ -122,7 +122,7 @@ pub const MAX_BASELINE_BYTES: usize = 1024 * 1024;
 /// this crate bound what a rule can *produce*; nothing bounds what a hand-edited
 /// file can *assert*. Without this, a 64 KB message repeated a hundred thousand
 /// times would be a hundred thousand findings rendered into a CI log by a
-///! command whose whole promise is that it is safe to script. A card this tool
+////! command whose whole promise is that it is safe to script. A card this tool
 /// can walk does not produce 4096 findings, and if one ever does the refusal
 /// will say so in words rather than truncate.
 pub const MAX_RECORDS: usize = 4096;
@@ -142,14 +142,14 @@ pub const MAX_TEXT_CHARS: usize = 1024;
 ///
 /// **The rule ID alone is not enough, and neither is the message.** A rule can
 /// legitimately fire many times in one scan - once per TAR, once per file - and
-///! [`crate::rules::Finding::to_json`] says in as many words that it is an array
-///! and not a map keyed by ID for exactly that reason. Keying on the ID alone
-///! would call a tenth unreadable EF a duplicate of the first.
+////! [`crate::rules::Finding::to_json`] says in as many words that it is an array
+////! and not a map keyed by ID for exactly that reason. Keying on the ID alone
+////! would call a tenth unreadable EF a duplicate of the first.
 ///
 /// [`rules::Location`]`s [`fmt::Display`] is the discriminator, and it is used
-///! rather than a re-render of the JSON because it is the spelling the human
-///! report already prints (`tar:00000000`, `file:3F00/6F07 selected 9804`) and so
-///! is one string a person can read in the refusal when two runs disagree.
+////! rather than a re-render of the JSON because it is the spelling the human
+////! report already prints (`tar:00000000`, `file:3F00/6F07 selected 9804`) and so
+////! is one string a person can read in the refusal when two runs disagree.
 fn matching_key(finding: &rules::Finding) -> String {
     format!("{} at {}", finding.rule(), finding.location())
 }
@@ -191,7 +191,12 @@ impl RunFacts {
     /// name, the dialect, the candidate set and the TAR selection are printed
     /// by `scan`, and `complete` / `truncated_by` / `limits_hit` are the walk's
     /// own words. Nothing here is a judgement this module makes about the card.
+    ///
+    /// Nine arguments rather than a struct literal, because the struct's fields
+    /// are private and the nine are the nine comparability axes. A caller that
+    /// could spell one without the others is a caller that will.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reader: impl Into<String>,
         dialect: impl Into<String>,
@@ -351,9 +356,9 @@ impl RunFacts {
 ///
 /// **The finding objects are the same ones the report carries**, not a
 /// projection of them, which is what makes the round trip lossless and keeps
-///! one definition of what a finding is. The bounds on the way back in are in
-///! [`Baseline::parse`], not here, because a value that arrived from a file was
-///! never constructed through [`rules::Finding::new`].
+////! one definition of what a finding is. The bounds on the way back in are in
+////! [`Baseline::parse`], not here, because a value that arrived from a file was
+////! never constructed through [`rules::Finding::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Baseline {
     sim_doctor_baseline: u32,
@@ -375,8 +380,8 @@ impl Baseline {
     ///
     /// **Stamped with the current time**, which is the only part of a baseline
     /// that is not a property of the card. Nothing reads a clock during a scan,
-    ///! so the file is the one place time enters, and it enters here where a
-    ///! reader looking for it will find it.
+    ////! so the file is the one place time enters, and it enters here where a
+    ////! reader looking for it will find it.
     #[must_use]
     pub fn new(run: RunFacts, findings: &[rules::Finding]) -> Self {
         Self {
@@ -511,9 +516,9 @@ impl Baseline {
     /// **Through a temporary file and a rename**, because the failure this
     /// avoids is a baseline half-written by a machine that lost power between
     /// the write and the rename. That file would parse, or would not, and
-    ///! whichever it did it would be a baseline no run chose. The rename is
-    ///! atomic on the platforms this crate runs on - it talks to PC/SC - so a
-    ///! reader either sees the old baseline or the new one.
+    ////! whichever it did it would be a baseline no run chose. The rename is
+    ////! atomic on the platforms this crate runs on - it talks to PC/SC - so a
+    ////! reader either sees the old baseline or the new one.
     ///
     /// **Refuses rather than truncating a long message.** Every string this
     /// writes is bounded by [`MAX_TEXT_CHARS`] so that what goes in is what
@@ -1012,8 +1017,17 @@ impl Diff {
     }
 
     /// Findings this run has that the baseline did not.
-    pub fn new(&self) -> &[rules::Finding] {
+    pub fn new_findings(&self) -> &[rules::Finding] {
         &self.new
+    }
+
+    /// How many findings are new.
+    ///
+    /// **Named apart from [`Diff::new_findings`] because a field and a
+    /// constructor are different things**, and a `Diff::new` accessor beside a
+    /// `new_findings_len` reads as if it built one.
+    pub fn new_findings_len(&self) -> usize {
+        self.new.len()
     }
 
     /// Findings the baseline had that this run does not.
@@ -1096,7 +1110,7 @@ impl Diff {
             "threshold": self.threshold.map(rules::Severity::id),
             "regressed": self.regressed(),
             "counts": {
-                "new": self.new.len(),
+                "new": self.new_findings_len(),
                 "fixed": self.fixed.len(),
                 "persisting": self.persisting.len(),
             },
@@ -1126,7 +1140,7 @@ impl Diff {
         ));
         out.push_str(&format!(
             "  NEW        {} (the baseline held {}, this run holds {})\n",
-            self.new.len(),
+            self.new_findings_len(),
             self.baseline_findings,
             self.current_findings,
         ));

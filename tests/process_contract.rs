@@ -658,83 +658,116 @@ fn an_unparsable_scan_command_line_exits_129() {
     );
 }
 
-/// The AGENTS.md section 3 flags whose behaviour does not exist yet must
-/// refuse, and refuse honestly.
+/// --baseline and --diff are implemented, and the process says so.
 ///
-/// **Two flags, not four.** --score and --severity are implemented as of issue
-/// #14 and reach the envelope; `implemented_flags_are_no_longer_deferred` is
-/// the test that pins that they are not on this list, because a `--score` that
-/// refused would make this one pass for the wrong reason.
+/// **They were the last two.** AGENTS.md section 3 required `--score`,
+/// `--severity`, `--baseline` and `--diff` to exist on the surface from day
+/// one, and each refused honestly until it was built. Issue #12 built the last
+/// two, so the `"implemented": false` document is now reachable from
+/// **nothing** on the command surface.
 ///
-/// What is pinned here is the refusal itself: exit 1 (a check that could not
-/// run, not a card that passed), one envelope under --json, and a `data` block
-/// saying `"implemented": false` and `"card_touched": false`. The failure mode
-/// these rules out is a --baseline that returned 0 because the comparison is
-/// unwritten, which would be indistinguishable from a clean card.
+/// What is pinned is the KIND of document, not the exit code. On a cardless
+/// machine `--baseline` still exits 1, but as a *failed scan* at
+/// `Pcsc::readers`: `card_touched: false` and an `error.kind`, which is a
+/// different document from a refusal. Under `--diff` it refuses at the file,
+/// with an `error.kind` of its own, and does so BEFORE a reader is opened.
+///
+/// The failure mode these rules out is the one the pattern started with: a
+/// `--baseline` that returned 0 because the comparison is unwritten would be
+/// indistinguishable from a clean card.
 #[test]
-fn every_deferred_scan_flag_refuses_without_touching_a_card() {
-    let cases: [(&[&str], &str); 2] = [
-        (
-            &["scan", "--baseline", "saved.json", "--json"],
-            "--baseline saved.json",
-        ),
-        (
-            &["scan", "--baseline", "saved.json", "--diff", "--json"],
-            "--baseline saved.json",
-        ),
-    ];
-
-    for (args, expected_flag) in cases {
+fn the_baseline_flags_no_longer_refuse_as_unimplemented() {
+    for args in [
+        &["scan", "--baseline", "saved.json", "--json"][..],
+        &["scan", "--baseline", "saved.json", "--diff", "--json"][..],
+    ] {
         let run = run_piped(args);
-        assert_eq!(run.code(), 1, "{args:?} exited {:?}", run.status);
-
-        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        let envelope = assert_exactly_one_envelope_for(args, &run.stdout);
         let data = envelope.payload().data();
-        assert_eq!(
-            data["implemented"],
-            serde_json::Value::Bool(false),
-            "{args:?}"
+
+        assert!(
+            data.get("implemented").is_none(),
+            "{args:?} is refusing, so the flag went back to deferred: {data}"
         );
-        assert_eq!(data["scanned"], serde_json::Value::Bool(false), "{args:?}");
+        assert_eq!(
+            data["scanned"],
+            serde_json::Value::Bool(false),
+            "{args:?}: no card was scanned"
+        );
         assert_eq!(
             data["card_touched"],
             serde_json::Value::Bool(false),
             "{args:?} claimed it contacted a card"
         );
-        assert_eq!(data["flag"], serde_json::json!(expected_flag), "{args:?}");
+        // A refusal and a failed scan are different documents, and the `error`
+        // key is what tells them apart. That is the discriminator the exit-
+        // code table leans on and the one issue #12 relies on for its own exits.
         assert!(
-            envelope.payload().message().contains("not implemented yet"),
-            "{args:?}: {:?}",
-            envelope.payload().message()
+            data.get("error").is_some(),
+            "{args:?} neither refused nor failed: {data}"
         );
-        assert!(
-            run.stderr.contains("not implemented yet"),
-            "{args:?}: {:?}",
-            run.stderr
+        assert_eq!(
+            envelope.payload().code().process_code(),
+            u8::try_from(run.code()).expect("an exit code fits in a byte"),
+            "{args:?}: payload.code must stay the number the process exits with"
         );
     }
 }
 
-/// The same refusals without --json print nothing at all on stdout.
+/// A `--diff` against a file that is not there refuses on the FILE, before a
+/// reader is ever opened.
 ///
-/// Under --json stdout is the envelope, so a refusal is a document there. In
-/// the human modes stdout is a report, and a refusal has no report to give -
-/// the sentence belongs on stderr. Asserting this is what keeps a refusal from
-/// being a half-written result on stdout.
+/// **This is the property that makes `--diff` safe to script.** The baseline is
+/// read at the top of `run_scan`, before `Pcsc::readers`, so an agent whose
+/// baseline path is wrong - a stale checkout, a job that never downloaded the
+/// artifact - finds out in milliseconds instead of after a walk of a card it was
+/// never going to compare against. `error.kind` names which refusal it is, so
+/// the agent does not have to parse the sentence.
 #[test]
-fn a_deferred_scan_flag_without_json_writes_nothing_to_stdout() {
-    let run = run_piped(&["scan", "--baseline", "saved.json"]);
+fn a_diff_against_a_missing_baseline_refuses_on_the_file_and_says_which() {
+    let missing = std::env::temp_dir().join("sim-doctor-no-such-baseline.json");
+    let _ = std::fs::remove_file(&missing);
+    let path = missing.display().to_string();
+
+    let run = run_piped(&["scan", "--diff", "--json", "--baseline", &path]);
 
     assert_eq!(run.code(), 1);
-    assert_eq!(run.stdout, "", "{:?}", run.stdout);
+    let envelope = assert_exactly_one_envelope_for(&["scan", "--diff"], &run.stdout);
+    let data = envelope.payload().data();
+    assert_eq!(data["error"]["kind"], serde_json::json!("baseline-unreadable"));
+    // A refusal is a refusal: no findings, and no diff that could be read as
+    // one.
+    assert!(data.get("findings").is_none(), "{data}");
+    assert!(data.get("diff").is_none(), "{data}");
     assert!(
-        run.stderr
-            .contains("--baseline saved.json is not implemented yet"),
-        "{:?}",
+        run.stderr.contains("baseline"),
+        "the sentence has to name what went wrong: {:?}",
         run.stderr
     );
 }
 
+/// The same refusal in the human mode writes nothing at all to stdout.
+///
+/// Under `--json` stdout is the envelope, so a refusal is a document there. In
+/// the human modes stdout is a report, and a refusal has no report to give, so
+/// the sentence belongs on stderr. Asserting this is what keeps a refusal from
+/// being a half-written result on stdout.
+#[test]
+fn a_refusal_without_json_writes_nothing_to_stdout() {
+    // --diff, not --baseline alone: the file is only READ when a comparison
+    // was asked for, so a bare --baseline goes on to look for a card and fails
+    // there. Both are refusals; this one is about the one that happens first.
+    let run = run_piped(&[
+        "scan",
+        "--diff",
+        "--baseline",
+        "/no/such/dir/baseline.json",
+    ]);
+
+    assert_eq!(run.code(), 1);
+    assert_eq!(run.stdout, "", "{:?}", run.stdout);
+    assert!(run.stderr.contains("baseline"), "{:?}", run.stderr);
+}
 /// --score and --severity are implemented, and the process says so.
 ///
 /// Before issue #14 both refused with `"implemented": false` in one envelope.
@@ -987,15 +1020,34 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
         assert!(run.stdout.contains(flag), "{flag} is missing from --help");
     }
 
-    // **Two** unimplemented flags, not four. --score and --severity shipped in
-    // issue #14, and the count is the assertion that would fail if one of them
-    // quietly went back to refusing.
+    // **None.** --score and --severity shipped in issue #14 and --baseline and
+    // --diff in issue #12, so every flag AGENTS.md section 3 requires is built.
+    // Zero is a stronger assertion than a count: a flag quietly going back to
+    // refusing puts a number back here, and a NEW unimplemented flag is only
+    // reachable by also adding a flag, which the loop above catches.
     assert_eq!(
         run.stdout.matches("NOT IMPLEMENTED YET").count(),
-        2,
-        "only --baseline and --diff defer: {}",
+        0,
+        "no flag on the surface defers any more: {}",
         run.stdout
     );
+
+    // The baseline flags describe what they do, and - the point of issue #12 -
+    // they publish the refusals they can make, because a gate is useless
+    // without knowing when it will refuse.
+    for phrase in [
+        "SAVING IS NOT A GATE",
+        "EXIT 1 WHEN THE DIFF REGRESSES",
+        "THE DIFF REFUSES RATHER THAN GUESSES",
+        "A RENAMED RULE READS AS A RENAME",
+        "A HAND-EDITED OR HOSTILE BASELINE IS REFUSED",
+    ] {
+        assert!(
+            run.stdout.contains(phrase),
+            "the --baseline/--diff help must state {phrase:?}: {}",
+            run.stdout
+        );
+    }
 
     // An implemented flag says what it does, and - the point of issue #14 - it
     // publishes the formula rather than asking the reader to find the source.
