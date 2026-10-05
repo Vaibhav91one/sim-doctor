@@ -30,6 +30,15 @@
 # prints on the way to each of those, so a green job means the assertions
 # behind them ran rather than the process exiting early.
 #
+# And issue #14's half of that command, `sim-doctor scan --score --severity`,
+# in a fourth test. This one is card-only in a way the others are not: with no
+# reader attached both flags fail at discovery and never produce a score
+# block, so tests/process_contract.rs can prove they are no longer DEFERRED
+# but only this job can prove they reach the envelope. The assertion it exists
+# for is the one a cardless run cannot make: that the score block carries its
+# formula and the penalty table, and that a 100 over an empty finding set
+# carries the warning saying nothing was checked.
+#
 # Every step sets "set -o pipefail". Both C projects build with -Werror, and a
 # step written as "make ... 2>&1 | tail -40" reports the exit status of tail,
 # so a build that produced no binary at all would look like a pass. Every step
@@ -346,16 +355,27 @@ jobs:
 
           # --ignored against a renamed or deleted test runs nothing and still
           # exits 0, so the log is asserted on rather than the exit code alone.
-          # ALL THREE card-backed tests must be in it:
+          # ALL FOUR card-backed tests must be in it:
           # drives_a_real_card_through_the_pcsc_transport is issue #4's
           # transport round trip, walks_the_file_system_of_a_real_card is
-          # issue #7's DF-tree walk, and scans_a_real_card_end_to_end is
-          # issue #6's M1 command run as a real binary. Naming two and ignoring
-          # the third would let the scan silently stop being card-verified.
-          grep -q '3 passed' "$log"
+          # issue #7's DF-tree walk, scans_a_real_card_end_to_end is issue #6's
+          # M1 command run as a real binary, and
+          # the_score_and_severity_flags_reach_the_envelope_against_a_real_card
+          # is issue #14's --score and --severity run as that same binary.
+          # Naming three and ignoring the fourth would let the severity and
+          # score contract silently stop being card-verified, which is the
+          # ONLY place it can be: on a cardless machine both flags fail at
+          # reader discovery before producing a score block at all.
+          #
+          # The COUNT moved from 3 to 4 with that test. It is a count rather
+          # than only names because `--ignored` against a deleted test still
+          # exits 0; the names pin the set and the count is what fails when a
+          # fifth test is added and not wired up here.
+          grep -q '4 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
           grep -q 'scans_a_real_card_end_to_end' "$log"
+          grep -q 'the_score_and_severity_flags_reach_the_envelope_against_a_real_card' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job
@@ -376,6 +396,19 @@ jobs:
           grep -q 'scan: selected' "$log"
           grep -q 'the report renders as .* bytes on one line' "$log"
           grep -q 'the binary emitted one envelope of .* bytes and exited 0' "$log"
+
+          # Issue #14's scan: --score and --severity against the same card,
+          # through the same built binary. These are the lines the test prints
+          # on the way to each property, so a green job means the assertions
+          # ran rather than the process having exited at reader discovery -
+          # which is exactly what a cardless run does.
+          grep -q 'severity/score: scanning with' "$log"
+          grep -q 'severity/score: a bare run carries a findings block and no score' "$log"
+          grep -q 'severity/score: --severity high reported the threshold it applied' "$log"
+          grep -q 'severity/score: --score emitted value .* penalty .* rules_run' "$log"
+          grep -q 'severity/score: the 100 carries the no-rules warning beside it' "$log"
+          grep -q 'severity/score: --severity critical --score scored what the report shows' "$log"
+          grep -q 'severity/score: the human report printed the formula and the warning' "$log"
 
           # Issue #4's test got as far as the SELECT MF and READ BINARY round
           # trips.

@@ -23,10 +23,14 @@ sim-doctor completions zsh        # shell completions for the whole flag surface
 
 What it is **not** yet: the rule model exists (#13 - findings, locations,
 bounded evidence, and a registry that refuses a duplicate rule ID) but **no rule
-runs yet**, so `scan` still exits 0 whatever it saw, `--score` and `--severity`
-refuse honestly rather than guessing, and `--baseline` / `--diff` are
-placeholders (#9). A truncated walk is always labelled as one, in both output
-modes. See [CONTEXT.md](CONTEXT.md) for the plan.
+runs yet**. So `scan --severity` and `scan --score` are implemented and honest
+about it - a score of 100 carries `rules_run`, `scored_findings` and a warning
+beside it saying that nothing on the card was checked - while
+`--baseline` / `--diff` are still placeholders (#9) and refuse with
+`"implemented": false`. `scan` exits 0 whatever it saw; see AGENTS.md section 3
+for why, and what has to move together if that ever changes. A truncated walk
+is always labelled as one, in both output modes. See [CONTEXT.md](CONTEXT.md) for
+the plan.
 
 ## Documentation
 
@@ -50,7 +54,7 @@ modes. See [CONTEXT.md](CONTEXT.md) for the plan.
 2. **Verified facts only.** Claims carry a [V] verified or [U] unverified tag so nobody
    builds on a guess. See AGENTS.md.
 3. **Testable without hardware.** The primary dev loop runs against a software SIM behind
-   a software PC/SC reader. `cargo test` needs no reader at all; the three
+   a software PC/SC reader. `cargo test` needs no reader at all; the four
    card-backed tests are behind the `card-fixture` feature and run in a separate
    CI job that builds swSIM and swicc-pcsc at pinned commits. See
    [docs/swsim-fixture.md](docs/swsim-fixture.md).

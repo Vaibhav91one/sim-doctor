@@ -48,6 +48,13 @@
 //! a walk using it, not reported missing, and a scanner that says "12 files"
 //! without saying which twelve it looked for has under-reported.
 //! `"candidates"."exhaustive"` says so in one boolean.
+//!
+//! **The `findings` block is reported, filtered and scored rather than
+//! assumed.** The severity threshold travels beside the list, because a
+//! shorter list is indistinguishable from a quieter card unless the filter
+//! that produced it is on the page, and the score travels with the penalty
+//! table that produced it, because a number nobody can reconstruct is worse
+//! than no number. See [`Verdict`].
 
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "scan";
@@ -59,6 +66,7 @@ use serde_json::{json, Value};
 
 use crate::fcp::{self, TagSet};
 use crate::fs;
+use crate::rules;
 use crate::tlv::Tag;
 use crate::walk::{self, Candidates, Limit, Limits, Node, NodeState, Note, Tree};
 
@@ -269,6 +277,272 @@ impl<'a> Context<'a> {
     }
 }
 
+/// The warning a score carries while no rule is implemented.
+///
+/// A named constant rather than a sentence written at each call site, so the
+/// flag help, the JSON and the human report cannot drift apart, and so a test
+/// can quote it instead of matching on a fragment of it.
+pub const NO_RULES_WARNING: &str =
+    "rules_run is 0: no rule has been implemented yet, so nothing on this card was checked. This score is 100 because there is nothing to subtract, NOT because the card is clean";
+
+// ---------------------------------------------------------------------------
+// What a scan concluded
+// ---------------------------------------------------------------------------
+
+/// The rules this scan runs over one walked card.
+///
+/// **Empty today, and that is the state of the project rather than a
+/// placeholder.** Issue #13 built the vocabulary a rule needs - the ID, the
+/// severity, what a finding is, and the registry that binds one to the other -
+/// and shipped no rule, because a rule that guessed would manufacture
+/// findings this repository cannot justify. So a scan evaluates zero rules and
+/// produces zero findings, and says so rather than letting an empty list read
+/// as a clean card.
+///
+/// **Which is why the score carries `rules_run`.** A score of 100 from an
+/// empty set is otherwise indistinguishable from a card that passed, which is
+/// precisely the failure [`NO_RULES_WARNING`] was written to prevent, and
+/// precisely the one [`Deferred::Score`] used to refuse rather than risk.
+/// Registering the first rule is the only change this function needs.
+fn rules() -> rules::Registry<Tree> {
+    rules::Registry::new()
+}
+
+/// How many rules a scan evaluates over one walked card.
+///
+/// Zero today, and reported next to every score for the reason above.
+pub fn rules_run() -> usize {
+    rules().len()
+}
+
+/// The findings one walked card produces, before any filtering.
+///
+/// Coverage is taken from the walk, not left at the default. A finding raised
+/// from a walk that hit `max_depth` may be entirely true, but the list
+/// cannot be read as the whole of the card, and [`rules::Findings::partial`]
+/// is how that travels on every finding rather than only on the report.
+///
+/// # Errors
+///
+/// [`rules::RegistryError::MisattributedFinding`] when a rule emits a finding
+/// under another rule's ID. The caller turns that into a failed scan rather
+/// than into a report: a finding nobody can address is not a finding, and
+/// [`rules::Registry`] already refuses it at every other boundary.
+pub fn findings(tree: &Tree) -> Result<rules::Findings, rules::RegistryError> {
+    let found = rules().evaluate(tree)?;
+    Ok(if tree.is_complete() {
+        rules::Findings::complete(found)
+    } else {
+        rules::Findings::partial(found, TRUNCATION_REASON)
+    })
+}
+
+/// The coverage reason a walk that hit a bound hands its findings.
+const TRUNCATION_REASON: &str = "the walk stopped at a bound, so this list may be short";
+
+/// What one scan concluded: the findings, the threshold they were filtered
+/// to, and the score.
+///
+/// **The filter runs first and the score is taken from what is reported.**
+/// That ordering is the whole of "a score must not hide a finding": the
+/// score is a function of the `findings` array the reader can see, so the two
+/// can never disagree about what was found. `scan --severity high --score`
+/// scores the findings at or above `high` and reports `scored_findings` as
+/// how many that was. It does not quietly discount the lows and hand back a
+/// number that does not match the document beside it, because a number an
+/// agent cannot reproduce from the output is a number the agent should not
+/// gate a build on.
+///
+/// Built through [`Verdict::new`] and the two `with_*` builders so the order
+/// the flags are applied in is the order they are read in, and so an unset
+/// filter has exactly one representation: [`None`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    findings: rules::Findings,
+    rules_run: usize,
+    threshold: Option<rules::Severity>,
+    score: bool,
+}
+
+impl Verdict {
+    /// A verdict over the findings a scan produced, with no filter and no
+    /// score asked for.
+    ///
+    /// `rules_run` is a parameter rather than a call to [`rules_run`] so that a
+    /// test can put findings in front of a scanner that has implemented no
+    /// rules and assert the *rendered* behaviour rather than the arithmetic,
+    /// which [`crate::rules`] already owns.
+    #[must_use]
+    pub fn new(findings: rules::Findings, rules_run: usize) -> Self {
+        Self {
+            findings,
+            rules_run,
+            threshold: None,
+            score: false,
+        }
+    }
+
+    /// The findings this verdict was built from, unfiltered.
+    ///
+    /// Only useful for reporting how much the filter removed. Nothing that
+    /// renders output should read it: the rendered output is
+    /// [`Verdict::findings`].
+    pub const fn unfiltered(&self) -> &rules::Findings {
+        &self.findings
+    }
+
+    /// Drops every finding below `level`, the whole of `--severity`.
+    ///
+    /// Applied here rather than at each render so the JSON and the human
+    /// report cannot disagree about which findings survived. A filtered-out
+    /// finding leaves no entry, no count and no rule ID anywhere in either.
+    #[must_use]
+    pub fn at_least(mut self, level: Option<rules::Severity>) -> Self {
+        self.findings = match level {
+            Some(level) => self.findings.filtered(level),
+            None => self.findings,
+        };
+        self.threshold = level;
+        self
+    }
+
+    /// Whether `--score` was asked for.
+    ///
+    /// Off by default. A score in every report would be a number an operator
+    /// learns to skim past, and the flag exists so that asking for it is a
+    /// deliberate act.
+    #[must_use]
+    pub fn scored(mut self, score: bool) -> Self {
+        self.score = score;
+        self
+    }
+
+    /// The findings this report carries, after the filter.
+    pub const fn findings(&self) -> &rules::Findings {
+        &self.findings
+    }
+
+    /// The `--severity` level in force, or `None` when nothing was filtered.
+    pub const fn threshold(&self) -> Option<rules::Severity> {
+        self.threshold
+    }
+
+    /// How many rules produced the findings above.
+    pub const fn rules_run(&self) -> usize {
+        self.rules_run
+    }
+
+    /// The score over the findings this report carries, if one was asked for.
+    ///
+    /// `None` when `--score` was not passed. The score is computed over the
+    /// **filtered** set, so this and [`Verdict::findings`] can never describe
+    /// different sets of findings.
+    pub fn score(&self) -> Option<rules::Score> {
+        self.score.then(|| self.findings.score())
+    }
+
+    /// The fields a scan report carries from a verdict: `findings`, and
+    /// `score` when one was asked for.
+    ///
+    /// Returned as a [`serde_json::Map`] rather than a [`Value`] because the
+    /// caller splices them into a report it has already built, and a `Map` is
+    /// what can be spliced without every field being named on both sides. A
+    /// field added here therefore cannot be half-added, which is the failure
+    /// a duplicated literal invites.
+    ///
+    /// `severity_threshold` sits inside the findings block rather than beside
+    /// it because it is a property of the list: a reader comparing two reports
+    /// needs to know they are looking at the same list before comparing
+    /// anything in it. `null` when nothing was filtered, which is different
+    /// from a threshold of `info` - the first is every finding, the second is
+    /// every finding the ladder can spell.
+    ///
+    /// The score block carries the penalty table that produced it, so the
+    /// number can be reconstructed from the document alone and not only from
+    /// a reader who has found the formula in AGENTS.md.
+    #[must_use]
+    pub fn fields(&self) -> serde_json::Map<String, Value> {
+        let mut findings = self.findings.to_json();
+        findings["severity_threshold"] = match self.threshold {
+            Some(level) => json!(level.id()),
+            None => Value::Null,
+        };
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("findings".to_owned(), findings);
+
+        if let Some(score) = self.score() {
+            fields.insert(
+                "score".to_owned(),
+                json!({
+                    "value": score.value(),
+                    "max": score.max(),
+                    "penalty": score.penalty(),
+                    "scored_findings": score.scored(),
+                    "rules_run": self.rules_run,
+                    "formula": rules::SCORE_FORMULA,
+                    "penalties": penalties_json(),
+                    "warning": (self.rules_run == 0).then_some(NO_RULES_WARNING),
+                }),
+            );
+        }
+        fields
+    }
+
+    /// The findings and score as a person reads them.
+    ///
+    /// The same information as [`Verdict::fields`] and no more: the score is
+    /// shown with the penalty it subtracted and the table it came from, so a
+    /// person reading a CI log can check the number rather than trust it.
+    /// Printed at the end of the report, after the walk, because the banner
+    /// has to stay first and a long file list is what the reader scrolls
+    /// past.
+    #[must_use]
+    pub fn to_human(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str(&format!("FINDINGS: {}", self.findings.len()));
+        match self.threshold {
+            Some(level) => out.push_str(&format!(" at or above {level}")),
+            None => out.push_str(" (no severity filter)"),
+        }
+        out.push('\n');
+        if self.findings.is_empty() {
+            out.push_str("  (none)\n");
+        }
+        for finding in self.findings.iter() {
+            out.push_str(&format!("  {finding}\n"));
+        }
+        if !self.findings.is_exhaustive() {
+            out.push_str(&format!("  coverage: {}\n", self.findings.coverage()));
+        }
+
+        if let Some(score) = self.score() {
+            out.push_str(&format!("\nSCORE {}\n", score));
+            out.push_str(&format!("  formula: {}\n", rules::SCORE_FORMULA));
+            out.push_str(&format!("  from {} finding(s)\n", score.scored()));
+            if self.rules_run == 0 {
+                out.push_str(&format!("  WARNING: {NO_RULES_WARNING}\n"));
+            }
+        }
+
+        out
+    }
+}
+
+/// The published penalty table as the JSON object a score block carries.
+///
+/// Built by walking [`rules::Severity::LADDER`] so that the keys are the
+/// ladder's own spellings and a severity added to the ladder cannot be
+/// missing from the table.
+fn penalties_json() -> Value {
+    let mut table = serde_json::Map::new();
+    for severity in rules::Severity::LADDER {
+        table.insert(severity.id().to_owned(), json!(rules::penalty(severity)));
+    }
+    Value::Object(table)
+}
+
 /// Renders a walk as the `data` a scan envelope carries.
 ///
 /// One call, one [`Value`]. The caller puts it in
@@ -293,7 +567,7 @@ impl<'a> Context<'a> {
 /// per-entry `"state"` discriminant. An agent that wants "what is on this card"
 /// reads `data.selected`; one that wants "what is there but not readable" reads
 /// `data.forbidden`, and neither has to subtract anything.
-pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
+pub fn to_json(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> Value {
     let report = tree.report();
     let dialect_tags = context.dialect.tag_set();
 
@@ -341,7 +615,7 @@ pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
         .identifiers(context.limits.max_children);
     let exhaustive = candidates_exhaustive(&context.candidates);
 
-    json!({
+    let mut report = json!({
         "reader": context.reader,
         "atr": context.atr.map(hex),
         "dialect": {
@@ -393,7 +667,17 @@ pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
         "refused": refused,
         "notes": notes,
         "files": files,
-    })
+    });
+
+    // The verdict is spliced in rather than named in the literal above, so
+    // there is one place that knows what a walk renders and one that knows
+    // what a verdict renders, and a field added to either cannot be half
+    // added. `as_object_mut` is `Some` because the literal above is an
+    // object; there is no shape here that silently drops the findings.
+    if let Some(fields) = report.as_object_mut() {
+        fields.extend(verdict.fields());
+    }
+    report
 }
 
 /// Renders a walk as the report a person reads.
@@ -406,7 +690,7 @@ pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
 /// The banner is the requirement, not decoration. It goes **first**, before the
 /// reader name, because a truncated scan read from the bottom up is a truncated
 /// scan that was skimmed.
-pub fn to_human(tree: &Tree, context: &Context<'_>) -> String {
+pub fn to_human(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> String {
     let report = tree.report();
     let dialect_tags = context.dialect.tag_set();
     let mut out = String::new();
@@ -536,6 +820,11 @@ pub fn to_human(tree: &Tree, context: &Context<'_>) -> String {
             out.push_str(&format!("  {}  {}\n", node.path(), note_line(note)));
         }
     }
+
+    // Last, and after a blank line, because the walk is the long part and the
+    // findings and the score are what the reader came for.
+    out.push('\n');
+    out.push_str(&verdict.to_human());
 
     out
 }
@@ -851,13 +1140,6 @@ fn tag_or_none(tag: Option<Tag>) -> String {
 /// would be indistinguishable from a card that passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Deferred {
-    /// `--score`, awaiting the rule model (issue #13).
-    Score,
-
-    /// `--severity <level>`, awaiting the rule model. The value is kept so the
-    /// refusal can quote what was asked for.
-    Severity(String),
-
     /// `--baseline <file>`, awaiting saved-run comparison.
     Baseline(String),
 
@@ -869,8 +1151,6 @@ impl Deferred {
     /// The flag as an operator typed it, including its value where it takes one.
     pub fn flag(&self) -> String {
         match self {
-            Self::Score => "--score".to_owned(),
-            Self::Severity(level) => format!("--severity {level}"),
             Self::Baseline(path) => format!("--baseline {path}"),
             Self::Diff => "--diff".to_owned(),
         }
@@ -879,12 +1159,6 @@ impl Deferred {
     /// One sentence saying why it is not implemented and what will implement it.
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::Score => {
-                "no rule produces findings yet (issue #13), so there is nothing to score"
-            }
-            Self::Severity(_) => {
-                "no rule produces findings yet (issue #13), so there is no severity to filter on"
-            }
             Self::Baseline(_) => "saving and comparing a run is issue #9",
             Self::Diff => "diffing against a baseline is issue #9",
         }
@@ -900,7 +1174,6 @@ impl Deferred {
             "flag": self.flag(),
             "reason": self.reason(),
             "tracking_issue": match self {
-                Self::Score | Self::Severity(_) => "#13",
                 Self::Baseline(_) | Self::Diff => "#9",
             },
             "scanned": false,
@@ -1151,6 +1424,17 @@ mod tests {
         )
     }
 
+    /// A verdict over the findings a scan produces today: none, from no rule.
+    ///
+    /// Every test above is about the WALK, so it renders with the verdict a
+    /// bare `sim-doctor scan --json` produces - no threshold, no score - and
+    /// the verdict itself is tested in its own section further down. Putting
+    /// findings in front of the walk tests here would make a failure in
+    /// either half point at the other.
+    fn verdict() -> Verdict {
+        Verdict::new(rules::Findings::complete(Vec::new()), rules_run())
+    }
+
     /// The two-octet space, for the exhaustive-candidate tests.
     fn whole_space() -> Candidates {
         Candidates::Range {
@@ -1236,7 +1520,7 @@ mod tests {
         let tree = walk_sample(&mut card, limits);
         assert!(!tree.is_complete(), "this fixture must actually truncate");
 
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         assert_eq!(data["truncated"], json!(true));
         assert_eq!(data["complete"], json!(false));
@@ -1264,7 +1548,7 @@ mod tests {
         let tree = walk_sample(&mut card, limits);
         assert!(tree.is_complete());
 
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
         assert_eq!(data["truncated"], json!(false));
         assert_eq!(data["complete"], json!(true));
         assert_eq!(data["truncated_by"], Value::Null);
@@ -1288,7 +1572,7 @@ mod tests {
             tree.limits_hit()
         );
 
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
         let hit: Vec<&str> = data["limits_hit"]
             .as_array()
             .expect("limits_hit is an array")
@@ -1321,7 +1605,7 @@ mod tests {
             ..Limits::default()
         };
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(probe_set(), limits));
+        let report = to_human(&tree, &context(probe_set(), limits), &verdict());
 
         let first_line = report.lines().next().unwrap_or_default();
         assert!(
@@ -1337,7 +1621,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(probe_set(), limits));
+        let report = to_human(&tree, &context(probe_set(), limits), &verdict());
 
         assert!(
             report.starts_with("COMPLETE:"),
@@ -1361,7 +1645,7 @@ mod tests {
         for dialect in Dialect::ALL {
             let tags = dialect.tag_set();
             let context = Context::new("fake card", None, dialect, probe_set(), limits);
-            let data = to_json(&tree, &context);
+            let data = to_json(&tree, &context, &verdict());
 
             assert_eq!(data["dialect"]["id"], json!(dialect.id()));
             assert_eq!(data["dialect"]["name"], json!(tags.name()));
@@ -1398,7 +1682,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(probe_set(), limits));
+        let report = to_human(&tree, &context(probe_set(), limits), &verdict());
 
         assert!(report.contains("FCP dialect      swicc"), "{report}");
         assert!(report.contains("swICC FCP builder"), "{report}");
@@ -1412,7 +1696,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let absent: Vec<String> = data["absent"]
             .as_array()
@@ -1445,7 +1729,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let states: Vec<&str> = data["files"]
             .as_array()
@@ -1470,7 +1754,7 @@ mod tests {
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
 
-        let sim_families = to_json(&tree, &context(Candidates::SimFamilies, limits));
+        let sim_families = to_json(&tree, &context(Candidates::SimFamilies, limits), &verdict());
         assert_eq!(sim_families["candidates"]["set"], json!("sim-families"));
         assert_eq!(sim_families["candidates"]["probed"], json!(1280));
         assert_eq!(sim_families["candidates"]["exhaustive"], json!(false));
@@ -1482,7 +1766,7 @@ mod tests {
         // Only a range over the whole two-octet space can say "exhaustive", and
         // then the warning is null rather than present-and-empty, so a consumer
         // branching on it sees the difference.
-        let whole = to_json(&tree, &context(whole_space(), limits));
+        let whole = to_json(&tree, &context(whole_space(), limits), &verdict());
         assert_eq!(whole["candidates"]["set"], json!("range"));
         assert_eq!(whole["candidates"]["exhaustive"], json!(true));
         assert_eq!(whole["candidates"]["warning"], Value::Null);
@@ -1493,7 +1777,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(Candidates::SimFamilies, limits));
+        let report = to_human(&tree, &context(Candidates::SimFamilies, limits), &verdict());
 
         assert!(report.contains("WARNING: "), "{report}");
         assert!(report.contains("INVISIBLE"), "{report}");
@@ -1505,7 +1789,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(whole_space(), limits));
+        let report = to_human(&tree, &context(whole_space(), limits), &verdict());
         assert!(!report.contains("INVISIBLE"), "{report}");
     }
 
@@ -1528,9 +1812,9 @@ mod tests {
 
     #[test]
     fn every_deferred_flag_names_itself_and_admits_nothing_was_scanned() {
+        // --score and --severity are NOT here: they are implemented as of issue
+        // #14 and reach the envelope, so a refusal for them would be the bug.
         let flags = [
-            Deferred::Score,
-            Deferred::Severity("high".to_owned()),
             Deferred::Baseline("baseline.json".to_owned()),
             Deferred::Diff,
         ];
@@ -1551,10 +1835,16 @@ mod tests {
     #[test]
     fn a_deferred_refusal_never_looks_like_a_score() {
         // The failure mode this type exists to prevent: a number that could be
-        // read as a verdict. There is no number anywhere in the refusal.
-        let data = deferred_json(&Deferred::Score);
-        assert!(data.get("score").is_none(), "{data}");
-        assert_eq!(data["implemented"], json!(false));
+        // read as a verdict. There is no number anywhere in the refusal, and
+        // that is still true of the two flags left in it.
+        for deferred in [
+            Deferred::Baseline("baseline.json".to_owned()),
+            Deferred::Diff,
+        ] {
+            let data = deferred_json(&deferred);
+            assert!(data.get("score").is_none(), "{data}");
+            assert_eq!(data["implemented"], json!(false));
+        }
     }
 
     #[test]
@@ -1576,7 +1866,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let imsi = file(&data, "3F00/2FE2");
         assert_eq!(imsi["state"], json!("selected"));
@@ -1600,7 +1890,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         // Not null: "the card did not send it" is a different statement from
         // "the card sent it and it is empty", and Reported is a three-way type.
@@ -1622,7 +1912,7 @@ mod tests {
             ..Limits::default()
         };
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let notes = data["notes"].as_array().expect("notes is an array");
         // Every node one past the bound carries the note, not only the first.
@@ -1660,7 +1950,7 @@ mod tests {
             max_directories: 13,
         };
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         assert_eq!(data["reader"], json!("fake card"));
         assert_eq!(data["atr"], json!("3B 16"));
@@ -1686,7 +1976,7 @@ mod tests {
 
         let limits = Limits::default();
         let context = context(probe_set(), limits).stopped_by("the card was removed mid-walk");
-        let data = to_json(&tree, &context);
+        let data = to_json(&tree, &context, &verdict());
 
         assert_eq!(data["complete"], json!(false));
         assert_eq!(data["truncated"], json!(true));
@@ -1703,7 +1993,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let rendered = serde_json::to_string(&data).expect("the report renders");
         assert!(!rendered.contains('\n'), "the report is one line");
@@ -1746,5 +2036,268 @@ mod tests {
     fn paths_render_the_way_the_rest_of_the_repository_renders_them() {
         let path: Path = "3F00/7F20/6F07".parse().expect("a valid path");
         assert_eq!(path.to_string(), "3F00/7F20/6F07");
+    }
+
+    // --- The verdict: what --severity and --score render. ---
+    //
+    // Every test below puts a Verdict in front of a real walked tree, because
+    // the two halves are only meaningful together: the question is not "does
+    // the filter work" but "what does the document a reader receives say", and
+    // a document is the walk rendered with a verdict spliced into it.
+
+    /// One finding at `severity`, under a rule ID that names it, so a test can
+    /// prove the finding is gone by grepping for the ID rather than by counting.
+    fn found(severity: rules::Severity) -> rules::Finding {
+        rules::Finding::new(
+            rules::RuleId::new(format!("test/severity-{}", severity.id())).expect("documented ID"),
+            severity,
+            format!("a finding at {severity}"),
+            rules::Location::tar(0x1234),
+            rules::Evidence::text("evidence"),
+        )
+    }
+
+    /// A walked sample card, rendered under `verdict`.
+    fn rendered(verdict: &Verdict) -> Value {
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        to_json(&tree, &context(probe_set(), limits), verdict)
+    }
+
+    /// One finding at each of three rungs, and the ID of the one that must
+    /// disappear.
+    fn mixed() -> rules::Findings {
+        rules::Findings::complete(vec![
+            found(rules::Severity::Critical),
+            found(rules::Severity::Medium),
+            found(rules::Severity::Info),
+        ])
+    }
+
+    #[test]
+    fn a_filtered_finding_leaves_no_trace_anywhere_in_the_document() {
+        // The sharpest form of "filter, not mask", and the one that matters:
+        // a placeholder carrying the ID, a zeroed entry or a `suppressed: true`
+        // flag would all pass a count assertion and all fail this one.
+        let verdict = Verdict::new(mixed(), 3).at_least(Some(rules::Severity::High));
+        let data = rendered(&verdict);
+
+        assert_eq!(data["findings"]["severity_threshold"], json!("high"));
+        assert_eq!(data["findings"]["count"], json!(1));
+        let survivors = json!([found(rules::Severity::Critical).to_json()]);
+        assert_eq!(data["findings"]["findings"], survivors);
+
+        // Not in the findings array, not in the count, and not anywhere else in
+        // the rendered document either - which is why this greps the whole
+        // serialisation rather than one field.
+        let rendered = serde_json::to_string(&data).expect("the report renders");
+        for dropped in [rules::Severity::Medium, rules::Severity::Info] {
+            let id = format!("test/severity-{}", dropped.id());
+            assert!(
+                !rendered.contains(&id),
+                "{id} survived the filter somewhere in the document: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("test/severity-critical"),
+            "the surviving rule ID must still be there: {rendered}"
+        );
+    }
+
+    #[test]
+    fn no_threshold_means_no_filter_and_a_null_one_says_so() {
+        // `null` and `"info"` are different answers and both have to be
+        // reachable: the first is every finding, the second is every finding
+        // the ladder can spell, and a document that cannot tell them apart
+        // cannot say which one it is.
+        let bare = rendered(&Verdict::new(mixed(), 3));
+        assert_eq!(bare["findings"]["severity_threshold"], Value::Null);
+        assert_eq!(bare["findings"]["count"], json!(3));
+
+        let every = rendered(&Verdict::new(mixed(), 3).at_least(Some(rules::Severity::Info)));
+        assert_eq!(every["findings"]["severity_threshold"], json!("info"));
+        assert_eq!(every["findings"]["count"], json!(3));
+    }
+
+    #[test]
+    fn the_filter_does_not_touch_the_walk() {
+        // Raising the level must never be able to make a truncated scan look
+        // like a whole one, which is the only way this flag could lie.
+        let mut card = sample_card();
+        let limits = Limits {
+            max_depth: 1,
+            ..Limits::default()
+        };
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+
+        let unfiltered = to_json(&tree, &context, &Verdict::new(mixed(), 3));
+        let filtered = to_json(
+            &tree,
+            &context,
+            &Verdict::new(mixed(), 3).at_least(Some(rules::Severity::Critical)),
+        );
+
+        for field in [
+            "complete",
+            "truncated",
+            "truncated_by",
+            "limits_hit",
+            "walk",
+            "selected",
+            "files",
+        ] {
+            assert_eq!(
+                filtered[field], unfiltered[field],
+                "--severity changed the walk report field {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_score_block_carries_everything_needed_to_rebuild_the_number() {
+        // The acceptance criterion: not that a number appears, but that a
+        // reader holding only this document can reconstruct it. So the block
+        // is checked by arithmetic, here, from the fields it published.
+        let verdict = Verdict::new(mixed(), 3).scored(true);
+        let data = rendered(&verdict);
+        let score = &data["score"];
+
+        assert_eq!(score["value"], json!(39), "100 - (50 + 10 + 1)");
+        assert_eq!(score["max"], json!(rules::SCORE_MAX));
+        assert_eq!(score["penalty"], json!(61));
+        assert_eq!(score["scored_findings"], json!(3));
+        assert_eq!(score["rules_run"], json!(3));
+        assert_eq!(score["formula"], json!(rules::SCORE_FORMULA));
+
+        // The table, keyed by the ladder's own spellings.
+        let penalties = score["penalties"].as_object().expect("a table");
+        assert_eq!(penalties.len(), rules::SCORE_PENALTY.len());
+        for severity in rules::Severity::LADDER {
+            assert_eq!(
+                penalties[severity.id()],
+                json!(rules::SCORE_PENALTY[severity.rank() as usize]),
+                "the published table disagrees with the constant at {}",
+                severity.id()
+            );
+        }
+
+        // The reader's arithmetic, from the document alone: sum the published
+        // penalties of the severities actually present, and subtract from the
+        // published maximum. No call into Score happens here, which is the
+        // point - this is the reconstruction a reader would do by hand.
+        let from_document: u64 = data["findings"]["findings"]
+            .as_array()
+            .expect("findings is an array")
+            .iter()
+            .map(|finding| {
+                let rank = usize::try_from(finding["severity_rank"].as_u64().expect("a rank"))
+                    .expect("a rank fits a usize");
+                let rung = rules::Severity::LADDER
+                    .get(rank)
+                    .expect("a rank inside the published ladder");
+                penalties[rung.id()].as_u64().expect("a whole penalty")
+            })
+            .sum();
+        assert_eq!(
+            from_document,
+            score["penalty"].as_u64().expect("a total"),
+            "the published total is not the sum of the published table over the published findings"
+        );
+        assert_eq!(
+            u64::from(rules::SCORE_MAX) - from_document,
+            score["value"].as_u64().expect("a whole score"),
+            "the score does not follow from the findings and the table printed beside it"
+        );
+    }
+
+    #[test]
+    fn a_score_with_nothing_to_score_says_so_rather_than_reading_as_a_clean_card() {
+        // The question a 100 cannot answer on its own. Three fields have to
+        // agree before it is answerable at all: rules_run is 0,
+        // scored_findings is 0, and the warning is a string rather than null.
+        let verdict = Verdict::new(rules::Findings::complete(Vec::new()), 0).scored(true);
+        let score = &rendered(&verdict)["score"].clone();
+
+        assert_eq!(score["value"], json!(rules::SCORE_MAX));
+        assert_eq!(score["penalty"], json!(0));
+        assert_eq!(score["scored_findings"], json!(0));
+        assert_eq!(score["rules_run"], json!(0));
+        assert_eq!(score["warning"], json!(NO_RULES_WARNING));
+        assert!(
+            score["warning"]
+                .as_str()
+                .expect("a warning")
+                .contains("NOT because the card is clean"),
+            "the warning has to say what the 100 does not mean: {}",
+            score["warning"]
+        );
+
+        // A 100 from a scan that RAN rules is a different claim, and it does
+        // not carry the warning - otherwise the warning stops meaning
+        // anything.
+        let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2).scored(true);
+        let ran = rendered(&ran)["score"].clone();
+        assert_eq!(ran["value"], json!(rules::SCORE_MAX));
+        assert_eq!(ran["rules_run"], json!(2));
+        assert_eq!(ran["warning"], Value::Null);
+    }
+
+    #[test]
+    fn the_filter_runs_before_the_score_so_the_two_cannot_disagree() {
+        // --severity high --score. The score is a function of the array
+        // printed beside it, so the number and the document cannot come apart.
+        let verdict = Verdict::new(mixed(), 3)
+            .at_least(Some(rules::Severity::High))
+            .scored(true);
+        let data = rendered(&verdict);
+
+        assert_eq!(data["findings"]["count"], json!(1));
+        assert_eq!(data["score"]["scored_findings"], json!(1));
+        assert_eq!(
+            data["score"]["value"],
+            json!(50),
+            "the two critical and medium findings were discounted, which is the bug"
+        );
+    }
+
+    #[test]
+    fn the_human_report_prints_the_score_its_formula_and_its_warning() {
+        // The human mode is a view over the same data, so a score a person
+        // cannot check is the same defect in a different font.
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+
+        let scored = to_human(
+            &tree,
+            &context,
+            &Verdict::new(rules::Findings::complete(Vec::new()), 0).scored(true),
+        );
+        assert!(scored.contains(rules::SCORE_FORMULA), "{scored}");
+        assert!(scored.contains("SCORE 100/100"), "{scored}");
+        assert!(scored.contains(NO_RULES_WARNING), "{scored}");
+
+        // The findings block names the threshold and the count it applied to.
+        let filtered = to_human(
+            &tree,
+            &context,
+            &Verdict::new(mixed(), 3).at_least(Some(rules::Severity::High)),
+        );
+        assert!(
+            filtered.contains("FINDINGS: 1 at or above high"),
+            "{filtered}"
+        );
+        assert!(
+            !filtered.contains("test/severity-info"),
+            "a dropped rule reached the human report: {filtered}"
+        );
+
+        // And with no --score there is no score at all: it is a deliberate
+        // act, not something every report carries.
+        let bare = to_human(&tree, &context, &Verdict::new(mixed(), 3));
+        assert!(!bare.contains("SCORE "), "{bare}");
     }
 }

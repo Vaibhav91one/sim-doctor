@@ -917,6 +917,21 @@ impl CardSession for Traced {
     }
 }
 
+/// A verdict over the findings a scan produces today: none, from no rule.
+///
+/// The card fixture is about the WALK and the binary, so it renders with the
+/// verdict a bare `sim-doctor scan --json` produces. The verdict itself is
+/// covered by `src/scan.rs` and, end to end through the built binary, by
+/// `the_score_and_severity_flags_reach_the_envelope_against_a_real_card`
+/// below - which is the only place a real card can show that --score puts a
+/// score block on stdout, because that needs a card in the first place.
+fn verdict() -> sim_doctor::scan::Verdict {
+    sim_doctor::scan::Verdict::new(
+        sim_doctor::rules::Findings::complete(Vec::new()),
+        sim_doctor::scan::rules_run(),
+    )
+}
+
 /// Every path the walk returned, selected ones only, for a failure message.
 fn tree_dump(tree: &sim_doctor::walk::Tree) -> String {
     tree.nodes()
@@ -995,7 +1010,7 @@ fn scans_a_real_card_end_to_end() {
     //    the assertion that would fail if someone picked a TagSet silently: the
     //    name in the output has to be the name of the table that was handed to
     //    the walk, not a constant.
-    let data = sim_doctor::scan::to_json(&tree, &context);
+    let data = sim_doctor::scan::to_json(&tree, &context, &verdict());
     println!(
         "scan: report names the dialect {:?} / {:?}",
         data["dialect"]["id"], data["dialect"]["name"]
@@ -1046,7 +1061,7 @@ fn scans_a_real_card_end_to_end() {
         data["truncated_by"], data["limits_hit"]
     );
 
-    let human = sim_doctor::scan::to_human(&tree, &context);
+    let human = sim_doctor::scan::to_human(&tree, &context, &verdict());
     assert!(
         human.starts_with("!! TRUNCATED"),
         "the human report opens with the cut: {}",
@@ -1154,14 +1169,33 @@ fn scans_a_real_card_end_to_end() {
     // 7. And the binary itself, which is the actual acceptance criterion.
     //    `CARGO_BIN_EXE_sim-doctor` is resolved by cargo at compile time, so
     //    this is the binary cargo built rather than a path guessed at run time.
+    //    **The exit-0 assertion below is a STATED contract decision, not a fact
+    //    about the card.** Issue #14 had to answer whether a scan that PRODUCES
+    //    findings should exit 1, because this line is what would move. It
+    //    decided no. Today a scan exits 1 for a check that could not run, and
+    //    making it also mean the card is dirty collapses we-did-not-check into
+    //    it-is-dirty, which is the more alarming of the two mistakes to make with
+    //    a security tool. No rule runs yet, so nothing can produce a finding at
+    //    all, and the line is correct as it stands.
+    //
+    //    It is therefore DELIBERATELY left asserting success. If the first rule
+    //    lands and somebody flips FINDINGS_FAIL_A_SCAN in src/main.rs, this
+    //    assertion goes red on purpose. That is the signal, and the message on
+    //    it names the other three places that have to move with it.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
         .args(["scan", "--json", "--reader", reader.as_str()])
-        .stdin(std::process::Stdio::null())
         .output()
         .expect("the binary should run");
     assert!(
         output.status.success(),
-        "sim-doctor scan --json exited {:?}\nstderr: {}\nstdout: {}",
+        concat!(
+            "sim-doctor scan --json exited {:?}. That is the assertion AGENTS.md ",
+            "section 3 names as moving IF a scan that produces findings is ever made ",
+            "to exit 1: change FINDINGS_FAIL_A_SCAN in src/main.rs, the exit code ",
+            "table, the GATE ON data.complete sentence in SCAN_LONG_ABOUT and this ",
+            "line together, or the tool will say two different things. ",
+            "stderr: {}\nstdout: {}"
+        ),
         output.status,
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
@@ -1195,4 +1229,210 @@ fn scans_a_real_card_end_to_end() {
         "scan: the binary emitted one envelope of {} bytes and exited 0",
         stdout.trim_end().len()
     );
+}
+
+/// Issue #14 against a real card: `--score` and `--severity` reach the
+/// envelope, and the score block can be rebuilt from the document it arrives
+/// in.
+///
+/// **Why this is a card test and not a process test.** On a machine with no
+/// reader, `--score` and `--severity` fail at reader discovery, so
+/// `tests/process_contract.rs` can only prove they are no longer *deferred*.
+/// Whether they actually put a `score` block and a filtered `findings` array
+/// on stdout needs a card, and this is the only place in the repository that
+/// has one.
+///
+/// **What it deliberately does not prove.** Anything about a finding. No rule
+/// runs yet, so the findings array is empty and `scored_findings` is 0 on every
+/// combination - which is exactly why the assertions below are about the shape
+/// of the block and the warning it carries rather than about a value. The
+/// arithmetic is proved in `src/rules.rs` and the rendering in `src/scan.rs`.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+
+    /// Runs the built binary and returns its exit code, stdout and parsed
+    /// envelope. One helper so every case below is held to the same purity
+    /// check rather than one of them being allowed to skip it.
+    fn scan(args: &[&str]) -> (i32, String, serde_json::Value) {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary should run");
+        let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+        assert!(
+            stdout.ends_with('\n'),
+            "{args:?}: stdout must end with the one newline that terminates the envelope: {stdout}"
+        );
+        assert_eq!(
+            stdout.matches('\n').count(),
+            1,
+            "{args:?}: stdout is not a single line: {stdout}"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(stdout.trim_end_matches('\n')).expect("one envelope");
+        assert_eq!(envelope["type"], serde_json::json!("scan"), "{args:?}");
+        (
+            output
+                .status
+                .code()
+                .expect("the process chose an exit code"),
+            stdout.clone(),
+            envelope,
+        )
+    }
+
+    let base = ["scan", "--json", "--reader", reader.as_str()];
+
+    // A bare run carries a findings block and no score: the score is a
+    // deliberate act, not something every report carries.
+    let (code, _, bare) = scan(&base);
+    println!("severity/score: scanning with {reader}");
+    assert_eq!(code, 0, "{bare:#}");
+    println!("severity/score: a bare run carries a findings block and no score");
+    assert!(
+        bare["payload"]["data"]["findings"].is_object(),
+        "every scan carries a findings block: {bare:#}"
+    );
+    assert_eq!(
+        bare["payload"]["data"]["findings"]["severity_threshold"],
+        serde_json::Value::Null,
+        "no --severity means no threshold, which is not the same as \"info\""
+    );
+    assert!(
+        bare["payload"]["data"].get("score").is_none(),
+        "--score was not asked for, so there is no score: {bare:#}"
+    );
+
+    // --severity on its own: the threshold is reported, and it is reported
+    // even when it removed nothing, because a short list is otherwise
+    // indistinguishable from a quiet card.
+    let mut filtered = base.to_vec();
+    filtered.extend_from_slice(&["--severity", "high"]);
+    let (code, _, high) = scan(&filtered);
+    assert_eq!(code, 0, "{high:#}");
+    println!("severity/score: --severity high reported the threshold it applied");
+    assert_eq!(
+        high["payload"]["data"]["findings"]["severity_threshold"],
+        serde_json::json!("high")
+    );
+    assert_eq!(
+        high["payload"]["data"]["findings"]["count"],
+        high["payload"]["data"]["findings"]["findings"]
+            .as_array()
+            .expect("findings is an array")
+            .len() as u64,
+        "count and the array beside it are the same set"
+    );
+
+    // --score, and the number a reader would rebuild from this document.
+    let mut scored = base.to_vec();
+    scored.extend_from_slice(&["--score"]);
+    let (code, _, with_score) = scan(&scored);
+    assert_eq!(code, 0, "{with_score:#}");
+    let block = &with_score["payload"]["data"]["score"];
+    assert_eq!(
+        block["formula"],
+        serde_json::json!(sim_doctor::rules::SCORE_FORMULA)
+    );
+    assert_eq!(
+        block["max"],
+        serde_json::json!(sim_doctor::rules::SCORE_MAX),
+        "the ceiling travels with the value"
+    );
+    assert_eq!(
+        block["rules_run"],
+        serde_json::json!(sim_doctor::scan::rules_run())
+    );
+
+    // A score of 100 on this card is NOT a clean card, and the envelope has to
+    // say so in words. This is the assertion the issue asked for and the one
+    // that would fail if somebody dropped the warning as noise.
+    assert_eq!(
+        block["scored_findings"],
+        serde_json::json!(0),
+        "no rule runs, so nothing was scored"
+    );
+    assert_eq!(
+        block["value"],
+        serde_json::json!(sim_doctor::rules::SCORE_MAX)
+    );
+    assert_eq!(block["penalty"], serde_json::json!(0));
+    assert_eq!(
+        block["warning"],
+        serde_json::json!(sim_doctor::scan::NO_RULES_WARNING),
+        "a 100 that means nothing was checked has to say so beside itself"
+    );
+
+    // The table travels too, so the number can be rebuilt without the source.
+    println!(
+        "severity/score: --score emitted value {} penalty {} over {} finding(s) with rules_run {}",
+        block["value"], block["penalty"], block["scored_findings"], block["rules_run"]
+    );
+    println!("severity/score: the 100 carries the no-rules warning beside it");
+
+    let penalties = block["penalties"]
+        .as_object()
+        .expect("the penalty table is an object");
+    assert_eq!(penalties.len(), sim_doctor::rules::SCORE_PENALTY.len());
+    for severity in sim_doctor::rules::Severity::LADDER {
+        assert_eq!(
+            penalties[severity.id()],
+            serde_json::json!(sim_doctor::rules::SCORE_PENALTY[severity.rank() as usize]),
+            "the published table disagrees with the constant at {}",
+            severity.id()
+        );
+    }
+
+    // Both flags together, which is the combination the flag matrix cannot
+    // reach without a card: the score is taken from the FILTERED set.
+    let mut both = base.to_vec();
+    both.extend_from_slice(&["--severity", "critical", "--score"]);
+    let (code, _, both) = scan(&both);
+    assert_eq!(code, 0, "{both:#}");
+    assert_eq!(
+        both["payload"]["data"]["score"]["scored_findings"],
+        both["payload"]["data"]["findings"]["count"],
+        "the score counts what the report shows, not what the scan found"
+    );
+    assert_eq!(
+        both["payload"]["data"]["findings"]["severity_threshold"],
+        serde_json::json!("critical")
+    );
+
+    // The human mode, so the score is not JSON-only. A report a person
+    println!("severity/score: --severity critical --score scored what the report shows");
+
+    // cannot check is the same defect in a different font.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args(["scan", "--score", "--reader", reader.as_str()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    let human = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert!(
+        output.status.success(),
+        "human mode exited {:?}",
+        output.status
+    );
+    assert!(
+        human.contains(sim_doctor::rules::SCORE_FORMULA),
+        "the human report prints the formula beside the number: {human}"
+    );
+    assert!(
+        human.contains(sim_doctor::scan::NO_RULES_WARNING),
+        "the human report prints the same warning: {human}"
+    );
+    println!("severity/score: the human report printed the formula and the warning");
 }
