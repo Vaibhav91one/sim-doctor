@@ -1,0 +1,47 @@
+Phase 1: the DF-tree filesystem walker (#7)
+
+SELECT the master file, probe every SIM-family identifier underneath,
+descend into the dedicated files, and hand back a typed tree that
+issue #9's scan serialises.
+
+Absent and forbidden are separate variants of walk::NodeState with no
+shared payload, and only a status word the caller has put in
+walk::StatusMeaning is classified at all. 6A 82 is the one entry this
+repository has verified; everything else reaches the caller as
+NodeState::Refused carrying its status word verbatim, so a card that
+answers a protected file differently from a missing one produces a
+finding rather than a guess.
+
+The traversal is an explicit stack, not recursion. Candidates are
+de-duplicated per directory so a path can be reached at most once, and
+a card describing an infinite tree is stopped by max_depth, max_nodes
+and max_directories, each reported as a Note::Limit rather than applied
+silently. A child whose identifier repeats one on its own path is NOT
+treated as a cycle: a file identifier is unique inside a directory and
+not across a card, so stopping there would hide legal files. It is
+recorded as Note::RepeatedAncestor and descended.
+
+Cards this project cannot control are the design premise, so nothing
+reaches a panic and nothing reaches an unbounded allocation: every
+response body goes through tlv::Stream and fcp::Template before it is
+read, a malformed template is a Note and a node with empty
+capabilities, and a response that is not a response stops the walk with
+Error::Session.
+
+Enumeration is by probing, because EF.DIR is not available on the
+fixture: swSIM's GET RESPONSE rejects any P1 other than 00 [V], swicc
+421c8cdd, and the 3GPP directory read is GET RESPONSE with P1 81.
+Addressing is SELECT by path from the MF by default, because SELECT by
+file identifier resolves globally on swSIM [V] and would produce a tree
+that is not the card's directory structure.
+
+tests/card_fixture.rs gains walks_the_file_system_of_a_real_card, which
+runs the walker against swSIM and asserts it terminates, finds the MF,
+reaches DF.GSM and the elementary files, reads EF.ICCID's real size
+through the swICC tag table, and reports nothing forbidden - the last
+because swICC evaluates no access condition on SELECT and therefore
+cannot produce that status. The card-fixture workflow now runs both
+card-backed tests and greps the walker's own log lines, so a green job
+means the walk happened.
+
+Co-Authored-By: DeepSeek Harness <noreply@deepseek.com>

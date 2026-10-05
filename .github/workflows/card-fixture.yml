@@ -15,6 +15,12 @@
 #   that returns the MF file capabilities template, and a READ BINARY of
 #   EF.DIR that returns the profile's actual bytes.
 #
+# It then runs issue #7's filesystem walker over the same card: SELECT MF, probe
+# all 1280 SIM-family identifiers under it, descend into the dedicated files,
+# decode their capabilities templates through the swICC tag table, and assert
+# the tree that comes back. The step asserts on the walker's own log lines, so
+# a green job means the walk happened rather than having been skipped.
+#
 # Every step sets "set -o pipefail". Both C projects build with -Werror, and a
 # step written as "make ... 2>&1 | tail -40" reports the exit status of tail,
 # so a build that produced no binary at all would look like a pass. Every step
@@ -319,17 +325,31 @@ jobs:
           test -x "$bin"
 
           log="$RUNNER_TEMP/card-test.log"
-          sudo "$PWD/$bin" \
-            --ignored --exact drives_a_real_card_through_the_pcsc_transport \
-            --nocapture 2>&1 | tee "$log"
+          sudo "$PWD/$bin" --ignored --nocapture 2>&1 | tee "$log"
 
-          # --ignored against a renamed or deleted test would run nothing and
-          # still exit 0. Assert that the test really ran, and that it really
-          # got as far as the SELECT MF and READ BINARY round trips, rather
-          # than trusting the exit code alone.
-          grep -q '1 passed' "$log"
+          # --ignored against a renamed or deleted test runs nothing and still
+          # exits 0, so the log is asserted on rather than the exit code alone.
+          # BOTH card-backed tests must be in it:
+          # drives_a_real_card_through_the_pcsc_transport is issue #4's
+          # transport round trip and walks_the_file_system_of_a_real_card is
+          # issue #7's DF-tree walk. Naming one and ignoring the other would
+          # let the walk silently stop being card-verified.
+          grep -q '2 passed' "$log"
+          grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
+          grep -q 'walks_the_file_system_of_a_real_card' "$log"
+
+          # Issue #4's test got as far as the SELECT MF and READ BINARY round
+          # trips.
           grep -q 'SELECT MF (3F00), no FCP' "$log"
           grep -q 'READ BINARY EF.DIR' "$log"
+
+          # Issue #7's test walked the tree. These greps are what make a green
+          # job mean the walker ran against a card rather than being skipped.
+          grep -q 'walking the card with 1280 candidate identifiers' "$log"
+          grep -q 'SELECTED  3F00$' "$log"
+          grep -q 'SELECTED  3F00/7F20$' "$log"
+          grep -q 'SELECTED  3F00/2FE2$' "$log"
+          grep -q 'report:' "$log"
 
       - name: Dump the fixture logs
         # Always, including after a failure: the daemon log says why a reader

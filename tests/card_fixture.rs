@@ -443,3 +443,356 @@ fn drives_a_real_card_through_the_pcsc_transport() {
         .expect("a second disconnect is specified to be a no-op");
     println!("card released");
 }
+
+/// The tag table the swSIM fixture answers SELECT with, and the one
+/// [`sim_doctor::walk::walk`] reads every template under.
+///
+/// Named by the software that was observed writing it rather than by a
+/// specification, because a real UICC may use the ISO table instead and the
+/// walker's whole job is to make that choice visible rather than hard-coded.
+/// See [`sim_doctor::fcp::TagSet`] and docs/swsim-fixture.md.
+fn swicc_dialect() -> sim_doctor::fcp::TagSet {
+    sim_doctor::fcp::TagSet::swicc()
+}
+
+/// Issues issue #7's whole scope against a live card: select the master file,
+/// probe every identifier of every SIM family underneath it, descend into the
+/// dedicated files, and hand back the tree.
+///
+/// **What this test is for.** The unit tests in [`sim_doctor::walk`] prove the
+/// walker's rules against a software card this repository controls. They cannot
+/// prove three things, and only a card can:
+///
+///   1. that the SELECT forms the walker puts on the wire are forms swSIM
+///      routes - the unit tests assert the bytes, this asserts the answers,
+///   2. that a real tree of real capabilities templates decodes,
+///   3. that the walk terminates on a card nobody designed it against.
+///
+/// **What it deliberately does not assert.** That a forbidden file is found.
+/// swICC's selection path never evaluates an access condition
+/// \\[V], `src/fs/va.c:va_select_file`, and its status table has no code for
+/// "access denied", so no fixture run can produce that answer. The
+/// absent/forbidden distinction is therefore proved by the unit tests and is
+/// reported here only as "nothing on this card was reported forbidden", which
+/// is itself the assertion a scan has to make.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn walks_the_file_system_of_a_real_card() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+
+    let session = PcscSession::open(reader)
+        .unwrap_or_else(|error| panic!("could not connect to {reader}: {error}"));
+
+    // Every exchange is logged, so a failing run says what the card actually
+    // answered rather than only what was expected. The walk itself logs
+    // nothing, so the wire trace is the only way to see what it asked for.
+    let mut traced = Traced {
+        inner: session,
+        exchanges: 0,
+    };
+
+    let dialect = swicc_dialect();
+    let options = sim_doctor::walk::Options {
+        candidates: sim_doctor::walk::Candidates::SimFamilies,
+        ..sim_doctor::walk::Options::default()
+    };
+    println!(
+        "walking the card with {} candidate identifiers per directory, under the {:?} tag table",
+        sim_doctor::walk::DEFAULT_MAX_CHILDREN,
+        dialect.name()
+    );
+
+    let tree = sim_doctor::walk::walk(&mut traced, &dialect, &options)
+        .unwrap_or_else(|error| panic!("the walk failed: {error}"));
+    println!(
+        "the walk issued {} exchanges and returned {} nodes",
+        traced.exchanges,
+        tree.len()
+    );
+    for node in tree.nodes() {
+        if node.state().is_selected() {
+            println!("  SELECTED  {}", node.path());
+        }
+    }
+
+    // 1. It terminates, and it says so if it did not. A walk that ran to a
+    //    bound has not seen the whole card and must not be reported as if it
+    //    had.
+    let report = tree.report();
+    println!(
+        "report: {} selected, {} absent, {} forbidden, {} refused, {} directories, {} repeated identifiers, truncated by {:?}",
+        report.selected,
+        report.absent,
+        report.forbidden,
+        report.refused,
+        report.directories,
+        report.repeated_ancestors,
+        report.truncated_by
+    );
+    assert!(
+        !report.is_truncated(),
+        "the whole card should fit inside the default bounds: {:?}",
+        report.truncated_by
+    );
+
+    // 2. It found the master file, and it knows it is the master file.
+    let root = tree
+        .node(tree.root())
+        .expect("a walk always returns its root");
+    assert_eq!(root.path().to_string(), "3F00");
+    assert_eq!(root.path().depth(), 1);
+    assert!(
+        root.state().is_selected(),
+        "SELECT MF: {:?} / {:?}",
+        root.state(),
+        root.notes()
+    );
+    assert_eq!(
+        root.state().kind(),
+        Some(sim_doctor::walk::Kind::MasterFile),
+        "3F00 is the master file by address"
+    );
+
+    // 3. It reached the dedicated files this profile is known to hold, by the
+    //    full path a scan would report. Every path the walk produces is
+    //    absolute, which is the property "correct paths" is really about.
+    let directory: sim_doctor::fs::Path = "3F00/7F20".parse().expect("a valid path");
+    let node = tree.at(&directory).unwrap_or_else(|| {
+        panic!(
+            "3F00/7F20 was not reached. The walk found:\n{}",
+            tree_dump(&tree)
+        )
+    });
+    assert!(
+        node.state().is_selected(),
+        "3F00/7F20: {:?} / {:?}",
+        node.state(),
+        node.notes()
+    );
+    assert_eq!(
+        node.state().kind(),
+        Some(sim_doctor::walk::Kind::Reported(
+            sim_doctor::fs::FileKind::DedicatedFile
+        )),
+        "7F20 is a dedicated file and the card's descriptor said so"
+    );
+    assert!(node.state().kind().expect("selected").is_container());
+
+    // Every child of the master file this profile is known to hold. EF.DIR
+    // (2F00), EF.PL (2F05) and EF.ICCID (2FE2) are all direct children of
+    // 3F00 in data/usim.json, and 7F20 is the only directory among them.
+    for expected in ["3F00/2F00", "3F00/2F05", "3F00/2FE2"] {
+        let path: sim_doctor::fs::Path = expected.parse().expect("a valid path");
+        let node = tree.at(&path).unwrap_or_else(|| {
+            panic!(
+                "{expected} was not reached. The walk found:\n{}",
+                tree_dump(&tree)
+            )
+        });
+        assert!(
+            node.state().is_selected(),
+            "{expected}: {:?} / {:?}",
+            node.state(),
+            node.notes()
+        );
+    }
+
+    // 4. It distinguished an elementary file from a directory by the card's own
+    //    descriptor, not by guessing from where it was found.
+    let imsi: sim_doctor::fs::Path = "3F00/2FE2".parse().expect("a valid path");
+    let node = tree.at(&imsi).unwrap_or_else(|| {
+        panic!(
+            "3F00/2FE2 was not reached. The walk found:\n{}",
+            tree_dump(&tree)
+        )
+    });
+    assert!(node.state().is_selected(), "3F00/2FE2: {:?}", node.state());
+    let kind = node.state().kind().expect("a selected file has a kind");
+    assert_eq!(
+        kind,
+        sim_doctor::walk::Kind::Reported(sim_doctor::fs::FileKind::ElementaryFile),
+        "2FE2 is transparent, so the descriptor's category bits say elementary"
+    );
+    assert!(!kind.is_container(), "an elementary file holds nothing");
+
+    // 5. It read real metadata through the caller's tag table, which is the
+    //    thing the swICC table exists for. EF.ICCID in data/usim.json is ten
+    //    octets, and reading this under the ISO table instead would report
+    //    2337.
+    let capabilities = node.state().capabilities().expect("selected");
+    let size = capabilities
+        .size
+        .reported()
+        .unwrap_or_else(|| {
+            panic!(
+                "EF.ICCID reported no size under the {} table: {:?}",
+                dialect.name(),
+                capabilities
+            )
+        })
+        .octets();
+    assert_eq!(
+        size, 10,
+        "EF.ICCID is ten octets in the swSIM USIM profile, and the file size \
+         lives in tag 80 on this card"
+    );
+    let descriptor = capabilities
+        .descriptor
+        .reported()
+        .unwrap_or_else(|| panic!("EF.ICCID reported no file descriptor: {:?}", capabilities));
+    assert_eq!(
+        descriptor.structure,
+        sim_doctor::fcp::Structure::Transparent
+    );
+    assert!(
+        capabilities.unknown_tags.is_empty(),
+        "the swICC table explains every tag this card sends for an elementary \
+         file, so a tag here would mean the mapping has drifted: {:?}",
+        capabilities.unknown_tags
+    );
+
+    // 6. The absent and forbidden answers came back apart, and neither was
+    //    invented. Every identifier the profile does not hold must read as
+    //    absent, and the count of them must be exactly the number of
+    //    identifiers that were not found.
+    assert_eq!(
+        report.forbidden, 0,
+        "swICC evaluates no access condition on SELECT, so nothing on this card \
+         can be forbidden. A non-zero count here would mean the walk invented a \
+         finding."
+    );
+    // A tag the mapping cannot read is named rather than dropped. swSIM sends
+    // a C6 PIN status template for every folder `[V]`, swSIM `src/3gpp.c`
+    // `o3gpp_select_res` at the pinned commit, and `TagSet::swicc()` has no tag
+    // for it, so a dedicated file's capabilities must carry it in the
+    // forward-compatibility list rather than losing it.
+    let folder = tree.at(&directory).expect("3F00/7F20 is in the tree");
+    let folder_unknown = &folder
+        .state()
+        .capabilities()
+        .expect("a selected folder has capabilities")
+        .unknown_tags;
+    assert!(
+        folder_unknown.iter().any(|tag| tag.octet() == 0xC6),
+        "the PIN status template the card sent is named, not dropped: {:?}",
+        folder_unknown
+    );
+
+    // Every identifier probed under the master file produced exactly one
+    // answer, and every answer is one of the four states. Nothing was skipped
+    // and nothing was invented.
+    let probed: Vec<&sim_doctor::walk::Node> = tree
+        .nodes()
+        .iter()
+        .filter(|node| node.path().depth() == 2)
+        .collect();
+    assert_eq!(
+        probed.len(),
+        sim_doctor::walk::DEFAULT_MAX_CHILDREN,
+        "the master file was probed for the whole SIM identifier space"
+    );
+    let counted = probed
+        .iter()
+        .filter(|node| node.state().is_selected())
+        .count()
+        + probed
+            .iter()
+            .filter(|node| matches!(node.state(), sim_doctor::walk::NodeState::Absent))
+            .count()
+        + probed
+            .iter()
+            .filter(|node| matches!(node.state(), sim_doctor::walk::NodeState::Forbidden { .. }))
+            .count()
+        + probed
+            .iter()
+            .filter(|node| matches!(node.state(), sim_doctor::walk::NodeState::Refused { .. }))
+            .count();
+    assert_eq!(
+        counted,
+        probed.len(),
+        "every identifier probed under the master file produced exactly one \
+         answer, and no answer was dropped"
+    );
+    assert!(
+        report.absent > 0,
+        "probing the SIM identifier space must find most of it missing"
+    );
+
+    // 7. Nothing under a file the card did not describe, and nothing past a
+    //    bound: both would mean the tree is not what it claims to be.
+    for node in tree.nodes() {
+        if let sim_doctor::walk::NodeState::Selected {
+            kind: sim_doctor::walk::Kind::Unreported,
+            ..
+        } = node.state()
+        {
+            assert!(
+                node.children().is_empty(),
+                "{} was not described and was not descended",
+                node.path()
+            );
+        }
+        assert!(
+            node.path().depth() <= options.limits.max_depth,
+            "{} is deeper than the bound",
+            node.path()
+        );
+    }
+
+    traced.inner.disconnect().expect("disconnect failed");
+    println!("card released after {} exchanges", traced.exchanges);
+}
+
+/// A transport that logs every exchange, because a walk logs nothing itself.
+///
+/// A thin wrapper rather than a change to [`PcscSession`] so that what a
+/// failing fixture run prints is the wire transcript and nothing else.
+struct Traced {
+    inner: PcscSession,
+    exchanges: usize,
+}
+
+impl std::fmt::Debug for Traced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Traced")
+            .field("reader", &self.inner.reader())
+            .field("exchanges", &self.exchanges)
+            .finish()
+    }
+}
+
+impl CardSession for Traced {
+    fn reader(&self) -> &sim_doctor::transport::ReaderName {
+        self.inner.reader()
+    }
+
+    fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, sim_doctor::transport::Error> {
+        self.exchanges += 1;
+        let response = self.inner.transmit(command)?;
+        println!("  -> {}\n  <- {}", hex(command), hex(&response));
+        Ok(response)
+    }
+
+    fn disconnect(&mut self) -> Result<(), sim_doctor::transport::Error> {
+        self.inner.disconnect()
+    }
+}
+
+/// Every path the walk returned, selected ones only, for a failure message.
+fn tree_dump(tree: &sim_doctor::walk::Tree) -> String {
+    tree.nodes()
+        .iter()
+        .filter(|node| node.state().is_selected())
+        .map(|node| format!("  {} {:?}", node.path(), node.state()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
