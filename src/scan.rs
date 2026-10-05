@@ -67,6 +67,7 @@ use serde_json::{json, Value};
 use crate::fcp::{self, TagSet};
 use crate::fs;
 use crate::rules;
+use crate::tar;
 use crate::tlv::Tag;
 use crate::walk::{self, Candidates, Limit, Limits, Node, NodeState, Note, Tree};
 
@@ -285,42 +286,182 @@ impl<'a> Context<'a> {
 pub const NO_RULES_WARNING: &str =
     "rules_run is 0: no rule has been implemented yet, so nothing on this card was checked. This score is 100 because there is nothing to subtract, NOT because the card is clean";
 
+/// The warning a score carries when a rule ran but gathered no evidence.
+///
+/// **This is the case `--tar off` produces, and it is not the same as the one
+/// above.** A rule is registered, so `rules_run` is 1, and the rule looked -
+/// but the TAR audit probed nothing, so it had nothing to look at. A score of
+/// 100 from that is not a verdict either: it says the MSL 0 check did not run.
+///
+/// The default is `off` because an ENVELOPE probe leaves swicc-pcsc unable to
+/// start a transaction for any later process. Turning the audit on is an
+/// explicit operator decision, and while it is off this sentence is the honest
+/// description of what the number means.
+pub const NO_TAR_EVIDENCE_WARNING: &str =
+    "the TAR audit probed nothing, so the MSL 0 check did not run: this score is 100 because no TAR was probed, NOT because the card refuses TAR 0. Run with --tar focused to check";
+
 // ---------------------------------------------------------------------------
 // What a scan concluded
 // ---------------------------------------------------------------------------
 
-/// The rules this scan runs over one walked card.
+/// What every rule in this scan is handed.
 ///
-/// **Empty today, and that is the state of the project rather than a
-/// placeholder.** Issue #13 built the vocabulary a rule needs - the ID, the
-/// severity, what a finding is, and the registry that binds one to the other -
-/// and shipped no rule, because a rule that guessed would manufacture
-/// findings this repository cannot justify. So a scan evaluates zero rules and
-/// produces zero findings, and says so rather than letting an empty list read
-/// as a clean card.
-///
-/// **Which is why the score carries `rules_run`.** A score of 100 from an
-/// empty set is otherwise indistinguishable from a card that passed, which is
-/// precisely the failure [`NO_RULES_WARNING`] was written to prevent, and
-/// precisely the one [`Deferred::Score`] used to refuse rather than risk.
-/// Registering the first rule is the only change this function needs.
-fn rules() -> rules::Registry<Tree> {
-    rules::Registry::new()
+/// **A subject, not a tree.** One scan now looks at two things about a card -
+/// the DF tree and its TAR accept-list - and a rule may need either, both or
+/// neither. [`crate::rules::Registry`] is generic over exactly this reason: a
+/// rule is a function of whatever the scan knows, so the scan is what says
+/// what the rules are handed.
+#[derive(Debug, Clone, Copy)]
+pub struct Subject<'a> {
+    /// The walked card.
+    pub tree: &'a Tree,
+    /// What the TAR audit concluded.
+    pub tar: &'a tar::Audit,
 }
 
-/// How many rules a scan evaluates over one walked card.
+/// The ID of the TAR rule, exactly as AGENTS.md section 3 spells it.
 ///
-/// Zero today, and reported next to every score for the reason above.
+/// A constant rather than a literal at each call site, because it is a public
+/// address: a baseline records it, a suppression names it, a CI filter greps
+/// for it, and a typo in it would produce a finding nobody can address.
+pub const MSL_ZERO_RULE: &str = "gsma/msl-zero-allowed";
+
+/// How serious MSL 0 is on this crate's ladder, and why.
+///
+/// **Critical, and the ladder is the reason rather than the mood.**
+/// [`rules::SCORE_PENALTY`] gives critical 50 points, half the scale, so one of
+/// these saturates a CI threshold on its own. That is the intended reading: a
+/// card running at MSL 0 executes any command under any TAR with no
+/// cryptographic verification, which is not a hardening gap but the absence of
+/// the control.
+fn msl_zero(subject: &Subject<'_>, reason: &str) -> rules::Finding {
+    let accepted = subject
+        .tar
+        .probes
+        .iter()
+        .find(|probe| probe.tar == tar::TAR_MIN)
+        .and_then(|probe| probe.verdict.status())
+        .map_or_else(
+            || "(no status word)".to_owned(),
+            |status| status.to_string(),
+        );
+    let baseline = subject
+        .tar
+        .baseline
+        .signature()
+        .map_or_else(|| "(none)".to_owned(), ToString::to_string);
+
+    let finding = rules::Finding::new(
+        rules::RuleId::new(MSL_ZERO_RULE).expect("a validated constant"),
+        rules::Severity::Critical,
+        format!(
+            "TAR 000000 was accepted: the card answered this TAR with {accepted}, which is not \
+             how it answers TARs it has no opinion about ({baseline}), so MSL is 0 and any \
+             command under any TAR may be run without cryptographic verification"
+        ),
+        rules::Location::tar(tar::TAR_MIN),
+        rules::Evidence::text(format!("accepted={accepted} baseline={baseline}")),
+    );
+    finding.partial(reason)
+}
+
+/// The MSL=0 rule: TAR zero was accepted.
+///
+/// **This is a differential rule and it says so in its evidence.** It does not
+/// ask whether `90 00` means accepted or `94 04` means refused, because this
+/// project can cite neither: AGENTS.md blocker 2 records that no 3GPP TS 31.111
+/// text has been read here, and the only card it has talked to answers GSM
+/// SELECT of a missing file with `94 04` [V] (swSIM `src/apduh.c`,
+/// `apduh_gsm_select`), so on that card `94 04` demonstrably does not mean
+/// "the TAR was refused". What it asks instead is whether **this** TAR's
+/// response differs from **this** card's response to TARs it has no opinion
+/// about - which is SIMTester's own `-stbs` algorithm, and the only criterion
+/// that can turn a card with no TAR check into a critical finding.
+///
+/// **A TAR accepted other than zero is not raised here.** It is reported in the
+/// `tar` block of the scan with its status word, because it is a different
+/// problem; and there is no agreed rule ID for it. Raising it under this ID
+/// would be the same category of mistake as flipping the exit code without
+/// moving the table that describes it.
+fn msl_zero_allowed(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    if !subject.tar.msl_zero_allowed() {
+        return Vec::new();
+    }
+    let reason = if subject.tar.is_complete() {
+        TAR_PARTIAL_REASON.to_owned()
+    } else {
+        subject
+            .tar
+            .stopped
+            .clone()
+            .unwrap_or_else(|| TAR_PARTIAL_REASON.to_owned())
+    };
+    vec![msl_zero(subject, &reason)]
+}
+
+/// The reason a TAR finding carries when the TAR scan did not finish.
+///
+/// **Both halves of the scan are named in one string, because
+/// [`crate::rules::Coverage`] carries exactly one.** The TAR scan is the
+/// half that matters for this particular finding - TAR zero was accepted,
+/// and that does not stop being true because the walk truncated - but a
+/// reader told only about the TAR scan would be left thinking the rest of
+/// the report is whole, which is the mistake AGENTS.md section 2 records
+/// at length.
+const TAR_PARTIAL_REASON: &str =
+    "the TAR scan did not finish, so this TAR is known to be accepted but the card may hold
+     others this scan never probed; this report is a list of what was found, not of everything
+     there is";
+
+/// The rules this scan runs over one card.
+///
+/// **One rule today, and that is what makes the score mean something.**
+/// Issue #13 built the vocabulary a rule needs and shipped none, because a
+/// rule that guessed would manufacture findings this repository cannot justify.
+/// Issue #24 adds the first one, `gsma/msl-zero-allowed`.
+///
+/// **Which is why the score carries `rules_run`.** A score of 100 from an empty
+/// set is indistinguishable from a card that passed, which is precisely the
+/// failure [`NO_RULES_WARNING`] was written to prevent. A scan that now runs a
+/// rule and finds nothing has earned its 100, and the warning going null is
+/// what says so - see [`Verdict::fields`].
+fn rules<'a>() -> rules::Registry<Subject<'a>> {
+    let mut registry = rules::Registry::new();
+    // Registration cannot fail: the ID is a constant and the registry is built
+    // fresh here. Expect rather than a silent fallback, because a duplicate
+    // would be a mistake visible right here and there is nothing sensible to
+    // fall back to.
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(MSL_ZERO_RULE).expect("a validated constant"),
+                rules::Severity::Critical,
+                "the card accepted TAR 000000, so it runs at MSL 0",
+            )
+            .with_remediation(
+                "raise MSL and load the card's TAR allow-list, then re-scan; a card at MSL 0 \
+                 accepts any command under any TAR with no cryptographic verification",
+            ),
+            msl_zero_allowed,
+        )
+        .expect("the TAR rule ID is unique in this registry");
+    registry
+}
+
+/// How many rules a scan evaluates over one card.
+///
+/// One today, and reported next to every score for the reason above.
 pub fn rules_run() -> usize {
     rules().len()
 }
 
-/// The findings one walked card produces, before any filtering.
+/// The findings one card produces, before any filtering.
 ///
-/// Coverage is taken from the walk, not left at the default. A finding raised
-/// from a walk that hit `max_depth` may be entirely true, but the list
-/// cannot be read as the whole of the card, and [`rules::Findings::partial`]
-/// is how that travels on every finding rather than only on the report.
+/// Coverage is taken from **both** halves of the scan, not just the walk. A
+/// finding raised from a walk that hit `max_depth` may be entirely true, but
+/// the list cannot be read as the whole of the card, and
+/// [`rules::Findings::partial`] is how that travels on every finding rather
+/// than only on the report.
 ///
 /// # Errors
 ///
@@ -328,9 +469,9 @@ pub fn rules_run() -> usize {
 /// under another rule's ID. The caller turns that into a failed scan rather
 /// than into a report: a finding nobody can address is not a finding, and
 /// [`rules::Registry`] already refuses it at every other boundary.
-pub fn findings(tree: &Tree) -> Result<rules::Findings, rules::RegistryError> {
-    let found = rules().evaluate(tree)?;
-    Ok(if tree.is_complete() {
+pub fn findings(subject: &Subject<'_>) -> Result<rules::Findings, rules::RegistryError> {
+    let found = rules().evaluate(subject)?;
+    Ok(if subject.tree.is_complete() {
         rules::Findings::complete(found)
     } else {
         rules::Findings::partial(found, TRUNCATION_REASON)
@@ -362,6 +503,7 @@ pub struct Verdict {
     rules_run: usize,
     threshold: Option<rules::Severity>,
     score: bool,
+    tar: tar::Audit,
 }
 
 impl Verdict {
@@ -379,6 +521,11 @@ impl Verdict {
             rules_run,
             threshold: None,
             score: false,
+            // The default is an audit that did not run, rather than one that
+            // ran and found nothing. A caller that forgets to attach the
+            // evidence must not leave the report claiming a TAR check with no
+            // evidence in it.
+            tar: tar::Audit::not_run("no TAR audit was attached to this verdict"),
         }
     }
 
@@ -415,6 +562,25 @@ impl Verdict {
     pub fn scored(mut self, score: bool) -> Self {
         self.score = score;
         self
+    }
+
+    /// Attaches what the TAR audit concluded.
+    ///
+    /// The evidence the TAR rule was decided from, so it travels beside the
+    /// finding rather than being somewhere else in the report: a reader who
+    /// greps for `gsma/msl-zero-allowed` reads one finding, and that
+    /// finding's own claim ("the card answered this TAR with 94 00, which is
+    /// not how it answers TARs it has no opinion about") is only checkable
+    /// against these numbers.
+    #[must_use]
+    pub fn tar_audit(mut self, audit: tar::Audit) -> Self {
+        self.tar = audit;
+        self
+    }
+
+    /// What the TAR audit concluded.
+    pub const fn tar(&self) -> &tar::Audit {
+        &self.tar
     }
 
     /// The findings this report carries, after the filter.
@@ -470,6 +636,7 @@ impl Verdict {
 
         let mut fields = serde_json::Map::new();
         fields.insert("findings".to_owned(), findings);
+        fields.insert("tar".to_owned(), self.tar.to_json());
 
         if let Some(score) = self.score() {
             fields.insert(
@@ -482,11 +649,43 @@ impl Verdict {
                     "rules_run": self.rules_run,
                     "formula": rules::SCORE_FORMULA,
                     "penalties": penalties_json(),
-                    "warning": (self.rules_run == 0).then_some(NO_RULES_WARNING),
+                    // Null as soon as one rule runs, which is now the case
+                    // for every real scan. That is the whole point of the
+                    // field: a 100 from an empty finding set because a rule
+                    // looked and found nothing is a verdict, and a 100 from
+                    // no rule having looked is not. A scan that somehow ran
+                    // zero rules still gets the sentence, so the constant
+                    // stays live rather than becoming dead code.
+                    // THREE ways this 100 is not a verdict, not one. No rule
+                    // has been implemented; a rule ran but the TAR audit probed
+                    // nothing, which is the default because an ENVELOPE leaves
+                    // swicc-pcsc unable to start a transaction; or a scan that
+                    // somehow ran zero rules. Each gets its own sentence, because
+                    // "nothing was checked" and "checked, found nothing" are
+                    // different claims and an operator has to be able to tell
+                    // them apart.
+                    "warning": if self.rules_run == 0 {
+                        Some(NO_RULES_WARNING)
+                    } else if self.tar.probes.is_empty() {
+                        Some(NO_TAR_EVIDENCE_WARNING)
+                    } else {
+                        None
+                    },
                 }),
             );
         }
         fields
+    }
+
+    /// The TAR audit as a person reads it.
+    ///
+    /// Printed before the findings and not after, because a finding an
+    /// operator cannot check is the failure this crate keeps designing
+    /// against: the TAR numbers come first and the verdict reads as a reading
+    /// of them.
+    #[must_use]
+    pub fn tar_to_human(&self) -> String {
+        self.tar.to_human()
     }
 
     /// The findings and score as a person reads them.
@@ -823,6 +1022,12 @@ pub fn to_human(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> String
 
     // Last, and after a blank line, because the walk is the long part and the
     // findings and the score are what the reader came for.
+    // The TAR block comes before the findings on purpose: a finding an
+    // operator cannot check against something is the failure this crate
+    // keeps designing against, so the evidence is on the page first and
+    // the verdict reads as a reading of it.
+    out.push('\n');
+    out.push_str(&verdict.tar_to_human());
     out.push('\n');
     out.push_str(&verdict.to_human());
 
@@ -2234,10 +2439,32 @@ mod tests {
             score["warning"]
         );
 
-        // A 100 from a scan that RAN rules is a different claim, and it does
-        // not carry the warning - otherwise the warning stops meaning
-        // anything.
-        let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2).scored(true);
+        // A 100 from a scan that RAN rules is a different claim - but only
+        // if it also had EVIDENCE to look at. `Verdict::new` attaches
+        // `tar::Audit::not_run`, so rules having run is not on its own enough
+        // to call this a verdict: a rule that ran against a TAR audit that
+        // probed nothing looked at nothing. That gets its own sentence.
+        let ran_no_evidence = Verdict::new(rules::Findings::complete(Vec::new()), 2).scored(true);
+        let ran_no_evidence = rendered(&ran_no_evidence)["score"].clone();
+        assert_eq!(ran_no_evidence["rules_run"], json!(2));
+        assert_eq!(ran_no_evidence["warning"], json!(NO_TAR_EVIDENCE_WARNING));
+
+        // With an audit that actually probed, it IS a verdict and the
+        // warning goes null - which is the whole point of the field.
+        let probed = tar::Audit {
+            selection: tar::Selection::focused(),
+            probes: vec![tar::Probe {
+                tar: 0,
+                verdict: tar::Verdict::Refused { status: None },
+            }],
+            baseline: tar::Baseline::of(&[]),
+            exhausted: true,
+            stopped: None,
+            exchanges: 2,
+        };
+        let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2)
+            .scored(true)
+            .tar_audit(probed);
         let ran = rendered(&ran)["score"].clone();
         assert_eq!(ran["value"], json!(rules::SCORE_MAX));
         assert_eq!(ran["rules_run"], json!(2));
@@ -2299,5 +2526,235 @@ mod tests {
         // act, not something every report carries.
         let bare = to_human(&tree, &context, &Verdict::new(mixed(), 3));
         assert!(!bare.contains("SCORE "), "{bare}");
+    }
+    // -----------------------------------------------------------------------
+    // The TAR rule: gsma/msl-zero-allowed
+    // -----------------------------------------------------------------------
+
+    /// A TAR audit in which the card refused everything except TAR zero.
+    ///
+    /// The shape is the one only a card with a real TAR check can produce: a
+    /// baseline of 9404 and one TAR that answered differently.
+    fn msl_zero_audit() -> tar::Audit {
+        let refused = tar::Verdict::Refused {
+            status: Some(StatusWord::new(0x94, 0x04)),
+        };
+        let accepted = tar::Verdict::Accepted {
+            status: Some(StatusWord::new(0x6D, 0x00)),
+            body_len: 0,
+        };
+        let baseline = tar::Baseline::of(&[
+            Some(tar::Signature::of(
+                &crate::apdu::Response::parse(&[0x94, 0x04]).expect("a response"),
+            )),
+            Some(tar::Signature::of(
+                &crate::apdu::Response::parse(&[0x94, 0x04]).expect("a response"),
+            )),
+        ]);
+        tar::Audit {
+            selection: tar::Selection::default(),
+            probes: vec![
+                tar::Probe {
+                    tar: tar::TAR_MIN,
+                    verdict: accepted,
+                },
+                tar::Probe {
+                    tar: 0x00_00_01,
+                    verdict: refused,
+                },
+            ],
+            baseline,
+            exhausted: true,
+            stopped: None,
+            exchanges: 4,
+        }
+    }
+
+    /// A TAR audit in which nothing was accepted, which is what a card with
+    /// no TAR check at all produces.
+    fn quiet_audit() -> tar::Audit {
+        let signature =
+            tar::Signature::of(&crate::apdu::Response::parse(&[0x90, 0x00]).expect("a response"));
+        tar::Audit {
+            selection: tar::Selection::default(),
+            probes: vec![tar::Probe {
+                tar: tar::TAR_MIN,
+                verdict: tar::Verdict::Refused {
+                    status: Some(StatusWord::new(0x90, 0x00)),
+                },
+            }],
+            baseline: tar::Baseline::of(&[Some(signature)]),
+            exhausted: true,
+            stopped: None,
+            exchanges: 2,
+        }
+    }
+
+    #[test]
+    fn the_tar_rule_is_registered_under_exactly_the_documented_id() {
+        // **Spelling is the contract.** AGENTS.md section 3 names
+        // gsma/msl-zero-allowed as one of the three rule IDs and an agent
+        // greps for that string, so a rule registered under anything else is
+        // a finding nobody can address.
+        assert_eq!(MSL_ZERO_RULE, "gsma/msl-zero-allowed");
+        let id = rules::RuleId::new(MSL_ZERO_RULE).expect("a validated ID");
+        assert_eq!(id.plugin(), "gsma");
+        assert_eq!(id.rule(), "msl-zero-allowed");
+
+        let registry = rules();
+        assert_eq!(registry.len(), 1, "one rule is registered over a card");
+        let rule = registry.get(&id).expect("the rule is registered");
+        assert_eq!(rule.severity(), rules::Severity::Critical);
+        assert!(
+            rule.spec().remediation().is_some(),
+            "a finding an operator cannot act on is half a finding"
+        );
+    }
+
+    #[test]
+    fn a_scan_evaluates_one_rule_so_the_no_rules_warning_cannot_fire() {
+        // **The warning going null here is CORRECT rather than defeated.**
+        // rules_run is 1 because a rule really ran, so the 100 it sits beside
+        // is a score over an audit rather than an absence of one. That is the
+        // whole difference NO_RULES_WARNING was written to make visible.
+        assert_eq!(rules_run(), 1);
+
+        let mut card = sample_card();
+        let tree = walk_sample(&mut card, Limits::default());
+        let audit = quiet_audit();
+        let found = findings(&Subject {
+            tree: &tree,
+            tar: &audit,
+        })
+        .expect("no misattribution");
+        assert!(
+            found.is_empty(),
+            "a card that refused every TAR found nothing"
+        );
+
+        // The audit has to be attached, not merely used above: without it
+        // the verdict reports no evidence and carries the no-evidence warning,
+        // which is the correct thing to say about a 100 with nothing behind it.
+        let verdict = Verdict::new(found, rules_run())
+            .scored(true)
+            .tar_audit(audit);
+        let block = verdict.fields();
+        let score = &block["score"];
+        assert_eq!(score["rules_run"], serde_json::json!(1));
+        assert_eq!(score["value"], serde_json::json!(rules::SCORE_MAX));
+        assert_eq!(
+            score["warning"],
+            serde_json::Value::Null,
+            "a 100 from a rule that looked is a verdict, and the warning is what \
+             distinguishes it from a 100 from nothing looking"
+        );
+    }
+
+    #[test]
+    fn tar_zero_accepted_is_reported_as_msl_zero_with_the_evidence_beside_it() {
+        let mut card = sample_card();
+        let tree = walk_sample(&mut card, Limits::default());
+        let audit = msl_zero_audit();
+        let found = findings(&Subject {
+            tree: &tree,
+            tar: &audit,
+        })
+        .expect("no misattribution");
+
+        assert_eq!(found.len(), 1, "one finding, for the one TAR that differed");
+        let finding = &found.as_slice()[0];
+        assert_eq!(finding.rule().as_str(), MSL_ZERO_RULE);
+        assert_eq!(finding.severity(), rules::Severity::Critical);
+        assert_eq!(finding.location(), &rules::Location::tar(tar::TAR_MIN));
+        assert!(
+            finding.message().contains("6D00") && finding.message().contains("9404"),
+            "the message carries both status words, so it can be checked rather than \
+             believed: {}",
+            finding.message()
+        );
+        assert_eq!(
+            finding
+                .evidence()
+                .as_text()
+                .expect("text evidence")
+                .as_str(),
+            "accepted=6D00 baseline=9404"
+        );
+        // The TAR audit finished; the WALK did not, and this fixture
+        // describes an unbounded tree. So the finding is partial because of the
+        // walk, and the reason on it says so rather than blaming the TAR scan.
+        // A scan that got both right carries complete here.
+        assert!(
+            !finding.coverage().is_complete(),
+            "this fixture's walk truncates, and coverage says so"
+        );
+        assert_eq!(
+            finding.coverage().reason(),
+            Some(TAR_PARTIAL_REASON),
+            "the TAR rule own reason wins, and it names both halves of the scan"
+        );
+
+        // And the score subtracts for it, which is the first time a real card
+        // has moved that number.
+        let verdict = Verdict::new(found, rules_run()).scored(true);
+        let block = verdict.fields();
+        assert_eq!(block["score"]["value"], serde_json::json!(50));
+        assert_eq!(block["score"]["penalty"], serde_json::json!(50));
+        assert_eq!(block["score"]["scored_findings"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn a_tar_audit_that_did_not_finish_marks_its_finding_partial() {
+        let mut card = sample_card();
+        let tree = walk_sample(&mut card, Limits::default());
+        let mut audit = msl_zero_audit();
+        audit.stopped = Some("the probe budget of 4096 TARs was reached".to_owned());
+        let found = findings(&Subject {
+            tree: &tree,
+            tar: &audit,
+        })
+        .expect("no misattribution");
+
+        // **The finding is still true.** TAR zero was accepted, and that does
+        // not stop being true because the scan stopped at 4096 of 16 777 216.
+        // What cannot be claimed is that nothing else is accepted, and that is
+        // what coverage says.
+        assert_eq!(found.len(), 1);
+        let finding = &found.as_slice()[0];
+        assert_eq!(
+            finding.coverage(),
+            &rules::Coverage::Partial {
+                reason: "the probe budget of 4096 TARs was reached".to_owned()
+            }
+        );
+        assert!(!found.is_exhaustive());
+    }
+
+    #[test]
+    fn a_tar_accepted_that_is_not_zero_is_reported_but_not_raised() {
+        let mut card = sample_card();
+        let tree = walk_sample(&mut card, Limits::default());
+        let mut audit = msl_zero_audit();
+        audit.probes.push(tar::Probe {
+            tar: 0x45_44_52,
+            verdict: tar::Verdict::Accepted {
+                status: Some(StatusWord::new(0x90, 0x00)),
+                body_len: 16,
+            },
+        });
+        let found = findings(&Subject {
+            tree: &tree,
+            tar: &audit,
+        })
+        .expect("no misattribution");
+
+        // One finding, not two. An over-broad TAR allow-list is a real
+        // problem, but no rule ID has been agreed for it and raising it under
+        // msl-zero-allowed would be a rule ID that lies about itself.
+        assert_eq!(found.len(), 1);
+        // It is still visible: the tar block lists it.
+        let block = audit.to_json();
+        assert_eq!(block["accepted_count"], serde_json::json!(2));
+        assert_eq!(block["accepted"][1]["tar"], serde_json::json!("454452"));
     }
 }

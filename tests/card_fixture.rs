@@ -1169,19 +1169,25 @@ fn scans_a_real_card_end_to_end() {
     // 7. And the binary itself, which is the actual acceptance criterion.
     //    `CARGO_BIN_EXE_sim-doctor` is resolved by cargo at compile time, so
     //    this is the binary cargo built rather than a path guessed at run time.
-    //    **The exit-0 assertion below is a STATED contract decision, not a fact
-    //    about the card.** Issue #14 had to answer whether a scan that PRODUCES
-    //    findings should exit 1, because this line is what would move. It
-    //    decided no. Today a scan exits 1 for a check that could not run, and
-    //    making it also mean the card is dirty collapses we-did-not-check into
-    //    it-is-dirty, which is the more alarming of the two mistakes to make with
-    //    a security tool. No rule runs yet, so nothing can produce a finding at
-    //    all, and the line is correct as it stands.
+    //    **The exit-0 assertion below is a STATED contract decision, and issue
+    //    #24 re-took it with a rule in place.** Issue #14 decided it while no
+    //    rule ran, so the question was not yet observable; issue #24 is the
+    //    first issue where a scan can produce a finding at all, which withdrew
+    //    reason 1 of the three AGENTS.md records and left reasons 2 and 3
+    //    standing. It decided no again, for a reason that did not exist
+    //    before: exit 1 is reachable from six conditions already (no reader,
+    //    unknown reader, reader unavailable, walk failed, rule misattribution,
+    //    a deferred flag) and every one of them emits a *refusal* document
+    //    carrying `data.error` and NO `data.findings` key. A scan that found
+    //    something emits the opposite shape. Giving one code two mutually
+    //    exclusive document schemas is the wrong trade for a tool whose whole
+    //    promise is that an agent can branch on the status.
     //
-    //    It is therefore DELIBERATELY left asserting success. If the first rule
-    //    lands and somebody flips FINDINGS_FAIL_A_SCAN in src/main.rs, this
-    //    assertion goes red on purpose. That is the signal, and the message on
-    //    it names the other three places that have to move with it.
+    //    So it stays asserting success, and the finding it would have covered
+    //    is covered by `data.score` and `data.complete` instead. If somebody
+    //    flips FINDINGS_FAIL_A_SCAN in src/main.rs, this assertion goes red on
+    //    purpose; the message on it names the other three places that have to
+    //    move with it.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
         .args(["scan", "--json", "--reader", reader.as_str()])
         .output()
@@ -1242,11 +1248,22 @@ fn scans_a_real_card_end_to_end() {
 /// on stdout needs a card, and this is the only place in the repository that
 /// has one.
 ///
-/// **What it deliberately does not prove.** Anything about a finding. No rule
-/// runs yet, so the findings array is empty and `scored_findings` is 0 on every
-/// combination - which is exactly why the assertions below are about the shape
-/// of the block and the warning it carries rather than about a value. The
-/// arithmetic is proved in `src/rules.rs` and the rendering in `src/scan.rs`.
+/// **What it now proves, and what it still cannot.** Issue #24 registered the
+/// first rule, so `rules_run` is 1 and the score block carries no warning. On
+/// this card the rule finds nothing - swSIM has no TAR check at all, which is
+/// what ``the_tar_audit_meets_a_card_with_no_tar_check`` below
+/// demonstrates from the wire - so `scored_findings` is 0 and the score is
+/// still 100. **Those four facts together are the assertion this issue
+/// turned this test into**: one rule ran, it looked, it found nothing, and the
+/// 100 is therefore a verdict rather than the absence of one. That is the
+/// exact confusion `NO_RULES_WARNING` existed to prevent, and it cannot now
+/// arise on a real scan.
+///
+/// **What it still cannot prove:** that a dirty card scores below 100. That
+/// needs a card that accepts TAR zero, and no fixture this repository has
+/// produces one - swSIM implements no MSL. The arithmetic is proved in
+/// `src/rules.rs`, the rendering in `src/scan.rs`, and the shape of the
+/// finding in `src/scan.rs`s` own tests.
 #[test]
 #[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
 fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
@@ -1356,23 +1373,42 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         serde_json::json!(sim_doctor::scan::rules_run())
     );
 
-    // A score of 100 on this card is NOT a clean card, and the envelope has to
-    // say so in words. This is the assertion the issue asked for and the one
-    // that would fail if somebody dropped the warning as noise.
+    // The four facts, asserted together rather than one at a time, because it
+    // is the COMBINATION that says what the 100 means.
+    //
+    //   rules_run 1          a rule really evaluated this card
+    //   scored_findings 0    it looked and found nothing
+    //   value 100 penalty 0  so nothing was subtracted
+    //   warning null         and this 100 is a verdict, not an absence of one
+    //
+    // The last one is the whole point. Before issue #24 this line asserted the
+    // warning WAS present, which said the opposite: nothing had been checked.
+    // Both are 100 with rules_run beside them; only one of them is a card that
+    // passed.
     assert_eq!(
         block["scored_findings"],
         serde_json::json!(0),
-        "no rule runs, so nothing was scored"
+        "the one rule this crate has found nothing on this card, which is the          right answer for a card with no TAR check"
     );
     assert_eq!(
         block["value"],
         serde_json::json!(sim_doctor::rules::SCORE_MAX)
     );
     assert_eq!(block["penalty"], serde_json::json!(0));
+    // rules_run is 1, so a rule DID run - but `--tar` defaults to off, so
+    // the audit probed nothing and the rule had nothing to look at. That is
+    // the no-evidence case, not the earned-100 case, and the warning has to
+    // say so. A null here would claim the card was checked for MSL 0 when no
+    // TAR was ever sent, which is the one thing this field must never do.
     assert_eq!(
         block["warning"],
-        serde_json::json!(sim_doctor::scan::NO_RULES_WARNING),
-        "a 100 that means nothing was checked has to say so beside itself"
+        serde_json::json!(sim_doctor::scan::NO_TAR_EVIDENCE_WARNING),
+        "the audit probed nothing, so this 100 is not a verdict about MSL 0"
+    );
+    assert_eq!(
+        block["rules_run"],
+        serde_json::json!(1),
+        "gsma/msl-zero-allowed is registered; a scan that evaluated zero rules          is the regression this assertion exists to catch"
     );
 
     // The table travels too, so the number can be rebuilt without the source.
@@ -1380,7 +1416,9 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         "severity/score: --score emitted value {} penalty {} over {} finding(s) with rules_run {}",
         block["value"], block["penalty"], block["scored_findings"], block["rules_run"]
     );
-    println!("severity/score: the 100 carries the no-rules warning beside it");
+    println!(
+        "severity/score: rules_run is 1 but the audit probed nothing, so the 100 carries the no-evidence warning rather than the earned-100 null"
+    );
 
     let penalties = block["penalties"]
         .as_object()
@@ -1431,8 +1469,8 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         "the human report prints the formula beside the number: {human}"
     );
     assert!(
-        human.contains(sim_doctor::scan::NO_RULES_WARNING),
-        "the human report prints the same warning: {human}"
+        !human.contains(sim_doctor::scan::NO_RULES_WARNING),
+        "the human report must not claim nothing was checked either: {human}"
     );
-    println!("severity/score: the human report printed the formula and the warning");
+    println!("severity/score: the human report printed the formula and no no-rules warning");
 }

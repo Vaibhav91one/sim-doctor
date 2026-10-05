@@ -24,8 +24,10 @@
 //!                template, and the file metadata read through it
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
+//! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
+//!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
-//! layer 1  scan        a walk turned into a report that admits what it missed
+//! layer 1  scan        a card turned into a report that admits what it missed
 //! ```
 //!
 //! Three consequences worth stating out loud, because later issues will
@@ -101,6 +103,7 @@ pub mod rules;
 pub mod scan;
 pub mod session;
 pub mod signals;
+pub mod tar;
 pub mod tlv;
 pub mod transport;
 pub mod walk;
@@ -177,14 +180,19 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[apdu::NAME, transport::NAME],
     },
     ModuleInfo {
+        name: tar::NAME,
+        owns: "The TAR value space, the ways to select a subset of it, the bounded ENVELOPE probe that puts a TAR on a card, and the baseline one is judged against.",
+        depends_on: &[apdu::NAME, transport::NAME, session::NAME],
+    },
+    ModuleInfo {
         name: walk::NAME,
         owns: "The DF-tree walk: select the master file, probe identifiers, descend, and keep absent apart from forbidden.",
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fcp::NAME, fs::NAME, session::NAME],
     },
     ModuleInfo {
         name: scan::NAME,
-        owns: "A walk rendered as JSON or prose, carrying the dialect it ran under and every bound it hit.",
-        depends_on: &[tlv::NAME, apdu::NAME, fcp::NAME, fs::NAME, walk::NAME],
+        owns: "A card rendered as JSON or prose, carrying the dialect it ran under, every bound it hit, the TAR audit, the rules and the score.",
+        depends_on: &[tlv::NAME, apdu::NAME, fcp::NAME, fs::NAME, rules::NAME, tar::NAME, walk::NAME],
     },
 ];
 

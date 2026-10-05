@@ -406,9 +406,9 @@ jobs:
           grep -q 'severity/score: a bare run carries a findings block and no score' "$log"
           grep -q 'severity/score: --severity high reported the threshold it applied' "$log"
           grep -q 'severity/score: --score emitted value .* penalty .* rules_run' "$log"
-          grep -q 'severity/score: the 100 carries the no-rules warning beside it' "$log"
+          grep -q 'severity/score: rules_run is 1 but the audit probed nothing' "$log"
           grep -q 'severity/score: --severity critical --score scored what the report shows' "$log"
-          grep -q 'severity/score: the human report printed the formula and the warning' "$log"
+          grep -q 'severity/score: the human report printed the formula and no no-rules warning' "$log"
 
           # Issue #4's test got as far as the SELECT MF and READ BINARY round
           # trips.
