@@ -836,8 +836,9 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     match emit_stdout(rendered.trim_end_matches('\n'), what) {
         // The one place FINDINGS_FAIL_A_SCAN would change the answer, and
         // deliberately unchanged for now. See the constant.
-        Ok(()) if FINDINGS_FAIL_A_SCAN && verdict.findings().reaches(rules::Severity::MIN) =>
-            contract::ExitCode::Findings,
+        Ok(()) if FINDINGS_FAIL_A_SCAN && verdict.findings().reaches(rules::Severity::MIN) => {
+            contract::ExitCode::Findings
+        }
         Ok(()) => contract::ExitCode::Success,
         Err(message) => {
             eprintln!("sim-doctor: {message}");
@@ -995,11 +996,13 @@ mod tests {
     fn findings_do_not_fail_a_scan_yet() {
         assert!(
             !FINDINGS_FAIL_A_SCAN,
-            "a scan that produced findings now exits 1. That IS a contract change: \n"
-                "AGENTS.md section 3 allows it, but it needs the scan --help \n"
-                "sentence GATE ON data.complete reworded, the exit-code table \n"
-                "updated, and tests/card_fixture.rs moved deliberately rather than \n"
+            concat!(
+                "a scan that produced findings now exits 1. That IS a contract change:\n",
+                "AGENTS.md section 3 allows it, but it needs the scan --help \n",
+                "sentence GATE ON data.complete reworded, the exit-code table \n",
+                "updated, and tests/card_fixture.rs moved deliberately rather than \n",
                 "quietly. Do those three things in the same commit as this constant."
+            )
         );
     }
 

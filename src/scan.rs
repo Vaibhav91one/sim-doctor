@@ -1424,6 +1424,17 @@ mod tests {
         )
     }
 
+    /// A verdict over the findings a scan produces today: none, from no rule.
+    ///
+    /// Every test above is about the WALK, so it renders with the verdict a
+    /// bare `sim-doctor scan --json` produces - no threshold, no score - and
+    /// the verdict itself is tested in its own section further down. Putting
+    /// findings in front of the walk tests here would make a failure in
+    /// either half point at the other.
+    fn verdict() -> Verdict {
+        Verdict::new(rules::Findings::complete(Vec::new()), rules_run())
+    }
+
     /// The two-octet space, for the exhaustive-candidate tests.
     fn whole_space() -> Candidates {
         Candidates::Range {
@@ -1509,7 +1520,7 @@ mod tests {
         let tree = walk_sample(&mut card, limits);
         assert!(!tree.is_complete(), "this fixture must actually truncate");
 
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         assert_eq!(data["truncated"], json!(true));
         assert_eq!(data["complete"], json!(false));
@@ -1537,7 +1548,7 @@ mod tests {
         let tree = walk_sample(&mut card, limits);
         assert!(tree.is_complete());
 
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
         assert_eq!(data["truncated"], json!(false));
         assert_eq!(data["complete"], json!(true));
         assert_eq!(data["truncated_by"], Value::Null);
@@ -1561,7 +1572,7 @@ mod tests {
             tree.limits_hit()
         );
 
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
         let hit: Vec<&str> = data["limits_hit"]
             .as_array()
             .expect("limits_hit is an array")
@@ -1594,7 +1605,7 @@ mod tests {
             ..Limits::default()
         };
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(probe_set(), limits));
+        let report = to_human(&tree, &context(probe_set(), limits), &verdict());
 
         let first_line = report.lines().next().unwrap_or_default();
         assert!(
@@ -1610,7 +1621,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(probe_set(), limits));
+        let report = to_human(&tree, &context(probe_set(), limits), &verdict());
 
         assert!(
             report.starts_with("COMPLETE:"),
@@ -1634,7 +1645,7 @@ mod tests {
         for dialect in Dialect::ALL {
             let tags = dialect.tag_set();
             let context = Context::new("fake card", None, dialect, probe_set(), limits);
-            let data = to_json(&tree, &context);
+            let data = to_json(&tree, &context, &verdict());
 
             assert_eq!(data["dialect"]["id"], json!(dialect.id()));
             assert_eq!(data["dialect"]["name"], json!(tags.name()));
@@ -1671,7 +1682,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(probe_set(), limits));
+        let report = to_human(&tree, &context(probe_set(), limits), &verdict());
 
         assert!(report.contains("FCP dialect      swicc"), "{report}");
         assert!(report.contains("swICC FCP builder"), "{report}");
@@ -1685,7 +1696,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let absent: Vec<String> = data["absent"]
             .as_array()
@@ -1718,7 +1729,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let states: Vec<&str> = data["files"]
             .as_array()
@@ -1743,7 +1754,7 @@ mod tests {
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
 
-        let sim_families = to_json(&tree, &context(Candidates::SimFamilies, limits));
+        let sim_families = to_json(&tree, &context(Candidates::SimFamilies, limits), &verdict());
         assert_eq!(sim_families["candidates"]["set"], json!("sim-families"));
         assert_eq!(sim_families["candidates"]["probed"], json!(1280));
         assert_eq!(sim_families["candidates"]["exhaustive"], json!(false));
@@ -1755,7 +1766,7 @@ mod tests {
         // Only a range over the whole two-octet space can say "exhaustive", and
         // then the warning is null rather than present-and-empty, so a consumer
         // branching on it sees the difference.
-        let whole = to_json(&tree, &context(whole_space(), limits));
+        let whole = to_json(&tree, &context(whole_space(), limits), &verdict());
         assert_eq!(whole["candidates"]["set"], json!("range"));
         assert_eq!(whole["candidates"]["exhaustive"], json!(true));
         assert_eq!(whole["candidates"]["warning"], Value::Null);
@@ -1766,7 +1777,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(Candidates::SimFamilies, limits));
+        let report = to_human(&tree, &context(Candidates::SimFamilies, limits), &verdict());
 
         assert!(report.contains("WARNING: "), "{report}");
         assert!(report.contains("INVISIBLE"), "{report}");
@@ -1778,7 +1789,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let report = to_human(&tree, &context(whole_space(), limits));
+        let report = to_human(&tree, &context(whole_space(), limits), &verdict());
         assert!(!report.contains("INVISIBLE"), "{report}");
     }
 
@@ -1801,9 +1812,9 @@ mod tests {
 
     #[test]
     fn every_deferred_flag_names_itself_and_admits_nothing_was_scanned() {
+        // --score and --severity are NOT here: they are implemented as of issue
+        // #14 and reach the envelope, so a refusal for them would be the bug.
         let flags = [
-            Deferred::Score,
-            Deferred::Severity("high".to_owned()),
             Deferred::Baseline("baseline.json".to_owned()),
             Deferred::Diff,
         ];
@@ -1824,10 +1835,16 @@ mod tests {
     #[test]
     fn a_deferred_refusal_never_looks_like_a_score() {
         // The failure mode this type exists to prevent: a number that could be
-        // read as a verdict. There is no number anywhere in the refusal.
-        let data = deferred_json(&Deferred::Score);
-        assert!(data.get("score").is_none(), "{data}");
-        assert_eq!(data["implemented"], json!(false));
+        // read as a verdict. There is no number anywhere in the refusal, and
+        // that is still true of the two flags left in it.
+        for deferred in [
+            Deferred::Baseline("baseline.json".to_owned()),
+            Deferred::Diff,
+        ] {
+            let data = deferred_json(&deferred);
+            assert!(data.get("score").is_none(), "{data}");
+            assert_eq!(data["implemented"], json!(false));
+        }
     }
 
     #[test]
@@ -1849,7 +1866,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let imsi = file(&data, "3F00/2FE2");
         assert_eq!(imsi["state"], json!("selected"));
@@ -1873,7 +1890,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         // Not null: "the card did not send it" is a different statement from
         // "the card sent it and it is empty", and Reported is a three-way type.
@@ -1895,7 +1912,7 @@ mod tests {
             ..Limits::default()
         };
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let notes = data["notes"].as_array().expect("notes is an array");
         // Every node one past the bound carries the note, not only the first.
@@ -1933,7 +1950,7 @@ mod tests {
             max_directories: 13,
         };
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         assert_eq!(data["reader"], json!("fake card"));
         assert_eq!(data["atr"], json!("3B 16"));
@@ -1959,7 +1976,7 @@ mod tests {
 
         let limits = Limits::default();
         let context = context(probe_set(), limits).stopped_by("the card was removed mid-walk");
-        let data = to_json(&tree, &context);
+        let data = to_json(&tree, &context, &verdict());
 
         assert_eq!(data["complete"], json!(false));
         assert_eq!(data["truncated"], json!(true));
@@ -1976,7 +1993,7 @@ mod tests {
         let mut card = sample_card();
         let limits = Limits::default();
         let tree = walk_sample(&mut card, limits);
-        let data = to_json(&tree, &context(probe_set(), limits));
+        let data = to_json(&tree, &context(probe_set(), limits), &verdict());
 
         let rendered = serde_json::to_string(&data).expect("the report renders");
         assert!(!rendered.contains('\n'), "the report is one line");
