@@ -832,6 +832,12 @@ fn walks_the_file_system_of_a_real_card() {
 
     // 7. Nothing under a file the card did not describe, and nothing past a
     //    bound: both would mean the tree is not what it claims to be.
+    //
+    //    The depth rule is that `max_depth` is the deepest path the walk
+    //    descends INTO, so a node at the bound has been descended and a node
+    //    one past it is the last one recorded. Every one of those carries the
+    //    bound on itself, so nothing is silently cut.
+    let past_the_bound = options.limits.max_depth + 1;
     for node in tree.nodes() {
         if let sim_doctor::walk::NodeState::Selected {
             kind: sim_doctor::walk::Kind::Unreported,
@@ -845,14 +851,21 @@ fn walks_the_file_system_of_a_real_card() {
             );
         }
         assert!(
-            node.path().depth() <= options.limits.max_depth,
-            "{} is deeper than the bound",
+            node.path().depth() <= past_the_bound,
+            "{} is past the depth bound",
             node.path()
         );
-        if node.path().depth() == options.limits.max_depth {
+        if node.path().depth() == past_the_bound {
             assert!(
                 node.children().is_empty(),
-                "{} is at the depth bound and must not have been descended",
+                "{} is one past the depth bound and must not have been descended",
+                node.path()
+            );
+            assert!(
+                node.notes().contains(&sim_doctor::walk::Note::Limit {
+                    limit: sim_doctor::walk::Limit::Depth,
+                }),
+                "{} is one past the depth bound and must say so",
                 node.path()
             );
         }
