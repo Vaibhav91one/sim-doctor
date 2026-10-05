@@ -75,6 +75,13 @@
 //! exchanges a walk can issue, not only on the size of what it returns. There is
 //! no configuration of [`Candidates`] that makes a walk longer than that, and a
 //! test asserts it.
+//!
+//! **And the default candidate set can miss a file.** [`Candidates::SimFamilies`]
+//! probes the five GSM 11.11 identifier families and nothing else. Every
+//! identifier on the swSIM profile is inside one of them, so it lost no coverage
+//! there, and a card that puts a file anywhere else is **invisible to this
+//! walk** rather than reported missing. A caller who has to be sure uses
+//! [`Candidates::Range`] over the whole two-octet space.
 
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "walk";
@@ -173,6 +180,16 @@ pub enum Candidates {
     ///
     /// The default, and the only enumeration that works on the swSIM fixture,
     /// for the reason the module documentation gives.
+    ///
+    /// **This default can miss files, and that is a choice rather than an
+    /// oversight.** Every identifier on the swSIM USIM profile falls inside one
+    /// of these five families, so narrowing to them cost no coverage *on that
+    /// card* `[V]`. A card that puts a file anywhere else - an identifier whose
+    /// first octet is not 2, 4, 5, 6 or 7 - is **invisible to this walk**, and
+    /// the walk cannot report it missing, because no probe ever happened. A
+    /// caller who needs certainty uses [`Candidates::Range`] over the whole
+    /// two-octet space, or a [`Candidates::List`] built from the card's own
+    /// directory listing.
     #[default]
     SimFamilies,
 
@@ -183,6 +200,11 @@ pub enum Candidates {
 impl Candidates {
     /// The identifiers to probe, in the order they will be tried, and whether
     /// anything was lost to the budget.
+    ///
+    /// Public because a caller has to be able to know what a walk is going to
+    /// ask for. A scan that cannot enumerate its own candidate set cannot
+    /// report that it covered everything, and `Candidates` is where a card
+    /// outside the default families would otherwise go unnoticed.
     ///
     /// The master file is *not* removed here even though it can never be a
     /// child. A caller who lists `3F00` deserves to be told the walk refused
@@ -197,7 +219,7 @@ impl Candidates {
     /// anything was lost. A range wider than the budget loses its high end, and
     /// the walk records that on the directory rather than reporting a partial
     /// listing as a whole one.
-    fn identifiers(self, budget: usize) -> (Vec<FileId>, bool) {
+    pub fn identifiers(self, budget: usize) -> (Vec<FileId>, bool) {
         let mut out: Vec<FileId> = match self {
             Self::Range { first, last } => {
                 let first = u16::from_be_bytes(first.to_bytes());
@@ -464,6 +486,10 @@ pub struct Options {
     pub addressing: Addressing,
 
     /// Which identifiers are probed. Defaults to [`Candidates::SimFamilies`].
+    ///
+    /// **The default can miss a file on a card that does not follow GSM 11.11's
+    /// identifier families.** See that variant's documentation. A scan that has
+    /// to be sure replaces this.
     pub candidates: Candidates,
 
     /// Which status words mean what. Defaults to [`StatusMeaning::default`].
@@ -865,7 +891,11 @@ impl Node {
 }
 
 /// What a walk found, counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Not [`Copy`], because the set of bounds a walk hit is a small heap vector
+/// and copying it into every accessor was not worth a field that a caller could
+/// forget to propagate.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WalkReport {
     /// Files recorded, including the ones that were not selected.
     pub nodes: usize,
@@ -888,7 +918,7 @@ pub struct WalkReport {
     /// Identifiers that repeated one already on their own path.
     pub repeated_ancestors: usize,
 
-    /// The first bound that stopped the walk, if one did.
+    /// Every bound the walk hit, in the order it hit them.
     ///
     /// **A caller that reports a tree has to report this.** A walk that stopped
     /// early did not see the whole card, and a file list an agent reads as a
@@ -896,15 +926,33 @@ pub struct WalkReport {
     /// stopped. That is a silent under-report of the attack surface, which is
     /// worse for this tool than refusing to produce a result at all, so the
     /// reason cannot be dropped on the way out: [`Tree::is_complete`] is false
-    /// whenever this is `Some`, and the JSON envelope in issue #8 has to carry
-    /// both.
+    /// whenever this is not empty, and the JSON envelope in issue #8 has to
+    /// carry it.
+    ///
+    /// Every entry is one of four values and the list is de-duplicated, so this
+    /// is bounded whatever the card does. One entry is the ordinary case; more
+    /// than one means a card that defeats several bounds at once, which is a
+    /// finding in its own right.
+    pub limits_hit: Vec<Limit>,
+
+    /// The first bound that stopped the walk, if one did.
+    ///
+    /// Shorthand for the head of `limits_hit`. **Not the whole answer**: a walk
+    /// that hit the depth bound and then ran out of node budget afterwards is
+    /// reported here as depth alone, which understates how much of the card was
+    /// missed. Read `limits_hit` to report it honestly.
     pub truncated_by: Option<Limit>,
 }
 
 impl WalkReport {
     /// Whether the tree is the whole card, or stopped early.
-    pub const fn is_truncated(&self) -> bool {
-        self.truncated_by.is_some()
+    pub fn is_truncated(&self) -> bool {
+        !self.limits_hit.is_empty()
+    }
+
+    /// Whether one specific bound stopped the walk.
+    pub fn hit(&self, limit: Limit) -> bool {
+        self.limits_hit.contains(&limit)
     }
 }
 
@@ -936,15 +984,21 @@ impl Tree {
     /// **Checked before this tree is reported, never after.** A truncated walk
     /// is a finding about the walk, not a footnote: a caller that shows a file
     /// list without saying it stopped has told an agent the card holds fewer
-    /// files than it does. See [`WalkReport::truncated_by`].
-    pub const fn is_complete(&self) -> bool {
-        self.report.truncated_by.is_none()
+    /// files than it does. See [`WalkReport::limits_hit`].
+    pub fn is_complete(&self) -> bool {
+        self.report.limits_hit.is_empty()
+    }
+
+    /// Every bound the walk hit, in the order it hit them.
+    pub fn limits_hit(&self) -> &[Limit] {
+        &self.report.limits_hit
     }
 
     /// The first bound that stopped the walk, if one did.
     ///
     /// Shorthand for [`Tree::report`]'s field of the same name, named because a
     /// caller reporting this tree should have to type the word *truncated*.
+    /// Prefer [`Tree::limits_hit`], which does not hide a second bound.
     pub const fn truncated_by(&self) -> Option<Limit> {
         self.report.truncated_by
     }
@@ -1485,18 +1539,15 @@ impl Frame {
             .candidates
             .clone()
             .identifiers(options.limits.max_children);
-        let mut notes = Vec::new();
-        if truncated {
-            notes.push(Note::Limit {
-                limit: Limit::Children,
-            });
-        }
+        // The truncation is carried in `stopped_by`, and `Builder::finish`
+        // turns that into the note on this node. Recording it here as well
+        // would print it twice.
         Self {
             dir,
             path,
             ancestors,
             remaining: candidates.into_iter(),
-            notes,
+            notes: Vec::new(),
             refusals: Uniform::None,
             selected: 0,
             probed: 0,
@@ -1540,6 +1591,7 @@ struct Builder<'a> {
     nodes: Vec<Node>,
     directories: usize,
     truncated_by: Option<Limit>,
+    limits_hit: Vec<Limit>,
 }
 
 impl<'a> Builder<'a> {
@@ -1551,6 +1603,7 @@ impl<'a> Builder<'a> {
             // The master file is already being enumerated.
             directories: 1,
             truncated_by: None,
+            limits_hit: Vec::new(),
         }
     }
 
@@ -1578,6 +1631,9 @@ impl<'a> Builder<'a> {
 
     fn mark_truncated(&mut self, limit: Limit) {
         self.truncated_by.get_or_insert(limit);
+        if !self.limits_hit.contains(&limit) {
+            self.limits_hit.push(limit);
+        }
     }
 
     /// Whether another directory may be expanded.
@@ -1594,7 +1650,12 @@ impl<'a> Builder<'a> {
     fn finish(&mut self, frame: Frame) {
         let mut notes = frame.notes;
         if let Some(limit) = frame.stopped_by {
+            // The reason has to be on the node as well as in the report. A
+            // caller rendering one directory cannot see the report, and a
+            // directory that is missing children because a bound ran out is
+            // the most misleading thing this tool could draw.
             self.mark_truncated(limit);
+            notes.push(Note::Limit { limit });
         }
         if frame.selected == 0 && frame.probed > 0 {
             if let Uniform::Same(status) = frame.refusals {
@@ -1636,6 +1697,7 @@ impl<'a> Builder<'a> {
             nodes: self.nodes.len(),
             directories: self.directories.min(self.nodes.len()),
             truncated_by: self.truncated_by,
+            limits_hit: self.limits_hit.clone(),
             ..WalkReport::default()
         };
         for node in &self.nodes {
@@ -3293,6 +3355,93 @@ mod tests {
         assert!(repeat.notes().contains(&Note::Limit {
             limit: Limit::Depth
         }));
+    }
+
+    #[test]
+    fn every_bound_a_walk_hit_is_reported_not_just_the_first() {
+        // A card that is deep enough to hit the depth bound and big enough to
+        // hit the node bound afterwards must report both. Reporting only the
+        // first understates how much of the card was missed.
+        let mut card =
+            FakeCard::default().with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None));
+        // Breadth: 512 directories directly under the master file, which is
+        // what makes the node bound reachable.
+        for high in [0x5Fu8, 0x6F] {
+            for low in 0..=0xFFu16 {
+                let id = FileId::from_bytes([high, low as u8]);
+                let mut path = Vec::from(FileId::MASTER_FILE.to_bytes());
+                path.extend(id.to_bytes());
+                card.files.insert(
+                    path,
+                    Held {
+                        fcp: fcp(id, DIRECTORY_DESCRIPTOR, None),
+                        refusal: None,
+                    },
+                );
+            }
+        }
+        // And depth: a chain under one of them, deeper than max_depth, which
+        // is what makes the depth bound reachable. Breadth alone never
+        // descends, because a leaf has nothing under it.
+        for (level, low) in [0x01u8, 0x02, 0x03, 0x04].into_iter().enumerate() {
+            let mut path = Vec::from(FileId::MASTER_FILE.to_bytes());
+            path.extend([0x5F, 0x00]);
+            for step in 0..=level {
+                path.extend([0x5F, low + u8::try_from(step).unwrap_or(0)]);
+            }
+            card.files.insert(
+                path,
+                Held {
+                    fcp: fcp(FileId::from_bytes([0x5F, low]), DIRECTORY_DESCRIPTOR, None),
+                    refusal: None,
+                },
+            );
+        }
+
+        let options = Options {
+            candidates: Candidates::List(
+                [0x5Fu8, 0x6F]
+                    .into_iter()
+                    .flat_map(|high| {
+                        (0..=0xFFu16).map(move |low| FileId::from_bytes([high, low as u8]))
+                    })
+                    .collect(),
+            ),
+            limits: Limits {
+                max_depth: 3,
+                // Deep enough to reach the depth bound first, small enough that
+                // the node bound is then hit as well. The point of the test is
+                // that BOTH are reported.
+                max_nodes: 1100,
+                max_directories: 64,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        let tree = walk(&mut card, &dialect(), &options).unwrap();
+
+        assert!(!tree.is_complete());
+        assert!(
+            tree.limits_hit().contains(&Limit::Depth),
+            "the chain is deeper than max_depth: {:?}",
+            tree.limits_hit()
+        );
+        assert!(
+            tree.limits_hit().contains(&Limit::Nodes),
+            "and 512 directories is more than max_nodes: {:?}",
+            tree.limits_hit()
+        );
+        // The first is still the first, and the headline does not hide the rest.
+        assert_eq!(tree.truncated_by(), tree.limits_hit().first().copied());
+        for limit in tree.limits_hit() {
+            assert!(tree
+                .nodes()
+                .iter()
+                .any(|node| node.notes().contains(&Note::Limit { limit: *limit })));
+        }
+        assert!(tree.report().hit(Limit::Nodes));
+        assert!(tree.report().hit(Limit::Depth));
+        assert!(!tree.report().hit(Limit::Children));
     }
 
     #[test]

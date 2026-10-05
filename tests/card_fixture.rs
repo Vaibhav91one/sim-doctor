@@ -567,7 +567,8 @@ fn walks_the_file_system_of_a_real_card() {
     );
     // A bound that stopped the walk is always recorded on a node, so a caller
     // reporting this tree cannot mistake "stopped here" for "that is all".
-    if let Some(limit) = report.truncated_by {
+    for limit in tree.limits_hit() {
+        let limit = *limit;
         assert!(
             tree.nodes().iter().any(|node| node
                 .notes()
@@ -575,6 +576,11 @@ fn walks_the_file_system_of_a_real_card() {
             "the walk stopped at {limit} and said so on the node it stopped at"
         );
     }
+    println!(
+        "bounds the walk hit: {:?}; first of them {:?}",
+        tree.limits_hit(),
+        report.truncated_by
+    );
     // 1b. The bound is not hiding anything real. The USIM profile in
     //     data/usim.json is two levels deep under the master file, and every
     //     selected file the walk reports past depth 2 is one of the 7F20
@@ -770,10 +776,32 @@ fn walks_the_file_system_of_a_real_card() {
         .iter()
         .filter(|node| node.path().depth() == 2)
         .collect();
+    // The master file was probed exactly once per candidate the walker was
+    // given, in order, until a bound said it could not go on. Asserted as a
+    // prefix of the candidate set rather than as a count, so narrowing or
+    // widening Candidates does not break a test that is about the walker and
+    // not about a number: a walker that skipped an identifier or probed one
+    // twice fails this, and a walker that simply stopped early does not.
+    let (candidates, _) = options.candidates.clone().identifiers(usize::MAX);
+    let observed: Vec<sim_doctor::fs::FileId> =
+        probed.iter().map(|node| node.path().leaf()).collect();
+    assert_eq!(
+        observed,
+        candidates[..observed.len()],
+        "the master file was probed once per candidate, in order, and stopped \
+         where a bound stopped it"
+    );
+    assert!(
+        observed.len() * 2 > candidates.len(),
+        "only {} of {} candidates were probed: a bound cut the walk short before \
+         it had enumerated anything useful",
+        observed.len(),
+        candidates.len()
+    );
     assert_eq!(
         probed.len(),
-        sim_doctor::walk::DEFAULT_MAX_CHILDREN,
-        "the master file was probed for the whole SIM identifier space"
+        observed.len(),
+        "one node per probe, and no other node at this depth"
     );
     let counted = probed
         .iter()
