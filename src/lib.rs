@@ -35,9 +35,11 @@
 //!   bytes; APDU chaining is built one layer up. Issue #10 wants chaining in
 //!   the transport, so it belongs in a session facade that composes the two,
 //! - `contract` does **not** know about `rules`. The envelope carries
-//!   `serde_json::Value`, so once issue #13 adds findings, they are serialized
-//!   into it by `rules` rather than wrapped in it. That is what keeps the
-//!   envelope shape free to change without dragging the rule model along.
+//!   `serde_json::Value`, so since issue #13 a finding is serialized *into*
+//!   it by `rules` rather than wrapped by it. That is what keeps the envelope
+//!   shape free to change without dragging the rule model along. A unit test
+//!   asserts neither module imports the other; the rest of the claim is proved
+//!   from outside the crate, in `tests/finding_contract.rs`.
 //! - `der` and `tlv` are both layer 0 and neither depends on the other. That
 //!   is the structural half of AGENTS.md 4.2: a strict-DER caller cannot
 //!   reach the BER path, because there is no path to reach.
@@ -75,8 +77,12 @@
 //!   but `--candidates` does not exist yet, so an operator who needs
 //!   certainty has no way to ask for it from the command line. Recorded on
 //!   `--max-children` rather than left to be discovered;
-//! - findings and the rule registry (#13). [`rules`] has the identifiers and
-//!   the severity ladder and no code that produces either,
+//! - a rule that finds anything (#13 delivered the vocabulary, not the rules).
+//!   [`rules`] has the identifiers, the severity ladder, what a finding is,
+//!   and the registry that binds an ID to the code that produces it; it has no
+//!   rule, and no command yet runs one. Wiring the first rule into `scan` is
+//!   what turns findings into an exit code, and the half of #13 that is still
+//!   open.
 //! - anything on the non-TLV side of the crypto stack. Issue #11 landed the
 //!   BER-TLV stream decoder ([`tlv::Stream`]), the caller-supplied file
 //!   capabilities tag table and the file metadata read through it ([`fcp`]),
@@ -142,7 +148,7 @@ pub const MODULES: &[ModuleInfo] = &[
     },
     ModuleInfo {
         name: rules::NAME,
-        owns: "Namespaced plugin/rule identifiers and the severity ladder.",
+        owns: "Namespaced plugin/rule identifiers, the severity ladder, what a finding is, and the registry binding an ID to its code.",
         depends_on: &[],
     },
     ModuleInfo {
@@ -237,6 +243,27 @@ mod tests {
             let module = MODULES.iter().find(|m| m.name == name).unwrap();
             assert!(module.depends_on.is_empty(), "{} must stay a leaf", name);
         }
+    }
+
+    #[test]
+    fn the_two_leaves_import_nothing_from_this_crate() {
+        // The MODULES table records what a module *declares*. This reads what
+        // it *does*. A leaf that quietly grew a `use crate::` would keep
+        // passing every test above while pulling a card type into the surface
+        // of every command.
+        //
+        // Intra-doc links do not count: a doc comment may say
+        // `[crate::contract]` to point at a type it refuses to name in code,
+        // and rustdoc resolves that without an edge. So this looks for
+        // `use crate::`, which is how a dependency actually arrives.
+        assert!(
+            !include_str!("rules.rs").contains("use crate::"),
+            "rules must stay a leaf and import nothing from this crate"
+        );
+        assert!(
+            !include_str!("contract.rs").contains("use crate::"),
+            "contract must stay a leaf and import nothing from this crate"
+        );
     }
 
     #[test]

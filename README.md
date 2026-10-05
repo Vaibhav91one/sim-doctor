@@ -21,10 +21,12 @@ sim-doctor scan --help            # what every flag does, and what it cannot do 
 sim-doctor completions zsh        # shell completions for the whole flag surface
 ```
 
-What it is **not** yet: no rule produces findings (#13), so `--score` and
-`--severity` refuse honestly rather than guessing, and `--baseline` / `--diff`
-are placeholders (#9). A truncated walk is always labelled as one, in both
-output modes. See [CONTEXT.md](CONTEXT.md) for the plan.
+What it is **not** yet: the rule model exists (#13 - findings, locations,
+bounded evidence, and a registry that refuses a duplicate rule ID) but **no rule
+runs yet**, so `scan` still exits 0 whatever it saw, `--score` and `--severity`
+refuse honestly rather than guessing, and `--baseline` / `--diff` are
+placeholders (#9). A truncated walk is always labelled as one, in both output
+modes. See [CONTEXT.md](CONTEXT.md) for the plan.
 
 ## Documentation
 
