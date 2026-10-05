@@ -1423,6 +1423,17 @@ impl Findings {
         Self::complete(entries)
     }
 
+    /// This set's quality score.
+    ///
+    /// Shorthand for [`Score::of`] on the set as it stands, which after
+    /// [`Findings::filtered`] is the set that will be reported. Scoring the
+    /// set a caller is holding rather than the set it will show is the whole
+    /// of "the score and the report cannot disagree".
+    #[must_use]
+    pub fn score(&self) -> Score {
+        Score::of(self)
+    }
+
     /// The set as the object that goes inside `payload.data`.
     ///
     /// `exhaustive` is the one word to read first. It is `false` when the

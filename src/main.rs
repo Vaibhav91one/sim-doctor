@@ -171,8 +171,25 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "  cut short: a card that describes an unbounded tree is a card we read part\n",
     "  of, and that is not a failed check. An agent gating a build should\n",
     "  require payload.data.complete to be true.\n\n",
+    "SEVERITY AND SCORE\n",
+    "  --severity <level> REMOVES findings below that level from the report.\n",
+    "  Not marked, not counted, absent from the JSON entirely, so a count or a\n",
+    "  grep sees only what survived. The level in force is reported as\n",
+    "  data.findings.severity_threshold. It does not filter the walk:\n",
+    "  complete, truncated and limits_hit are unaffected by it.\n",
+    "  --score adds data.score, an INTEGER 0-100 computed as\n",
+    "    max(0, 100 - sum of one penalty per finding)\n",
+    "  with a penalty of info 1, low 3, medium 10, high 25, critical 50. The\n",
+    "  block carries the formula, that penalty table, the penalty total and\n",
+    "  the number of findings scored, so the number can be recomputed from\n",
+    "  the report. It scores the findings this report carries, so --severity\n",
+    "  and --score compose rather than contradict each other.\n",
+    "  UNTIL A RULE IS IMPLEMENTED the score is 100 with rules_run 0 and a\n",
+    "  warning beside it. That 100 means nothing was checked, not that the\n",
+    "  card is clean, and the output says so in words.\n\n",
     "EXIT CODES\n",
-    "  0  the walk finished\n",
+    "  0  the walk finished. A FINDING DOES NOT CHANGE THIS - gate on\n",
+    "     data.complete and data.score, never on payload.code alone.\n",
     "  1  the walk could not run, or a requested flag is not implemented yet\n",
     "  129  the command line could not be parsed\n",
     "  130  interrupted\n",
@@ -247,25 +264,46 @@ struct ScanArgs {
     #[arg(long, value_name = "N")]
     max_directories: Option<usize>,
 
-    /// NOT IMPLEMENTED YET. Exits 1 with "implemented": false before any reader
-    /// is opened.
+    /// Add one quality score for this card, for CI gating.
     ///
-    /// AGENTS.md section 3 requires this flag on the surface from day one
-    /// because agents script against the contract: a flag that exists and
-    /// answers "not yet" is found at design time, a missing flag is found at
-    /// runtime. There is nothing to score until a rule produces findings (issue
-    /// #13), and a --score that returned 0 because the scorer is unwritten
-    /// would be indistinguishable from a card that passed. The flag is here so
-    /// a script finds out in milliseconds instead of in production.
+    /// Implemented. The score is an INTEGER from 0 to 100, and it is
+    /// reproducible rather than merely present: 100 minus the penalty of every
+    /// finding in this report, where a finding costs info 1, low 3, medium 10,
+    /// high 25 or critical 50, floored at 0. AGENTS.md section 3 states the
+    /// formula in full, and the JSON repeats it - the formula, the penalty
+    /// table, the penalty total and how many findings were scored - so an
+    /// agent can recompute the number from the document it is holding.
+    ///
+    /// It scores what this report carries, so --severity and --score compose:
+    /// `--severity high --score` scores the high and critical findings and
+    /// nothing else, and `data.score.scored_findings` says how many that was.
+    ///
+    /// WHILE NO RULE IS IMPLEMENTED the score is 100 with `rules_run` 0 and a
+    /// warning beside it. A 100 that means "nothing was checked" is not a
+    /// clean card, and the report says so rather than leaving a CI gate to
+    /// work that out from the absence of findings.
     #[arg(long)]
     score: bool,
 
-    /// NOT IMPLEMENTED YET. Exits 1 with "implemented": false before any reader
-    /// is opened.
+    /// Drop findings below this severity.
     ///
-    /// Accepted and validated as one of info, low, medium, high, critical, so a
-    /// typo is still exit 129 rather than being silently ignored. Filtering
-    /// needs findings to filter (issue #13).
+    /// Implemented. Accepted and validated as one of info, low, medium, high,
+    /// critical, so a typo is still exit 129 rather than being silently
+    /// ignored.
+    ///
+    /// A finding below the level is REMOVED, not marked: it is absent from
+    /// `data.findings.findings`, absent from `data.findings.count`, and its
+    /// rule ID appears nowhere in the document. An agent counting findings
+    /// therefore gets the count that survived the filter, and an agent
+    /// grepping for a dropped rule finds nothing rather than an empty shell
+    /// carrying the ID.
+    ///
+    /// The level in force is reported as `data.findings.severity_threshold`,
+    /// because a short list is otherwise indistinguishable from a quiet card.
+    ///
+    /// It does not filter the WALK. `complete`, `truncated`, `truncated_by`
+    /// and `limits_hit` are unchanged by it, so raising the level can never
+    /// make a truncated scan look like a whole one.
     #[arg(long, value_name = "LEVEL")]
     severity: Option<rules::Severity>,
 
@@ -285,6 +323,36 @@ struct ScanArgs {
     diff: bool,
 }
 
+/// Whether a scan that produced findings exits 1.
+///
+/// **No. It does not, and that is a decision rather than an omission.**
+///
+/// AGENTS.md section 3 lists exit 1 as "findings present (or checks failed)"
+/// and this run takes the second half only. Three reasons, in the order they
+/// carried weight:
+///
+/// 1. **No rule runs yet** (issue #13 shipped the vocabulary and no rules),
+///    so there is nothing that can produce a finding today. Wiring the exit
+///    code now would be a behaviour change with no test that could observe
+///    it, which is the shape of a regression that waits.
+/// 2. **`scan --help` already tells an agent what to gate on.** It says
+///    "GATE ON data.complete, NOT ON payload.code", and `payload.code` is 0
+///    for every walk that finished, including a truncated one. Changing what
+///    the code means without changing that sentence would make the help
+///    wrong; changing the sentence too is a contract edit that belongs with
+///    the first rule, not with the scorer.
+/// 3. **Exit 1 currently means "a check failed"** - no reader, no card, an
+///    unwritable stdout. Letting it also mean "the card is dirty" collapses
+///    "you did not check" into "it is dirty", and for a security tool the
+///    first of those two is the more alarming mistake to make.
+///
+/// The primitive for the change is already written and tested:
+/// [`rules::Findings::reaches`] over [`Verdict::findings`](scan::Verdict), at
+/// the `Ok(()) => contract::ExitCode::Success` arm of [`run_scan`]. Flip this
+/// to `true` and move that line; [`findings_do_not_fail_a_scan_yet`] fails
+/// until the constant and its test agree.
+const FINDINGS_FAIL_A_SCAN: bool = false;
+
 impl ScanArgs {
     /// The first requested flag whose behaviour is not built, if there is one.
     ///
@@ -293,12 +361,6 @@ impl ScanArgs {
     /// flags. Only one is reported: listing every unimplemented flag at once is
     /// noise, and the operator will find the next one on the next run.
     fn deferred(&self) -> Option<scan::Deferred> {
-        if self.score {
-            return Some(scan::Deferred::Score);
-        }
-        if let Some(level) = &self.severity {
-            return Some(scan::Deferred::Severity(level.to_string()));
-        }
         if let Some(path) = &self.baseline {
             return Some(scan::Deferred::Baseline(path.clone()));
         }
@@ -622,8 +684,11 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 /// with. See [`report_interrupted`] and CONTEXT.md section 3.
 ///
 /// The deferred flags are checked before the first checkpoint and before any
-/// I/O, because `--score` has an answer whether or not a card exists and an
-/// agent that scripts against it deserves that answer in milliseconds.
+/// I/O, because `--baseline` has an answer whether or not a card exists and
+/// an agent that scripts against it deserves that answer in milliseconds.
+///
+/// `--score` and `--severity` are NOT deferred any more. They need a card,
+/// because what they say is about a card.
 fn run_scan(args: ScanArgs) -> contract::ExitCode {
     if let Some(deferred) = args.deferred() {
         return report_deferred(&deferred, args.json);
@@ -693,6 +758,26 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         return report_interrupted(scan::KIND, args.json);
     }
 
+    // The rules, over the tree that is still in memory. Zero of them are
+    // implemented - issue #13 shipped the vocabulary a rule needs and no rule -
+    // so this is an empty set today and `rules_run` is what says so in the
+    // output rather than letting an empty findings list read as a clean card.
+    let found = match scan::findings(&tree) {
+        Ok(found) => found,
+        Err(err) => {
+            return report_failure(
+                &scan::Failure::new("rule-misattribution", err.to_string()),
+                args.json,
+            )
+        }
+    };
+
+    // Filtered before it is scored, and the score taken from what is left:
+    // the number in the report is a function of the findings in the report.
+    let verdict = scan::Verdict::new(found, scan::rules_run())
+        .at_least(args.severity)
+        .scored(args.score);
+
     let context = scan::Context::new(
         reader.as_str(),
         atr.as_deref(),
@@ -708,7 +793,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             scan::KIND,
             contract::ExitCode::Success,
             contract::OK_MESSAGE,
-            scan::to_json(&tree, &context),
+            scan::to_json(&tree, &context, &verdict),
         );
         match envelope.to_json() {
             Ok(line) => line,
@@ -718,7 +803,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             }
         }
     } else {
-        scan::to_human(&tree, &context)
+        scan::to_human(&tree, &context, &verdict)
     };
 
     // One line on stderr for a truncated walk, in BOTH modes, on top of the
@@ -749,6 +834,10 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         "the scan report"
     };
     match emit_stdout(rendered.trim_end_matches('\n'), what) {
+        // The one place FINDINGS_FAIL_A_SCAN would change the answer, and
+        // deliberately unchanged for now. See the constant.
+        Ok(()) if FINDINGS_FAIL_A_SCAN && verdict.findings().reaches(rules::Severity::MIN) =>
+            contract::ExitCode::Findings,
         Ok(()) => contract::ExitCode::Success,
         Err(message) => {
             eprintln!("sim-doctor: {message}");
@@ -889,6 +978,69 @@ fn exit_with_clap_error(err: clap::Error) -> process::ExitCode {
     exit(code)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decision `run_scan`'s success arm is built on, pinned.
+    ///
+    /// This test exists so that flipping [`FINDINGS_FAIL_A_SCAN`] to `true`
+    /// cannot be an accident: the constant becomes the only place the
+    /// behaviour is written, and this is the place somebody has to read
+    /// before agreeing to it. The card fixture's
+    /// `scans_a_real_card_end_to_end` asserts exit 0 against a live card and
+    /// would go red on the day the first rule lands, which is the intended
+    /// signal and not a surprise.
+    #[test]
+    fn findings_do_not_fail_a_scan_yet() {
+        assert!(
+            !FINDINGS_FAIL_A_SCAN,
+            "a scan that produced findings now exits 1. That IS a contract change: \n"
+                "AGENTS.md section 3 allows it, but it needs the scan --help \n"
+                "sentence GATE ON data.complete reworded, the exit-code table \n"
+                "updated, and tests/card_fixture.rs moved deliberately rather than \n"
+                "quietly. Do those three things in the same commit as this constant."
+        );
+    }
+
+    /// `--severity` and `--score` are no longer deferred flags.
+    ///
+    /// The refusal they used to raise is gone, so this pins the direction the
+    /// change went: only `--baseline` and `--diff` still stand in the way.
+    #[test]
+    fn only_the_baseline_flags_still_defer() {
+        let deferring = ScanArgs {
+            json: false,
+            dialect: scan::Dialect::Swicc,
+            reader: None,
+            max_depth: None,
+            max_children: None,
+            max_nodes: None,
+            max_directories: None,
+            score: true,
+            severity: Some(rules::Severity::High),
+            baseline: Some("saved.json".to_owned()),
+            diff: true,
+        };
+
+        // With a baseline in the list, that is what refuses - the two
+        // implemented flags are not what stands in the way.
+        assert_eq!(
+            deferring.deferred(),
+            Some(scan::Deferred::Baseline("saved.json".to_owned()))
+        );
+
+        // And on their own they defer to nothing at all.
+        let alone = ScanArgs {
+            baseline: None,
+            diff: false,
+            ..deferring
+        };
+        assert_eq!(alone.deferred(), None);
+        assert!(alone.score, "the flag is still on the surface");
+        assert_eq!(alone.severity, Some(rules::Severity::High));
+    }
+}
 /// Converts a contract exit code into the exit status of this process.
 fn exit(code: contract::ExitCode) -> process::ExitCode {
     process::ExitCode::from(code.process_code())

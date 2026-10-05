@@ -48,6 +48,13 @@
 //! a walk using it, not reported missing, and a scanner that says "12 files"
 //! without saying which twelve it looked for has under-reported.
 //! `"candidates"."exhaustive"` says so in one boolean.
+//!
+//! **The `findings` block is reported, filtered and scored rather than
+//! assumed.** The severity threshold travels beside the list, because a
+//! shorter list is indistinguishable from a quieter card unless the filter
+//! that produced it is on the page, and the score travels with the penalty
+//! table that produced it, because a number nobody can reconstruct is worse
+//! than no number. See [`Verdict`].
 
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "scan";
@@ -59,6 +66,7 @@ use serde_json::{json, Value};
 
 use crate::fcp::{self, TagSet};
 use crate::fs;
+use crate::rules;
 use crate::tlv::Tag;
 use crate::walk::{self, Candidates, Limit, Limits, Node, NodeState, Note, Tree};
 
@@ -269,6 +277,272 @@ impl<'a> Context<'a> {
     }
 }
 
+/// The warning a score carries while no rule is implemented.
+///
+/// A named constant rather than a sentence written at each call site, so the
+/// flag help, the JSON and the human report cannot drift apart, and so a test
+/// can quote it instead of matching on a fragment of it.
+pub const NO_RULES_WARNING: &str =
+    "rules_run is 0: no rule has been implemented yet, so nothing on this card was checked. This score is 100 because there is nothing to subtract, NOT because the card is clean";
+
+// ---------------------------------------------------------------------------
+// What a scan concluded
+// ---------------------------------------------------------------------------
+
+/// The rules this scan runs over one walked card.
+///
+/// **Empty today, and that is the state of the project rather than a
+/// placeholder.** Issue #13 built the vocabulary a rule needs - the ID, the
+/// severity, what a finding is, and the registry that binds one to the other -
+/// and shipped no rule, because a rule that guessed would manufacture
+/// findings this repository cannot justify. So a scan evaluates zero rules and
+/// produces zero findings, and says so rather than letting an empty list read
+/// as a clean card.
+///
+/// **Which is why the score carries `rules_run`.** A score of 100 from an
+/// empty set is otherwise indistinguishable from a card that passed, which is
+/// precisely the failure [`NO_RULES_WARNING`] was written to prevent, and
+/// precisely the one [`Deferred::Score`] used to refuse rather than risk.
+/// Registering the first rule is the only change this function needs.
+fn rules() -> rules::Registry<Tree> {
+    rules::Registry::new()
+}
+
+/// How many rules a scan evaluates over one walked card.
+///
+/// Zero today, and reported next to every score for the reason above.
+pub fn rules_run() -> usize {
+    rules().len()
+}
+
+/// The findings one walked card produces, before any filtering.
+///
+/// Coverage is taken from the walk, not left at the default. A finding raised
+/// from a walk that hit `max_depth` may be entirely true, but the list
+/// cannot be read as the whole of the card, and [`rules::Findings::partial`]
+/// is how that travels on every finding rather than only on the report.
+///
+/// # Errors
+///
+/// [`rules::RegistryError::MisattributedFinding`] when a rule emits a finding
+/// under another rule's ID. The caller turns that into a failed scan rather
+/// than into a report: a finding nobody can address is not a finding, and
+/// [`rules::Registry`] already refuses it at every other boundary.
+pub fn findings(tree: &Tree) -> Result<rules::Findings, rules::RegistryError> {
+    let found = rules().evaluate(tree)?;
+    Ok(if tree.is_complete() {
+        rules::Findings::complete(found)
+    } else {
+        rules::Findings::partial(found, TRUNCATION_REASON)
+    })
+}
+
+/// The coverage reason a walk that hit a bound hands its findings.
+const TRUNCATION_REASON: &str = "the walk stopped at a bound, so this list may be short";
+
+/// What one scan concluded: the findings, the threshold they were filtered
+/// to, and the score.
+///
+/// **The filter runs first and the score is taken from what is reported.**
+/// That ordering is the whole of "a score must not hide a finding": the
+/// score is a function of the `findings` array the reader can see, so the two
+/// can never disagree about what was found. `scan --severity high --score`
+/// scores the findings at or above `high` and reports `scored_findings` as
+/// how many that was. It does not quietly discount the lows and hand back a
+/// number that does not match the document beside it, because a number an
+/// agent cannot reproduce from the output is a number the agent should not
+/// gate a build on.
+///
+/// Built through [`Verdict::new`] and the two `with_*` builders so the order
+/// the flags are applied in is the order they are read in, and so an unset
+/// filter has exactly one representation: [`None`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    findings: rules::Findings,
+    rules_run: usize,
+    threshold: Option<rules::Severity>,
+    score: bool,
+}
+
+impl Verdict {
+    /// A verdict over the findings a scan produced, with no filter and no
+    /// score asked for.
+    ///
+    /// `rules_run` is a parameter rather than a call to [`rules_run`] so that a
+    /// test can put findings in front of a scanner that has implemented no
+    /// rules and assert the *rendered* behaviour rather than the arithmetic,
+    /// which [`crate::rules`] already owns.
+    #[must_use]
+    pub fn new(findings: rules::Findings, rules_run: usize) -> Self {
+        Self {
+            findings,
+            rules_run,
+            threshold: None,
+            score: false,
+        }
+    }
+
+    /// The findings this verdict was built from, unfiltered.
+    ///
+    /// Only useful for reporting how much the filter removed. Nothing that
+    /// renders output should read it: the rendered output is
+    /// [`Verdict::findings`].
+    pub const fn unfiltered(&self) -> &rules::Findings {
+        &self.findings
+    }
+
+    /// Drops every finding below `level`, the whole of `--severity`.
+    ///
+    /// Applied here rather than at each render so the JSON and the human
+    /// report cannot disagree about which findings survived. A filtered-out
+    /// finding leaves no entry, no count and no rule ID anywhere in either.
+    #[must_use]
+    pub fn at_least(mut self, level: Option<rules::Severity>) -> Self {
+        self.findings = match level {
+            Some(level) => self.findings.filtered(level),
+            None => self.findings,
+        };
+        self.threshold = level;
+        self
+    }
+
+    /// Whether `--score` was asked for.
+    ///
+    /// Off by default. A score in every report would be a number an operator
+    /// learns to skim past, and the flag exists so that asking for it is a
+    /// deliberate act.
+    #[must_use]
+    pub fn scored(mut self, score: bool) -> Self {
+        self.score = score;
+        self
+    }
+
+    /// The findings this report carries, after the filter.
+    pub const fn findings(&self) -> &rules::Findings {
+        &self.findings
+    }
+
+    /// The `--severity` level in force, or `None` when nothing was filtered.
+    pub const fn threshold(&self) -> Option<rules::Severity> {
+        self.threshold
+    }
+
+    /// How many rules produced the findings above.
+    pub const fn rules_run(&self) -> usize {
+        self.rules_run
+    }
+
+    /// The score over the findings this report carries, if one was asked for.
+    ///
+    /// `None` when `--score` was not passed. The score is computed over the
+    /// **filtered** set, so this and [`Verdict::findings`] can never describe
+    /// different sets of findings.
+    pub fn score(&self) -> Option<rules::Score> {
+        self.score.then(|| self.findings.score())
+    }
+
+    /// The fields a scan report carries from a verdict: `findings`, and
+    /// `score` when one was asked for.
+    ///
+    /// Returned as a [`serde_json::Map`] rather than a [`Value`] because the
+    /// caller splices them into a report it has already built, and a `Map` is
+    /// what can be spliced without every field being named on both sides. A
+    /// field added here therefore cannot be half-added, which is the failure
+    /// a duplicated literal invites.
+    ///
+    /// `severity_threshold` sits inside the findings block rather than beside
+    /// it because it is a property of the list: a reader comparing two reports
+    /// needs to know they are looking at the same list before comparing
+    /// anything in it. `null` when nothing was filtered, which is different
+    /// from a threshold of `info` - the first is every finding, the second is
+    /// every finding the ladder can spell.
+    ///
+    /// The score block carries the penalty table that produced it, so the
+    /// number can be reconstructed from the document alone and not only from
+    /// a reader who has found the formula in AGENTS.md.
+    #[must_use]
+    pub fn fields(&self) -> serde_json::Map<String, Value> {
+        let mut findings = self.findings.to_json();
+        findings["severity_threshold"] = match self.threshold {
+            Some(level) => json!(level.id()),
+            None => Value::Null,
+        };
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("findings".to_owned(), findings);
+
+        if let Some(score) = self.score() {
+            fields.insert(
+                "score".to_owned(),
+                json!({
+                    "value": score.value(),
+                    "max": score.max(),
+                    "penalty": score.penalty(),
+                    "scored_findings": score.scored(),
+                    "rules_run": self.rules_run,
+                    "formula": rules::SCORE_FORMULA,
+                    "penalties": penalties_json(),
+                    "warning": (self.rules_run == 0).then_some(NO_RULES_WARNING),
+                }),
+            );
+        }
+        fields
+    }
+
+    /// The findings and score as a person reads them.
+    ///
+    /// The same information as [`Verdict::fields`] and no more: the score is
+    /// shown with the penalty it subtracted and the table it came from, so a
+    /// person reading a CI log can check the number rather than trust it.
+    /// Printed at the end of the report, after the walk, because the banner
+    /// has to stay first and a long file list is what the reader scrolls
+    /// past.
+    #[must_use]
+    pub fn to_human(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str(&format!("FINDINGS: {}", self.findings.len()));
+        match self.threshold {
+            Some(level) => out.push_str(&format!(" at or above {level}")),
+            None => out.push_str(" (no severity filter)"),
+        }
+        out.push('\n');
+        if self.findings.is_empty() {
+            out.push_str("  (none)\n");
+        }
+        for finding in self.findings.iter() {
+            out.push_str(&format!("  {finding}\n"));
+        }
+        if !self.findings.is_exhaustive() {
+            out.push_str(&format!("  coverage: {}\n", self.findings.coverage()));
+        }
+
+        if let Some(score) = self.score() {
+            out.push_str(&format!("\nSCORE {}\n", score));
+            out.push_str(&format!("  formula: {}\n", rules::SCORE_FORMULA));
+            out.push_str(&format!("  from {} finding(s)\n", score.scored()));
+            if self.rules_run == 0 {
+                out.push_str(&format!("  WARNING: {NO_RULES_WARNING}\n"));
+            }
+        }
+
+        out
+    }
+}
+
+/// The published penalty table as the JSON object a score block carries.
+///
+/// Built by walking [`rules::Severity::LADDER`] so that the keys are the
+/// ladder's own spellings and a severity added to the ladder cannot be
+/// missing from the table.
+fn penalties_json() -> Value {
+    let mut table = serde_json::Map::new();
+    for severity in rules::Severity::LADDER {
+        table.insert(severity.id().to_owned(), json!(rules::penalty(severity)));
+    }
+    Value::Object(table)
+}
+
 /// Renders a walk as the `data` a scan envelope carries.
 ///
 /// One call, one [`Value`]. The caller puts it in
@@ -293,7 +567,7 @@ impl<'a> Context<'a> {
 /// per-entry `"state"` discriminant. An agent that wants "what is on this card"
 /// reads `data.selected`; one that wants "what is there but not readable" reads
 /// `data.forbidden`, and neither has to subtract anything.
-pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
+pub fn to_json(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> Value {
     let report = tree.report();
     let dialect_tags = context.dialect.tag_set();
 
@@ -341,7 +615,7 @@ pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
         .identifiers(context.limits.max_children);
     let exhaustive = candidates_exhaustive(&context.candidates);
 
-    json!({
+    let mut report = json!({
         "reader": context.reader,
         "atr": context.atr.map(hex),
         "dialect": {
@@ -393,7 +667,17 @@ pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
         "refused": refused,
         "notes": notes,
         "files": files,
-    })
+    });
+
+    // The verdict is spliced in rather than named in the literal above, so
+    // there is one place that knows what a walk renders and one that knows
+    // what a verdict renders, and a field added to either cannot be half
+    // added. `as_object_mut` is `Some` because the literal above is an
+    // object; there is no shape here that silently drops the findings.
+    if let Some(fields) = report.as_object_mut() {
+        fields.extend(verdict.fields());
+    }
+    report
 }
 
 /// Renders a walk as the report a person reads.
@@ -406,7 +690,7 @@ pub fn to_json(tree: &Tree, context: &Context<'_>) -> Value {
 /// The banner is the requirement, not decoration. It goes **first**, before the
 /// reader name, because a truncated scan read from the bottom up is a truncated
 /// scan that was skimmed.
-pub fn to_human(tree: &Tree, context: &Context<'_>) -> String {
+pub fn to_human(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> String {
     let report = tree.report();
     let dialect_tags = context.dialect.tag_set();
     let mut out = String::new();
@@ -536,6 +820,11 @@ pub fn to_human(tree: &Tree, context: &Context<'_>) -> String {
             out.push_str(&format!("  {}  {}\n", node.path(), note_line(note)));
         }
     }
+
+    // Last, and after a blank line, because the walk is the long part and the
+    // findings and the score are what the reader came for.
+    out.push('\n');
+    out.push_str(&verdict.to_human());
 
     out
 }
@@ -851,13 +1140,6 @@ fn tag_or_none(tag: Option<Tag>) -> String {
 /// would be indistinguishable from a card that passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Deferred {
-    /// `--score`, awaiting the rule model (issue #13).
-    Score,
-
-    /// `--severity <level>`, awaiting the rule model. The value is kept so the
-    /// refusal can quote what was asked for.
-    Severity(String),
-
     /// `--baseline <file>`, awaiting saved-run comparison.
     Baseline(String),
 
@@ -869,8 +1151,6 @@ impl Deferred {
     /// The flag as an operator typed it, including its value where it takes one.
     pub fn flag(&self) -> String {
         match self {
-            Self::Score => "--score".to_owned(),
-            Self::Severity(level) => format!("--severity {level}"),
             Self::Baseline(path) => format!("--baseline {path}"),
             Self::Diff => "--diff".to_owned(),
         }
@@ -879,12 +1159,6 @@ impl Deferred {
     /// One sentence saying why it is not implemented and what will implement it.
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::Score => {
-                "no rule produces findings yet (issue #13), so there is nothing to score"
-            }
-            Self::Severity(_) => {
-                "no rule produces findings yet (issue #13), so there is no severity to filter on"
-            }
             Self::Baseline(_) => "saving and comparing a run is issue #9",
             Self::Diff => "diffing against a baseline is issue #9",
         }
@@ -900,7 +1174,6 @@ impl Deferred {
             "flag": self.flag(),
             "reason": self.reason(),
             "tracking_issue": match self {
-                Self::Score | Self::Severity(_) => "#13",
                 Self::Baseline(_) | Self::Diff => "#9",
             },
             "scanned": false,
