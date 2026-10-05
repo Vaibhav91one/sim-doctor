@@ -56,7 +56,7 @@ Never make hardware a prerequisite for running the test suite.
 **This is standing up, in issue #4.** Both projects are pinned by SHA, built and
 installed in a separate CI workflow, and the card-backed tests run against
 [src/transport/pcsc.rs](src/transport/pcsc.rs), the real `pcsc` implementation of
-[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs). Four
+[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs). Five
 tests live behind the gate:
 
 | Test | Proves |
@@ -64,7 +64,8 @@ tests live behind the gate:
 | `drives_a_real_card_through_the_pcsc_transport` | the transport round trip: SELECT MF, GET RESPONSE, READ BINARY (issue #4) |
 | `walks_the_file_system_of_a_real_card` | the DF-tree walk against real capabilities templates (issue #7) |
 | `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one envelope, exit 0 (issue #6) |
-| `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula and its no-rules warning on real stdout (issue #14) |
+| `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula, and the difference between an earned 100 and an unearned one on real stdout (issue #14, rewritten by #24) |
+| `the_tar_audit_meets_a_card_with_no_tar_check` | the TAR scanner against a live card: the ENVELOPE exchange, the measured baseline, and the fact that swSIM has no TAR check to find (issue #24) |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
 executable. The argument parsing, the reader choice, the envelope, the stdout
@@ -73,7 +74,10 @@ reach them. The fourth exists for the same reason and for one more:
 `--score` and `--severity` need a card before they produce anything at all, so
 on a cardless machine the process tests can only prove they are no longer
 **deferred**. Whether the score block reaches stdout, carrying its formula and
-its penalty table, is card-only.
+its penalty table, is card-only. The fifth is the one that made the difference between an
+earned score and an absent check meaningful: with a rule registered, `rules_run` is 1 and
+the warning is null, so the 100 on a real card now means a rule looked and found nothing
+rather than that nothing looked.
 
 The gate keeping the default suite hardware-free is the **`card-fixture` cargo
 feature**, which is off by default; the test additionally carries `#[ignore]`.
@@ -167,35 +171,65 @@ real exit status, not by asserting the enum: [tests/process_contract.rs](tests/p
 
 #### A scan that PRODUCES findings exits 0, and that is a decision [V]
 
-**The table above permits exit 1 for findings. `scan` does not use it yet, and says so
-in the output instead.** The second half - "or checks failed" - is what a scan currently
-returns 1 for: no reader, no card, a walk that could not run, a deferred flag. A scan that
-ran to the end and found something to report exits **0** whatever it found.
+**The table above permits exit 1 for findings. `scan` does not use it, and says so
+in the output instead.** The second half - "or checks failed" - is what a scan
+currently returns 1 for: no reader, no card, a walk that could not run, a
+deferred flag. A scan that ran to the end and found something to report exits
+**0** whatever it found.
 
-Three reasons, in the order they carried weight:
+Three reasons were recorded when this was first decided, in the order they
+carried weight. **Issue #24 withdrew the first one, because issue #24 shipped a
+rule; the other two are unchanged and were re-checked against a scan that can
+actually produce a finding.**
 
-1. **No rule runs yet.** Issue #13 shipped the vocabulary a rule needs - the ID, the
-   severity, the registry - and no rule, because a rule that guessed would manufacture
-   findings this repository cannot justify. So there is nothing that can produce a
-   finding today and the question is not yet observable.
-2. **`payload.code` already means something else.** It is 0 whenever the walk *finished*,
-   including a walk that was cut short, and `scan --help` has said
-   `GATE ON data.complete, NOT ON payload.code` since issue #6. Spending code 1 on
-   "the card is dirty" without rewording that sentence would make the help wrong.
-3. **Collapsing the two is the more dangerous mistake.** Today exit 1 means *a check did
-   not run*. If it also meant *the card is dirty*, then an agent that gated on the exit
-   code would have to tell those two apart from the status alone, and for a security tool
-   "we did not check" is the one that must never be mistaken for "it is fine".
+1. ~~**No rule runs yet.**~~ **WITHDRAWN by issue #24.** Issue #13 shipped
+   the vocabulary a rule needs - the ID, the severity, the registry - and no
+   rule, because a rule that guessed would manufacture findings this
+   repository cannot justify. Issue #24 registers the first one,
+   `gsma/msl-zero-allowed`, so the question is observable for the first time. A
+   reason that has stopped being true must stop being written down, or the
+   next reader inherits it as a live argument.
+2. **`payload.code` already means something else.** Still true, and
+   independent of the first: it is 0 whenever the walk *finished*, including a
+   walk that was cut short, and `scan --help` has said
+   `GATE ON data.complete, NOT ON payload.code` since issue #6. Spending code
+   1 on "the card is dirty" without rewording that sentence would make the help
+   wrong.
+3. **The two meanings have two different documents.** **This is the decisive
+   one, and it was not written down before.** Exit 1 is reachable from six
+   conditions today - no reader, unknown reader, reader unavailable, walk
+   failed, rule misattribution, a deferred flag - plus an unwritable stdout.
+   Every one of them emits a *refusal* document: `data.error` and
+   `data.card_touched`, and **no `data.findings` key at all**. A scan that found
+   something emits the opposite shape: `data.findings` and `data.score`, and
+   **no `data.error` key at all**. Flipping the switch therefore does not add a
+   meaning to an exit code; it gives one code two mutually exclusive document
+   schemas, and an agent branching on the status has to read the body to pick
+   one. For a tool whose whole promise is that an agent can branch on the
+   status, that is the wrong trade to make in the same release that first
+   produces a finding.
+
+**What to gate on instead, and it is already in the document.** A CI gate reads
+`data.complete` (was the whole card read?) and `data.score.value` (is it under
+the threshold?). Both are per-field, neither collides with the exit code, and
+neither can be mistaken for the other.
+
+**When to revisit.** When #9 lands `--baseline` and `--diff`, both of which are
+already designed to exit 1, a gate has a *threshold* to fail against rather
+than a bare "something is wrong". That is the moment findings-fail-a-scan can
+be attached to a number an operator chose, instead of being smeared across
+every way a scan can go wrong.
 
 The primitive for the change is already written and tested:
-[`Findings::reaches`](src/rules.rs) over the rendered set, at the `Ok(())` arm of
+[
+`Findings::reaches`](src/rules.rs) over the rendered set, at the `Ok(())` arm of
 `run_scan`. The switch is the single constant `FINDINGS_FAIL_A_SCAN` in
-[src/main.rs](src/main.rs), and `findings_do_not_fail_a_scan_yet` fails the moment it is
-flipped to `true`. **Flipping it is a contract change and is not a one-line edit**: the
-table above, the `GATE ON data.complete` sentence in `scan --help`, and the
-`scans_a_real_card_end_to_end` assertion in [tests/card_fixture.rs](tests/card_fixture.rs)
-which currently expects exit 0 against a live swSIM card all have to move in the same
-commit. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
+[src/main.rs](src/main.rs). **Flipping it is a contract change and is not a
+one-line edit**: the table above, the `GATE ON data.complete` sentence in
+`scan --help`, and the `scans_a_real_card_end_to_end` assertion in
+[tests/card_fixture.rs](tests/card_fixture.rs) which currently expects exit 0
+against a live swSIM card all have to move in the same commit. Full reasoning
+in [CONTEXT.md](CONTEXT.md) section 3.
 
 **SIGINT is handled, not inherited.** The handler sets one atomic flag and returns;
 ordinary code notices at a checkpoint and exits 130 itself, so a handled interrupt
@@ -212,6 +246,7 @@ finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 | `--json` | implemented | structured output on stdout, nothing else on stdout |
 | `--score` | implemented | single numeric quality score for CI gating, with its formula beside it |
 | `--severity <level>` | implemented | remove findings below a minimum severity |
+| `--tar <selection>` | implemented | which TARs to probe for MSL 0: `off`, `focused`, `full`, `range:FIRST-LAST`, `regex:PATTERN`; capped at 4096 probes |
 | `--baseline <file>` / `--diff` | **deferred** | regression gating against a saved run; exits 1 with `"implemented": false` before a reader is opened |
 
 A deferred flag refuses honestly rather than returning a plausible-looking number. It emits
@@ -274,6 +309,93 @@ exists because getting it wrong breaks somebody downstream:
 ```
 sim-doctor scan --json | jq '.data.findings[] | select(.rule == "gsma/msl-zero-allowed")'
 ```
+
+### TAR scanning and MSL=0
+
+A TAR is a three-octet value a network uses to route an SMS payload to one
+application on a card. **A card running at MSL 0 accepts ANY command under ANY
+TAR with no cryptographic verification**, so the security question is not "can
+this card be attacked" but "which TARs will it act on". `gsma/msl-zero-allowed`
+answers the sharpest form of it: does this card act on TAR `000000`?
+
+Three things about this feature are contract, and each of them exists because
+the naive version of it is wrong.
+
+#### A TAR reaches a card inside an ENVELOPE, and the ENVELOPE is two exchanges
+
+There is no TAR in a bare command header. The chain is: a 3GPP TS 03.48
+Command Packet holding the TAR, inside a TS 23.040 SMS-DELIVER TPDU, inside an
+ISO/IEC 7816-4 SMS-PP-DOWNLOAD envelope (BER-TLV tag `D1`), inside an ENVELOPE
+command. [src/tar.rs](src/tar.rs) reproduces it octet for octet from SIMTester
+at `d197fef`; the tests pin the bytes against those constants.
+
+**The ENVELOPE cannot be sent in one APDU.** swSIM answers the opening with a
+`61 Lc` procedure byte *before reading a single octet of the data field* [V]
+(swSIM `src/apduh.c`, `apduh_etsi_cat_envelope`: with `procedure_count == 0`
+and `*cmd->p3 > 0` it sets `SWICC_APDU_SW1_PROC_ACK_ALL`, copies nothing out of
+`cmd->data`, and returns). A scanner that transmits the whole envelope inline
+and moves on **leaves the card holding half a command**: the next APDU is
+swallowed as this one's continuation and every later probe is answering about
+the wrong TAR. So the probe is the opening `CLA INS P1 P2 Lc`, then exactly
+`Lc` octets, and the scanner abandons the scan rather than continue if the card
+asks for anything else.
+
+#### "Accepted" is a measurement, not a status word
+
+A TAR is reported **accepted** when the card's answer to it **differs from the
+answer it gives to TARs it has no opinion about**. That is a differential and it
+is SIMTester's own algorithm: `-stbs` runs `TARScanner.tryBeingSmart`, which
+probes twenty TARs, counts the responses, and declares **the most common one to
+be the false response**.
+
+**No status word is hard-coded as "refused", because this project cannot cite
+one.** AGENTS.md blocker 2 records that no 3GPP TS 31.111 text has been read
+here, and the only card this project has talked to contradicts the obvious
+guess: swSIM answers GSM SELECT of a missing file with `94 04` [V] (swSIM
+`src/apduh.c`, `apduh_gsm_select`, `/* "File ID not found" */`). On that card
+`94 04` demonstrably does **not** mean "the TAR was refused". The baseline is
+therefore measured on every scan and published in `data.tar.baseline`.
+
+**This is what stops the rule manufacturing findings, and the fixture proves it.**
+swSIM's proactive application recognises exactly one envelope root tag, `D3`
+(Menu Selection) [V] (swSIM `src/proactive.c`, `proactive_app_default__envelope`,
+`root_tag = {0xD3}`). It has no notion of `D1`, no notion of a TAR and **no
+notion of an MSL at all**. Every SMS-PP-DOWNLOAD envelope on that card, TAR zero
+included, is swallowed and answered `90 00`. A scanner that read `90 00` as
+"accepted" would raise a critical MSL=0 finding for all 656 probes, on a card
+with no TAR check to find. The differential absorbs it: the modal response is
+`90 00`, so nothing is reported. **A card that answers every TAR identically
+reports nothing, and on a card with no TAR check that is the correct answer
+rather than a miss.** When even a baseline cannot be established - the responses
+tied, or carried no status word - `data.tar.blind_spot` says so in words and
+nothing is raised.
+
+#### The probe count is bounded, and the range is justified
+
+The TAR space is 16 777 216 values. **Nothing here will send them all to a
+card.** `tar::MAX_PROBES` caps one scan at **4096** whatever `--tar` asks for; a
+selection that runs past it stops there, reports `data.tar.stopped`, and every
+finding it carries is marked `partial` rather than read as an exhaustive audit of
+the card's TAR allow-list.
+
+`--tar` takes `off`, `focused` (the default), `full`, `range:FIRST-LAST` or
+`regex:PATTERN`, mirroring SIMTester's `-st full` / `-str` / `-stre`. **The
+focused default is 656 TARs**, taken from SIMTester's own band list
+(`TARScanner.prepareTARlist`) and narrowed: `000000`-`0000FF` (which contains TAR
+zero), the five `00NN0F` bands, `3F0000`-`3F003F`, and `BFFF00`-`BFFFFF`. SIMTester's
+list also contains every three-character permutation of printable ASCII - which
+is where real OTA service TARs come from, since a TAR is chosen to look like an
+SMS originator address - but that is over 400 000 values, which does not fit the
+bound and is why `-str` there takes coffee. An operator who wants them says
+`--tar range:200000-7FFFFF`.
+
+A regex is matched against the **six-hex-digit** spelling, so it is six
+characters or it can never match. **This is not what SIMTester's `-stre` does**:
+`TARScanner.analyseResponse` applies its pattern to `currentResponse`, the
+card's *response*, and skips the TAR whose response matched [V]. That is a
+response filter rather than a TAR selector. Both halves exist here and are
+named apart - `--tar regex:` chooses which TARs to probe, and every response is
+recorded per probe under `data.tar.probes`.
 
 ### Severity and score
 
@@ -350,13 +472,30 @@ a decision to record in CONTEXT.md, not a tune.
 | `penalties` | the whole table, keyed by severity spelling |
 | `warning` | non-null when there was nothing to score - see below |
 
-**`scored_findings: 0` is not a clean card.** It is a scan that produced no findings, which
-today means no rule has been implemented. A score of 100 from an empty set is otherwise
-indistinguishable from a card that passed, which is exactly the failure the field exists to
-prevent - so while `rules_run` is 0 the block carries a warning string saying in words that
-nothing on this card was checked. The human report prints the same warning. A CI gate that
-reads `value` without reading `warning` is still making a mistake, and this is documented
-rather than defended against, because a contract that cannot be broken cannot be relied on.
+**`scored_findings: 0` is not automatically a clean card, and `rules_run` is
+what tells the two apart.** A score of 100 from an empty finding set is
+otherwise indistinguishable from a card that passed. **The card fixture proved
+why in issue #24**: on a live swSIM card the scan reports `rules_run` 1,
+`scored_findings` 0, `value` 100, `warning` null - which is a rule that looked
+and found nothing, a verdict - and before any rule existed the same 100 carried
+a warning string saying nothing had been checked at all. Those are the same
+number with opposite meanings, and the difference between them is exactly one
+integer.
+
+So the contract is: while `rules_run` is 0 the block carries a warning string
+saying in words that nothing on this card was checked, and the human report
+prints the same warning. A scan that runs a rule and finds nothing has *earned*
+its 100 and the warning is null. A CI gate that reads `value` without reading
+`rules_run` is still making a mistake, and this is documented rather than
+defended against, because a contract that cannot be broken cannot be relied on.
+
+**This is also why a TAR scan that cannot decide anything is loud.** The swSIM
+card has no TAR check at all, so a scanner that read its answer literally would
+report TAR zero accepted. It does not, because the TAR verdict is a
+*measurement* against a baseline rather than a status word this tool guessed at,
+and `data.tar.blind_spot` says so in words when even that could not be
+established.
+
 
 #### Proving the three copies still agree
 
@@ -511,6 +650,37 @@ Distilled from [docs/research-report.md](docs/research-report.md). All `[V]` unl
 
 Note: `FuzzerFactory.java` is a fuzzer factory, NOT an APDU fuzzer factory. APDU discovery is
 a separate `APDUScanner.java` (`-sa LEVEL 1` CLA via OTA, `-sal2` LEVEL 2 CLA+INS) [V].
+
+### What issue #24 read in SIMTester's TAR scanner [V]
+
+Everything above about the reference is read out of `srlabs/SIMTester` at the
+pinned SHA `d197fef`, not recalled. The four facts worth not rediscovering:
+
+- **The TAR is three octets and there is no header encoding for it.**
+  `TARScanner.HIGHEST_TAR = 16777215` ("this is 0xFFFFFF"), and a TAR reaches a
+  card only inside an SMS-PP-DOWNLOAD envelope.
+- **The envelope is `80 C2 00 00 <data>`** (`Envelope.getAPDU`, 3G branch), built
+  from a TS 03.48 Command Packet (`CommandPacket._formatMessage`), a TS 23.040
+  SMS-DELIVER TPDU (`SMSDeliverTPDU.getBytes`) and a `D1` BER-TLV
+  (`EnvelopeSMSPPDownload`). ISO/IEC 7816-4 numbers ENVELOPE `CA`; the two
+  implementations agree on `C2` and this crate follows them.
+- **`-stbs` is a differential, and that is the algorithm.**
+  `TARScanner.tryBeingSmart` probes twenty TARs, counts the responses and declares
+  **the most common one to be the false response**, skipping anything equal to it.
+  `analyseResponse` calls that "GOT VALID TAR!!" for anything else. A TAR is
+  reported when the response carries a TS 03.48 Response Packet whose status code
+  is not 9, or when the response is not an error at all.
+- **`-stre` filters on the RESPONSE, not on the TAR.**
+  `analyseResponse` matches `_regexp_to_match_response_pattern` against
+  `currentResponse`, so it skips a TAR *whose answer* matched. This crate's
+  `--tar regex:` is a TAR selector instead, and the response side of the
+  comparison is reported per probe.
+
+`prepareTARlist` is also where the focused range came from: `-str` builds its
+list from every three-character permutation of printable ASCII plus the hex
+bands listed in [TAR scanning and MSL=0](#tar-scanning-and-msl0). The
+permutations are over 400 000 values, which is why `-str` there says "go get a
+(few) coffee(s)" and why this crate caps its own sweep.
 
 ### 5.3 pySim-shell command surface
 

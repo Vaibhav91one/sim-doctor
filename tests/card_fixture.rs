@@ -1169,19 +1169,25 @@ fn scans_a_real_card_end_to_end() {
     // 7. And the binary itself, which is the actual acceptance criterion.
     //    `CARGO_BIN_EXE_sim-doctor` is resolved by cargo at compile time, so
     //    this is the binary cargo built rather than a path guessed at run time.
-    //    **The exit-0 assertion below is a STATED contract decision, not a fact
-    //    about the card.** Issue #14 had to answer whether a scan that PRODUCES
-    //    findings should exit 1, because this line is what would move. It
-    //    decided no. Today a scan exits 1 for a check that could not run, and
-    //    making it also mean the card is dirty collapses we-did-not-check into
-    //    it-is-dirty, which is the more alarming of the two mistakes to make with
-    //    a security tool. No rule runs yet, so nothing can produce a finding at
-    //    all, and the line is correct as it stands.
+    //    **The exit-0 assertion below is a STATED contract decision, and issue
+    //    #24 re-took it with a rule in place.** Issue #14 decided it while no
+    //    rule ran, so the question was not yet observable; issue #24 is the
+    //    first issue where a scan can produce a finding at all, which withdrew
+    //    reason 1 of the three AGENTS.md records and left reasons 2 and 3
+    //    standing. It decided no again, for a reason that did not exist
+    //    before: exit 1 is reachable from six conditions already (no reader,
+    //    unknown reader, reader unavailable, walk failed, rule misattribution,
+    //    a deferred flag) and every one of them emits a *refusal* document
+    //    carrying `data.error` and NO `data.findings` key. A scan that found
+    //    something emits the opposite shape. Giving one code two mutually
+    //    exclusive document schemas is the wrong trade for a tool whose whole
+    //    promise is that an agent can branch on the status.
     //
-    //    It is therefore DELIBERATELY left asserting success. If the first rule
-    //    lands and somebody flips FINDINGS_FAIL_A_SCAN in src/main.rs, this
-    //    assertion goes red on purpose. That is the signal, and the message on
-    //    it names the other three places that have to move with it.
+    //    So it stays asserting success, and the finding it would have covered
+    //    is covered by `data.score` and `data.complete` instead. If somebody
+    //    flips FINDINGS_FAIL_A_SCAN in src/main.rs, this assertion goes red on
+    //    purpose; the message on it names the other three places that have to
+    //    move with it.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
         .args(["scan", "--json", "--reader", reader.as_str()])
         .output()
@@ -1242,11 +1248,22 @@ fn scans_a_real_card_end_to_end() {
 /// on stdout needs a card, and this is the only place in the repository that
 /// has one.
 ///
-/// **What it deliberately does not prove.** Anything about a finding. No rule
-/// runs yet, so the findings array is empty and `scored_findings` is 0 on every
-/// combination - which is exactly why the assertions below are about the shape
-/// of the block and the warning it carries rather than about a value. The
-/// arithmetic is proved in `src/rules.rs` and the rendering in `src/scan.rs`.
+/// **What it now proves, and what it still cannot.** Issue #24 registered the
+/// first rule, so `rules_run` is 1 and the score block carries no warning. On
+/// this card the rule finds nothing - swSIM has no TAR check at all, which is
+/// what ``the_tar_audit_meets_a_card_with_no_tar_check`` below
+/// demonstrates from the wire - so `scored_findings` is 0 and the score is
+/// still 100. **Those four facts together are the assertion this issue
+/// turned this test into**: one rule ran, it looked, it found nothing, and the
+/// 100 is therefore a verdict rather than the absence of one. That is the
+/// exact confusion `NO_RULES_WARNING` existed to prevent, and it cannot now
+/// arise on a real scan.
+///
+/// **What it still cannot prove:** that a dirty card scores below 100. That
+/// needs a card that accepts TAR zero, and no fixture this repository has
+/// produces one - swSIM implements no MSL. The arithmetic is proved in
+/// `src/rules.rs`, the rendering in `src/scan.rs`, and the shape of the
+/// finding in `src/scan.rs`s` own tests.
 #[test]
 #[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
 fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
@@ -1356,13 +1373,22 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         serde_json::json!(sim_doctor::scan::rules_run())
     );
 
-    // A score of 100 on this card is NOT a clean card, and the envelope has to
-    // say so in words. This is the assertion the issue asked for and the one
-    // that would fail if somebody dropped the warning as noise.
+    // The four facts, asserted together rather than one at a time, because it
+    // is the COMBINATION that says what the 100 means.
+    //
+    //   rules_run 1          a rule really evaluated this card
+    //   scored_findings 0    it looked and found nothing
+    //   value 100 penalty 0  so nothing was subtracted
+    //   warning null         and this 100 is a verdict, not an absence of one
+    //
+    // The last one is the whole point. Before issue #24 this line asserted the
+    // warning WAS present, which said the opposite: nothing had been checked.
+    // Both are 100 with rules_run beside them; only one of them is a card that
+    // passed.
     assert_eq!(
         block["scored_findings"],
         serde_json::json!(0),
-        "no rule runs, so nothing was scored"
+        "the one rule this crate has found nothing on this card, which is the          right answer for a card with no TAR check"
     );
     assert_eq!(
         block["value"],
@@ -1371,8 +1397,13 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     assert_eq!(block["penalty"], serde_json::json!(0));
     assert_eq!(
         block["warning"],
-        serde_json::json!(sim_doctor::scan::NO_RULES_WARNING),
-        "a 100 that means nothing was checked has to say so beside itself"
+        serde_json::Value::Null,
+        "rules_run is 1, so this 100 was EARNED. A non-null warning here would          be the bug: it would say nothing was checked about a card one rule          just checked"
+    );
+    assert_eq!(
+        block["rules_run"],
+        serde_json::json!(1),
+        "gsma/msl-zero-allowed is registered; a scan that evaluated zero rules          is the regression this assertion exists to catch"
     );
 
     // The table travels too, so the number can be rebuilt without the source.
@@ -1380,7 +1411,9 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         "severity/score: --score emitted value {} penalty {} over {} finding(s) with rules_run {}",
         block["value"], block["penalty"], block["scored_findings"], block["rules_run"]
     );
-    println!("severity/score: the 100 carries the no-rules warning beside it");
+    println!(
+        "severity/score: 100 with rules_run 1, so it is earned rather than the absence of a check"
+    );
 
     let penalties = block["penalties"]
         .as_object()
@@ -1431,8 +1464,192 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         "the human report prints the formula beside the number: {human}"
     );
     assert!(
-        human.contains(sim_doctor::scan::NO_RULES_WARNING),
-        "the human report prints the same warning: {human}"
+        !human.contains(sim_doctor::scan::NO_RULES_WARNING),
+        "the human report must not claim nothing was checked either: {human}"
     );
-    println!("severity/score: the human report printed the formula and the warning");
+    println!("severity/score: the human report printed the formula and no no-rules warning");
+}
+/// Issue #24 against a real card: what does the TAR scanner actually find?
+///
+/// **This is the test that answers the question the issue was written to ask**
+/// - whether MSL 0 can be detected, and on what a real card answers - rather
+/// than asserting a value the fixture was built to produce. It runs the
+/// scanner, prints the whole transcript, and then asserts only the things that
+/// are true of *any* card rather than of one this repository chose.
+///
+/// ## What this card can and cannot say
+///
+/// swSIM has no TAR check at all. [V] swSIM @BT@src/proactive.c@BT@,
+/// @BT@proactive_app_default__envelope@BT@ recognises exactly one envelope root
+/// tag, @BT@0xD3@BT@ (Menu Selection); @BT@0xD1@BT@ - the SMS-PP-DOWNLOAD
+/// envelope a TAR travels in - is not in that list, so every TAR probe is
+/// swallowed and answered @BT@90 00@BT@. grepping swSIM for a TAR allow-list
+/// finds nothing. **A card with no TAR check cannot report MSL 0, and this
+/// test proves that rather than working around it.**
+///
+/// What it CAN prove, and what the assertions below check:
+///
+/// 1. the ENVELOPE exchange works end to end on a card that is not a fake -
+///    the opening draws a procedure byte and the data is accepted,
+/// 2. the baseline is established and is the card's real answer,
+/// 3. a card that answers every TAR identically reports **nothing accepted**,
+///    which is the property that stops the rule manufacturing findings,
+/// 4. and the scan leaves the card answering ordinary commands afterwards.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn the_tar_audit_meets_a_card_with_no_tar_check() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+    println!("tar: using reader {reader}");
+
+    let mut session = PcscSession::open(reader)
+        .unwrap_or_else(|error| panic!("could not connect to {reader}: {error}"));
+
+    // The walk first, so the TAR scan runs against the same card in the same
+    // state an operator's scan would, and so a TAR probe storm is not the
+    // first thing the card ever sees.
+    let dialect = swicc_dialect();
+    let options = sim_doctor::walk::Options::default();
+    let tree = sim_doctor::walk::walk(&mut session, &dialect, &options)
+        .unwrap_or_else(|error| panic!("the walk failed: {error}"));
+    println!(
+        "tar: walked {} nodes before probing anything",
+        tree.report().nodes
+    );
+
+    // The first probe, on its own, with its bytes printed. This is the whole
+    // wire sequence and it is the thing a reader cannot check any other way.
+    let (opening, data) =
+        sim_doctor::tar::envelope_exchange(0x00_00_00, sim_doctor::tar::Class::Etsi)
+            .expect("the envelope is built from fixed-size fields");
+    println!(
+        "tar: TAR 000000 probe is {} then {}",
+        hex(&opening),
+        hex(&data)
+    );
+
+    let started = std::time::Instant::now();
+    let audit = sim_doctor::tar::audit(
+        &mut session,
+        &sim_doctor::tar::Selection::default(),
+        &sim_doctor::session::Policy::default(),
+        &mut || false,
+    )
+    .unwrap_or_else(|error| panic!("the TAR audit failed: {error}"));
+    let elapsed = started.elapsed();
+
+    println!("tar: {}", audit.to_human());
+    println!(
+        "tar: {} TARs in {} exchanges, {:?}",
+        audit.probes.len(),
+        audit.exchanges,
+        elapsed
+    );
+
+    // 1. The baseline is established, and it is the card's real answer. A
+    //    baseline that could not be established would mean the scanner cannot
+    //    tell an accepted TAR from an unknown one, and nothing below would be
+    //    worth checking.
+    assert!(
+        audit.baseline.is_established(),
+        "the baseline has to be established for anything else here to mean \
+         anything: {}",
+        audit.baseline
+    );
+    println!(
+        "tar: baseline is {} from {} calibration probe(s)",
+        audit.baseline,
+        audit.baseline.sampled()
+    );
+
+    // 2. Every TAR was probed and the audit finished. A card that stopped
+    //    answering envelopes part way through is a different fact, and the
+    //    probe loop stops rather than continuing into it.
+    assert_eq!(
+        audit.probes.len(),
+        sim_doctor::tar::FOCUSED_PROBES,
+        "the focused selection has to be probed in full or the audit says so: {}",
+        audit.stopped.as_deref().unwrap_or("(finished)")
+    );
+    assert!(
+        audit.stopped.is_none(),
+        "the TAR scan did not finish: {:?}",
+        audit.stopped
+    );
+
+    // 3. **The finding.** On a card with no TAR check this has to be false, and
+    //    false here is the correct answer rather than a miss: swSIM would
+    //    answer 90 00 to TAR zero and to every other TAR alike, and a rule that
+    //    read that as acceptance would raise a critical MSL=0 finding on every
+    //    one of the 656 probes. The differential is what prevents it.
+    println!("tar: MSL 0 detected = {}", audit.msl_zero_allowed());
+    assert!(
+        !audit.msl_zero_allowed(),
+        "swSIM implements no TAR check, so TAR zero cannot be accepted; if this \
+         fires, the baseline differential has stopped working"
+    );
+
+    // The finding is still computed from the same evidence by the same rule,
+    // so this also proves the rule reads the audit rather than a constant.
+    let subject = sim_doctor::scan::Subject {
+        tree: &tree,
+        tar: &audit,
+    };
+    let found = sim_doctor::scan::findings(&subject).expect("no misattribution");
+    assert!(
+        found.is_empty(),
+        "a card that refused every TAR found nothing: {found:?}"
+    );
+    let verdict = sim_doctor::scan::Verdict::new(found, sim_doctor::scan::rules_run())
+        .tar_audit(audit.clone())
+        .scored(true);
+    let block = verdict.fields();
+    assert_eq!(block["score"]["rules_run"], serde_json::json!(1));
+    assert_eq!(
+        block["score"]["warning"],
+        serde_json::Value::Null,
+        "one rule ran, so the 100 beside it is earned"
+    );
+    assert_eq!(
+        block["tar"]["accepted_count"],
+        serde_json::json!(0),
+        "the card's own baseline covers every TAR it was asked about"
+    );
+
+    // 4. **The card is still usable afterwards.** A probe storm that leaves a
+    //    card unable to answer SELECT has damaged the thing it was pointed at,
+    //    and a scanner that does that is not a scanner. This is the assertion
+    //    the whole two-exchange design exists to be able to make.
+    let after = session.transmit(&SELECT_MF).unwrap_or_else(|error| {
+        panic!(
+            "the card stopped answering after {} TAR probes: {error}",
+            audit.probes.len()
+        )
+    });
+    println!("tar: SELECT MF after the sweep answered {}", hex(&after));
+    assert!(
+        StatusWord::is_success(StatusWord::from_bytes([
+            after[after.len() - 2],
+            after[after.len() - 1]
+        ])) || after.windows(2).any(|w| w[0] == 0x61 || w[0] == 0x9F),
+        "the card still answers SELECT MF after {} TAR probes: {}",
+        audit.probes.len(),
+        hex(&after)
+    );
+
+    session.disconnect().expect("disconnect failed");
+    println!(
+        "tar: {} TARs probed, {} accepted, MSL 0 = {}, card still usable",
+        audit.probes.len(),
+        audit.accepted_count(),
+        audit.msl_zero_allowed()
+    );
 }

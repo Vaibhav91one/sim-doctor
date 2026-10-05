@@ -395,10 +395,8 @@ fn msl_zero_allowed(subject: &Subject<'_>) -> Vec<rules::Finding> {
 /// the report is whole, which is the mistake AGENTS.md section 2 records
 /// at length.
 const TAR_PARTIAL_REASON: &str =
-    "the TAR scan did not finish, so this TAR is known to be accepted but the card may hold \
-
-     others this scan never probed; this report is a list of what was found, not of everything \
-
+    "the TAR scan did not finish, so this TAR is known to be accepted but the card may hold
+     others this scan never probed; this report is a list of what was found, not of everything
      there is";
 
 /// The rules this scan runs over one card.
