@@ -19,6 +19,7 @@
 //! layer 0  transport  bytes to a card and bytes back
 //! layer 0  rules      plugin/rule identifiers and the severity ladder
 //! layer 0  contract   JSON envelope and process exit codes
+//! layer 0  signals    the SIGINT flag, and when it may be acted on
 //! layer 1  fcp        the caller-supplied tag table of a file capabilities
 //!                template, and the file metadata read through it
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
@@ -61,8 +62,12 @@
 //!   keeps a file that is not there apart from a file this terminal may not
 //!   read, in the type rather than in a flag. What is missing is a command
 //!   that turns a [`walk::Tree`] into findings,
-//! - turning findings into an exit code, and SIGINT handling (#8).
-//!   [`contract`] has the four numbers and nothing that chooses between them,
+//! - turning findings into an exit code (#13). Issue #8 landed SIGINT:
+//!   [`signals`] installs the handler, [`contract`] has the number, and
+//!   `src/main.rs` decides that an interrupted run reports
+//!   `ExitCode::Interrupted` at a checkpoint. What is still missing is the
+//!   half that reads a scan's findings and picks between 0 and 1, which
+//!   needs rules that produce findings.
 //! - the clap command surface beyond `sim-doctor modules` (#6),
 //! - findings and the rule registry (#13). [`rules`] has the identifiers and
 //!   the severity ladder and no code that produces either,
@@ -82,6 +87,7 @@ pub mod fcp;
 pub mod fs;
 pub mod rules;
 pub mod session;
+pub mod signals;
 pub mod tlv;
 pub mod transport;
 pub mod walk;
@@ -135,6 +141,11 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: contract::NAME,
         owns: "The lpac-shaped JSON envelope and the four process exit codes.",
+        depends_on: &[],
+    },
+    ModuleInfo {
+        name: signals::NAME,
+        owns: "The SIGINT handler: one atomic flag, checked at a checkpoint, that becomes exit code 130.",
         depends_on: &[],
     },
     ModuleInfo {

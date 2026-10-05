@@ -1961,6 +1961,7 @@ dependencies = [
  "hex",
  "hmac",
  "iso7816",
+ "libc",
  "milenage",
  "oid",
  "owo-colors",

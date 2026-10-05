@@ -37,6 +37,43 @@ pub const DEFAULT_KIND: &str = "lpa";
 /// The `message` an [`ExitCode::Success`] envelope carries.
 pub const OK_MESSAGE: &str = "ok";
 
+/// The `message` an [`ExitCode::Interrupted`] envelope carries.
+///
+/// An interrupted run emits **one** envelope carrying this message and code
+/// 130, and never a partial result. That is a decision, not an omission, and it
+/// is the reason the constant exists:
+///
+/// - **stdin stays pure in every mode.** With `--json`, stdout is one complete
+///   envelope whether the run finished or was cut short, so a consumer never
+///   has to special-case an empty stream.
+/// - **`payload.code` keeps meaning what it is documented to mean.**
+///   [`Payload::code`] says it is "the same value the process exits with". An
+///   interrupted run that printed nothing would break that correspondence on
+///   exactly the one code where a caller most wants to check it; a caller that
+///   reads only the envelope, and never looks at the exit status, still learns
+///   the run was interrupted.
+/// - **a half-finished scan is not a result.** A caller must never be able to
+///   read partial findings as though a walk had completed, so `data` is an empty
+///   object rather than whatever had been gathered when the signal arrived.
+///   Empty rather than null so `data` is always indexable.
+///
+/// In the human (non-`--json`) modes the same event prints a line on **stderr**
+/// and nothing on stdout, because stdout there is a report and there is no
+/// report to give.
+pub const INTERRUPTED_MESSAGE: &str = "interrupted";
+
+/// The `data` an interrupted envelope carries: an empty object.
+///
+/// Never findings, never a count, never a partial tree. See
+/// [`INTERRUPTED_MESSAGE`] for why.
+///
+/// A function rather than a `const` because `serde_json::Map::new` is not a
+/// constant expression; the value it builds is two words wide either way, so
+/// callers should not need to hold on to it.
+pub fn interrupted_data() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// The four statuses a `sim-doctor` process may exit with.
 ///
 /// `u8` rather than a wider integer because every one of the four fits and
@@ -290,6 +327,29 @@ mod tests {
             envelope.to_json().unwrap(),
             r#"{"type":"lpa","payload":{"code":0,"message":"ok","data":{}}}"#
         );
+    }
+
+    #[test]
+    fn an_interrupted_envelope_is_byte_for_byte_the_documented_shape() {
+        // The other end of the contract from
+        // a_success_envelope_is_byte_for_byte_the_documented_shape. Pinned
+        // here because it is the shape an operator triggers by hand, and a
+        // change to it is as breaking for an agent as a change to the success
+        // envelope.
+        let envelope = Envelope::new(
+            DEFAULT_KIND,
+            ExitCode::Interrupted,
+            INTERRUPTED_MESSAGE,
+            interrupted_data(),
+        );
+        assert_eq!(
+            envelope.to_json().unwrap(),
+            r##"{"type":"lpa","payload":{"code":130,"message":"interrupted","data":{}}}"##
+        );
+
+        // The field names and order are the success envelope's, unchanged.
+        let parsed: Envelope = serde_json::from_str(&envelope.to_json().unwrap()).unwrap();
+        assert_eq!(parsed, envelope);
     }
 
     #[test]

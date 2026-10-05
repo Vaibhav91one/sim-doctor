@@ -145,6 +145,17 @@ the reference implementation for agent-friendly terminal UX.
 | 130 | Interrupted by user (SIGINT) |
 | 129 | Invalid usage / bad arguments |
 
+Every one of the four is proved by a test that spawns the built binary and reads its
+real exit status, not by asserting the enum: [tests/process_contract.rs](tests/process_contract.rs).
+
+**SIGINT is handled, not inherited.** The handler sets one atomic flag and returns;
+ordinary code notices at a checkpoint and exits 130 itself, so a handled interrupt
+reports `code() == Some(130)` and never `signal() == Some(SIGINT)`. An interrupted run
+still emits **one** envelope carrying code 130 and an empty `data` - never a partial
+result - so `payload.code` keeps meaning the value the process exits with. Checkpoints
+go before output and never after: a run that has already written its envelope has
+finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
+
 ### Flags
 
 - `--json` - structured output on stdout, nothing else on stdout
