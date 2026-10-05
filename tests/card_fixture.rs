@@ -67,10 +67,11 @@ const SELECT_EF_DIR: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x2F, 0x00];
 /// READ BINARY, offset 0, with Le filled in at run time.
 const READ_BINARY_PREFIX: [u8; 4] = [0x00, 0xB0, 0x00, 0x00];
 
-/// BER-TLV tags the test needs out of a file capabilities template.
+/// The tag table this card answers SELECT with.
 ///
-/// **These are swICC's numbers, not ISO/IEC 7816-4's.** swICC documents its
-/// own mapping in its FCP builder, src/3gpp.c:
+/// **These are swICC's numbers, not ISO/IEC 7816-4's**, and the test now says
+/// so by *passing* them rather than by hard-coding a tag at each use site.
+/// swICC documents its own mapping in its FCP builder, src/3gpp.c:
 ///
 ///     0x80, /* '62': File size,        'A5': UICC characteristics. */
 ///     0x81, /* '62': Total file size,  'A5': App power consumption. */
@@ -78,25 +79,39 @@ const READ_BINARY_PREFIX: [u8; 4] = [0x00, 0xB0, 0x00, 0x00];
 ///     0x83, /* '62': File ID,          ... */
 ///
 /// ISO/IEC 7816-4 table 42 uses 0x82 for the file size and 0x83 for the file
-/// descriptor, so the two disagree on 0x82 and 0x83. Reading an swSIM FCP as
-/// if it were the ISO table yields a nonsense file size, which is exactly what
-/// happened the first time this test ran. [V] for swSIM, read at the pinned
-/// commit. A real card may follow the ISO table instead, so this mapping is
-/// the simulator's, not the protocol's.
-const TAG_FILE_SIZE: u8 = 0x80;
-const TAG_FILE_ID: u8 = 0x83;
-
-/// Finds a two-octet BER-TLV value carrying `tag` inside a template.
+/// descriptor, so the two disagree. Reading an swSIM FCP as if it were the ISO
+/// table yields a nonsense file size, which is exactly what happened the first
+/// time this test ran. [V] for swSIM, read at the pinned commit. A real card
+/// may follow the ISO table instead, which is why the mapping is a value this
+/// test supplies and not a default anywhere in the library: see
+/// `sim_doctor::fcp::TagSet`.
 ///
-/// Deliberately minimal and deliberately explained. The crate can decode one
-/// TLV atom but cannot walk a whole FCP template yet (issue #11), and all this
-/// needs is the file size and the file identifier, both of which are two-octet
-/// values on a SIM. Every match is checked against an expected value by the
-/// caller, so a coincidental hit cannot pass.
-fn find_two_octet_tlv(body: &[u8], tag: u8) -> Option<[u8; 2]> {
-    body.windows(4)
-        .find(|window| window[0] == tag && window[1] == 0x02)
-        .map(|window| [window[2], window[3]])
+/// Issue #11 replaced the four-byte window scan this test used to do with a
+/// real walk over the template. The window scan searched for the byte pattern
+/// `tag 02 xx xx` anywhere in the response, including straddling an atom
+/// boundary, so a value that happened to contain those four octets could
+/// satisfy the assertion; walking the template cannot produce a match that is
+/// not an atom.
+fn swicc_tags() -> sim_doctor::fcp::TagSet {
+    sim_doctor::fcp::TagSet::swicc()
+}
+
+/// Parses a file capabilities template under the dialect the test was told
+/// the card uses.
+///
+/// The dialect is passed in rather than built here because
+/// `fcp::Template<'a>` borrows it: the mapping is owned by whoever is reading
+/// the card, which is the whole point of it being caller-supplied.
+fn parse_fcp<'a>(
+    body: &'a [u8],
+    dialect: &'a sim_doctor::fcp::TagSet,
+) -> sim_doctor::fcp::Template<'a> {
+    sim_doctor::fcp::Template::parse(body, dialect).unwrap_or_else(|error| {
+        panic!(
+            "the FCP is not a usable template: {error}, was {}",
+            hex(body)
+        )
+    })
 }
 
 /// Renders bytes as spaced uppercase hex, the form every reader of this repo's
@@ -271,6 +286,10 @@ fn select_mf_and_settle(session: &mut PcscSession) {
 #[test]
 #[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
 fn drives_a_real_card_through_the_pcsc_transport() {
+    // Which tag table this card answers SELECT with. Stated once, here,
+    // because it is a property of the card rather than of the format.
+    let dialect = swicc_tags();
+
     // 1. A PC/SC context exists and the fixture's reader is in it.
     let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
     println!("readers: {}", reader_list(&readers));
@@ -317,8 +336,11 @@ fn drives_a_real_card_through_the_pcsc_transport() {
     let response = exchange(&mut session, &get_response, "GET RESPONSE (FCP)");
     assert_body_then_normal_processing("GET RESPONSE (FCP)", &response, usize::from(fcp_len));
     let fcp = &response[..usize::from(fcp_len)];
+    let template = parse_fcp(fcp, &dialect);
     assert_eq!(
-        find_two_octet_tlv(fcp, TAG_FILE_ID),
+        template
+            .file_id()
+            .unwrap_or_else(|error| panic!("file ID unreadable: {error}, FCP was {}", hex(fcp))),
         Some([0x3F, 0x00]),
         "the FCP file ID should be 3F00, FCP was {}",
         hex(fcp)
@@ -356,15 +378,20 @@ fn drives_a_real_card_through_the_pcsc_transport() {
         usize::from(fcp_len),
     );
     let fcp = &response[..usize::from(fcp_len)];
+    let template = parse_fcp(fcp, &dialect);
     assert_eq!(
-        find_two_octet_tlv(fcp, TAG_FILE_ID),
+        template
+            .file_id()
+            .unwrap_or_else(|error| panic!("file ID unreadable: {error}, FCP was {}", hex(fcp))),
         Some([0x2F, 0xE2]),
         "the FCP file ID should be 2FE2, FCP was {}",
         hex(fcp)
     );
-    let size = find_two_octet_tlv(fcp, TAG_FILE_SIZE)
-        .map(u16::from_be_bytes)
-        .unwrap_or_else(|| panic!("the FCP has no two-octet file size tag: {}", hex(fcp)));
+    let size = template
+        .file_size()
+        .unwrap_or_else(|error| panic!("file size unreadable: {error}, FCP was {}", hex(fcp)))
+        .unwrap_or_else(|| panic!("the FCP has no file size tag: {}", hex(fcp)))
+        .octets();
     // The read length comes from the card, not from a guess, and a short APDU
     // data field cannot carry more than 255 bytes, so cap rather than fail if
     // a future profile has a larger EF.

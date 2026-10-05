@@ -111,7 +111,18 @@ behaviour, and are flagged as such so nobody generalises them.
   and the file ID in `0x83`, where the ISO table says `82` is the file size
   (`swICC/src/3gpp.c`, the FCP builder's own tag table). Reading an swSIM FCP
   as if it were the ISO table yields a nonsense size. A real card may follow
-  the ISO table, so issue #11 must not hard-code either mapping.
+  the ISO table, so neither mapping may be hard-coded anywhere.
+
+  **RESOLVED by issue #11.** `fcp::TagSet` is the mapping, it is a value the
+  caller supplies, and it has no `Default` and no constructor that invents tags.
+  `fcp::Template::parse` takes one, so a decoder cannot be reached until somebody
+  has recorded which dialect is being read. `TagSet::iec_7816_4_table_42()` and
+  `TagSet::swicc()` are the two known ones; `TagSet::named(..)` plus the
+  `with_*` builders are for a card nobody has characterised. Every `TagSet`
+  carries the name it was given so a scan can report the assumption it ran
+  under. The swICC mapping is named after the software that was observed
+  writing it, not after a specification, because the spec swICC cites
+  (ETSI TS 102 221 clause 11.1.1.3) has not been read here.
 
 ### Never commit card secrets
 
@@ -175,8 +186,41 @@ show - selects the previous major line and will not satisfy milenage at all.
 `der 0.8.2` is strict DER [V]. It rejects the non-minimal BER lengths common in real SIM and
 SGP.22 BPP payloads. It is NOT a drop-in BPP parser.
 
-Use `iso7816-tlv 0.4.4` (preferred, scoped to ISO/IEC 7816-4) or `flexiber 0.2.0` for BER-TLV.
 Keep `der` for actual DER, i.e. certificates.
+
+#### 4.2.1 Which BER-TLV library: none. RESOLVED by issue #11 [V]
+
+This section used to nominate `iso7816-tlv 0.4.4` or `flexiber 0.2.0`. Issue #11 read
+both at those versions and **removed both from `Cargo.toml`**. BER-TLV is
+[src/tlv.rs](src/tlv.rs), hand-rolled, and the strict DER counterpart is
+[src/der.rs](src/der.rs), a separate module with separate types.
+
+Why, in the order the arguments actually carried weight:
+
+- **`iso7816-tlv` 0.4.4 reads an indefinite length (`80`) as length zero** instead of
+  rejecting it (`ber/tlv.rs`, `Tlv::read_len`: `n_bytes == 0` means the loop runs zero
+  times). A decoder that answers a question instead of saying it cannot is the worst
+  failure mode available, and `tlv::Error::IndefiniteLength` exists to prevent it.
+- It **owns and copies** every value into nested `Vec`s (`Value::Primitive(Vec<u8>)`,
+  `Value::Constructed(Vec<Tlv>)`). A card file body is up to 65535 octets and a scan walks
+  dozens of them; `Tlv<'a>` borrows out of the response buffer instead.
+- It **rejects a single-octet tag whose low five bits are all set** (`Tag::try_from` returns
+  `InvalidInput` for `7F`) because it decodes the identifier octet as a multi-octet BER
+  tag. That is the class-bit question `Tag` deliberately leaves open.
+- Its **encoder is not canonical**: `Tlv::inner_len_to_vec` tests `l < 0x7f` rather than
+  `l <= 0x7f`, so a re-encode writes a 127-octet value as `81 7F`.
+- **`flexiber` 0.2.0's length rules are behaviourally identical to ours** - short form
+  below `0x80`, `80` rejected, `81`/`82` accepted non-minimally, `83`+ rejected
+  (`length.rs`, `impl Decodable for Length`). That is real validation of the design. But it
+  keeps only the parsed length and **discards the form it arrived in**, which is exactly
+  what `tlv::Length` exists to preserve, and it is BER-only so it could not have supplied
+  the strict half either.
+- Decisive: **the acceptance criterion is that the non-minimal tolerance be tested here.**
+  Delegating the decoder delegates the property, and a property this repository cannot
+  assert is not a property this project has.
+
+Adding a BER crate later would mean rewriting `tlv.rs`, not wrapping it. Do not re-add
+these without reopening that decision in CONTEXT.md.
 
 ### 4.3 Yanked versions to avoid
 

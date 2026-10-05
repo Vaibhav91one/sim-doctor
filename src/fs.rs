@@ -3,13 +3,15 @@
 //! **Owns.** The vocabulary of the card file system: what a file is called
 //! ([`FileId`]), whether it can hold other files ([`FileKind`]), and how a
 //! file is addressed from the root ([`Path`]). This is the only module allowed
-//! to depend on [`crate::apdu`] and [`crate::tlv`], because it is the only one
+//! to depend on [`crate::apdu`] and [`crate::fcp`], because it is the only one
 //! that knows both vocabularies at once: it can say "SELECT this file" and it
 //! can read the file descriptor a card hands back.
 //!
 //! **Does not own.** Walking the tree, which is issue #7. This module can
 //! address a file and read one identifier out of a response; it cannot list a
-//! directory, enumerate children, or decide what a scan found.
+//! directory, enumerate children, or decide what a scan found. Decoding a file
+//! capabilities template is [`crate::fcp`]'s, and [`selected_file_id`] is a
+//! two-line adapter over it rather than a second TLV walker.
 //!
 //! **What `Path` deliberately does not know.** A path is a sequence of file
 //! identifiers, and a sequence alone does not say whether the last segment is
@@ -27,22 +29,10 @@ pub const NAME: &str = "fs";
 
 use std::{fmt, str::FromStr};
 
-use crate::{apdu, tlv};
+use crate::{apdu, fcp};
 
 /// The separator between file identifiers in a rendered [`Path`].
 const SEPARATOR: char = '/';
-
-/// The BER tag a SELECT response uses to report the file identifier of the
-/// file it selected.
-const FILE_ID_TAG: u8 = 0x84;
-
-/// How deep [`selected_file_id`] will look for a file identifier.
-///
-/// One is enough for every FCP template a SIM returns: the identifier is a
-/// direct child of the template at the top of the response. The cap is here
-/// so that a malformed or hostile response cannot drive unbounded recursion,
-/// and it is small because a SIM never needs more.
-const MAX_TEMPLATE_DEPTH: usize = 4;
 
 /// A two-octet SIM file identifier.
 ///
@@ -286,7 +276,7 @@ impl FromStr for Path {
 /// `00 A4 00 00`, with the target file identifier in the data field. GSM
 /// 11.11 sends that identifier unadorned, not wrapped in a TLV, which is why
 /// this hands back an [`apdu::Header`] and an identifier rather than a
-/// [`tlv::Tlv`].
+/// [`crate::tlv::Tlv`].
 ///
 /// A free function rather than a method because there is exactly one SELECT
 /// command; it is the same whether the target is the master file, a dedicated
@@ -299,52 +289,45 @@ pub fn select_header() -> apdu::Header {
 ///
 /// Most SIM files do not echo their identifier, in which case this returns
 /// `None` and the caller already knows which file it asked for. A card that
-/// does echo it puts a two-octet FileID atom (`84`) inside the file
-/// descriptor template at the top of the response.
+/// does echo it puts a two-octet FileID atom inside the file capabilities
+/// template at the top of the response.
 ///
-/// This reads one identifier out of a response. It is not a response
-/// decoder: interpreting file size, file type, or access conditions is issue
-/// #7, and belongs with the scanner rather than with the vocabulary.
+/// **Which tag that is, is the caller's decision.** `dialect` says which
+/// table the card being read follows: [`fcp::TagSet::iec_7816_4_table_42`]
+/// puts the file identifier in `84`, and [`fcp::TagSet::swicc`] puts it in
+/// `83`. Hard-coding either one is the bug AGENTS.md section 2 records, and
+/// the parameter is how this function refuses to do it.
+///
+/// This reads one identifier and nothing else. Interpreting file size, file
+/// type or access conditions is [`fcp`]'s, and deciding what a scan found is
+/// issue #7's; this is the one adapter between the two vocabularies.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Tlv`] if the body is not well-formed BER-TLV, and
-/// [`Error::MalformedFileIdTag`] if a `84` atom holds anything other than two
-/// octets.
-pub fn selected_file_id(response_body: &[u8]) -> Result<Option<FileId>, Error> {
-    let Some(atom) = find_file_id(response_body, 0)? else {
+/// Returns [`Error::Fcp`] if the body is not well-formed BER-TLV, or if the
+/// file identifier atom holds anything other than two octets. The latter is
+/// reported rather than truncated: reading the first two octets of a
+/// three-octet value would fabricate an address the card never sent.
+///
+/// # Example
+///
+/// ```
+/// use sim_doctor::{fcp::TagSet, fs};
+///
+/// // swSIM answers SELECT EF.IMSI with its identifier in `83`.
+/// let body = [0x62, 0x04, 0x83, 0x02, 0x2F, 0xE2];
+/// let id = fs::selected_file_id(&body, &TagSet::swicc())?;
+/// assert_eq!(id.unwrap().to_string(), "2FE2");
+/// # Ok::<(), fs::Error>(())
+/// ```
+pub fn selected_file_id(
+    response_body: &[u8],
+    dialect: &fcp::TagSet,
+) -> Result<Option<FileId>, Error> {
+    let Some(bytes) = fcp::Template::parse(response_body, dialect)?.file_id()? else {
         return Ok(None);
     };
-    let bytes: [u8; 2] = atom
-        .value()
-        .try_into()
-        .map_err(|_| Error::MalformedFileIdTag {
-            found: atom.value().len(),
-        })?;
     Ok(Some(FileId::from_bytes(bytes)))
-}
-
-/// Looks for a `84` atom at or just inside the templates of `body`.
-///
-/// Depth-limited by [`MAX_TEMPLATE_DEPTH`]. Returns the atom rather than a
-/// [`FileId`] so that the caller can report a wrong-sized value precisely
-/// instead of getting a generic "not found".
-fn find_file_id(body: &[u8], depth: usize) -> Result<Option<tlv::Tlv<'_>>, Error> {
-    let mut rest = body;
-    while !rest.is_empty() {
-        let (atom, consumed) = tlv::Tlv::decode(rest)?;
-        rest = &rest[consumed..];
-
-        if atom.tag().octet() == FILE_ID_TAG {
-            return Ok(Some(atom));
-        }
-        if atom.is_constructed() && depth < MAX_TEMPLATE_DEPTH {
-            if let Some(found) = find_file_id(atom.value(), depth + 1)? {
-                return Ok(Some(found));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// Everything that can go wrong while naming a file.
@@ -372,16 +355,13 @@ pub enum Error {
         segment: String,
     },
 
-    /// A FileID atom held something other than two octets.
-    #[error("a FileID template held {found} octets, not the 2 a file identifier needs")]
-    MalformedFileIdTag {
-        /// How many octets the atom actually held.
-        found: usize,
-    },
-
-    /// The response body was not well-formed BER-TLV.
-    #[error("the response body is not well-formed BER-TLV: {0}")]
-    Tlv(#[from] tlv::Error),
+    /// The response body was not usable as a file capabilities template.
+    ///
+    /// Either not well-formed BER-TLV, or well formed but carrying a file
+    /// identifier of the wrong shape. [`crate::fcp::Error`] distinguishes the
+    /// two, and a scan wants to as well.
+    #[error("the response body is not a usable file capabilities template: {0}")]
+    Fcp(#[from] fcp::Error),
 }
 
 #[cfg(test)]
@@ -523,31 +503,54 @@ mod tests {
     #[test]
     fn a_response_that_echoes_its_identifier_is_read_out_of_the_template() {
         // A FileDescriptor template holding a two-octet FileID atom, which is
-        // the shape a card answers SELECT with when it echoes at all.
-        let body = [0x6F, 0x06, 0x84, 0x02, 0x2F, 0xE2, 0x82, 0x01, 0x02];
+        // the shape a card answers SELECT with when it echoes at all. Tag 84
+        // is the ISO table's choice, so the caller says so.
+        let body = [0x6F, 0x07, 0x84, 0x02, 0x2F, 0xE2, 0x82, 0x01, 0x02];
+        let iso = fcp::TagSet::iec_7816_4_table_42();
         assert_eq!(
-            selected_file_id(&body).unwrap(),
+            selected_file_id(&body, &iso).unwrap(),
             Some(FileId::from_bytes([0x2F, 0xE2])),
         );
+    }
+
+    #[test]
+    fn the_same_bytes_read_under_the_wrong_table_yield_nothing() {
+        // The finding, as code: tag 84 is the file identifier under one table
+        // and nothing at all under the other. Returning `None` rather than a
+        // guess is the whole reason the mapping is a parameter.
+        let body = [0x62, 0x04, 0x83, 0x02, 0x2F, 0xE2];
+        assert_eq!(
+            selected_file_id(&body, &fcp::TagSet::swicc()).unwrap(),
+            Some(FileId::from_bytes([0x2F, 0xE2])),
+        );
+
+        let iso = fcp::TagSet::iec_7816_4_table_42();
+        assert_eq!(selected_file_id(&body, &iso).unwrap(), None);
     }
 
     #[test]
     fn a_response_that_echoes_nothing_returns_nothing() {
         // Most SIM files do not echo their identifier; the caller already
         // knows which file it asked for.
+        let dialect = fcp::TagSet::swicc();
         let body = [0x62, 0x00];
-        assert_eq!(selected_file_id(&body).unwrap(), None);
-        assert_eq!(selected_file_id(&[]).unwrap(), None);
+        assert_eq!(selected_file_id(&body, &dialect).unwrap(), None);
+        assert_eq!(selected_file_id(&[], &dialect).unwrap(), None);
     }
 
     #[test]
     fn an_echoed_identifier_of_the_wrong_size_is_an_error_not_a_guess() {
         // Three octets is not a file identifier, and reading the first two
         // would fabricate an identifier the card never sent.
-        let body = [0x6F, 0x05, 0x84, 0x03, 0x2F, 0xE2, 0x00];
-        assert_eq!(
-            selected_file_id(&body),
-            Err(Error::MalformedFileIdTag { found: 3 }),
+        let dialect = fcp::TagSet::swicc();
+        let body = [0x6F, 0x05, 0x83, 0x03, 0x2F, 0xE2, 0x00];
+        let error = selected_file_id(&body, &dialect).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Fcp(fcp::Error::MalformedField { found: 3, .. })
+            ),
+            "{error}"
         );
     }
 
@@ -555,7 +558,11 @@ mod tests {
     fn a_malformed_response_body_surfaces_the_tlv_failure() {
         // The template claims six octets and supplies three. The caller needs
         // to know the bytes were unusable, not that no file was found.
+        let dialect = fcp::TagSet::iec_7816_4_table_42();
         let body = [0x6F, 0x06, 0x84, 0x02];
-        assert!(matches!(selected_file_id(&body), Err(Error::Tlv(_))));
+        assert!(matches!(
+            selected_file_id(&body, &dialect),
+            Err(Error::Fcp(fcp::Error::Tlv(_)))
+        ));
     }
 }

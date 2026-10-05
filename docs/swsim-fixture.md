@@ -183,9 +183,14 @@ Not "a reader was listed". In order:
    **SELECT MF** again because 2F00 and 2FE2 hang off the MF and not off
    DF GSM.
 6. **SELECT EF.IMSI (2FE2)** with FCP returns **61 xx**; the **GET RESPONSE**
-   body must carry the tag **83** file descriptor with the value **2F E2**,
-   proving which file was actually selected, and the tag **82** file size,
-   which is then used as the Le of the read rather than a guessed number.
+   body must carry the file identifier **2F E2** in tag **83**, proving which
+   file was actually selected, and the file size in tag **80**, which is then
+   used as the Le of the read rather than a guessed number. The test reads
+   both through `fcp::TagSet::swicc()`, the swICC mapping, because that is what
+   this card answers with. The earlier version of this test said "tag **83**
+   file descriptor and tag **82** file size", which is the ISO table's reading
+   of swICC's bytes; issue #11 made the mapping an explicit argument so the two
+   cannot be confused again.
 7. **READ BINARY** of exactly that many bytes returns exactly that many bytes
    of non-fill content followed by a normal processing status word.
 8. **READ BINARY on EF.DIR (2F00)** must be **refused** with a 6X status.
@@ -266,6 +271,25 @@ So inside an FCP template swSIM puts the **file size in 0x80**, the file
 descriptor in **0x82**, and the **file ID in 0x83**. [V], read in swSIM source
 at the pinned commit.
 
+**Where the file actually is.** `src/3gpp.c` is in **swSIM**
+(`tomasz-lisowski/swsim`), not in swICC, at commit
+`281da8c63398ece9a5126cad969674f4f413ab63`; swICC is the library swSIM links
+against, pinned as submodule `421c8cdd544d1fab508351d8cd81c5f61aae6363`. The
+file-descriptor byte layout this crate reads comes from that swICC commit's
+`src/fs.c` (`swicc_fs_file_descr_byte`), whose own comment cites
+ISO/IEC 7816-4:2020 clause 7.4.5 table 12. swSIM's own comments attribute the
+FCP tag table to ETSI TS 102 221 V16.4.0 clause 11.1.1.3, which this repository
+has not read, so the mapping is named after the software that was observed
+writing it rather than after that specification.
+
+**How the crate handles it.** `fcp::TagSet` is the mapping, supplied by the
+caller. It has no `Default` and no constructor that invents tags, so
+`fcp::Template::parse` cannot be reached until somebody has said which table
+is being read; `TagSet::swicc()` and `TagSet::iec_7816_4_table_42()` are the two
+known ones, and `TagSet::named(..)` plus the `with_*` builders are there for a
+card nobody has characterised. Every `TagSet` carries the name it was given, so
+a scan can report the assumption it ran under instead of burying it.
+
 Two FCPs as the card actually sent them:
 
 ~~~
@@ -319,9 +343,17 @@ Two habits this changed in the test, both worth keeping:
   carries the file identifier, so the test asserts it equals **2F E2** before
   issuing the read. A SELECT that answers 9000 has told you it resolved
   something, not which.
-- **Take the length from the FCP, not from a guess.** Tag **82** is the file
-  size; asking for a hardcoded 15 because EF.DIR looked about that long is
-  exactly the kind of assertion that rots silently.
+- **Take the length from the FCP, not from a guess.** On this card the file
+  size is tag **80**; asking for a hardcoded 15 because EF.DIR looked about
+  that long is exactly the kind of assertion that rots silently.
+- **Say which tag table you are reading.** The test passes
+  `fcp::TagSet::swicc()` explicitly rather than relying on a default, because
+  there is no default and there cannot be one. Before issue #11 the test
+  scanned the FCP with a four-octet window and hard-coded `0x80` and `0x83`;
+  that window would have matched a three-octet file identifier and passed on a
+  template it should have rejected. It now walks the template with
+  `tlv::Stream` and reads it through the mapping, which is what makes step 6's
+  assertion a real check.
 
 ### Why GET RESPONSE uses CLA 0xA0
 

@@ -13,17 +13,20 @@
 //! dependency names a module that does not exist.
 //!
 //! ```text
-//! layer 0  tlv        tag, length and value atoms
+//! layer 0  tlv        tag, length and value atoms, and a stream over them
+//! layer 0  der        strict DER: minimal lengths, definite, certificates only
 //! layer 0  apdu       CLA INS P1 P2 and the two-byte status word
 //! layer 0  transport  bytes to a card and bytes back
 //! layer 0  rules      plugin/rule identifiers and the severity ladder
 //! layer 0  contract   JSON envelope and process exit codes
-//! layer 1  fs         file identifiers, file kinds and paths over apdu + tlv
+//! layer 1  fcp        the caller-supplied tag table of a file capabilities
+//!                template, and the file metadata read through it
+//! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
 //! ```
 //!
-//! Two consequences worth stating out loud, because later issues will press
-//! on both:
+//! Three consequences worth stating out loud, because later issues will
+//! press on all of them:
 //!
 //! - `transport` does **not** know about `apdu`. The transport moves opaque
 //!   bytes; APDU chaining is built one layer up. Issue #10 wants chaining in
@@ -32,10 +35,13 @@
 //!   `serde_json::Value`, so once issue #13 adds findings, they are serialized
 //!   into it by `rules` rather than wrapped in it. That is what keeps the
 //!   envelope shape free to change without dragging the rule model along.
+//! - `der` and `tlv` are both layer 0 and neither depends on the other. That
+//!   is the structural half of AGENTS.md 4.2: a strict-DER caller cannot
+//!   reach the BER path, because there is no path to reach.
 //!
 //! # What this crate does not contain yet
 //!
-//! This is Phase 0: module boundaries and the vocabulary that crosses them.
+//! This is Phase 1: module boundaries and the vocabulary that crosses them.
 //! Every module doc comment names the issue that fills it in. What is absent
 //! on purpose, stated precisely so the list does not rot:
 //!
@@ -50,20 +56,27 @@
 //!   is still missing is the typed encode/decode that makes a session useful
 //!   for scanning (#5, landed in [`apdu`]), and the human-facing session
 //!   facade (#10, on top of [`session`]).
-//! - BER-TLV stream decoding (#11). [`tlv`] decodes one atom and reports its
-//!   length; walking a whole file body is not written,
-//! - filesystem walking (#7). [`fs`] can address a file and read one identifier
-//!   out of a response; it cannot enumerate anything,
+//! - filesystem walking (#7). [`fs`] can address a file and read one
+//!   identifier out of a response, and [`fcp`] reads a whole capabilities
+//!   template; what is missing is the walk that ties them to a card,
 //! - turning findings into an exit code, and SIGINT handling (#8).
 //!   [`contract`] has the four numbers and nothing that chooses between them,
 //! - the clap command surface beyond `sim-doctor modules` (#6),
 //! - findings and the rule registry (#13). [`rules`] has the identifiers and
-//!   the severity ladder and no code that produces either.
+//!   the severity ladder and no code that produces either,
+//! - anything on the non-TLV side of the crypto stack. Issue #11 landed the
+//!   BER-TLV stream decoder ([`tlv::Stream`]), the caller-supplied file
+//!   capabilities tag table and the file metadata read through it ([`fcp`]),
+//!   and the strict DER path as its own type ([`der`]). Still missing: an
+//!   SGP.22 BPP builder, and a certificate parser that hands validated bytes
+//!   to the `der` crate.
 
 #![deny(missing_docs)]
 
 pub mod apdu;
 pub mod contract;
+pub mod der;
+pub mod fcp;
 pub mod fs;
 pub mod rules;
 pub mod session;
@@ -97,6 +110,11 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[],
     },
     ModuleInfo {
+        name: der::NAME,
+        owns: "Strict DER for certificates: minimal lengths, definite form, a different type from tlv.",
+        depends_on: &[],
+    },
+    ModuleInfo {
         name: apdu::NAME,
         owns: "The typed ISO 7816-4 command header and the two-byte status word.",
         depends_on: &[],
@@ -117,9 +135,14 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[],
     },
     ModuleInfo {
+        name: fcp::NAME,
+        owns: "The caller-supplied tag table of a file capabilities template, and the file metadata read through it.",
+        depends_on: &[tlv::NAME],
+    },
+    ModuleInfo {
         name: fs::NAME,
         owns: "File identifiers, file kinds and paths over the card's file system.",
-        depends_on: &[apdu::NAME, tlv::NAME],
+        depends_on: &[apdu::NAME, fcp::NAME],
     },
     ModuleInfo {
         name: session::NAME,

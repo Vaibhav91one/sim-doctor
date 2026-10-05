@@ -27,15 +27,14 @@ sha3 = "0.12.0"
 p256  = "0.14.0"    # NIST P-256, otPK/otSK .ECKA
 ecdsa = "0.17.0"    # RFC 6979 deterministic signing
 
-# --- ASN.1 ---
+# --- ASN.1 / DER ---
 # WARNING: der is STRICT DER only and will NOT parse BER-TLV BPP payloads.
-# Use iso7816-tlv for BER-TLV. Keep der for certificates only.
+# BER-TLV for SIM files and SGP.22 payloads is src/tlv.rs, hand-rolled: see the
+# module documentation for why neither iso7816-tlv nor flexiber was adopted.
+# Keep der for certificates only. src/der.rs is the strict path inside this
+# crate, as a separate type so the two cannot be confused.
 der = "0.8.2"       # 0.8.0 is YANKED
 oid = "0.3.0"
-
-# --- BER-TLV (SIM/UICC files + SGP.22 BPP) ---
-iso7816-tlv = "0.4.4"  # ISO/IEC 7816-4 TLV handling - primary choice
-flexiber     = "0.2.0"  # ISO 7816-4 BER-TLV encode/decode - alternative
 
 # --- CLI / TUI ---
 clap = { version = "4.6.7", features = ["derive"] }
