@@ -1031,13 +1031,24 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
 /// that round-trips to the same bytes, and a code that matches the process.
 #[test]
 fn json_stdout_is_one_envelope_across_the_whole_flag_matrix() {
-    let severities = ["info", "low", "medium", "high", "critical"];
-    let matrix: [(&[&str], &str); 15] = [
+    // Every rung of the ladder appears, because a spelling that parses at one
+    // level and not another is a flag-level bug a cardless machine would
+    // otherwise report as a reader failure rather than as a parse failure.
+    let matrix: [(&[&str], &str); 18] = [
         (&["--json"], "bare"),
         (&["--json", "--score"], "score"),
-        (&["--json", "--severity", "high"], "one severity"),
-        (&["--json", "--severity", "info"], "lowest severity"),
-        (&["--json", "--severity", "critical"], "highest severity"),
+        (&["--json", "--severity", "info"], "the lowest severity"),
+        (&["--json", "--severity", "low"], "low"),
+        (&["--json", "--severity", "medium"], "medium"),
+        (&["--json", "--severity", "high"], "high"),
+        (
+            &["--json", "--severity", "critical"],
+            "the highest severity",
+        ),
+        (
+            &["--json", "--score", "--severity", "low"],
+            "score and the lowest rung",
+        ),
         (
             &["--json", "--score", "--severity", "high"],
             "score and severity",
@@ -1085,7 +1096,6 @@ fn json_stdout_is_one_envelope_across_the_whole_flag_matrix() {
             "an implemented flag beside a deferred one",
         ),
     ];
-    debug_assert_eq!(matrix.len(), severities.len() + 10);
 
     for (flags, what) in matrix {
         let mut args = vec!["scan"];
