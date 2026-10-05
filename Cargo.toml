@@ -52,6 +52,10 @@ thiserror = "2.0.21"
 # --- Logging / util ---
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+libc = "0.2.190"      # POSIX signal(2) for the SIGINT handler in src/signals.rs.
+                      # NOT a new package in the tree: libc 0.2.190 is already in
+                      # Cargo.lock via pcsc and the crypto stack, so this only
+                      # adds a direct edge, not a download.
 hex = "0.4.3"
 bytes = "1.12.1"
 rand = "0.10.3"      # MAJOR LINE JUMP 0.8->0.9->0.10 - see AGENTS.md warning
