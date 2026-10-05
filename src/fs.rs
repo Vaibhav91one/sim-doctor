@@ -285,6 +285,48 @@ pub fn select_header() -> apdu::Header {
     apdu::Header::new(0x00, 0xA4, 0x00, 0x00)
 }
 
+/// The header of a SELECT that asks for the file's capabilities template.
+///
+/// `00 A4 00 04`. P1 is the GSM 11.11 "select by file identifier" coding and
+/// P2's bit b2 selects the file capabilities template as the response data.
+///
+/// **Issue #7 added this beside [`select_header`] because the two are not
+/// interchangeable and only one of them is answerable by a UICC.** P2 `00` asks
+/// for a file control information template, which ISO/IEC 7816-4 clause 7.5.1
+/// allows and which swSIM answers, but swSIM's own 3GPP SELECT handler treats a
+/// P2 that is neither `04` (FCP) nor `0C` (no response data) as RFU and answers
+/// `6A 86` \\\[V], read in swSIM `src/apduh.c:apduh_3gpp_select` at swsim commit
+/// `281da8c63398ece9a5126cad969674f4f413ab63`. A walk that wants a file's own
+/// capabilities has to say so in P2, and saying so is this header.
+///
+/// [`select_header`] is left alone because its own test states the GSM 11.11
+/// spelling rather than claiming a card will answer it.
+pub fn select_capabilities_header() -> apdu::Header {
+    apdu::Header::new(0x00, 0xA4, 0x00, 0x04)
+}
+
+/// The header of a SELECT addressed by an absolute path from the master file.
+///
+/// `00 A4 08 04`. P1 `08` is the 3GPP "select by path from the MF" coding and
+/// the command data is the whole path with the master file's own identifier
+/// removed, so the deepest file a walker addresses needs four octets of data.
+///
+/// This exists because a two-octet file identifier is not an absolute address.
+/// GSM 11.11 reads a SELECT by file identifier against the master file, so on a
+/// card that follows it, asking for a file inside a dedicated file by
+/// identifier alone either resolves somewhere else or not at all. The path
+/// form does not care what the card currently has selected.
+///
+/// swSIM answers both forms \\\[V], read in `src/apduh.c:apduh_3gpp_select` and
+/// `src/fs/va.c:swicc_va_select_file_path` at swsim commit `281da8c6`: P1 `08`
+/// walks the path one segment at a time from `3F00`, and a path the card does
+/// not hold comes back `6A 82`. It needs at least one identifier in the data
+/// field, so the master file itself cannot be addressed this way and
+/// [`select_capabilities_header`] is used for it instead.
+pub fn select_path_header() -> apdu::Header {
+    apdu::Header::new(0x00, 0xA4, 0x08, 0x04)
+}
+
 /// The file identifier a SELECT response reports back, if it reports one.
 ///
 /// Most SIM files do not echo their identifier, in which case this returns

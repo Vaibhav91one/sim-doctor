@@ -23,6 +23,7 @@
 //!                template, and the file metadata read through it
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
+//! layer 1  walk        the DF-tree walk: probe, descend, bound, report
 //! ```
 //!
 //! Three consequences worth stating out loud, because later issues will
@@ -56,9 +57,10 @@
 //!   is still missing is the typed encode/decode that makes a session useful
 //!   for scanning (#5, landed in [`apdu`]), and the human-facing session
 //!   facade (#10, on top of [`session`]).
-//! - filesystem walking (#7). [`fs`] can address a file and read one
-//!   identifier out of a response, and [`fcp`] reads a whole capabilities
-//!   template; what is missing is the walk that ties them to a card,
+//! - the rule layer's view of a walk (#9). [`walk`] walks the tree and
+//!   keeps a file that is not there apart from a file this terminal may not
+//!   read, in the type rather than in a flag. What is missing is a command
+//!   that turns a [`walk::Tree`] into findings,
 //! - turning findings into an exit code, and SIGINT handling (#8).
 //!   [`contract`] has the four numbers and nothing that chooses between them,
 //! - the clap command surface beyond `sim-doctor modules` (#6),
@@ -82,6 +84,7 @@ pub mod rules;
 pub mod session;
 pub mod tlv;
 pub mod transport;
+pub mod walk;
 
 /// One module root: what it is called, what it owns, and what it may use.
 ///
@@ -148,6 +151,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: session::NAME,
         owns: "Typed exchanges over a card: chaining, follow-ups, reassembly.",
         depends_on: &[apdu::NAME, transport::NAME],
+    },
+    ModuleInfo {
+        name: walk::NAME,
+        owns: "The DF-tree walk: select the master file, probe identifiers, descend, and keep absent apart from forbidden.",
+        depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fcp::NAME, fs::NAME, session::NAME],
     },
 ];
 

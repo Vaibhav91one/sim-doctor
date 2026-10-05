@@ -362,6 +362,144 @@ src/apduh.c dispatches CLA 0xA0 INS 0xC0 to the same response queue the 3GPP
 SELECT filled. CLA 0x00 INS 0xC0 is not dispatched at all. [V], read in
 swSIM source at the pinned commit.
 
+## What issue #7's walk added, and what it cost a CI run to learn
+
+The walker lives in [../src/walk.rs](../src/walk.rs) and is verified on this
+fixture by `walks_the_file_system_of_a_real_card` in
+[../tests/card_fixture.rs](../tests/card_fixture.rs). Four facts came out of
+reading swSIM and swICC at the pinned commits, and a later issue that walks a
+card will meet all four.
+
+### SELECT must ask for the capabilities template, or it gets 6A 86
+
+`src/apduh.c:apduh_3gpp_select` decodes P2 into a data-request field and
+rejects anything that is neither `04` (FCP) nor `0C` (no response data):
+
+~~~c
+switch (cmd->hdr->p2 & 0b10011100)
+{
+case 0b00000100: data_req = DATA_REQ_FCP;     break;
+case 0b00001100: data_req = DATA_REQ_ABSENT; break;
+default:        data_req = DATA_REQ_RFU;     break;
+}
+...
+if (meth == METH_RFU || data_req == DATA_REQ_RFU ...)
+{
+    res->sw1 = SWICC_APDU_SW1_CHER_P1P2;  /* 6A */
+    res->sw2 = 0;
+}
+~~~
+
+So the GSM 11.11 spelling `00 A4 00 00 02 3F 00`, which asks for a file
+control information template, is **refused**. A walk that wants a file's own
+capabilities has to send P2 = `04`, which is why
+`fs::select_capabilities_header()` now sits beside `fs::select_header()`. \\[V],
+swSIM `281da8c6`.
+
+### P1 = 08 is "select by path from the MF", and it works
+
+`apduh_3gpp_select` maps P1 `08` to `METH_PATH_MF` and hands the data field
+to `swicc_va_select_file_path`, which walks it one segment at a time from
+`3F00` with `swicc_disk_file_foreach(..., recurse = false)`. A path the card
+does not hold comes back `6A 82`. \\[V], swSIM `src/apduh.c` and swicc
+`src/fs/va.c` at `421c8cdd`.
+
+**The two-octet form does not do this.** `METH_FID` calls
+`swicc_va_select_file_id`, which calls `swicc_disk_lutid_lookup` over *every*
+tree in the disk. So on swSIM a SELECT by file identifier is a **global**
+lookup: `00 A4 00 04 02 FF01` reaches ADF.USIM from anywhere, and a walk that
+used it would produce a tree that is not the card's directory structure. That
+is why `walk::Addressing::PathFromMasterFile` is the default and why
+`Addressing::Identifier` carries a warning saying exactly this. \\[V].
+
+### GET RESPONSE cannot read EF.DIR
+
+`apduh_res_get` in swicc rejects any P1 or P2 other than `00`:
+
+~~~c
+if (cmd->hdr->p1 != 0U || cmd->hdr->p2 != 0U)
+{
+    res->sw1 = SWICC_APDU_SW1_CHER_P1P2_INFO;
+    res->sw2 = 0x86;
+}
+~~~
+
+The 3GPP way to read a directory's listing is GET RESPONSE with **P1 = `81`**.
+So the efficient enumeration is unavailable on this fixture and the walk
+enumerates by probing identifiers instead. \\[V], swicc `421c8cdd`.
+
+### This card cannot say "forbidden"
+
+`va_select_file` evaluates no access condition and returns only success or
+not-found, and the status table in swicc `include/swicc/apdu.h` has no code for
+"access denied". So the absent/forbidden distinction is proved by the unit tests
+and **cannot** be proved on this card. The card test asserts the opposite
+direction instead: `report.forbidden == 0`, because a non-zero count would mean
+the walk invented a finding. \\[V], swicc `src/fs/va.c` and
+`include/swicc/apdu.h` at `421c8cdd`.
+
+### What the walk found when it ran
+
+The USIM profile in `data/usim.json` holds exactly four files under `3F00`:
+`2F00` (EF.DIR), `2F05` (EF.PL), `2FE2` (EF.ICCID) and `7F20` (DF.GSM), and
+DF.GSM is **empty** in that profile. ADF.USIM (`FF01`) is a separate disk tree,
+reachable only by AID or by the reserved FID `7FFF`, so a path-based walk
+correctly reports it absent under `3F00` where an identifier-based walk would
+report it present. That single difference is the clearest demonstration of why
+the addressing form is a parameter and not a constant.
+
+The MF's FCP carries **no file size** (it is not an elementary file) and every
+folder's carries a `C6` PIN status template, which `TagSet::swicc()` has no tag
+for. Both are things the walk reports rather than guesses at: the size as
+`Reported::NotReported`, and the tag in `Capabilities::unknown_tags`.
+
+### This card describes an infinite tree, and that cost issue #7 a CI run
+
+`swicc_disk_file_foreach` runs its callback on the starting file **itself**
+before its children; the function's own comment says "including the file
+itself" \\[V], swicc `src/fs/disk.c` at `421c8cdd`. `va_select_file_path` uses
+it to walk a SELECT-by-path one segment at a time. So asking for
+`3F00/7F20/7F20` searches the children of `7F20` for `7F20`, matches `7F20`
+itself on the very first callback, and **succeeds**. Every further identical
+segment does the same, so the card will select `3F00/7F20/7F20/7F20/...` forever.
+
+This is not a bug the walker can detect by looking at identifiers, because it
+is not a bug in the card's *file system* - it is a bug in the card's *path
+resolver*. A real SIM file identifier repeats legally across directories, so a
+walker that refused to descend on a repeat would hide files. What stops this
+card is a bound: `walk` hit `Limits::max_depth` at sixteen levels and reported
+`Note::Limit { limit: Depth }` on the node it did not descend.
+
+**The first run of `walks_the_file_system_of_a_real_card` failed on exactly
+this**, and the assertion it failed was "the whole card should fit inside the
+default bounds". That assertion was wrong: the card does not fit, and saying
+so is the correct behaviour. It is replaced by assertions that the truncation is
+**reported on a node** rather than silently applied, and that the repeated
+identifiers are recorded as `Note::RepeatedAncestor`.
+
+## Both card-backed tests must run serially
+
+A card has one current directory and one response queue. swSIM clears the
+queue on **every** command that is not GET RESPONSE \\[V], swicc
+\`src/apduh.c:swicc_apdu_rc_reset\` at \`421c8cdd\`:
+
+~~~c
+case SWICC_APDU_CLA_TYPE_INTERINDUSTRY:
+    if (cmd->hdr->ins != 0xC0) /* GET RESPONSE instruction */
+    {
+        /* Make GET RESPONSE deterministically not work if resumed. */
+        swicc_apdu_rc_reset(&swicc_state->apdu_rc);
+    }
+~~~
+
+So a GET RESPONSE only returns the template the **most recent** SELECT queued.
+Run two card-backed tests in parallel and one of them sends
+\`A0 C0 00 00 33\` after the other has already reset the queue,
+and the card answers \`6F 00\`. That is exactly what happened the
+first time issue #7's walk and issue #4's transport test ran together, and the
+card-fixture workflow now passes \`--test-threads=1\`. **One card,
+one test at a time.**
+
 ## macOS: this does not work, and here is why
 
 **Plainly: the swSIM fixture cannot be run on macOS with this project's setup.**

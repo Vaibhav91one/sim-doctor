@@ -15,6 +15,12 @@
 #   that returns the MF file capabilities template, and a READ BINARY of
 #   EF.DIR that returns the profile's actual bytes.
 #
+# It then runs issue #7's filesystem walker over the same card: SELECT MF, probe
+# all 1280 SIM-family identifiers under it, descend into the dedicated files,
+# decode their capabilities templates through the swICC tag table, and assert
+# the tree that comes back. The step asserts on the walker's own log lines, so
+# a green job means the walk happened rather than having been skipped.
+#
 # Every step sets "set -o pipefail". Both C projects build with -Werror, and a
 # step written as "make ... 2>&1 | tail -40" reports the exit status of tail,
 # so a build that produced no binary at all would look like a pass. Every step
@@ -319,17 +325,49 @@ jobs:
           test -x "$bin"
 
           log="$RUNNER_TEMP/card-test.log"
-          sudo "$PWD/$bin" \
-            --ignored --exact drives_a_real_card_through_the_pcsc_transport \
-            --nocapture 2>&1 | tee "$log"
+          # --test-threads=1 is not optional. Both tests talk to the SAME card
+          # through the SAME reader, and a card has one current DF and one
+          # response queue: swSIM's demux resets the queue on every command
+          # that is not GET RESPONSE \\[V], swicc
+          # \`src/apduh.c:swicc_apdu_rc_reset\`, and the first version of this
+          # step ran the tests in parallel and got \`6F 00\` from a GET
+          # RESPONSE whose SELECT had already been wiped by the other test.
+          # Two tests against one card must be serial.
+          sudo "$PWD/$bin" --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
 
-          # --ignored against a renamed or deleted test would run nothing and
-          # still exit 0. Assert that the test really ran, and that it really
-          # got as far as the SELECT MF and READ BINARY round trips, rather
-          # than trusting the exit code alone.
-          grep -q '1 passed' "$log"
+          # --ignored against a renamed or deleted test runs nothing and still
+          # exits 0, so the log is asserted on rather than the exit code alone.
+          # BOTH card-backed tests must be in it:
+          # drives_a_real_card_through_the_pcsc_transport is issue #4's
+          # transport round trip and walks_the_file_system_of_a_real_card is
+          # issue #7's DF-tree walk. Naming one and ignoring the other would
+          # let the walk silently stop being card-verified.
+          grep -q '2 passed' "$log"
+          grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
+          grep -q 'walks_the_file_system_of_a_real_card' "$log"
+
+          # Issue #4's test got as far as the SELECT MF and READ BINARY round
+          # trips.
           grep -q 'SELECT MF (3F00), no FCP' "$log"
           grep -q 'READ BINARY EF.DIR' "$log"
+
+          # Issue #7's test walked the tree. These greps are what make a green
+          # job mean the walker ran against a card rather than being skipped.
+          #
+          # Nothing here matches on a COUNT. An earlier version grepped for the
+          # candidate count, which couples the gate to a default that is a
+          # tuning knob: change DEFAULT_MAX_CHILDREN or the candidate set and CI
+          # fails on a number rather than on behaviour. What is checked instead
+          # is the shape of the answer - it walked, it found the master file,
+          # it found a directory and an elementary file, and it reported its
+          # counts and its bounds.
+          grep -q 'walking the card with .* candidate identifiers per directory' "$log"
+          grep -q 'SELECTED  3F00$' "$log"
+          grep -q 'SELECTED  3F00/7F20$' "$log"
+          grep -q 'SELECTED  3F00/2FE2$' "$log"
+          grep -q 'report: .* selected, .* absent, 0 forbidden' "$log"
+          grep -q 'bounds the walk hit: \[' "$log"
+          grep -q 'deepest file the card actually holds is' "$log"
 
       - name: Dump the fixture logs
         # Always, including after a failure: the daemon log says why a reader
