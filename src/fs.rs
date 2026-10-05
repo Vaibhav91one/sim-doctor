@@ -88,7 +88,7 @@ impl FromStr for FileId {
     /// Parses four hex digits, in either case.
     ///
     /// A file path is typed by a human at a prompt, so both cases are
-    /// accepted; [`Display`] always emits uppercase.
+    /// accepted; [`FileId`]'s own `Display` always emits uppercase.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         if text.len() != 4 {
             return Err(Error::MalformedFileId {

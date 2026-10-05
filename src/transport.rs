@@ -115,7 +115,7 @@ pub trait CardSession {
 ///
 /// `#[non_exhaustive]` because the PC/SC layer has dozens of documented
 /// failure codes and this enum models the handful an operator can act on.
-/// Issue #4 added the mapping in [@@BT@@pcsc@@BT@@]; issue #10 extends it, and
+/// Issue #4 added the mapping in [`pcsc`]; issue #10 extends it, and
 /// downstream matches should not have to be rewritten when it does.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

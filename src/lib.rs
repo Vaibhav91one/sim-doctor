@@ -19,6 +19,7 @@
 //! layer 0  rules      plugin/rule identifiers and the severity ladder
 //! layer 0  contract   JSON envelope and process exit codes
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + tlv
+//! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
 //! ```
 //!
 //! Two consequences worth stating out loud, because later issues will press
@@ -38,15 +39,17 @@
 //! Every module doc comment names the issue that fills it in. What is absent
 //! on purpose, stated precisely so the list does not rot:
 //!
-//! - byte-level APDU encode and decode, command chaining, and GET RESPONSE
-//!   following (#5). [`apdu`] has the header and the status word and nothing
-//!   that turns either into bytes,
+//! - a human-facing session facade over [`session`] (#10). The composition
+//!   layer landed with #5: [`session`] chains a long command, follows a
+//!   `61 xx` with GET RESPONSE, drains a pending proactive command with FETCH
+//!   and reassembles the response. What is still missing is the CLI surface
+//!   and the rule wiring on top of it,
 //! - the `pcsc`-backed transport beyond opening a reader and moving bytes
 //!   (#10). [`transport::pcsc`] does establish a context, list readers,
 //!   connect and exchange APDUs, which is what issue #4's fixture needs. What
-//!   is still missing is the typed encode/decode, chaining and GET RESPONSE
-//!   following that make a session useful for scanning (#5), and the
-//!   human-facing session facade (#10).
+//!   is still missing is the typed encode/decode that makes a session useful
+//!   for scanning (#5, landed in [`apdu`]), and the human-facing session
+//!   facade (#10, on top of [`session`]).
 //! - BER-TLV stream decoding (#11). [`tlv`] decodes one atom and reports its
 //!   length; walking a whole file body is not written,
 //! - filesystem walking (#7). [`fs`] can address a file and read one identifier
@@ -63,6 +66,7 @@ pub mod apdu;
 pub mod contract;
 pub mod fs;
 pub mod rules;
+pub mod session;
 pub mod tlv;
 pub mod transport;
 
@@ -116,6 +120,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: fs::NAME,
         owns: "File identifiers, file kinds and paths over the card's file system.",
         depends_on: &[apdu::NAME, tlv::NAME],
+    },
+    ModuleInfo {
+        name: session::NAME,
+        owns: "Typed exchanges over a card: chaining, follow-ups, reassembly.",
+        depends_on: &[apdu::NAME, transport::NAME],
     },
 ];
 
