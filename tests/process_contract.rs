@@ -734,7 +734,10 @@ fn a_diff_against_a_missing_baseline_refuses_on_the_file_and_says_which() {
     assert_eq!(run.code(), 1);
     let envelope = assert_exactly_one_envelope_for(&["scan", "--diff"], &run.stdout);
     let data = envelope.payload().data();
-    assert_eq!(data["error"]["kind"], serde_json::json!("baseline-unreadable"));
+    assert_eq!(
+        data["error"]["kind"],
+        serde_json::json!("baseline-unreadable")
+    );
     // A refusal is a refusal: no findings, and no diff that could be read as
     // one.
     assert!(data.get("findings").is_none(), "{data}");
@@ -757,12 +760,7 @@ fn a_refusal_without_json_writes_nothing_to_stdout() {
     // --diff, not --baseline alone: the file is only READ when a comparison
     // was asked for, so a bare --baseline goes on to look for a card and fails
     // there. Both are refusals; this one is about the one that happens first.
-    let run = run_piped(&[
-        "scan",
-        "--diff",
-        "--baseline",
-        "/no/such/dir/baseline.json",
-    ]);
+    let run = run_piped(&["scan", "--diff", "--baseline", "/no/such/dir/baseline.json"]);
 
     assert_eq!(run.code(), 1);
     assert_eq!(run.stdout, "", "{:?}", run.stdout);

@@ -978,20 +978,34 @@ impl Diff {
         // the same card and the same baseline. "JSON-stable across runs" is one
         // of issue #12's acceptance criteria and it is a property of this map,
         // not of the order a rule happened to fire in.
-        for (key, then) in &was {
-            if withheld.contains(&then[0].rule()) {
-                continue;
-            }
+        //
+        // One pass over the union of the keys, in key order. Both sides of a
+        // key that exists in BOTH runs are handled here, surplus included: two
+        // findings of one rule at one location are two findings, so the surplus
+        // on the current side is new and the surplus on the baseline side is
+        // fixed. A key only one side has is new or fixed outright, unless its
+        // rule drifted - then it is withheld and appears under `rules` instead.
+        for key in was
+            .keys()
+            .chain(now.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let then = was.get(key).map(Vec::as_slice).unwrap_or(&[]);
             let here = now.get(key).map(Vec::as_slice).unwrap_or(&[]);
+            if let Some(rule) = then
+                .first()
+                .or_else(|| here.first())
+                .map(rules::Finding::rule)
+            {
+                if withheld.contains(&rule) {
+                    continue;
+                }
+            }
+
             let pairs = then.len().min(here.len());
             persisting.extend(here[..pairs].iter().cloned());
+            new.extend(here[pairs..].iter().cloned());
             fixed.extend(then[pairs..].iter().cloned());
-        }
-        for (key, here) in &now {
-            if was.contains_key(key) || withheld.contains(&here[0].rule()) {
-                continue;
-            }
-            new.extend(here.iter().cloned());
         }
 
         Self {
@@ -1315,5 +1329,887 @@ impl Error {
             Self::Unwritable(_) => "baseline-unwritable",
             Self::Render(_) => "baseline-render-failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The MSL 0 rule, with and without a TAR audit to look at.
+    const TAR_RULE: &str = "gsma/msl-zero-allowed";
+
+    /// A different rule ID, for the rename case.
+    const RENAMED_RULE: &str = "gsma/msl-zero-accepted";
+
+    /// A rule ID no registry could ever have produced. `RuleId` refuses it.
+    const IMPOSSIBLE_RULE: &str = "GSMA/msl-zero-allowed";
+
+    fn rule(text: &str) -> rules::RuleId {
+        rules::RuleId::new(text).expect("a validated constant")
+    }
+
+    fn msl_zero() -> rules::Finding {
+        rules::Finding::new(
+            rule(TAR_RULE),
+            rules::Severity::Critical,
+            "TAR 000000 was accepted: MSL is 0",
+            rules::Location::tar(0),
+            rules::Evidence::text("accepted=9404 baseline=9000"),
+        )
+    }
+
+    fn unreadable(path: &str) -> rules::Finding {
+        rules::Finding::new(
+            rule("filesystem/unreadable-ef"),
+            rules::Severity::High,
+            "EF.ICCID could not be selected",
+            rules::Location::forbidden_file(path, rules::Status::from_bytes([0x98, 0x04])),
+            rules::Evidence::bytes(b"a4000a4f"),
+        )
+    }
+
+    /// Facts for a run that checked the card properly.
+    ///
+    /// `evidence: true` is the one that matters: a `--tar focused` sweep, so
+    /// the MSL 0 rule had something to decide from.
+    fn good(evidence: bool) -> RunFacts {
+        RunFacts::new(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            true,
+            None,
+            Vec::new(),
+            vec![rules::RuleRun::new(rule(TAR_RULE), evidence)],
+        )
+    }
+
+    /// The same run with one axis changed, for the refusal tests.
+    fn facts_with(
+        reader: &str,
+        dialect: &str,
+        candidates: &str,
+        severity: Option<rules::Severity>,
+        tar: &str,
+        complete: bool,
+        evidence: bool,
+    ) -> RunFacts {
+        RunFacts::new(
+            reader,
+            dialect,
+            candidates,
+            severity,
+            tar,
+            complete,
+            (!complete).then(|| "max-depth".to_owned()),
+            (!complete)
+                .then(|| "max-depth".to_owned())
+                .into_iter()
+                .collect(),
+            vec![rules::RuleRun::new(rule(TAR_RULE), evidence)],
+        )
+    }
+
+    /// A saved run: the facts plus the findings it reported.
+    fn saved(facts: RunFacts, findings: &[rules::Finding]) -> Baseline {
+        Baseline::new(facts, findings)
+    }
+
+    /// A run saves and reloads losslessly.
+    ///
+    /// **Issue #12 acceptance criterion 1, and lossless means the findings, not
+    /// a projection of them.** The same `rules::Finding` values come back,
+    /// evidence and coverage included, because the baseline stores the objects
+    /// the report carries rather than re-spelling them.
+    #[test]
+    fn a_run_saves_and_reloads_losslessly() {
+        let found = vec![msl_zero(), unreadable("3F00/2F00/6F07")];
+        let original = saved(good(true), &found);
+
+        let text = serde_json::to_string_pretty(&original.to_json()).expect("renderable");
+        let reloaded = Baseline::parse(&text).expect("this build wrote it");
+
+        assert_eq!(reloaded.findings(), found.as_slice());
+        assert_eq!(reloaded.run(), original.run());
+        assert_eq!(reloaded.created(), original.created());
+        assert_eq!(reloaded, original);
+    }
+
+    /// The file holds findings and comparability facts, and nothing else.
+    ///
+    /// **The constraint the issue states directly: a baseline is a local
+    /// artifact and must not carry card secrets.** A scan report holds the ATR,
+    /// the whole DF tree and per-file notes; none of those belong in a file
+    /// that lands in a CI workspace and is read back by an agent. Asserting the
+    /// key set is what stops one being added by accident.
+    #[test]
+    fn a_baseline_records_nothing_the_diff_does_not_need() {
+        let text = serde_json::to_string_pretty(&saved(good(true), &[msl_zero()]).to_json())
+            .expect("renderable");
+
+        for key in ["sim_doctor_baseline", "created", "run", "findings"] {
+            assert!(text.contains(key), "{key} is missing from {text}");
+        }
+        for forbidden in [
+            r#""atr""#,
+            r#""files""#,
+            r#""notes""#,
+            r#""selected""#,
+            r#""keys""#,
+            r#""probes""#,
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "a baseline must not carry {forbidden}: {text}"
+            );
+        }
+    }
+
+    /// New, fixed and persisting are reported separately and correctly.
+    ///
+    /// **Issue #12 acceptance criterion 2.** Three findings move between the
+    /// two lists in three different ways and each has to land in exactly one,
+    /// because a gate reads those three numbers and nothing else.
+    #[test]
+    fn new_fixed_and_persisting_are_separate_and_correct() {
+        let one = unreadable("3F00/2F00/6F07");
+        let two = unreadable("3F00/6F38");
+        let three = unreadable("3F00/6F3A");
+
+        // The baseline holds one, two and three. This run holds one and three,
+        // plus a fourth that is new and minus two.
+        let then = saved(good(true), &[one.clone(), two.clone(), three.clone()]);
+        let now = vec![one.clone(), three.clone(), msl_zero()];
+        let diff = Diff::compare(&then, &good(true), &now).expect("two comparable runs");
+
+        assert_eq!(diff.persisting(), &[one, three][..]);
+        assert_eq!(diff.fixed(), &[two][..]);
+        assert_eq!(
+            diff.new_findings(),
+            &[msl_zero()][..],
+            "a finding the baseline never held is new"
+        );
+        assert!(diff.regressed());
+
+        // And the counts in the JSON agree with the lists beside them, because
+        // a gate reads the counts.
+        let json = diff.to_json();
+        assert_eq!(json["counts"]["new"], serde_json::json!(1));
+        assert_eq!(json["counts"]["fixed"], serde_json::json!(1));
+        assert_eq!(json["counts"]["persisting"], serde_json::json!(2));
+        assert_eq!(json["regressed"], serde_json::json!(true));
+    }
+
+    /// A run that is no worse than its baseline does not regress.
+    ///
+    /// **A fix must never fail a build.** A gate that exits non-zero when a
+    /// card improved is a gate nobody turns on, and this is the half of
+    /// `regressed` that a test written only for the failing case would miss.
+    #[test]
+    fn a_card_that_got_better_does_not_regress() {
+        let one = unreadable("3F00/6F38");
+        let then = saved(good(true), &[one.clone(), msl_zero()]);
+        let diff = Diff::compare(&then, &good(true), &[msl_zero()]).expect("comparable");
+
+        assert_eq!(diff.fixed(), &[one][..]);
+        assert!(diff.new_findings().is_empty());
+        assert!(!diff.regressed(), "a fix is not a regression");
+        assert_eq!(diff.to_json()["regressed"], serde_json::json!(false));
+    }
+
+    /// Two findings of one rule at the same location are two findings.
+    ///
+    /// A rule may legitimately fire many times in one scan - once per TAR, once
+    /// per file - and `Finding::to_json` is an array for exactly that reason.
+    /// Keying on the rule ID alone would call the second unreadable EF a
+    /// duplicate of the first and report a card that regressed when nothing did.
+    #[test]
+    fn two_findings_of_one_rule_at_one_location_are_two() {
+        let mut pair = unreadable("3F00/6F38");
+        pair = rules::Finding::new(
+            pair.rule().clone(),
+            rules::Severity::Medium,
+            "EF.PSMS could not be selected either",
+            pair.location().clone(),
+            rules::Evidence::None,
+        );
+        let then = saved(good(true), &[pair.clone()]);
+        let diff = Diff::compare(&then, &good(true), &[pair.clone(), pair]).expect("comparable");
+
+        assert_eq!(diff.persisting().len(), 1);
+        assert_eq!(diff.new_findings().len(), 1);
+        assert_eq!(diff.fixed().len(), 0);
+    }
+
+    /// The same two runs produce the same diff bytes.
+    ///
+    /// **Issue #12 acceptance criterion 3.** Findings are grouped through a
+    /// `BTreeMap`, so the order is the key order and not the order a rule
+    /// happened to fire in; without that, two CI logs of the same card would
+    /// not diff and the output of a regression gate would be unreviewable.
+    #[test]
+    fn the_diff_is_stable_across_runs_of_the_same_pair() {
+        let findings = vec![
+            unreadable("3F00/6F3A"),
+            unreadable("3F00/2F00/6F07"),
+            msl_zero(),
+            unreadable("3F00/6F38"),
+        ];
+        // Two baselines built independently, so their `created` differs and
+        // nothing else may.
+        let first = saved(good(true), &findings);
+        let second = saved(good(true), &findings);
+
+        let a = Diff::compare(&first, &good(true), &findings).expect("comparable");
+        let b = Diff::compare(&second, &good(true), &findings).expect("comparable");
+
+        // Two baselines taken a few microseconds apart carry different
+        // timestamps, and that is the ONE field allowed to differ: it is a
+        // fact about when the run happened, not about what it found.
+        let mut a_json = a.to_json();
+        let mut b_json = b.to_json();
+        assert_ne!(a_json["baseline"]["created"], b_json["baseline"]["created"]);
+        a_json["baseline"]["created"] = json!("normalized");
+        b_json["baseline"]["created"] = json!("normalized");
+        assert_eq!(a_json, b_json);
+
+        // And with the findings supplied in a different order, because that is
+        // what a re-ordered registry would look like.
+        let mut shuffled = findings.clone();
+        shuffled.reverse();
+        let c = Diff::compare(&first, &good(true), &shuffled).expect("comparable");
+        assert_eq!(a.to_json(), c.to_json());
+    }
+
+    /// A RENAMED RULE READS AS A RENAME, not as a fix plus a new finding.
+    ///
+    /// **The property AGENTS.md section 3 buys with "an ID must never be renamed
+    /// casually", and the reason a baseline outlives the release that wrote
+    /// it.** The baseline recorded a critical MSL 0 finding under the old ID;
+    /// this run raises it under the new one. A naive diff reports a FIX (the
+    /// old ID is gone) and a NEW (the new ID appeared), which says the card was
+    /// fixed and regressed in the same breath and is a claim no file supports.
+    ///
+    /// So neither list carries it, and the rules block carries both IDs with
+    /// the findings they held and a warning naming what cannot be told apart.
+    #[test]
+    fn a_renamed_rule_is_neither_fixed_nor_new() {
+        let renamed = rules::Finding::new(
+            rule(RENAMED_RULE),
+            rules::Severity::Critical,
+            "TAR 000000 was accepted: MSL is 0",
+            rules::Location::tar(0),
+            rules::Evidence::text("accepted=9404 baseline=9000"),
+        );
+
+        let baseline_facts = RunFacts::new(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            true,
+            None,
+            Vec::new(),
+            vec![rules::RuleRun::new(rule(TAR_RULE), true)],
+        );
+        let this_facts = RunFacts::new(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            true,
+            None,
+            Vec::new(),
+            vec![rules::RuleRun::new(rule(RENAMED_RULE), true)],
+        );
+
+        let then = saved(baseline_facts, &[msl_zero()]);
+        let diff = Diff::compare(&then, &this_facts, &[renamed]).expect("comparable");
+
+        assert!(
+            diff.new_findings().is_empty(),
+            "a rename is not a regression: {:?}",
+            diff.new_findings()
+        );
+        assert!(
+            diff.fixed().is_empty(),
+            "a rename is not a fix: {:?}",
+            diff.fixed()
+        );
+        assert!(!diff.regressed(), "a rename must not fail a build");
+
+        // Both sides are reported, and the withheld finding is still printed,
+        // so nothing is silently dropped either.
+        let drift = diff.rule_drift();
+        assert_eq!(drift.len(), 2);
+        assert_eq!(drift[0].id(), &rule(TAR_RULE));
+        assert_eq!(drift[0].direction(), Direction::Retired);
+        assert_eq!(drift[0].findings(), &[msl_zero()][..]);
+        assert_eq!(drift[1].id(), &rule(RENAMED_RULE));
+        assert_eq!(drift[1].direction(), Direction::Added);
+
+        // And the warning says what it is, without claiming to have resolved it.
+        let warning = diff.rules_warning().expect("there is something to say");
+        assert!(warning.contains("RENAME"), "{warning}");
+        assert!(warning.contains(TAR_RULE), "{warning}");
+        assert!(warning.contains(RENAMED_RULE), "{warning}");
+
+        let json = diff.to_json();
+        assert_eq!(json["rules"]["changed"].as_array().map(Vec::len), Some(2));
+        assert_eq!(json["counts"]["new"], serde_json::json!(0));
+        assert_eq!(json["counts"]["fixed"], serde_json::json!(0));
+        assert_eq!(json["regressed"], serde_json::json!(false));
+    }
+
+    /// A rule only this run knows is a first check, not a regression.
+    ///
+    /// The card may have had the problem since the day it was provisioned and
+    /// the baseline simply could not see it. Calling that new would fail every
+    /// build on the day the rule lands.
+    #[test]
+    fn a_rule_the_baseline_never_ran_does_not_regress_a_build() {
+        let baseline_facts = RunFacts::new(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            true,
+            None,
+            Vec::new(),
+            vec![rules::RuleRun::new(rule(TAR_RULE), true)],
+        );
+        let this_facts = RunFacts::new(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            true,
+            None,
+            Vec::new(),
+            vec![
+                rules::RuleRun::new(rule(TAR_RULE), true),
+                rules::RuleRun::new(rule("filesystem/unreadable-ef"), true),
+            ],
+        );
+
+        let then = saved(baseline_facts, &[]);
+        let diff =
+            Diff::compare(&then, &this_facts, &[unreadable("3F00/6F38")]).expect("comparable");
+
+        assert!(diff.new_findings().is_empty());
+        assert!(!diff.regressed());
+        assert_eq!(diff.rule_drift().len(), 1);
+        assert_eq!(diff.rule_drift()[0].direction(), Direction::Added);
+    }
+
+    /// A TRUNCATED BASELINE IS REFUSED, not compared.
+    ///
+    /// **The first half of "a diff is only as good as its baseline".** A walk
+    /// that stopped at a bound did not see the whole card, so every finding
+    /// this run raises would read as new and none as fixed. Both numbers would
+    /// be wrong and neither would look wrong.
+    #[test]
+    fn a_truncated_baseline_is_refused_rather_than_compared() {
+        let facts = facts_with(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            false,
+            true,
+        );
+        let then = saved(facts, &[]);
+        let now = good(true);
+
+        let error = Diff::compare(&then, &now, &[msl_zero()])
+            .expect_err("a truncated baseline cannot say the card is clean");
+        assert_eq!(error.kind(), "baseline-truncated");
+        assert!(
+            error.to_string().contains("max-depth"),
+            "the refusal must name the bound: {error}"
+        );
+        assert!(
+            error
+                .explain(&then, &now)
+                .contains("Save a baseline from a complete scan"),
+            "{}",
+            error.explain(&then, &now)
+        );
+    }
+
+    /// A TRUNCATED CURRENT RUN IS REFUSED, and this is the dangerous direction.
+    ///
+    /// Everything the baseline found and this run does not have would read as
+    /// fixed, and the reason it is missing is that the walk never got there. A
+    /// diff that reported improvements against a walk that stopped early tells
+    /// an operator a card got better, which is worse than reporting nothing.
+    #[test]
+    fn a_truncated_run_is_refused_rather_than_reported_as_improvements() {
+        let then = saved(good(true), &[msl_zero()]);
+        let now = facts_with(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            false,
+            true,
+        );
+
+        let error = Diff::compare(&then, &now, &[]).expect_err("a truncated run invents fixes");
+        assert_eq!(error.kind(), "run-truncated");
+        assert!(error.to_string().contains("max-depth"), "{error}");
+    }
+
+    /// A rule with evidence on one run and none on the other is refused.
+    ///
+    /// **The default case, and the reason this module exists.** The default TAR
+    /// selection is off, so the common baseline is one where the MSL 0 rule
+    /// ran with nothing to look at. A baseline recording only the rule ID would
+    /// report the first real MSL 0 finding as a regression and fail a build
+    /// over a check that had never been made.
+    #[test]
+    fn the_default_tar_off_baseline_cannot_be_diffed_against_a_tar_sweep() {
+        // What a scan writes today with the default flags: the rule is
+        // registered, it evaluates, and it has nothing to evaluate against.
+        let baseline_facts = good(false);
+        let this_facts = good(true);
+
+        let error = Diff::compare(
+            &saved(baseline_facts.clone(), &[]),
+            &this_facts,
+            &[msl_zero()],
+        )
+        .expect_err("the baseline never checked MSL 0");
+        assert_eq!(error.kind(), "evidence-mismatch");
+        let sentence = error.to_string();
+        assert!(sentence.contains(TAR_RULE), "{sentence}");
+        assert!(
+            sentence.contains("first check rather than a change"),
+            "{sentence}"
+        );
+
+        // And the other direction: a baseline that DID check, against a run that
+        // does not, cannot claim fixes either.
+        let error = Diff::compare(&saved(this_facts, &[msl_zero()]), &baseline_facts, &[])
+            .expect_err("this run looked at less than the baseline did");
+        assert_eq!(error.kind(), "evidence-mismatch");
+    }
+
+    /// The other four axes refuse as well, each naming itself.
+    ///
+    /// One test for all of them because they are one rule - two runs that asked
+    /// different questions are not comparable - and four near-identical tests
+    /// would say the same thing four times. The differing half is the severity
+    /// one, where a mismatch lies in both directions.
+    #[test]
+    fn two_runs_that_asked_different_questions_are_refused() {
+        let then = saved(good(true), &[]);
+        let cases: [(RunFacts, &str); 4] = [
+            (
+                facts_with(
+                    "fake card",
+                    "iec-7816-4-table-42",
+                    "sim-families (1280 probed, exhaustive=false)",
+                    None,
+                    "focused@00",
+                    true,
+                    true,
+                ),
+                "dialect-mismatch",
+            ),
+            (
+                facts_with(
+                    "fake card",
+                    "swicc",
+                    "sim-families (16 probed, exhaustive=false)",
+                    None,
+                    "focused@00",
+                    true,
+                    true,
+                ),
+                "candidate-mismatch",
+            ),
+            (
+                facts_with(
+                    "fake card",
+                    "swicc",
+                    "sim-families (1280 probed, exhaustive=false)",
+                    None,
+                    "off@00",
+                    true,
+                    true,
+                ),
+                "tar-selection-mismatch",
+            ),
+            (
+                facts_with(
+                    "fake card",
+                    "swicc",
+                    "sim-families (1280 probed, exhaustive=false)",
+                    Some(rules::Severity::High),
+                    "focused@00",
+                    true,
+                    true,
+                ),
+                "severity-mismatch",
+            ),
+        ];
+
+        for (this_facts, kind) in cases {
+            let error = Diff::compare(&then, &this_facts, &[msl_zero()])
+                .expect_err("two different questions are not comparable");
+            assert_eq!(error.kind(), kind);
+            // And the refusal says what each side was, so an operator does not
+            // have to open the file to find out which axis moved.
+            let explained = error.explain(&then, &this_facts);
+            assert!(explained.contains("The baseline ran as:"), "{explained}");
+            assert!(explained.contains("This run ran as:"), "{explained}");
+        }
+    }
+
+    /// A reader name is recorded but never a reason to refuse.
+    ///
+    /// Moving a card to a different reader is an ordinary thing for an operator
+    /// to do. Making it a refusal would fail every build on a machine upgrade,
+    /// and the field is in the file because a diff that suddenly changed is
+    /// helped by knowing the reader changed too.
+    #[test]
+    fn moving_the_card_to_another_reader_is_not_a_refusal() {
+        let then = saved(good(true), &[]);
+        let other = facts_with(
+            "Identiv SCR3500",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            None,
+            "focused@00",
+            true,
+            true,
+        );
+
+        assert!(Diff::compare(&then, &other, &[]).is_ok());
+    }
+
+    /// A hand-edited baseline cannot inject a rule ID no registry could make.
+    ///
+    /// **Issue #13 made this deliberate** - `RuleId` re-validates on the way
+    /// back in - and a baseline is the input it was designed for. The refusal
+    /// is the point: a file naming `GSMA/msl-zero-allowed` must not be compared
+    /// against, because nothing could ever have produced that finding.
+    #[test]
+    fn a_hand_edited_rule_id_is_refused_rather_than_compared() {
+        let text = format!(
+            r#"{{"sim_doctor_baseline":1,"created":"2026-01-01T00:00:00Z",
+            "run":{{"reader":"fake","dialect":"swicc",
+            "candidates":"sim-families","severity_threshold":null,
+            "tar_selection":"focused@00","complete":true,"truncated_by":null,
+            "limits_hit":[],"rules_run":1,
+            "rules":[{{"id":"{IMPOSSIBLE_RULE}","evidence":true}}]}},
+            "findings":[]}}"#
+        );
+        let error = Baseline::parse(&text).expect_err("no registry could have made that ID");
+        assert_eq!(error.kind(), "baseline-malformed");
+    }
+
+    /// A baseline from another format version is refused, not guessed at.
+    ///
+    /// A diff computed against a shape it is guessing at would report new and
+    /// fixed findings and mean something else entirely, which is the exact
+    /// failure AGENTS.md section 3 forbids: a plausible-looking number for
+    /// something that was not done.
+    #[test]
+    fn a_baseline_from_another_format_version_is_refused() {
+        let text = format!(
+            r#"{{"sim_doctor_baseline":{},"created":"2026-01-01T00:00:00Z",
+            "run":{{"reader":"fake","dialect":"swicc",
+            "candidates":"sim-families","severity_threshold":null,
+            "tar_selection":"focused@00","complete":true,"truncated_by":null,
+            "limits_hit":[],"rules_run":0,"rules":[]}},
+            "findings":[]}}"#,
+            VERSION + 1
+        );
+        let error = Baseline::parse(&text).expect_err("the shapes are not the same");
+        assert_eq!(error.kind(), "baseline-version");
+        assert!(
+            error.to_string().contains("Re-take the baseline"),
+            "{error}"
+        );
+    }
+
+    /// Unknown FIELDS are ignored; unknown values are not.
+    ///
+    /// CONTEXT.md section 3 records this from issue #13: a baseline written by a
+    /// later version has to stay readable by this one, so the strictness goes on
+    /// the values and not on the key set. A file that is not a baseline at all
+    /// is still refused, which is what the version key is for.
+    #[test]
+    fn a_field_from_a_later_version_is_ignored_and_a_foreign_document_is_not() {
+        let original = saved(good(true), &[msl_zero()]);
+        let mut document = original.to_json();
+        document
+            .as_object_mut()
+            .expect("an object")
+            .insert("written_by".to_owned(), json!("a future build"));
+
+        let reloaded = Baseline::parse(&document.to_string()).expect("readable");
+        assert_eq!(reloaded, original);
+
+        // And the document is still refused for the right reason rather than
+        // being read as an empty baseline.
+        let error = Baseline::parse(r#"{"hello":"world"}"#).expect_err("not a baseline");
+        assert_eq!(error.kind(), "baseline-malformed");
+    }
+
+    /// A HOSTILE BASELINE CANNOT PRODUCE UNBOUNDED OUTPUT.
+    ///
+    /// **Evidence is bounded on the way IN as well as out.** A finding's
+    /// message is an unbounded string in the wire type, so a hand-edited file
+    /// carrying a megabyte in one message would otherwise be rendered into a CI
+    /// log by a command whose whole promise is that it is safe to script. The
+    /// check walks the raw document before the typed parse, so it also covers
+    /// the location paths and the coverage reason, and it covers a field added
+    /// next year without anyone editing this function.
+    #[test]
+    fn a_hostile_baseline_cannot_produce_unbounded_output() {
+        let huge = "x".repeat(MAX_TEXT_CHARS + 1);
+        let template = |message: &str| {
+            format!(
+                r#"{{"sim_doctor_baseline":1,"created":"2026-01-01T00:00:00Z",
+                "run":{{"reader":"fake","dialect":"swicc",
+                "candidates":"sim-families","severity_threshold":null,
+                "tar_selection":"focused@00","complete":true,"truncated_by":null,
+                "limits_hit":[],"rules_run":1,
+                "rules":[{{"id":"{TAR_RULE}","evidence":true}}]}},
+                "findings":[{{"rule":"{TAR_RULE}","severity":"critical",
+                "severity_rank":4,"message":"{message}",
+                "location":{{"kind":"tar","tar":0}},
+                "evidence":{{"kind":"none"}},
+                "coverage":{{"status":"complete"}}}}]}}"#
+            )
+        };
+
+        // Inside the limit: read, so the refusal above is about the bound and
+        // not about the shape.
+        assert!(Baseline::parse(&template(&"x".repeat(MAX_TEXT_CHARS))).is_ok());
+
+        let error = Baseline::parse(&template(&huge)).expect_err("a megabyte of message");
+        assert_eq!(error.kind(), "baseline-text-too-long");
+        assert!(
+            error.to_string().contains(&MAX_TEXT_CHARS.to_string()),
+            "{error}"
+        );
+
+        // And the same bound applies to a location path, which is a different
+        // field with the same risk.
+        let long_path = "A".repeat(MAX_TEXT_CHARS + 1);
+        let text = format!(
+            r#"{{"sim_doctor_baseline":1,"created":"2026-01-01T00:00:00Z",
+            "run":{{"reader":"fake","dialect":"swicc",
+            "candidates":"sim-families","severity_threshold":null,
+            "tar_selection":"focused@00","complete":true,"truncated_by":null,
+            "limits_hit":[],"rules_run":1,
+            "rules":[{{"id":"{TAR_RULE}","evidence":true}}]}},
+            "findings":[{{"rule":"filesystem/unreadable-ef","severity":"high",
+            "severity_rank":3,"message":"short",
+            "location":{{"kind":"file","path":"{long_path}","access":"forbidden",
+            "status":"9804"}},
+            "evidence":{{"kind":"none"}},
+            "coverage":{{"status":"complete"}}}}]}}"#
+        );
+        assert_eq!(
+            Baseline::parse(&text)
+                .expect_err("a megabyte of path")
+                .kind(),
+            "baseline-text-too-long"
+        );
+    }
+
+    /// Too many findings, and too many of anything, are refused.
+    ///
+    /// The record count is a contract question rather than a sanity check: a
+    /// card this tool can walk does not produce 4096 findings, and if one ever
+    /// does the refusal says so in words rather than truncating.
+    #[test]
+    fn an_oversized_record_set_is_refused_rather_than_truncated() {
+        let many: Vec<serde_json::Value> = (0..=MAX_RECORDS)
+            .map(|i| {
+                json!({
+                    "rule": "filesystem/unreadable-ef",
+                    "severity": "high",
+                    "severity_rank": 3,
+                    "message": format!("EF {i} could not be selected"),
+                    "location": { "kind": "tar", "tar": i },
+                    "evidence": { "kind": "none" },
+                    "coverage": { "status": "complete" },
+                })
+            })
+            .collect();
+
+        let document = json!({
+            "sim_doctor_baseline": VERSION,
+            "created": "2026-01-01T00:00:00Z",
+            "run": {
+                "reader": "fake", "dialect": "swicc",
+                "candidates": "sim-families", "severity_threshold": null,
+                "tar_selection": "focused@00", "complete": true,
+                "truncated_by": null, "limits_hit": [],
+                "rules_run": 1,
+                "rules": [{ "id": TAR_RULE, "evidence": true }],
+            },
+            "findings": many,
+        });
+
+        let error = Baseline::parse(&document.to_string())
+            .expect_err("no card this tool can walk produces that many");
+        assert_eq!(error.kind(), "baseline-too-many-records");
+        assert!(
+            error.to_string().contains(&(MAX_RECORDS + 1).to_string()),
+            "{error}"
+        );
+    }
+
+    /// A file over the byte ceiling is refused while it is read, not after.
+    ///
+    /// **The ceiling has to be enforced while reading**, because the whole point
+    /// of having one is that a hostile file cannot make this process allocate
+    /// its way to the end of the disk; checking the length afterwards means the
+    /// allocation already happened.
+    #[test]
+    fn a_file_over_the_byte_ceiling_is_refused() {
+        let path = std::env::temp_dir().join("sim-doctor-too-big-baseline.json");
+        std::fs::write(&path, "x".repeat(MAX_BASELINE_BYTES + 1)).expect("a file to refuse");
+        let error = Baseline::load(&path).expect_err("over the ceiling");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(error.kind(), "baseline-too-large");
+    }
+
+    /// A finding too long to record is refused on the way OUT, not truncated.
+    ///
+    /// A baseline holding a shortened message would be compared against text
+    /// the file does not contain, and the next run would diff against a
+    /// sentence that was never written. Failing loudly, naming the rule, is the
+    /// honest answer.
+    #[test]
+    fn saving_refuses_a_message_it_could_not_read_back() {
+        let long = rules::Finding::new(
+            rule(TAR_RULE),
+            rules::Severity::Critical,
+            "x".repeat(MAX_TEXT_CHARS + 1),
+            rules::Location::tar(0),
+            rules::Evidence::None,
+        );
+        let path = std::env::temp_dir().join("sim-doctor-long-message-baseline.json");
+        let error = saved(good(true), &[long])
+            .save(&path)
+            .expect_err("that message would not survive the round trip");
+        assert!(
+            !path.exists(),
+            "a save that refused must not have created the file"
+        );
+        assert_eq!(error.kind(), "finding-message-too-long");
+        assert!(error.to_string().contains(TAR_RULE), "{error}");
+    }
+
+    /// A save leaves the real file untouched when it fails.
+    ///
+    /// The write goes through a temporary file and a rename precisely so that a
+    /// machine which dies between the two cannot leave a half-written baseline
+    /// that the next diff reads as though somebody chose it. This is the
+    /// in-process version of the same property.
+    #[test]
+    fn a_failed_save_leaves_the_previous_baseline_intact() {
+        let directory = std::env::temp_dir().join("sim-doctor-baseline-atomicity");
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("baseline.json");
+
+        let good_one = saved(good(true), &[msl_zero()]);
+        good_one.save(&path).expect("the first save works");
+        let before = std::fs::read(&path).expect("the first save landed");
+
+        let too_long = rules::Finding::new(
+            rule(TAR_RULE),
+            rules::Severity::Critical,
+            "x".repeat(MAX_TEXT_CHARS + 1),
+            rules::Location::tar(0),
+            rules::Evidence::None,
+        );
+        assert!(saved(good(true), &[too_long]).save(&path).is_err());
+
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            before,
+            "a refused save must not have touched the file an operator already had"
+        );
+        // And no scratch file is left lying beside it.
+        let leftovers: Vec<String> = std::fs::read_dir(&directory)
+            .expect("readable")
+            .filter_map(|entry| {
+                entry
+                    .ok()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            })
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A saved baseline reloads from the path it was written to.
+    ///
+    /// The end-to-end half: `save` then `load`, across a real filesystem,
+    /// which is the only way to prove the temporary-file-and-rename dance did
+    /// not lose anything on the way.
+    #[test]
+    fn a_saved_baseline_reloads_from_the_path_it_was_written_to() {
+        let directory = std::env::temp_dir().join("sim-doctor-baseline-roundtrip");
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("baseline.json");
+
+        let found = vec![msl_zero(), unreadable("3F00/2F00/6F07")];
+        let original = saved(good(true), &found);
+        original.save(&path).expect("saved");
+
+        let reloaded = Baseline::load(&path).expect("read back");
+        assert_eq!(reloaded.findings(), found.as_slice());
+        assert_eq!(reloaded.run(), original.run());
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The threshold in force is carried beside the verdict.
+    ///
+    /// A reader must never have to infer which severity level produced a diff,
+    /// because the same new finding is a regression at `high` and not one at
+    /// `info`.
+    #[test]
+    fn the_diff_carries_the_threshold_that_decided_it() {
+        let facts = facts_with(
+            "fake card",
+            "swicc",
+            "sim-families (1280 probed, exhaustive=false)",
+            Some(rules::Severity::High),
+            "focused@00",
+            true,
+            true,
+        );
+        let diff =
+            Diff::compare(&saved(facts.clone(), &[]), &facts, &[msl_zero()]).expect("comparable");
+
+        assert_eq!(diff.threshold(), Some(rules::Severity::High));
+        assert_eq!(
+            diff.to_json()["threshold"],
+            serde_json::json!("high"),
+            "the gate and the threshold it used travel together"
+        );
     }
 }
