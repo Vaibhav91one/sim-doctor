@@ -18,6 +18,14 @@
 //! rule out, so "no reader" here is a failure carrying the reader list in the
 //! message.
 
+//! **These tests must run serially.** A card has one current directory and
+//! one response queue. swSIM clears the queue on every command that is not
+//! GET RESPONSE \\[V], swicc `src/apduh.c:swicc_apdu_rc_reset` at `421c8cdd`, so
+//! two tests exchanging APDUs at the same time take each other's queued
+//! capabilities templates. The card-fixture workflow passes
+//! `--test-threads=1`, and this note is here so the next person who "speeds
+//! the fixture up" learns why they cannot.
+
 #![cfg(feature = "card-fixture")]
 
 use sim_doctor::apdu::StatusWord;

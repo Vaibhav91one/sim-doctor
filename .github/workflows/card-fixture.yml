@@ -325,7 +325,15 @@ jobs:
           test -x "$bin"
 
           log="$RUNNER_TEMP/card-test.log"
-          sudo "$PWD/$bin" --ignored --nocapture 2>&1 | tee "$log"
+          # --test-threads=1 is not optional. Both tests talk to the SAME card
+          # through the SAME reader, and a card has one current DF and one
+          # response queue: swSIM's demux resets the queue on every command
+          # that is not GET RESPONSE \\[V], swicc
+          # \`src/apduh.c:swicc_apdu_rc_reset\`, and the first version of this
+          # step ran the tests in parallel and got \`6F 00\` from a GET
+          # RESPONSE whose SELECT had already been wiped by the other test.
+          # Two tests against one card must be serial.
+          sudo "$PWD/$bin" --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
 
           # --ignored against a renamed or deleted test runs nothing and still
           # exits 0, so the log is asserted on rather than the exit code alone.

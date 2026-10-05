@@ -453,6 +453,29 @@ folder's carries a `C6` PIN status template, which `TagSet::swicc()` has no tag
 for. Both are things the walk reports rather than guesses at: the size as
 `Reported::NotReported`, and the tag in `Capabilities::unknown_tags`.
 
+## Both card-backed tests must run serially
+
+A card has one current directory and one response queue. swSIM clears the
+queue on **every** command that is not GET RESPONSE \\[V], swicc
+\`src/apduh.c:swicc_apdu_rc_reset\` at \`421c8cdd\`:
+
+~~~c
+case SWICC_APDU_CLA_TYPE_INTERINDUSTRY:
+    if (cmd->hdr->ins != 0xC0) /* GET RESPONSE instruction */
+    {
+        /* Make GET RESPONSE deterministically not work if resumed. */
+        swicc_apdu_rc_reset(&swicc_state->apdu_rc);
+    }
+~~~
+
+So a GET RESPONSE only returns the template the **most recent** SELECT queued.
+Run two card-backed tests in parallel and one of them sends
+\`A0 C0 00 00 33\` after the other has already reset the queue,
+and the card answers \`6F 00\`. That is exactly what happened the
+first time issue #7's walk and issue #4's transport test ran together, and the
+card-fixture workflow now passes \`--test-threads=1\`. **One card,
+one test at a time.**
+
 ## macOS: this does not work, and here is why
 
 **Plainly: the swSIM fixture cannot be run on macOS with this project's setup.**
