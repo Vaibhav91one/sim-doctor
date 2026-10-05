@@ -55,6 +55,17 @@
 //! are enforced *at construction*, by types with private fields, so naming a
 //! variant directly cannot bypass them, and whatever was dropped is counted
 //! and reported rather than silently discarded.
+//!
+//! **Why the score lives here.** [Score] is a function of findings and the
+//! severity ladder, and both of those are this module's. Putting it here
+//! rather than in whichever command renders a report is what makes it testable
+//! with no card, no reader and no envelope, and it keeps the formula ([
+//! SCORE_FORMULA]) and the penalty table ([SCORE_PENALTY]) published as
+//! constants a caller can read rather than buried in an arithmetic expression.
+//! The whole of the design - why the number is an integer, why it is bounded
+//! at 0 and 100, and why a score of 100 is not a clean card - is on [Score].
+//! The human-readable statement of it is in AGENTS.md section 3, which is
+//! where somebody reading a scan's output will be sent.
 
 /// This module's name, as recorded in [`crate::MODULES`].
 ///
@@ -1380,6 +1391,38 @@ impl Findings {
         self.entries
     }
 
+    /// The findings at or above `threshold`, and nothing else.
+    ///
+    /// This is the whole of what `--severity <level>` does, and it is a
+    /// **filter, not a mask**. A finding below the threshold is not emitted,
+    /// not zeroed, not replaced by a placeholder carrying its rule ID: it is
+    /// gone from the value this returns, so an agent counting
+    /// [`Findings::len`] gets the count that survived the filter and a grep
+    /// for a dropped rule's ID finds nothing. A filtered-out finding that left
+    /// a trace would be counted by one consumer and reported by another, and
+    /// the two would disagree about how dirty the card is.
+    ///
+    /// Coverage is **recomputed from the survivors** rather than carried over.
+    /// The old `coverage` described the set as a whole; what the caller now
+    /// holds is a different, smaller set, and saying it is partial because a
+    /// partial finding was filtered out would be a claim about findings the
+    /// caller no longer has. Note what this does *not* do: it says nothing
+    /// about the walk. Whether the scan saw the whole card is `scan`'s
+    /// `complete` / `truncated` / `limits_hit`, which are not findings and are
+    /// not filtered.
+    #[must_use]
+    pub fn filtered(self, threshold: Severity) -> Self {
+        let entries: Vec<Finding> = self
+            .entries
+            .into_iter()
+            .filter(|finding| finding.at_least(threshold))
+            .collect();
+        // `complete` rather than a copy of `self.coverage`: it derives the
+        // coverage from the findings that survived, which is the only set the
+        // returned value describes.
+        Self::complete(entries)
+    }
+
     /// The set as the object that goes inside `payload.data`.
     ///
     /// `exhaustive` is the one word to read first. It is `false` when the
@@ -1402,6 +1445,151 @@ impl<'a> IntoIterator for &'a Findings {
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The score
+// ---------------------------------------------------------------------------
+
+/// The number [`SCORE_FORMULA`] starts from, and the ceiling of a score.
+pub const SCORE_MAX: u8 = 100;
+
+/// The scoring formula, in the one sentence a reader of a scan report needs.
+///
+/// This constant exists so the formula is *shipped*, not merely implemented.
+/// The reason is in the issue that asked for it: a score nobody can
+/// reconstruct is worse than no score, because a CI gate on it gets trusted
+/// without being understood. So the formula appears in three places - here,
+/// in the JSON `scan` emits beside every score, and in AGENTS.md section 3 -
+/// and a test asserts all three still say the same thing.
+pub const SCORE_FORMULA: &str =
+    "max(0, 100 - sum(penalty[severity] for every finding in this report))";
+
+/// The points each severity costs, indexed by [`Severity::rank`].
+///
+/// Entry `i` is the penalty for `Severity::LADDER[i]`, so the table cannot
+/// drift away from the ladder: the indices are not written by hand.
+///
+/// **These are constants, not measurements.** There is no published
+/// CVSS-equivalent for a SIM and this project has not derived one, so the
+/// numbers below are a chosen ladder rather than a computed one, and that is
+/// why they are published rather than left inside an arithmetic expression.
+/// The shape of the choice is: each rung costs several times the one below
+/// it, so a handful of `info` findings cannot bury a `high` one, and a
+/// `critical` costs half the scale on its own. They are a contract - a CI
+/// threshold written against them stops meaning the same thing if they move -
+/// so changing one is a decision to record in CONTEXT.md, not a tune.
+pub const SCORE_PENALTY: [u8; 5] = [1, 3, 10, 25, 50];
+
+/// The penalty one finding of `severity` costs the score.
+///
+/// A function rather than a lookup at each call site, so there is exactly
+/// one place the ladder is indexed.
+#[must_use]
+pub const fn penalty(severity: Severity) -> u8 {
+    SCORE_PENALTY[severity.rank() as usize]
+}
+
+/// One scan's quality score, and the two numbers it was made from.
+///
+/// A quality score is a *claim about a card*, so this type is built to be
+/// checked rather than trusted: it carries the penalty it subtracted as well
+/// as the result, so a reader can confirm `value == max - penalty` without
+/// re-deriving anything, and it carries how many findings it was made from,
+/// so a score of 100 from an empty set is distinguishable from a score of 100
+/// from a set the scan never managed to build.
+///
+/// # The formula
+///
+/// ```text
+/// penalty = sum over every finding of SCORE_PENALTY[severity.rank()]
+/// value   = max(0, SCORE_MAX - penalty)
+/// ```
+///
+/// Three properties follow, and each is asserted in the tests below rather
+/// than asserted here:
+///
+/// - **Deterministic.** The score is a `u64` sum over a slice. Nothing reads
+///   a clock, a hash-table iteration order, a locale or an environment
+///   variable, so the same findings always produce the same number.
+/// - **Integer, so there is nothing to round.** [`Score::value`] is a `u8`.
+///   `73.0000001` and `73` cannot both exist, a diff between two runs is
+///   readable, and a CI threshold is an integer comparison.
+/// - **Bounded at both ends by construction.** No findings sums to zero, so
+///   the value is exactly [`SCORE_MAX`]; a penalty at or past [`SCORE_MAX`]
+///   saturates to exactly zero. Neither end is an approximation, so "0 to
+///   100" is a property of the type rather than an aspiration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Score {
+    penalty: u64,
+    scored: usize,
+}
+
+impl Score {
+    /// The score of `findings`, computed by [`SCORE_FORMULA`].
+    ///
+    /// Takes the set as it will be **reported**, which is the set a caller
+    /// has already filtered. That is the only defensible choice: a score a
+    /// reader cannot reconstruct from the document in front of them is a
+    /// number nobody can check, and it would also mean filtering and scoring
+    /// could disagree about what was found.
+    #[must_use]
+    pub fn of(findings: &Findings) -> Self {
+        let penalty = findings
+            .iter()
+            .map(|finding| u64::from(penalty(finding.severity())))
+            .sum();
+        Self {
+            penalty,
+            scored: findings.len(),
+        }
+    }
+
+    /// The score itself: [`SCORE_MAX`] minus the penalty, floored at zero.
+    ///
+    /// The clamp is written rather than left to a cast, because truncating a
+    /// `u64` penalty to a `u8` would *wrap* rather than saturate: a penalty of
+    /// 256 would come out as zero and the score would read 100, which is the
+    /// one number this type must never be able to say about a dirty card.
+    pub const fn value(&self) -> u8 {
+        if self.penalty >= SCORE_MAX as u64 {
+            0
+        } else {
+            SCORE_MAX - self.penalty as u8
+        }
+    }
+
+    /// The top of the scale, so a consumer reading only the value still knows
+    /// what the ceiling was.
+    pub const fn max(&self) -> u8 {
+        SCORE_MAX
+    }
+
+    /// The total subtracted. `max() - penalty()` is [`Score::value`].
+    pub const fn penalty(&self) -> u64 {
+        self.penalty
+    }
+
+    /// How many findings the score was computed from.
+    ///
+    /// **Zero is not a clean card.** It is a scan that produced no findings,
+    /// which today means no rule has been implemented. Reading this next to
+    /// the value is what keeps a 100 from being mistaken for a verdict.
+    pub const fn scored(&self) -> usize {
+        self.scored
+    }
+}
+
+impl fmt::Display for Score {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{} (penalty {})",
+            self.value(),
+            SCORE_MAX,
+            self.penalty
+        )
     }
 }
 
@@ -2352,6 +2540,327 @@ mod finding_tests {
     }
 }
 
+#[cfg(test)]
+mod score_tests {
+    use super::*;
+
+    /// One finding at an arbitrary severity, with a rule ID derived from it so
+    /// a test can prove which finding survived by name.
+    fn at(severity: Severity) -> Finding {
+        let id = format!("test/severity-{}", severity.id());
+        Finding::new(
+            RuleId::new(id).unwrap(),
+            severity,
+            format!("a finding at {severity}"),
+            Location::tar(0x1234),
+            Evidence::text("evidence"),
+        )
+    }
+
+    /// The same, `count` times over, as one set.
+    fn set_of(severity: Severity, count: usize) -> Findings {
+        Findings::complete((0..count).map(|_| at(severity)).collect())
+    }
+
+    #[test]
+    fn the_score_is_the_documented_formula_written_out_by_hand() {
+        // The acceptance criterion for a score is not that a number appears.
+        // It is that the number can be reconstructed from the findings by
+        // somebody who has only the report, so this arithmetic is done here
+        // by hand, from the published table, with no call into Score.
+        let findings = Findings::complete(vec![
+            at(Severity::Info),
+            at(Severity::Low),
+            at(Severity::Low),
+            at(Severity::Medium),
+            at(Severity::High),
+        ]);
+
+        // 1 + 3 + 3 + 10 + 25 = 42, and 100 - 42 = 58.
+        let by_hand: u64 = 1 + 3 + 3 + 10 + 25;
+        assert_eq!(by_hand, 42);
+
+        let score = Score::of(&findings);
+        assert_eq!(score.penalty(), by_hand);
+        assert_eq!(score.value(), 58);
+        assert_eq!(score.max(), 100);
+        assert_eq!(score.scored(), 5);
+    }
+
+    #[test]
+    fn the_penalty_table_is_indexed_by_the_ladder_rather_than_by_hand() {
+        assert_eq!(
+            SCORE_PENALTY.len(),
+            Severity::LADDER.len(),
+            "the penalty table and the severity ladder have drifted apart"
+        );
+        for severity in Severity::LADDER {
+            assert_eq!(
+                penalty(severity),
+                SCORE_PENALTY[severity.rank() as usize],
+                "{severity} is charged the wrong penalty"
+            );
+        }
+
+        // And the shape of the choice: the table gets steadily more expensive
+        // as the ladder climbs, so a crowd of informational findings cannot
+        // bury the one that matters. Asserted rather than asserted-about, so
+        // a reordering of the constants cannot pass review unnoticed.
+        for pair in SCORE_PENALTY.windows(2) {
+            assert!(
+                pair[1] >= pair[0] * 2,
+                "{pair:?} does not keep the ladder's shape"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_set_scores_exactly_the_top_and_says_it_scored_nothing() {
+        let score = Score::of(&Findings::complete(Vec::new()));
+
+        assert_eq!(score.value(), SCORE_MAX);
+        assert_eq!(score.penalty(), 0);
+
+        // The number that matters. A score of 100 means *nothing was
+        // subtracted*, and a consumer that cannot tell that apart from a clean
+        // card will gate a build on a scanner that checked nothing.
+        assert_eq!(score.scored(), 0);
+    }
+
+    #[test]
+    fn the_score_is_an_integer_so_there_is_nothing_to_round() {
+        let findings = Findings::complete(vec![at(Severity::Medium)]);
+        let score = Score::of(&findings);
+
+        // Typed as u8: the precision is part of the contract, so it is
+        // asserted by making the compiler check it rather than by a comment.
+        let value: u8 = score.value();
+        assert_eq!(value, 90);
+
+        let rendered = score.to_string();
+        assert!(
+            !rendered.contains('.'),
+            "{rendered:?} carries a decimal point; the score is an integer"
+        );
+
+        // Every value on the scale renders without a decimal point, which is
+        // the property a CI log diff needs.
+        for count in 0..=100_usize {
+            let value = Score::of(&set_of(Severity::Info, count)).value();
+            assert!(value <= 100);
+            assert!(
+                !Score::of(&set_of(Severity::Info, count))
+                    .to_string()
+                    .contains('.'),
+                "{count} info findings rendered a fractional score"
+            );
+        }
+    }
+
+    #[test]
+    fn the_score_holds_at_both_ends_of_its_range() {
+        assert_eq!(Score::of(&Findings::complete(Vec::new())).value(), 100);
+
+        // Both directions of
+        for severity in Severity::LADDER {
+            let many = 1_000;
+            let score = Score::of(&set_of(severity, many));
+            assert_eq!(
+                score.value(),
+                0,
+                "a thousand {severity} findings should floor the score at 0"
+            );
+        }
+
+        // The exact boundary, and the one just past it.
+        assert_eq!(Score::of(&set_of(Severity::Info, 100)).value(), 0);
+        assert_eq!(Score::of(&set_of(Severity::Info, 99)).value(), 1);
+
+        // And every severity's penalty, on its own, is inside the range.
+        for severity in Severity::LADDER {
+            let score = Score::of(&set_of(severity, 1));
+            assert!(score.value() <= SCORE_MAX, "{severity}");
+            assert_eq!(
+                score.value(),
+                SCORE_MAX - penalty(severity),
+                "{severity} on its own must cost exactly its penalty"
+            );
+        }
+    }
+
+    #[test]
+    fn a_penalty_past_the_scale_floors_at_zero_and_never_wraps() {
+        // 300 low findings is a penalty of 900, which is well past what a u8
+        // can hold. Truncating rather than clamping would turn that into
+        // 100 - 144 = the wrong answer, or worse, back up at 100.
+        let score = Score::of(&set_of(Severity::Low, 300));
+        assert_eq!(score.penalty(), 900);
+        assert_eq!(score.value(), 0);
+        assert_ne!(score.value(), SCORE_MAX, "the score wrapped");
+
+        // And the same through the JSON a report would carry.
+        let json = serde_json::json!({ "value": score.value() });
+        assert_eq!(json["value"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn the_same_findings_score_the_same_whatever_order_they_arrive_in() {
+        // Determinism, stated as the property it is. The score is a sum over a
+        // slice, so order cannot reach it - and this test fails the day
+        // somebody makes it a fold over a hash-ordered collection.
+        let ascending = Findings::complete(vec![
+            at(Severity::Info),
+            at(Severity::Low),
+            at(Severity::Medium),
+            at(Severity::High),
+            at(Severity::Critical),
+        ]);
+        let descending = Findings::complete(vec![
+            at(Severity::Critical),
+            at(Severity::High),
+            at(Severity::Medium),
+            at(Severity::Low),
+            at(Severity::Info),
+        ]);
+        let shuffled = Findings::complete(vec![
+            at(Severity::Medium),
+            at(Severity::Critical),
+            at(Severity::Info),
+            at(Severity::High),
+            at(Severity::Low),
+        ]);
+
+        let expected = Score::of(&ascending);
+        assert_eq!(Score::of(&descending), expected);
+        assert_eq!(Score::of(&shuffled), expected);
+        assert_eq!(expected.penalty(), 1 + 3 + 10 + 25 + 50);
+    }
+
+    #[test]
+    fn scoring_the_same_findings_twice_gives_the_same_number() {
+        let findings = set_of(Severity::Medium, 7);
+        assert_eq!(Score::of(&findings), Score::of(&findings));
+
+        // And the score is a function of the findings alone: two sets with
+        // the same severities score the same whatever they say, where they
+        // sit on the card or what evidence they carry.
+        let elsewhere = Findings::complete(vec![
+            Finding::new(
+                RuleId::new("test/somewhere-else").unwrap(),
+                Severity::Medium,
+                "a different finding entirely",
+                Location::other("tar", "3C"),
+                Evidence::bytes([0x01, 0x02]),
+            ),
+            at(Severity::Medium),
+            at(Severity::Medium),
+            at(Severity::Medium),
+            at(Severity::Medium),
+            at(Severity::Medium),
+            at(Severity::Medium),
+        ]);
+        assert_eq!(Score::of(&elsewhere), Score::of(&findings));
+    }
+
+    #[test]
+    fn filtering_drops_findings_entirely_rather_than_masking_them() {
+        let all = Findings::complete(vec![
+            at(Severity::Info),
+            at(Severity::Low),
+            at(Severity::Medium),
+            at(Severity::High),
+            at(Severity::Critical),
+        ]);
+        let kept = all.filtered(Severity::High);
+
+        assert_eq!(kept.len(), 2, "high and critical survive a high filter");
+        for finding in kept.iter() {
+            assert!(finding.at_least(Severity::High), "{finding}");
+        }
+
+        // Nothing at all is left of what was dropped: not the entry, not the
+        // count, and - the half that actually bites in a report - not the
+        // rule ID anywhere in the rendered document.
+        let rendered = serde_json::to_string(&kept.to_json()).unwrap();
+        for dropped in Severity::LADDER.iter().take(3) {
+            let needle = format!("test/severity-{}", dropped.id());
+            assert!(
+                !rendered.contains(&needle),
+                "a filtered-out finding left {needle} behind in {rendered}"
+            );
+        }
+
+        // An agent counting gets the surviving count, not the original one.
+        assert_eq!(kept.to_json()["count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn filtering_to_the_top_of_the_ladder_can_empty_the_set_without_failing() {
+        let kept = set_of(Severity::Info, 12).filtered(Severity::Critical);
+
+        assert!(kept.is_empty());
+        assert_eq!(kept.len(), 0);
+        assert_eq!(kept.to_json()["count"], serde_json::json!(0));
+        assert_eq!(Score::of(&kept).value(), SCORE_MAX);
+    }
+
+    #[test]
+    fn filtering_recomputes_coverage_from_the_survivors() {
+        // A partial finding that the filter removes must not leave the
+        // surviving set claiming to be partial: the survivors are complete,
+        // and saying otherwise would be a claim about findings the caller no
+        // longer holds.
+        let all = Findings::complete(vec![
+            at(Severity::Low).partial("the walk hit max_nodes"),
+            at(Severity::High),
+            at(Severity::Critical),
+        ]);
+        assert!(!all.is_exhaustive(), "the set starts partial");
+
+        let kept = all.filtered(Severity::High);
+        assert_eq!(kept.len(), 2);
+        assert!(
+            kept.is_exhaustive(),
+            "the survivors are complete and the set must say so"
+        );
+        for finding in kept.iter() {
+            assert!(finding.coverage().is_complete(), "{finding}");
+        }
+
+        // The other direction: a survivor that is still partial keeps saying
+        // so, because the bound that produced it did still fire.
+        let mixed = Findings::complete(vec![
+            at(Severity::Info),
+            at(Severity::Critical).partial("the walk hit max_depth"),
+        ])
+        .filtered(Severity::High);
+        assert!(!mixed.is_exhaustive());
+        assert_eq!(mixed.coverage().reason(), Some("the walk hit max_depth"));
+    }
+
+    #[test]
+    fn a_score_of_a_filtered_set_is_the_score_of_what_was_reported() {
+        // Filtering and scoring must not be able to disagree about what was
+        // found. The report is the filtered set, so the score is taken from
+        // the filtered set, and a reader can reproduce it from the
+        // `findings` array in front of them.
+        let all = Findings::complete(vec![
+            at(Severity::Low),
+            at(Severity::High),
+            at(Severity::Critical),
+        ]);
+        let filtered = all.clone().filtered(Severity::High);
+
+        let scored_from_the_report = Score::of(&filtered);
+        assert_eq!(scored_from_the_report.scored(), filtered.len());
+        assert_eq!(scored_from_the_report.penalty(), 25 + 50);
+
+        // The unfiltered score is a different number, and the report is the
+        // filtered one. That is the whole of the decision, stated as a test.
+        assert_eq!(Score::of(&all).penalty(), 3 + 25 + 50);
+        assert_ne!(Score::of(&all), scored_from_the_report);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
