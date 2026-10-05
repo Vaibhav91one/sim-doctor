@@ -535,6 +535,26 @@ fn emit_modules(json: bool) -> Result<(), String> {
 /// 101, which is not one of the four numbers AGENTS.md section 3 promises. Going
 /// through `write_all` is what makes that failure reach a caller as
 /// [`contract::ExitCode::Findings`] instead.
+///
+/// **The `flush` is load-bearing, and its absence is a silent zero.** `stdout()`
+/// is a line-buffered writer, so `write_all` returning `Ok` means "accepted into
+/// the buffer", not "the bytes reached the stream". Anything still buffered when
+/// the command returns is flushed by the standard library's exit-time cleanup,
+/// which runs after `main` has already chosen the process exit code and
+/// discards the error. A caller of a run whose envelope was never written would
+/// therefore get exit 0 and nothing on stdout: the pipe closed, the answer was
+/// never delivered, and the status said everything was fine. That is strictly
+/// worse for an agent than the `println!` panic this function exists to replace,
+/// and it is exactly what
+/// `a_run_that_cannot_write_its_report_exits_1_and_explains_itself_on_stderr`
+/// exists to catch.
+///
+/// Whether the buffer happens to be flushed inside `write_all` is not this
+/// crate's to rely on. It depends on the payload's size against the buffer's
+/// capacity and on how the standard library flushes a completed line, and that
+/// has moved between releases and between platforms. Observed both ways: the
+/// Ubuntu runner returned 0 where the same binary on macOS returned 1. Flushing
+/// explicitly is what makes the property hold on every toolchain.
 fn emit_stdout(text: &str, what: &str) -> Result<(), String> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
@@ -543,6 +563,10 @@ fn emit_stdout(text: &str, what: &str) -> Result<(), String> {
     line.push('\n');
     handle
         .write_all(line.as_bytes())
+        // Checked rather than chained blindly: a write that failed must not be
+        // reported as a flush failure, and a write that succeeded must not be
+        // allowed to hide a flush that did not.
+        .and_then(|()| handle.flush())
         .map_err(|e| format!("cannot write {what} to stdout: {e}"))
 }
 

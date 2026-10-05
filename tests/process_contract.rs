@@ -65,7 +65,38 @@ impl Run {
     }
 }
 
+/// Serializes every process this file spawns.
+///
+/// **Descriptors are process-global state, and this file mutates them.** The
+/// closed-stdout handshake creates a raw pipe, closes one end and hands the
+/// other to a child, which is a sequence of operations on descriptor numbers
+/// every other thread in the process shares. One test doing that while another
+/// is mid-spawn is how a handshake ends up measuring something other than what
+/// it claims: the symptom observed in CI was a run against a closed stdout that
+/// exited 0 having written nothing, i.e. the pipe had a reader after all.
+/// Close-on-exec closes the inheritance route (see
+/// `the_closed_stdout_handshake_marks_both_pipe_ends_close_on_exec`), but
+/// descriptor NUMBERS are shared regardless, and a property that depends on
+/// which thread happens to be where is not a property.
+///
+/// Serializing costs this file well under a second and makes every spawn
+/// deterministic. Poisoning is recovered from rather than propagated: a
+/// previous test panicking says nothing about whether the lock is usable, and
+/// the alternative is every later test failing for an unrelated reason.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`SPAWN_LOCK`], recovering from a poisoned lock.
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Runs the binary with stderr captured, and stdout replaced if asked.
+///
+/// **Callers hold [`SPAWN_LOCK`]**, which is why this does not take it itself: the
+/// closed-stdout handshake has to hold the lock across pipe creation and spawn,
+/// and a lock taken in here as well would be taken twice by one thread.
 fn run(args: &[&str], stdout: Stdio) -> Run {
     let output = Command::new(binary())
         .args(args)
@@ -86,6 +117,7 @@ fn run(args: &[&str], stdout: Stdio) -> Run {
 
 /// Runs the binary with both streams captured from a pipe.
 fn run_piped(args: &[&str]) -> Run {
+    let _guard = spawn_lock();
     run(args, Stdio::piped())
 }
 
@@ -153,6 +185,7 @@ const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the binary is its pid.
 #[cfg(unix)]
 fn interrupt(args: &[&str]) -> Run {
+    let _guard = spawn_lock();
     let mut child = Command::new(binary())
         .args(args)
         .env("SIM_DOCTOR_TEST_SIGNAL_HOLD_MS", HOLD_MS.to_string())
@@ -239,9 +272,89 @@ fn success() -> Run {
 /// with `/dev/null`. Closing the read end before the child is spawned also
 /// removes the race that closing it afterwards would leave.
 fn undeliverable() -> Run {
+    run_with_a_closed_stdout(&["modules", "--json"])
+}
+
+/// [`undeliverable`], parameterised so a second test can prove the same property
+/// on a different payload without copying the unsafe handshake.
+///
+/// Parameterised rather than duplicated because the handshake is the delicate
+/// part: a second copy is a second set of raw descriptors to keep correct, and
+/// nothing about the property under test depends on which command produced the
+/// bytes.
+fn run_with_a_closed_stdout(args: &[&str]) -> Run {
+    let _guard = spawn_lock();
+    let (read_end, write_end) = pipe_with_a_protected_read_end();
+
+    // SAFETY: `read_end` is a descriptor this process opened moments ago and
+    // nobody else can hold it, now that it is close-on-exec, so closing it
+    // cannot affect any other descriptor.
+    unsafe { libc::close(read_end) };
+
+    // SAFETY: `write_end` is a fresh descriptor owned by nobody else, so the
+    // resulting `Stdio` is its only owner and no double close is possible.
+    let stdout = unsafe { Stdio::from_raw_fd(write_end) };
+    run(args, stdout)
+}
+
+/// Marks one descriptor close-on-exec, and fails the test if it cannot.
+///
+/// Not ignored on failure: a handshake whose descriptors can still leak is a
+/// handshake that silently measures nothing, and the failure it produces is a
+/// green run with a meaningless exit code in it. Better to stop here.
+///
+/// # Panics
+///
+/// Panics if `F_GETFD` or `F_SETFD` fails, naming the descriptor.
+fn set_close_on_exec(fd: libc::c_int) {
+    // SAFETY: `fd` is a descriptor this process opened moments ago and nobody
+    // else holds. F_GETFD only reads a flag off it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(
+        flags >= 0,
+        "F_GETFD on descriptor {fd} failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: as above, and `flags` came back from the kernel moments ago.
+    let set = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    assert!(
+        set >= 0,
+        "F_SETFD on descriptor {fd} failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Creates the pipe [`run_with_a_closed_stdout`] hands to a child, with
+/// both ends marked close-on-exec before it returns.
+///
+/// **Why the flag is set here and not by the caller.** `libc::pipe()` creates two
+/// descriptors that survive every later fork+exec in this process, and this test
+/// binary runs its tests in parallel while spawning children constantly. So
+/// between `pipe()` and the `close()` of the read end there is a window in which
+/// an UNRELATED child can be spawned, and it inherits the read end. That child
+/// then holds the pipe open long enough for the run under test to write to it
+/// SUCCESSFULLY, and the run exits 0 having delivered nothing: precisely the
+/// silent success this handshake exists to manufacture a failure for. Whether it
+/// ever happens is pure timing, which is why it reads as a platform difference
+/// rather than as a bug - observed as `left: 0` on a loaded Linux runner with
+/// the same binary returning 1 on macOS.
+///
+/// The write end is marked too, deliberately and harmlessly: `Stdio` arranges
+/// for it to reach this test's own child as fd 1, and the marker is undone by
+/// that arrangement rather than relied upon to be undone.
+///
+/// `pipe2(O_CLOEXEC)` would do both in one call but is Linux-only and this suite
+/// runs on macOS. `fcntl` is the portable spelling of the same flag, and it goes
+/// on BEFORE anything else so the window is empty from the first instruction.
+///
+/// One function rather than inline code, because
+/// `the_closed_stdout_handshake_marks_both_pipe_ends_close_on_exec` reads the
+/// flag back off the descriptors this returns. Removing the flag therefore fails
+/// that test with a message naming the race, instead of quietly re-opening it.
+fn pipe_with_a_protected_read_end() -> (libc::c_int, libc::c_int) {
     let mut ends = [0 as libc::c_int; 2];
-    // SAFETY: `ends` is a two-element array of the type `pipe` writes into, and
-    // `pipe` either fills both slots or fails without touching either.
+    // SAFETY: `ends` is a two-element array of exactly the type `pipe` writes
+    // into, and `pipe` either fills both slots or fails without touching them.
     let piped = unsafe { libc::pipe(ends.as_mut_ptr()) };
     assert_eq!(
         piped,
@@ -249,20 +362,60 @@ fn undeliverable() -> Run {
         "could not create a pipe: {}",
         std::io::Error::last_os_error()
     );
-    let (read_end, write_end) = (ends[0], ends[1]);
-
-    // SAFETY: `read_end` is a descriptor this process opened moments ago and
-    // nobody else holds, so closing it cannot affect any other descriptor.
-    unsafe { libc::close(read_end) };
-
-    // `Stdio::from_raw_fd` takes ownership of the write end, hands it to the
-    // child as fd 1, and closes the parent's copy once the child is spawned.
-    // SAFETY: `write_end` is a fresh descriptor owned by nobody else, so the
-    // resulting `Stdio` is its only owner and no double close is possible.
-    let stdout = unsafe { Stdio::from_raw_fd(write_end) };
-    run(&["modules", "--json"], stdout)
+    set_close_on_exec(ends[0]);
+    set_close_on_exec(ends[1]);
+    (ends[0], ends[1])
 }
 
+/// Proves the handshake marks BOTH ends of its pipe close-on-exec, and fails the
+/// moment it stops doing so.
+///
+/// This is the test that makes the fix visible. The race it guards is timing
+/// dependent and its symptom is a bare `left: 0` with nothing written, which took
+/// a full CI cycle to attribute; a comment would not have stopped the next person
+/// from deleting two lines and re-opening it. Reading the flag back off the
+/// descriptors [`pipe_with_a_protected_read_end`] returns fails deterministically,
+/// on every platform, with no other test having to lose a race first.
+///
+/// It checks the FLAG rather than trying to observe an exec, deliberately. An
+/// earlier version of this test did observe one, by listing `/dev/fd` inside a
+/// spawned shell, and it was wrong twice over: the kernel reuses the number of a
+/// close-on-exec descriptor for the probe's own pipe, so the listing reported an
+/// inherited descriptor that was not inherited; and parsing `ls -l` output for
+/// numbers is parsing a human-readable table. The flag is the thing the fix
+/// actually sets, so that is the thing worth asserting.
+#[test]
+fn the_closed_stdout_handshake_marks_both_pipe_ends_close_on_exec() {
+    let (read_end, write_end) = pipe_with_a_protected_read_end();
+
+    for (label, fd) in [("read", read_end), ("write", write_end)] {
+        // SAFETY: `fd` is a descriptor this process opened moments ago and nobody
+        // else holds it; F_GETFD only reads a flag off it.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "F_GETFD on the {label} end failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the {label} end of the handshake's pipe is inheritable again. A child \
+             spawned inside the handshake window in run_with_a_closed_stdout can \
+             then hold the read end open, the run under test writes successfully, \
+             and a_run_that_cannot_write_its_report_exits_1_and_explains_itself_on_stderr \
+             fails with a bare left: 0 and nothing on stdout. Restore the \
+             set_close_on_exec calls in pipe_with_a_protected_read_end."
+        );
+    }
+
+    // SAFETY: both are descriptors this process opened moments ago and nobody
+    // else holds them.
+    unsafe {
+        libc::close(read_end);
+        libc::close(write_end);
+    }
+}
 /// A run whose command line could not be understood.
 fn invalid_usage() -> Run {
     run_piped(&["modules", "--no-such-flag"])
@@ -308,7 +461,18 @@ fn a_clean_run_exits_0_and_says_nothing_on_stderr() {
 fn a_run_that_cannot_write_its_report_exits_1_and_explains_itself_on_stderr() {
     let run = undeliverable();
 
-    assert_eq!(run.code(), 1);
+    // The message carries the child's own stderr and its raw status on purpose.
+    // This test went red once with left: 0 on the Ubuntu runner and green on
+    // macOS with the same binary, and the only thing the assertion said about
+    // it was which two numbers disagreed. A failure here should now be
+    // diagnosable from the failure message alone.
+    assert_eq!(
+        run.code(),
+        1,
+        "an unwritable stdout must be exit 1, never 101 (a println! panic) and          never 0, which would tell an agent the run succeeded while delivering          nothing. status {:?}, stderr {:?}",
+        run.status,
+        run.stderr
+    );
     assert_eq!(
         run.stdout, "",
         "nothing could be written, so nothing must have been"
