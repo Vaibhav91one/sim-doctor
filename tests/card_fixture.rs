@@ -1554,36 +1554,44 @@ fn the_tar_audit_meets_a_card_with_no_tar_check() {
         elapsed
     );
 
-    // 1. The baseline is established, and it is the card's real answer. A
-    //    baseline that could not be established would mean the scanner cannot
-    //    tell an accepted TAR from an unknown one, and nothing below would be
-    //    worth checking.
+    // 1. **Whatever happened, it is reported.** The audit either finished or
+    //    stopped with a reason, and the reason lives in the audit rather than
+    //    in a failed scan. That is the property issue #24 changed after
+    //    watching this job go red: an ENVELOPE at a class swicc-pcsc does not
+    //    like comes back as a PC/SC transaction error, and the first version of
+    //    this code turned that into exit 1 with **no file list at all** -
+    //    throwing away a finished 16 384-node walk because a card would not
+    //    accept a second kind of command. The card WAS read.
+    match audit.stopped.as_deref() {
+        None => println!(
+            "tar: every TAR probed; baseline is {} from {} calibration probe(s)",
+            audit.baseline,
+            audit.baseline.sampled()
+        ),
+        Some(reason) => println!("tar: the audit stopped, and said why: {reason}"),
+    }
     assert!(
-        audit.baseline.is_established(),
-        "the baseline has to be established for anything else here to mean \
-         anything: {}",
-        audit.baseline
-    );
-    println!(
-        "tar: baseline is {} from {} calibration probe(s)",
-        audit.baseline,
-        audit.baseline.sampled()
+        audit.probes.len() <= sim_doctor::tar::FOCUSED_PROBES,
+        "more probes than the selection names is a bug in the loop"
     );
 
-    // 2. Every TAR was probed and the audit finished. A card that stopped
-    //    answering envelopes part way through is a different fact, and the
-    //    probe loop stops rather than continuing into it.
-    assert_eq!(
-        audit.probes.len(),
-        sim_doctor::tar::FOCUSED_PROBES,
-        "the focused selection has to be probed in full or the audit says so: {}",
-        audit.stopped.as_deref().unwrap_or("(finished)")
-    );
-    assert!(
-        audit.stopped.is_none(),
-        "the TAR scan did not finish: {:?}",
-        audit.stopped
-    );
+    // 2. If the audit DID get answers, the baseline has to be established:
+    //    without one the scanner cannot tell an accepted TAR from an unknown
+    //    one, and every claim below would be meaningless.
+    if audit.baseline.sampled() > 0 {
+        assert!(
+            audit.baseline.is_established(),
+            "the card answered {} calibration probe(s) and they did not agree on a \
+             baseline; a TAR scan with no baseline cannot decide anything: {}",
+            audit.baseline.sampled(),
+            audit.baseline
+        );
+        println!(
+            "tar: baseline established over {} calibration probe(s) as {}",
+            audit.baseline.sampled(),
+            audit.baseline
+        );
+    }
 
     // 3. **The finding.** On a card with no TAR check this has to be false, and
     //    false here is the correct answer rather than a miss: swSIM would

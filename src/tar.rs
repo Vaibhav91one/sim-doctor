@@ -1478,6 +1478,22 @@ enum Stop {
     /// holding half a command, and every later probe would then be answering
     /// about the wrong TAR.
     CardNotAnswering(String),
+
+    /// The reader or card stopped answering part way through.
+    ///
+    /// **This degrades the audit rather than failing the scan**, and that is
+    /// the decision issue #24 learned from running against swicc-pcsc: an
+    /// ENVELOPE at a class that handler does not like ends up as a PC/SC
+    /// transaction error, and a scan that treated that as fatal threw away a
+    /// finished filesystem walk. The card WAS read. Losing that report
+    /// because a card would not accept a second kind of command is a worse
+    /// failure than reporting the walk and saying the TAR half stopped.
+    ///
+    /// [V] Observed against the CI card job: `sim-doctor scan --json` on the
+    /// swSIM fixture answered `An attempt was made to end a non-existent
+    /// transaction` on the first ENVELOPE, which made the whole scan exit 1
+    /// with no file list at all.
+    Reader(String),
 }
 
 /// One ENVELOPE exchange's worth of answer, reduced to what the differential
@@ -1664,11 +1680,11 @@ pub fn audit<S: CardSession + ?Sized>(
                 halted = Some(Stop::CardNotAnswering(reason));
                 break;
             }
-            // A reader that has gone away has not produced a short TAR
-            // audit, it has produced no audit. Reporting a partial one as
-            // a result would put "we could not ask" beside a TAR list and
-            // let a reader take one for the other.
-            Err(err) => return Err(err),
+            Err(Error::Transport(reason)) => {
+                halted = Some(Stop::Reader(reason.to_string()));
+                break;
+            }
+            Err(other) => return Err(other),
         }
     }
 
@@ -1701,7 +1717,11 @@ pub fn audit<S: CardSession + ?Sized>(
                     halted = Some(Stop::CardNotAnswering(reason));
                     break;
                 }
-                Err(err) => return Err(err),
+                Err(Error::Transport(reason)) => {
+                    halted = Some(Stop::Reader(reason.to_string()));
+                    break;
+                }
+                Err(other) => return Err(other),
             }
         }
     }
@@ -1714,6 +1734,9 @@ pub fn audit<S: CardSession + ?Sized>(
             Stop::Interrupted => "the scan was interrupted".to_owned(),
             Stop::CardNotAnswering(reason) => {
                 format!("the card stopped answering envelopes: {reason}")
+            }
+            Stop::Reader(reason) => {
+                format!("the reader stopped answering part way through: {reason}")
             }
         })
     } else {
@@ -2433,18 +2456,33 @@ mod tests {
         assert!(audit.blind_spot().is_some());
     }
 
-    /// A reader that fails is an error, not a finding.
+    /// A reader that is gone before the first probe degrades the audit
+    /// rather than failing the scan.
+    ///
+    /// **Same rule as the mid-probe case, at the other end of the range**
+    /// and it is the one that decides whether a scan of an unplugged card
+    /// still reports the filesystem it read. It does not: the walk had
+    /// already finished, so throwing the report away would lose real
+    /// findings to make room for a sentence about a TAR sweep.
     #[test]
-    fn a_reader_failure_is_reported_not_swallowed() {
+    fn a_reader_that_is_gone_from_the_start_degrades_the_audit() {
         let mut card = Broken::new();
-        let err = audit(
+        let audit = audit(
             &mut card,
             &Selection::default(),
             &Policy::default(),
             &mut never,
         )
-        .expect_err("the reader is gone");
-        assert!(matches!(err, Error::Transport(_)), "{err}");
+        .expect("the audit returns what it has rather than failing the scan");
+
+        assert!(!audit.is_complete());
+        let stopped = audit.stopped.as_deref().expect("a reason");
+        assert!(
+            stopped.contains("the reader stopped answering part way through"),
+            "{stopped}"
+        );
+        assert_eq!(audit.probes.len(), 0);
+        assert!(!audit.msl_zero_allowed());
     }
 
     /// The block a report carries names the bound, the baseline and the class
@@ -2610,5 +2648,72 @@ mod tests {
     }
     fn spaced(bytes: &[u8]) -> String {
         octets(bytes)
+    }
+
+    /// **A reader that fails part way through degrades the audit and never the
+    /// scan.**
+    ///
+    /// This is the failure the CI card job actually produced: swicc-pcsc
+    /// answers the first ENVELOPE with a PC/SC transaction error, and a scan
+    /// that treated that as fatal discarded a finished 16 384-node walk. The
+    /// walk was real; the card was read. So the TAR half stops with a reason
+    /// and the rest of the report stands.
+    #[test]
+    fn a_reader_that_fails_mid_probe_degrades_the_audit_rather_than_the_scan() {
+        struct FailsAfterFirst {
+            inner: Scripted,
+            sent: usize,
+        }
+
+        impl CardSession for FailsAfterFirst {
+            fn reader(&self) -> &ReaderName {
+                self.inner.reader()
+            }
+
+            fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, TransportError> {
+                self.sent += 1;
+                // One good exchange, then the reader goes away.
+                if self.sent == 1 {
+                    return self.inner.transmit(command);
+                }
+                Err(TransportError::Transmit {
+                    reader: self.inner.reader().clone(),
+                    detail: "the PC/SC layer refused the exchange".to_owned(),
+                })
+            }
+
+            fn disconnect(&mut self) -> Result<(), TransportError> {
+                self.inner.disconnect()
+            }
+        }
+
+        let mut card = FailsAfterFirst {
+            inner: Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]),
+            sent: 0,
+        };
+        let audit = audit(
+            &mut card,
+            &Selection::default(),
+            &Policy::default(),
+            &mut never,
+        )
+        .expect("the audit returns what it has rather than failing the scan");
+
+        assert!(!audit.is_complete());
+        let stopped = audit.stopped.as_deref().expect("a reason");
+        assert!(
+            stopped.contains("the reader stopped answering part way through"),
+            "{stopped}"
+        );
+        assert!(
+            stopped.contains("the PC/SC layer refused the exchange"),
+            "the driver's own words travel into the report, because they are the only \
+             thing that says which layer refused: {stopped}"
+        );
+        assert!(
+            !audit.msl_zero_allowed(),
+            "a scan that got no answer reports nothing accepted"
+        );
+        assert!(audit.blind_spot().is_some());
     }
 }
