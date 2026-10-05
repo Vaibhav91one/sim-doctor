@@ -445,3 +445,315 @@ fn asking_for_help_is_not_a_failure() {
     );
     assert_eq!(run.stderr, "");
 }
+
+/// The shells `clap_complete` can generate for.
+///
+/// Written out rather than derived from the enum so a shell the crate adds
+/// later fails this test loudly instead of silently going untested.
+const SHELLS: [&str; 5] = ["bash", "elvish", "fish", "powershell", "zsh"];
+
+/// Issue #6's first acceptance criterion, on the command surface itself: a
+/// flag this tool does not understand is exit 129, and `scan` is no exception
+/// to the rule `modules` already follows.
+///
+/// Both an unknown flag and a value outside a flag's own vocabulary are tested.
+/// The second is the one that is easy to regress: --severity has to reject
+/// "NOPE" with 129 rather than accepting any string and deferring it, because
+/// an agent that typos a severity deserves to find out at parse time rather
+/// than after a walk.
+#[test]
+fn an_unparsable_scan_command_line_exits_129() {
+    let unknown_flag = run_piped(&["scan", "--no-such-flag"]);
+    assert_eq!(unknown_flag.code(), 129);
+    assert_eq!(
+        unknown_flag.stdout, "",
+        "clap's usage error must not land on stdout under --json semantics"
+    );
+    assert!(
+        !unknown_flag.stderr.is_empty(),
+        "a bad flag that reports nothing is a bad flag nobody can debug"
+    );
+
+    let bad_value = run_piped(&["scan", "--severity", "NOPE"]);
+    assert_eq!(
+        bad_value.code(),
+        129,
+        "a value outside the severity ladder is bad usage, not a deferred flag"
+    );
+    assert_eq!(bad_value.stdout, "");
+
+    // --diff without --baseline cannot mean anything, and saying so at parse
+    // time is better than deferring a request that could never be met.
+    let orphan_diff = run_piped(&["scan", "--diff"]);
+    assert_eq!(orphan_diff.code(), 129);
+    assert_eq!(orphan_diff.stdout, "");
+    assert!(
+        orphan_diff.stderr.contains("baseline"),
+        "{:?}",
+        orphan_diff.stderr
+    );
+}
+
+/// The four AGENTS.md section 3 flags that exist before their behaviour does
+/// must refuse, and refuse honestly.
+///
+/// What is pinned here is the refusal itself: exit 1 (a check that could not
+/// run, not a card that passed), one envelope under --json, and a `data` block
+/// saying `"implemented": false` and `"card_touched": false`. The failure mode
+/// these rules out is a --score that returned 0 because the scorer is
+/// unwritten, which would be indistinguishable from a clean card.
+#[test]
+fn every_deferred_scan_flag_refuses_without_touching_a_card() {
+    let cases: [(&[&str], &str); 4] = [
+        (&["scan", "--score", "--json"], "--score"),
+        (&["scan", "--severity", "high", "--json"], "--severity high"),
+        (
+            &["scan", "--baseline", "saved.json", "--json"],
+            "--baseline saved.json",
+        ),
+        (
+            &["scan", "--baseline", "saved.json", "--diff", "--json"],
+            "--baseline saved.json",
+        ),
+    ];
+
+    for (args, expected_flag) in cases {
+        let run = run_piped(args);
+        assert_eq!(run.code(), 1, "{args:?} exited {:?}", run.status);
+
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        let data = envelope.payload().data();
+        assert_eq!(
+            data["implemented"],
+            serde_json::Value::Bool(false),
+            "{args:?}"
+        );
+        assert_eq!(data["scanned"], serde_json::Value::Bool(false), "{args:?}");
+        assert_eq!(
+            data["card_touched"],
+            serde_json::Value::Bool(false),
+            "{args:?} claimed it contacted a card"
+        );
+        assert_eq!(data["flag"], serde_json::json!(expected_flag), "{args:?}");
+        assert!(
+            envelope.payload().message().contains("not implemented yet"),
+            "{args:?}: {:?}",
+            envelope.payload().message()
+        );
+        assert!(
+            run.stderr.contains("not implemented yet"),
+            "{args:?}: {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// The same refusals without --json print nothing at all on stdout.
+///
+/// Under --json stdout is the envelope, so a refusal is a document there. In
+/// the human modes stdout is a report, and a refusal has no report to give -
+/// the sentence belongs on stderr. Asserting this is what keeps a refusal from
+/// being a half-written result on stdout.
+#[test]
+fn a_deferred_scan_flag_without_json_writes_nothing_to_stdout() {
+    let run = run_piped(&["scan", "--score"]);
+
+    assert_eq!(run.code(), 1);
+    assert_eq!(run.stdout, "", "{:?}", run.stdout);
+    assert!(
+        run.stderr.contains("--score is not implemented yet"),
+        "{:?}",
+        run.stderr
+    );
+}
+
+/// A SIGINT on `scan` exits 130 with one interrupted envelope and no partial
+/// tree, on a machine with no card at all.
+///
+/// This runs everywhere, card or no card, because the first checkpoint is
+/// before the reader is opened. That placement is the point: an operator who
+/// hits Ctrl-C while the tool is still finding hardware is not made to wait
+/// for a card, and - more importantly - a run that is interrupted before it
+/// has anything to report still emits exactly one envelope carrying 130 and an
+/// empty `data`, never half a tree.
+#[test]
+#[cfg(unix)]
+fn interrupting_a_scan_exits_130_and_emits_no_partial_tree() {
+    let run = interrupt(&["scan", "--json"]);
+
+    assert_eq!(
+        run.status.signal(),
+        None,
+        "the process died of the signal instead of handling it, so exit code 130 is not being produced by this crate at all"
+    );
+    assert_eq!(run.code(), 130);
+
+    let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
+    assert_eq!(envelope.kind(), sim_doctor::scan::KIND);
+    assert_eq!(envelope.payload().message(), contract::INTERRUPTED_MESSAGE);
+    assert_eq!(
+        envelope.payload().data(),
+        &contract::interrupted_data(),
+        "an interrupted scan must not carry a partial tree, a count, or the \
+         reader it had found"
+    );
+    assert!(run.stderr.contains("interrupted"), "{:?}", run.stderr);
+}
+
+/// Issue #6's third acceptance criterion: generated completions build cleanly.
+///
+/// "Build cleanly" is asserted two ways. Every shell `clap_complete` supports
+/// produces a script that names this binary, and the script is syntactically
+/// whole: the bash one is checked with `bash -n` when bash is on PATH, because a
+/// completion script that does not parse is exactly the failure a golden-file
+/// comparison would not catch.
+///
+/// The second assertion is the one about the contract: every AGENTS.md section
+/// 3 flag has to appear in the script. An agent that types "sim-doctor scan --"
+/// and hits tab must see --score and --baseline, because a flag that exists and
+/// says "not yet" is the whole point of having them. A completion script that
+/// hid the unimplemented half of the surface would reintroduce the missing-flag
+/// problem in a place nobody looks.
+#[test]
+fn completions_build_for_every_shell_and_name_the_whole_flag_surface() {
+    for shell in SHELLS {
+        let run = run_piped(&["completions", shell]);
+
+        assert_eq!(run.code(), 0, "completions {shell} exited {:?}", run.status);
+        assert_eq!(
+            run.stderr, "",
+            "generating a completion script writes nothing to stderr: {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stdout.contains("sim-doctor"),
+            "the {shell} script never names the binary it completes"
+        );
+        assert!(!run.stdout.trim().is_empty(), "the {shell} script is empty");
+    }
+
+    // The flag surface, asserted once against one shell so the failure message
+    // is about the contract rather than about shell quoting.
+    let zsh = run_piped(&["completions", "zsh"]);
+    for flag in [
+        "--json",
+        "--dialect",
+        "--reader",
+        "--score",
+        "--severity",
+        "--baseline",
+        "--diff",
+    ] {
+        assert!(
+            zsh.stdout.contains(flag),
+            "the completion script omits {flag}, so an agent cannot discover it"
+        );
+    }
+
+    // A shell that does not exist is bad usage, not an empty script.
+    let bogus = run_piped(&["completions", "not-a-shell"]);
+    assert_eq!(bogus.code(), 129);
+    assert_eq!(bogus.stdout, "");
+
+    // Parse check, when there is a bash to parse with. Skipped rather than
+    // failed off a platform without one: the fixture gate in AGENTS.md section
+    // 2 is about cards, and a missing /bin/bash is not a defect in this crate.
+    if which("bash").is_some() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "sim-doctor-completions-{}.bash",
+            std::process::id()
+        ));
+        let write = std::fs::write(&path, run_piped(&["completions", "bash"]).stdout.as_bytes());
+        assert!(
+            write.is_ok(),
+            "could not write the script to {}",
+            path.display()
+        );
+        let parsed = Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("bash should run");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            parsed.status.success(),
+            "the generated bash script does not parse: {}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+    }
+}
+
+/// Whether a program is on PATH, so a test can skip rather than fail when the
+/// platform does not ship it.
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `scan` --help has to say the two things that decide whether a result can be
+/// trusted, and the process is the only place that text is observable.
+///
+/// The first is that the default candidate set can MISS a file. The second is
+/// that every flag whose behaviour is not built says so where the operator will
+/// read it. Both are pinned by quoting, because prose that is merely present is
+/// prose the next person rewords.
+#[test]
+fn scan_help_states_what_the_defaults_cannot_guarantee() {
+    let run = run_piped(&["scan", "--help"]);
+    assert_eq!(run.code(), 0);
+    assert_eq!(run.stderr, "");
+
+    // Truncation is the requirement an agent scripting against this tool most
+    // needs stated, so it is in the long help rather than only in a flag. The
+    // second assertion is the sharper one: an agent that gated on
+    // `payload.code` alone would read a partial walk as a clean card, so the
+    // help has to name `data.complete` as the thing to gate on.
+    assert!(
+        run.stdout.contains("Truncation is always reported"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("limits_hit"), "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("GATE ON data.complete, NOT ON payload.code"),
+        "the help must say which field an agent gates on: {}",
+        run.stdout
+    );
+
+    // The candidate-set under-report, in the flag that governs it.
+    assert!(
+        run.stdout
+            .contains("THE DEFAULT CANDIDATE SET CAN MISS A FILE"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("INVISIBLE"),
+        "the warning has to say the file is invisible, not merely unlisted: {}",
+        run.stdout
+    );
+
+    // The dialect assumption, and the flag that lets the operator state it.
+    assert!(run.stdout.contains("--dialect"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("assumption"),
+        "the --dialect help must say the default is an assumption: {}",
+        run.stdout
+    );
+
+    // Every unimplemented flag says so, in the place an operator will read it.
+    for flag in ["--score", "--severity", "--baseline", "--diff"] {
+        assert!(run.stdout.contains(flag), "{flag} is missing from --help");
+    }
+    assert_eq!(
+        run.stdout.matches("NOT IMPLEMENTED YET").count(),
+        4,
+        "all four deferred flags must say so: {}",
+        run.stdout
+    );
+}

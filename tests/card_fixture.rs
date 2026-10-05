@@ -926,3 +926,273 @@ fn tree_dump(tree: &sim_doctor::walk::Tree) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Issue #6's acceptance criterion, run against a live card: `sim-doctor scan`
+/// opens a real PC/SC session, selects the master file, walks the tree, and
+/// emits its report - in one process, through the same code path an operator
+/// gets.
+///
+/// **What only a card can prove, and why the library half is still here.**
+/// [`walks_the_file_system_of_a_real_card`] already proved that the walker
+/// works on real hardware. What this adds is everything *around* it, and none
+/// of it can be proved without a card:
+///
+///   1. reader discovery and `PcscSession::open` feeding a walk, which is the
+///      composition that did not exist anywhere before this issue,
+///   2. the report that walk produces surviving `serde_json` on a real card's
+///      real capabilities templates, rather than on a hand-written fixture,
+///   3. **the built binary** running the whole thing and exiting 0 with one
+///      envelope on stdout. The unit tests prove the renderers; only this
+///      proves the command.
+///
+/// **What it deliberately does not prove.** That a forbidden file is found.
+/// swICC evaluates no access condition on SELECT \[V], swicc
+/// `src/fs/va.c:va_select_file`, so no fixture run can produce that status.
+/// The absent/forbidden separation is asserted here as "nothing on this card
+/// was reported forbidden, and every refusal landed in exactly one of the
+/// three arrays", which is the part a card can say anything about at all.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn scans_a_real_card_end_to_end() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+    println!("scan: using reader {reader}");
+
+    let dialect = swicc_dialect();
+    let options = sim_doctor::walk::Options::default();
+    let mut session = PcscSession::open(reader)
+        .unwrap_or_else(|error| panic!("could not connect to {reader}: {error}"));
+    let atr = session.atr().expect("could not read the ATR");
+
+    let tree = sim_doctor::walk::walk(&mut session, &dialect, &options)
+        .unwrap_or_else(|error| panic!("the walk failed: {error}"));
+    println!(
+        "scan: walked {} nodes, {} selected, {} absent, {} forbidden, bounds hit {:?}",
+        tree.report().nodes,
+        tree.report().selected,
+        tree.report().absent,
+        tree.report().forbidden,
+        tree.limits_hit()
+    );
+
+    let context = sim_doctor::scan::Context::new(
+        reader.as_str(),
+        Some(&atr),
+        sim_doctor::scan::Dialect::Swicc,
+        options.candidates.clone(),
+        options.limits,
+    );
+
+    // 1. The dialect the scan ran under is named, in both renderings. This is
+    //    the assertion that would fail if someone picked a TagSet silently: the
+    //    name in the output has to be the name of the table that was handed to
+    //    the walk, not a constant.
+    let data = sim_doctor::scan::to_json(&tree, &context);
+    println!(
+        "scan: report names the dialect {:?} / {:?}",
+        data["dialect"]["id"], data["dialect"]["name"]
+    );
+    assert_eq!(data["dialect"]["id"], serde_json::json!("swicc"));
+    assert_eq!(
+        data["dialect"]["name"],
+        serde_json::json!(dialect.name()),
+        "the JSON must name the very table the walk ran under"
+    );
+    assert_eq!(
+        data["dialect"]["tags"]["file_size"],
+        serde_json::json!(dialect.file_size().map(|tag| tag.to_string()).unwrap()),
+        "swICC reads the file size out of 80, not out of the ISO table's 82"
+    );
+    assert_eq!(data["reader"], serde_json::json!(reader.as_str()));
+    assert_eq!(
+        data["addressing"],
+        serde_json::json!("path-from-master-file")
+    );
+
+    // 2. Truncation reaches the output. On this card the walk stops because the
+    //    card's own path resolver answers for a repeated 7F20 at every depth -
+    //    see the note in walks_the_file_system_of_a_real_card - so a truncated
+    //    report is the *expected* shape here and asserting it is meaningful
+    //    rather than convenient.
+    assert!(
+        !tree.is_complete(),
+        "this card describes an unbounded tree, so the walk is expected to \
+         truncate; if it did not, the bounds changed and this test must be \
+         reconsidered"
+    );
+    assert_eq!(data["complete"], serde_json::Value::Bool(false));
+    assert_eq!(data["truncated"], serde_json::Value::Bool(true));
+    assert!(
+        data["truncated_by"].is_string(),
+        "the first bound that fired has to be named: {data:#}"
+    );
+    assert!(
+        !data["limits_hit"]
+            .as_array()
+            .expect("limits_hit is an array")
+            .is_empty(),
+        "the full list of bounds has to be carried, not only the first: {data:#}"
+    );
+    println!(
+        "scan: reported truncated_by {:?} with limits_hit {:?}",
+        data["truncated_by"], data["limits_hit"]
+    );
+
+    let human = sim_doctor::scan::to_human(&tree, &context);
+    assert!(
+        human.starts_with("!! TRUNCATED"),
+        "the human report opens with the cut: {}",
+        human.lines().next().unwrap_or_default()
+    );
+    assert!(
+        human.contains("Every bound hit:"),
+        "the human report names every bound, not only the first"
+    );
+
+    // 3. The candidate set's coverage is stated. Nothing on this card falls
+    //    outside the five GSM families, so the walk lost no coverage here - and
+    //    the output still has to say so, because a reader cannot know that from
+    //    a file count.
+    assert_eq!(data["candidates"]["set"], serde_json::json!("sim-families"));
+    assert_eq!(
+        data["candidates"]["exhaustive"],
+        serde_json::Value::Bool(false)
+    );
+    assert_eq!(
+        data["candidates"]["warning"],
+        serde_json::json!(sim_doctor::scan::CANDIDATE_WARNING),
+        "the under-report warning travels with the report"
+    );
+
+    // 4. Absent and forbidden stayed in three separate arrays, and nothing was
+    //    invented into the forbidden one.
+    assert_eq!(
+        tree.report().forbidden,
+        0,
+        "swICC evaluates no access condition on SELECT, so a non-zero \
+         forbidden count here would mean the scan invented a finding"
+    );
+    assert!(
+        data["forbidden"]
+            .as_array()
+            .expect("forbidden is an array")
+            .is_empty(),
+        "{data:#}"
+    );
+    assert!(
+        data["absent"].as_array().expect("absent is an array").len() > 0,
+        "probing the SIM identifier space must have found most of it missing"
+    );
+    assert!(data["refused"]
+        .as_array()
+        .expect("refused is an array")
+        .is_empty());
+    assert!(
+        data["files"]
+            .as_array()
+            .expect("files is an array")
+            .iter()
+            .all(|file| {
+                matches!(
+                    file["state"].as_str(),
+                    Some("selected" | "absent" | "forbidden" | "refused")
+                )
+            }),
+        "every node has exactly one of the four state names: {data:#}"
+    );
+
+    // 5. It found what this profile holds, by absolute path, which is what a
+    //    scan reports and what an agent reads.
+    let selected: Vec<&str> = data["selected"]
+        .as_array()
+        .expect("selected is an array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    println!("scan: selected {:?}", selected);
+    for expected in ["3F00", "3F00/2F00", "3F00/2F05", "3F00/2FE2", "3F00/7F20"] {
+        assert!(
+            selected.contains(&expected),
+            "{expected} was not selected. The scan selected: {selected:?}"
+        );
+    }
+    // And EF.ICCID's size came out of the swicc table as ten octets, which is
+    // what data/usim.json says. Under the ISO table this is the number that
+    // reads 2337, so it is the single most valuable line in this test.
+    let iccid = data["files"]
+        .as_array()
+        .expect("files is an array")
+        .iter()
+        .find(|file| file["path"] == serde_json::json!("3F00/2FE2"))
+        .expect("3F00/2FE2 is in the report");
+    assert_eq!(
+        iccid["size"]["value"]["octets"],
+        serde_json::json!(10),
+        "EF.ICCID is ten octets and the size lives in tag 80 on this card; \
+         a different number means the dialect the scan ran under is wrong"
+    );
+
+    // 6. The whole document renders as one line, because that is what --json
+    //    puts on stdout.
+    let rendered = serde_json::to_string(&data).expect("the report renders");
+    assert!(!rendered.contains('\n'), "the report must be one line");
+    println!(
+        "scan: the report renders as {} bytes on one line",
+        rendered.len()
+    );
+
+    session.disconnect().expect("disconnect failed");
+
+    // 7. And the binary itself, which is the actual acceptance criterion.
+    //    `CARGO_BIN_EXE_sim-doctor` is resolved by cargo at compile time, so
+    //    this is the binary cargo built rather than a path guessed at run time.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args(["scan", "--json", "--reader", reader.as_str()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    assert!(
+        output.status.success(),
+        "sim-doctor scan --json exited {:?}\nstderr: {}\nstdout: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert!(
+        stdout.ends_with('\n'),
+        "one envelope and the newline that terminates it"
+    );
+    assert_eq!(
+        stdout.matches('\n').count(),
+        1,
+        "stdout is not a single line, so it is not a single envelope: {stdout}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(stdout.trim_end_matches('\n')).expect("stdout is one envelope");
+    assert_eq!(envelope["type"], serde_json::json!("scan"));
+    assert_eq!(envelope["payload"]["code"], serde_json::json!(0));
+    assert_eq!(
+        envelope["payload"]["data"]["dialect"]["name"],
+        serde_json::json!(dialect.name()),
+        "the binary reported the dialect it ran under"
+    );
+    assert_eq!(
+        envelope["payload"]["data"]["truncated"],
+        serde_json::Value::Bool(true),
+        "the binary reported the same truncation the library run did"
+    );
+    println!(
+        "scan: the binary emitted one envelope of {} bytes and exited 0",
+        stdout.trim_end().len()
+    );
+}
