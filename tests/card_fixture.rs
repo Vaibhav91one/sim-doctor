@@ -1395,10 +1395,15 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         serde_json::json!(sim_doctor::rules::SCORE_MAX)
     );
     assert_eq!(block["penalty"], serde_json::json!(0));
+    // rules_run is 1, so a rule DID run - but `--tar` defaults to off, so
+    // the audit probed nothing and the rule had nothing to look at. That is
+    // the no-evidence case, not the earned-100 case, and the warning has to
+    // say so. A null here would claim the card was checked for MSL 0 when no
+    // TAR was ever sent, which is the one thing this field must never do.
     assert_eq!(
         block["warning"],
-        serde_json::Value::Null,
-        "rules_run is 1, so this 100 was EARNED. A non-null warning here would          be the bug: it would say nothing was checked about a card one rule          just checked"
+        serde_json::json!(sim_doctor::scan::NO_TAR_EVIDENCE_WARNING),
+        "the audit probed nothing, so this 100 is not a verdict about MSL 0"
     );
     assert_eq!(
         block["rules_run"],
