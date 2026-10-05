@@ -23,10 +23,14 @@ sim-doctor completions zsh        # shell completions for the whole flag surface
 
 What it is **not** yet: the rule model exists (#13 - findings, locations,
 bounded evidence, and a registry that refuses a duplicate rule ID) but **no rule
-runs yet**, so `scan` still exits 0 whatever it saw, `--score` and `--severity`
-refuse honestly rather than guessing, and `--baseline` / `--diff` are
-placeholders (#9). A truncated walk is always labelled as one, in both output
-modes. See [CONTEXT.md](CONTEXT.md) for the plan.
+runs yet**. So `scan --severity` and `scan --score` are implemented and honest
+about it - a score of 100 carries `rules_run`, `scored_findings` and a warning
+beside it saying that nothing on the card was checked - while
+`--baseline` / `--diff` are still placeholders (#9) and refuse with
+`"implemented": false`. `scan` exits 0 whatever it saw; see AGENTS.md section 3
+for why, and what has to move together if that ever changes. A truncated walk
+is always labelled as one, in both output modes. See [CONTEXT.md](CONTEXT.md) for
+the plan.
 
 ## Documentation
 
