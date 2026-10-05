@@ -54,7 +54,7 @@ the plan.
 2. **Verified facts only.** Claims carry a [V] verified or [U] unverified tag so nobody
    builds on a guess. See AGENTS.md.
 3. **Testable without hardware.** The primary dev loop runs against a software SIM behind
-   a software PC/SC reader. `cargo test` needs no reader at all; the three
+   a software PC/SC reader. `cargo test` needs no reader at all; the four
    card-backed tests are behind the `card-fixture` feature and run in a separate
    CI job that builds swSIM and swicc-pcsc at pinned commits. See
    [docs/swsim-fixture.md](docs/swsim-fixture.md).

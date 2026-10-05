@@ -56,7 +56,7 @@ Never make hardware a prerequisite for running the test suite.
 **This is standing up, in issue #4.** Both projects are pinned by SHA, built and
 installed in a separate CI workflow, and the card-backed tests run against
 [src/transport/pcsc.rs](src/transport/pcsc.rs), the real `pcsc` implementation of
-[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs). Three
+[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs). Four
 tests live behind the gate:
 
 | Test | Proves |
@@ -64,11 +64,16 @@ tests live behind the gate:
 | `drives_a_real_card_through_the_pcsc_transport` | the transport round trip: SELECT MF, GET RESPONSE, READ BINARY (issue #4) |
 | `walks_the_file_system_of_a_real_card` | the DF-tree walk against real capabilities templates (issue #7) |
 | `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one envelope, exit 0 (issue #6) |
+| `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula and its no-rules warning on real stdout (issue #14) |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
 executable. The argument parsing, the reader choice, the envelope, the stdout
 purity and the exit status all live in the binary, so no library-level test can
-reach them.
+reach them. The fourth exists for the same reason and for one more:
+`--score` and `--severity` need a card before they produce anything at all, so
+on a cardless machine the process tests can only prove they are no longer
+**deferred**. Whether the score block reaches stdout, carrying its formula and
+its penalty table, is card-only.
 
 The gate keeping the default suite hardware-free is the **`card-fixture` cargo
 feature**, which is off by default; the test additionally carries `#[ignore]`.
@@ -76,7 +81,7 @@ Three commands to check the gate holds:
 
 ```
 cargo test --locked                                   # no reader, no daemon, no card
-cargo test --locked --all-features                     # still green; the card test is ignored
+cargo test --locked --all-features                     # still green; the card tests are ignored
 cargo test --locked --features card-fixture -- --ignored --nocapture   # needs the fixture
 ```
 

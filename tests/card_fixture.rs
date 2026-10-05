@@ -1298,7 +1298,9 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     // A bare run carries a findings block and no score: the score is a
     // deliberate act, not something every report carries.
     let (code, _, bare) = scan(&base);
+    println!("severity/score: scanning with {reader}");
     assert_eq!(code, 0, "{bare:#}");
+    println!("severity/score: a bare run carries a findings block and no score");
     assert!(
         bare["payload"]["data"]["findings"].is_object(),
         "every scan carries a findings block: {bare:#}"
@@ -1320,6 +1322,7 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     filtered.extend_from_slice(&["--severity", "high"]);
     let (code, _, high) = scan(&filtered);
     assert_eq!(code, 0, "{high:#}");
+    println!("severity/score: --severity high reported the threshold it applied");
     assert_eq!(
         high["payload"]["data"]["findings"]["severity_threshold"],
         serde_json::json!("high")
@@ -1373,6 +1376,12 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     );
 
     // The table travels too, so the number can be rebuilt without the source.
+    println!(
+        "severity/score: --score emitted value {} penalty {} over {} finding(s) with rules_run {}",
+        block["value"], block["penalty"], block["scored_findings"], block["rules_run"]
+    );
+    println!("severity/score: the 100 carries the no-rules warning beside it");
+
     let penalties = block["penalties"]
         .as_object()
         .expect("the penalty table is an object");
@@ -1403,6 +1412,8 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     );
 
     // The human mode, so the score is not JSON-only. A report a person
+    println!("severity/score: --severity critical --score scored what the report shows");
+
     // cannot check is the same defect in a different font.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
         .args(["scan", "--score", "--reader", reader.as_str()])
@@ -1423,4 +1434,5 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         human.contains(sim_doctor::scan::NO_RULES_WARNING),
         "the human report prints the same warning: {human}"
     );
+    println!("severity/score: the human report printed the formula and the warning");
 }
