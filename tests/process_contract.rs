@@ -65,7 +65,38 @@ impl Run {
     }
 }
 
+/// Serializes every process this file spawns.
+///
+/// **Descriptors are process-global state, and this file mutates them.** The
+/// closed-stdout handshake creates a raw pipe, closes one end and hands the
+/// other to a child, which is a sequence of operations on descriptor numbers
+/// every other thread in the process shares. One test doing that while another
+/// is mid-spawn is how a handshake ends up measuring something other than what
+/// it claims: the symptom observed in CI was a run against a closed stdout that
+/// exited 0 having written nothing, i.e. the pipe had a reader after all.
+/// Close-on-exec closes the inheritance route (see
+/// `the_closed_stdout_handshake_marks_both_pipe_ends_close_on_exec`), but
+/// descriptor NUMBERS are shared regardless, and a property that depends on
+/// which thread happens to be where is not a property.
+///
+/// Serializing costs this file well under a second and makes every spawn
+/// deterministic. Poisoning is recovered from rather than propagated: a
+/// previous test panicking says nothing about whether the lock is usable, and
+/// the alternative is every later test failing for an unrelated reason.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`SPAWN_LOCK`], recovering from a poisoned lock.
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Runs the binary with stderr captured, and stdout replaced if asked.
+///
+/// **Callers hold [`SPAWN_LOCK`]**, which is why this does not take it itself: the
+/// closed-stdout handshake has to hold the lock across pipe creation and spawn,
+/// and a lock taken in here as well would be taken twice by one thread.
 fn run(args: &[&str], stdout: Stdio) -> Run {
     let output = Command::new(binary())
         .args(args)
@@ -86,6 +117,7 @@ fn run(args: &[&str], stdout: Stdio) -> Run {
 
 /// Runs the binary with both streams captured from a pipe.
 fn run_piped(args: &[&str]) -> Run {
+    let _guard = spawn_lock();
     run(args, Stdio::piped())
 }
 
@@ -153,6 +185,7 @@ const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the binary is its pid.
 #[cfg(unix)]
 fn interrupt(args: &[&str]) -> Run {
+    let _guard = spawn_lock();
     let mut child = Command::new(binary())
         .args(args)
         .env("SIM_DOCTOR_TEST_SIGNAL_HOLD_MS", HOLD_MS.to_string())
@@ -239,9 +272,89 @@ fn success() -> Run {
 /// with `/dev/null`. Closing the read end before the child is spawned also
 /// removes the race that closing it afterwards would leave.
 fn undeliverable() -> Run {
+    run_with_a_closed_stdout(&["modules", "--json"])
+}
+
+/// [`undeliverable`], parameterised so a second test can prove the same property
+/// on a different payload without copying the unsafe handshake.
+///
+/// Parameterised rather than duplicated because the handshake is the delicate
+/// part: a second copy is a second set of raw descriptors to keep correct, and
+/// nothing about the property under test depends on which command produced the
+/// bytes.
+fn run_with_a_closed_stdout(args: &[&str]) -> Run {
+    let _guard = spawn_lock();
+    let (read_end, write_end) = pipe_with_a_protected_read_end();
+
+    // SAFETY: `read_end` is a descriptor this process opened moments ago and
+    // nobody else can hold it, now that it is close-on-exec, so closing it
+    // cannot affect any other descriptor.
+    unsafe { libc::close(read_end) };
+
+    // SAFETY: `write_end` is a fresh descriptor owned by nobody else, so the
+    // resulting `Stdio` is its only owner and no double close is possible.
+    let stdout = unsafe { Stdio::from_raw_fd(write_end) };
+    run(args, stdout)
+}
+
+/// Marks one descriptor close-on-exec, and fails the test if it cannot.
+///
+/// Not ignored on failure: a handshake whose descriptors can still leak is a
+/// handshake that silently measures nothing, and the failure it produces is a
+/// green run with a meaningless exit code in it. Better to stop here.
+///
+/// # Panics
+///
+/// Panics if `F_GETFD` or `F_SETFD` fails, naming the descriptor.
+fn set_close_on_exec(fd: libc::c_int) {
+    // SAFETY: `fd` is a descriptor this process opened moments ago and nobody
+    // else holds. F_GETFD only reads a flag off it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(
+        flags >= 0,
+        "F_GETFD on descriptor {fd} failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: as above, and `flags` came back from the kernel moments ago.
+    let set = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    assert!(
+        set >= 0,
+        "F_SETFD on descriptor {fd} failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Creates the pipe [`run_with_a_closed_stdout`] hands to a child, with
+/// both ends marked close-on-exec before it returns.
+///
+/// **Why the flag is set here and not by the caller.** `libc::pipe()` creates two
+/// descriptors that survive every later fork+exec in this process, and this test
+/// binary runs its tests in parallel while spawning children constantly. So
+/// between `pipe()` and the `close()` of the read end there is a window in which
+/// an UNRELATED child can be spawned, and it inherits the read end. That child
+/// then holds the pipe open long enough for the run under test to write to it
+/// SUCCESSFULLY, and the run exits 0 having delivered nothing: precisely the
+/// silent success this handshake exists to manufacture a failure for. Whether it
+/// ever happens is pure timing, which is why it reads as a platform difference
+/// rather than as a bug - observed as `left: 0` on a loaded Linux runner with
+/// the same binary returning 1 on macOS.
+///
+/// The write end is marked too, deliberately and harmlessly: `Stdio` arranges
+/// for it to reach this test's own child as fd 1, and the marker is undone by
+/// that arrangement rather than relied upon to be undone.
+///
+/// `pipe2(O_CLOEXEC)` would do both in one call but is Linux-only and this suite
+/// runs on macOS. `fcntl` is the portable spelling of the same flag, and it goes
+/// on BEFORE anything else so the window is empty from the first instruction.
+///
+/// One function rather than inline code, because
+/// `the_closed_stdout_handshake_marks_both_pipe_ends_close_on_exec` reads the
+/// flag back off the descriptors this returns. Removing the flag therefore fails
+/// that test with a message naming the race, instead of quietly re-opening it.
+fn pipe_with_a_protected_read_end() -> (libc::c_int, libc::c_int) {
     let mut ends = [0 as libc::c_int; 2];
-    // SAFETY: `ends` is a two-element array of the type `pipe` writes into, and
-    // `pipe` either fills both slots or fails without touching either.
+    // SAFETY: `ends` is a two-element array of exactly the type `pipe` writes
+    // into, and `pipe` either fills both slots or fails without touching them.
     let piped = unsafe { libc::pipe(ends.as_mut_ptr()) };
     assert_eq!(
         piped,
@@ -249,20 +362,60 @@ fn undeliverable() -> Run {
         "could not create a pipe: {}",
         std::io::Error::last_os_error()
     );
-    let (read_end, write_end) = (ends[0], ends[1]);
-
-    // SAFETY: `read_end` is a descriptor this process opened moments ago and
-    // nobody else holds, so closing it cannot affect any other descriptor.
-    unsafe { libc::close(read_end) };
-
-    // `Stdio::from_raw_fd` takes ownership of the write end, hands it to the
-    // child as fd 1, and closes the parent's copy once the child is spawned.
-    // SAFETY: `write_end` is a fresh descriptor owned by nobody else, so the
-    // resulting `Stdio` is its only owner and no double close is possible.
-    let stdout = unsafe { Stdio::from_raw_fd(write_end) };
-    run(&["modules", "--json"], stdout)
+    set_close_on_exec(ends[0]);
+    set_close_on_exec(ends[1]);
+    (ends[0], ends[1])
 }
 
+/// Proves the handshake marks BOTH ends of its pipe close-on-exec, and fails the
+/// moment it stops doing so.
+///
+/// This is the test that makes the fix visible. The race it guards is timing
+/// dependent and its symptom is a bare `left: 0` with nothing written, which took
+/// a full CI cycle to attribute; a comment would not have stopped the next person
+/// from deleting two lines and re-opening it. Reading the flag back off the
+/// descriptors [`pipe_with_a_protected_read_end`] returns fails deterministically,
+/// on every platform, with no other test having to lose a race first.
+///
+/// It checks the FLAG rather than trying to observe an exec, deliberately. An
+/// earlier version of this test did observe one, by listing `/dev/fd` inside a
+/// spawned shell, and it was wrong twice over: the kernel reuses the number of a
+/// close-on-exec descriptor for the probe's own pipe, so the listing reported an
+/// inherited descriptor that was not inherited; and parsing `ls -l` output for
+/// numbers is parsing a human-readable table. The flag is the thing the fix
+/// actually sets, so that is the thing worth asserting.
+#[test]
+fn the_closed_stdout_handshake_marks_both_pipe_ends_close_on_exec() {
+    let (read_end, write_end) = pipe_with_a_protected_read_end();
+
+    for (label, fd) in [("read", read_end), ("write", write_end)] {
+        // SAFETY: `fd` is a descriptor this process opened moments ago and nobody
+        // else holds it; F_GETFD only reads a flag off it.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "F_GETFD on the {label} end failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the {label} end of the handshake's pipe is inheritable again. A child \
+             spawned inside the handshake window in run_with_a_closed_stdout can \
+             then hold the read end open, the run under test writes successfully, \
+             and a_run_that_cannot_write_its_report_exits_1_and_explains_itself_on_stderr \
+             fails with a bare left: 0 and nothing on stdout. Restore the \
+             set_close_on_exec calls in pipe_with_a_protected_read_end."
+        );
+    }
+
+    // SAFETY: both are descriptors this process opened moments ago and nobody
+    // else holds them.
+    unsafe {
+        libc::close(read_end);
+        libc::close(write_end);
+    }
+}
 /// A run whose command line could not be understood.
 fn invalid_usage() -> Run {
     run_piped(&["modules", "--no-such-flag"])
@@ -308,7 +461,18 @@ fn a_clean_run_exits_0_and_says_nothing_on_stderr() {
 fn a_run_that_cannot_write_its_report_exits_1_and_explains_itself_on_stderr() {
     let run = undeliverable();
 
-    assert_eq!(run.code(), 1);
+    // The message carries the child's own stderr and its raw status on purpose.
+    // This test went red once with left: 0 on the Ubuntu runner and green on
+    // macOS with the same binary, and the only thing the assertion said about
+    // it was which two numbers disagreed. A failure here should now be
+    // diagnosable from the failure message alone.
+    assert_eq!(
+        run.code(),
+        1,
+        "an unwritable stdout must be exit 1, never 101 (a println! panic) and          never 0, which would tell an agent the run succeeded while delivering          nothing. status {:?}, stderr {:?}",
+        run.status,
+        run.stderr
+    );
     assert_eq!(
         run.stdout, "",
         "nothing could be written, so nothing must have been"
@@ -444,4 +608,316 @@ fn asking_for_help_is_not_a_failure() {
         run.stdout
     );
     assert_eq!(run.stderr, "");
+}
+
+/// The shells `clap_complete` can generate for.
+///
+/// Written out rather than derived from the enum so a shell the crate adds
+/// later fails this test loudly instead of silently going untested.
+const SHELLS: [&str; 5] = ["bash", "elvish", "fish", "powershell", "zsh"];
+
+/// Issue #6's first acceptance criterion, on the command surface itself: a
+/// flag this tool does not understand is exit 129, and `scan` is no exception
+/// to the rule `modules` already follows.
+///
+/// Both an unknown flag and a value outside a flag's own vocabulary are tested.
+/// The second is the one that is easy to regress: --severity has to reject
+/// "NOPE" with 129 rather than accepting any string and deferring it, because
+/// an agent that typos a severity deserves to find out at parse time rather
+/// than after a walk.
+#[test]
+fn an_unparsable_scan_command_line_exits_129() {
+    let unknown_flag = run_piped(&["scan", "--no-such-flag"]);
+    assert_eq!(unknown_flag.code(), 129);
+    assert_eq!(
+        unknown_flag.stdout, "",
+        "clap's usage error must not land on stdout under --json semantics"
+    );
+    assert!(
+        !unknown_flag.stderr.is_empty(),
+        "a bad flag that reports nothing is a bad flag nobody can debug"
+    );
+
+    let bad_value = run_piped(&["scan", "--severity", "NOPE"]);
+    assert_eq!(
+        bad_value.code(),
+        129,
+        "a value outside the severity ladder is bad usage, not a deferred flag"
+    );
+    assert_eq!(bad_value.stdout, "");
+
+    // --diff without --baseline cannot mean anything, and saying so at parse
+    // time is better than deferring a request that could never be met.
+    let orphan_diff = run_piped(&["scan", "--diff"]);
+    assert_eq!(orphan_diff.code(), 129);
+    assert_eq!(orphan_diff.stdout, "");
+    assert!(
+        orphan_diff.stderr.contains("baseline"),
+        "{:?}",
+        orphan_diff.stderr
+    );
+}
+
+/// The four AGENTS.md section 3 flags that exist before their behaviour does
+/// must refuse, and refuse honestly.
+///
+/// What is pinned here is the refusal itself: exit 1 (a check that could not
+/// run, not a card that passed), one envelope under --json, and a `data` block
+/// saying `"implemented": false` and `"card_touched": false`. The failure mode
+/// these rules out is a --score that returned 0 because the scorer is
+/// unwritten, which would be indistinguishable from a clean card.
+#[test]
+fn every_deferred_scan_flag_refuses_without_touching_a_card() {
+    let cases: [(&[&str], &str); 4] = [
+        (&["scan", "--score", "--json"], "--score"),
+        (&["scan", "--severity", "high", "--json"], "--severity high"),
+        (
+            &["scan", "--baseline", "saved.json", "--json"],
+            "--baseline saved.json",
+        ),
+        (
+            &["scan", "--baseline", "saved.json", "--diff", "--json"],
+            "--baseline saved.json",
+        ),
+    ];
+
+    for (args, expected_flag) in cases {
+        let run = run_piped(args);
+        assert_eq!(run.code(), 1, "{args:?} exited {:?}", run.status);
+
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        let data = envelope.payload().data();
+        assert_eq!(
+            data["implemented"],
+            serde_json::Value::Bool(false),
+            "{args:?}"
+        );
+        assert_eq!(data["scanned"], serde_json::Value::Bool(false), "{args:?}");
+        assert_eq!(
+            data["card_touched"],
+            serde_json::Value::Bool(false),
+            "{args:?} claimed it contacted a card"
+        );
+        assert_eq!(data["flag"], serde_json::json!(expected_flag), "{args:?}");
+        assert!(
+            envelope.payload().message().contains("not implemented yet"),
+            "{args:?}: {:?}",
+            envelope.payload().message()
+        );
+        assert!(
+            run.stderr.contains("not implemented yet"),
+            "{args:?}: {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// The same refusals without --json print nothing at all on stdout.
+///
+/// Under --json stdout is the envelope, so a refusal is a document there. In
+/// the human modes stdout is a report, and a refusal has no report to give -
+/// the sentence belongs on stderr. Asserting this is what keeps a refusal from
+/// being a half-written result on stdout.
+#[test]
+fn a_deferred_scan_flag_without_json_writes_nothing_to_stdout() {
+    let run = run_piped(&["scan", "--score"]);
+
+    assert_eq!(run.code(), 1);
+    assert_eq!(run.stdout, "", "{:?}", run.stdout);
+    assert!(
+        run.stderr.contains("--score is not implemented yet"),
+        "{:?}",
+        run.stderr
+    );
+}
+
+/// A SIGINT on `scan` exits 130 with one interrupted envelope and no partial
+/// tree, on a machine with no card at all.
+///
+/// This runs everywhere, card or no card, because the first checkpoint is
+/// before the reader is opened. That placement is the point: an operator who
+/// hits Ctrl-C while the tool is still finding hardware is not made to wait
+/// for a card, and - more importantly - a run that is interrupted before it
+/// has anything to report still emits exactly one envelope carrying 130 and an
+/// empty `data`, never half a tree.
+#[test]
+#[cfg(unix)]
+fn interrupting_a_scan_exits_130_and_emits_no_partial_tree() {
+    let run = interrupt(&["scan", "--json"]);
+
+    assert_eq!(
+        run.status.signal(),
+        None,
+        "the process died of the signal instead of handling it, so exit code 130 is not being produced by this crate at all"
+    );
+    assert_eq!(run.code(), 130);
+
+    let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
+    assert_eq!(envelope.kind(), sim_doctor::scan::KIND);
+    assert_eq!(envelope.payload().message(), contract::INTERRUPTED_MESSAGE);
+    assert_eq!(
+        envelope.payload().data(),
+        &contract::interrupted_data(),
+        "an interrupted scan must not carry a partial tree, a count, or the \
+         reader it had found"
+    );
+    assert!(run.stderr.contains("interrupted"), "{:?}", run.stderr);
+}
+
+/// Issue #6's third acceptance criterion: generated completions build cleanly.
+///
+/// "Build cleanly" is asserted two ways. Every shell `clap_complete` supports
+/// produces a script that names this binary, and the script is syntactically
+/// whole: the bash one is checked with `bash -n` when bash is on PATH, because a
+/// completion script that does not parse is exactly the failure a golden-file
+/// comparison would not catch.
+///
+/// The second assertion is the one about the contract: every AGENTS.md section
+/// 3 flag has to appear in the script. An agent that types "sim-doctor scan --"
+/// and hits tab must see --score and --baseline, because a flag that exists and
+/// says "not yet" is the whole point of having them. A completion script that
+/// hid the unimplemented half of the surface would reintroduce the missing-flag
+/// problem in a place nobody looks.
+#[test]
+fn completions_build_for_every_shell_and_name_the_whole_flag_surface() {
+    for shell in SHELLS {
+        let run = run_piped(&["completions", shell]);
+
+        assert_eq!(run.code(), 0, "completions {shell} exited {:?}", run.status);
+        assert_eq!(
+            run.stderr, "",
+            "generating a completion script writes nothing to stderr: {:?}",
+            run.stderr
+        );
+        assert!(
+            run.stdout.contains("sim-doctor"),
+            "the {shell} script never names the binary it completes"
+        );
+        assert!(!run.stdout.trim().is_empty(), "the {shell} script is empty");
+    }
+
+    // The flag surface, asserted once against one shell so the failure message
+    // is about the contract rather than about shell quoting.
+    let zsh = run_piped(&["completions", "zsh"]);
+    for flag in [
+        "--json",
+        "--dialect",
+        "--reader",
+        "--score",
+        "--severity",
+        "--baseline",
+        "--diff",
+    ] {
+        assert!(
+            zsh.stdout.contains(flag),
+            "the completion script omits {flag}, so an agent cannot discover it"
+        );
+    }
+
+    // A shell that does not exist is bad usage, not an empty script.
+    let bogus = run_piped(&["completions", "not-a-shell"]);
+    assert_eq!(bogus.code(), 129);
+    assert_eq!(bogus.stdout, "");
+
+    // Parse check, when there is a bash to parse with. Skipped rather than
+    // failed off a platform without one: the fixture gate in AGENTS.md section
+    // 2 is about cards, and a missing /bin/bash is not a defect in this crate.
+    if which("bash").is_some() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "sim-doctor-completions-{}.bash",
+            std::process::id()
+        ));
+        let write = std::fs::write(&path, run_piped(&["completions", "bash"]).stdout.as_bytes());
+        assert!(
+            write.is_ok(),
+            "could not write the script to {}",
+            path.display()
+        );
+        let parsed = Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("bash should run");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            parsed.status.success(),
+            "the generated bash script does not parse: {}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+    }
+}
+
+/// Whether a program is on PATH, so a test can skip rather than fail when the
+/// platform does not ship it.
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `scan` --help has to say the two things that decide whether a result can be
+/// trusted, and the process is the only place that text is observable.
+///
+/// The first is that the default candidate set can MISS a file. The second is
+/// that every flag whose behaviour is not built says so where the operator will
+/// read it. Both are pinned by quoting, because prose that is merely present is
+/// prose the next person rewords.
+#[test]
+fn scan_help_states_what_the_defaults_cannot_guarantee() {
+    let run = run_piped(&["scan", "--help"]);
+    assert_eq!(run.code(), 0);
+    assert_eq!(run.stderr, "");
+
+    // Truncation is the requirement an agent scripting against this tool most
+    // needs stated, so it is in the long help rather than only in a flag. The
+    // second assertion is the sharper one: an agent that gated on
+    // `payload.code` alone would read a partial walk as a clean card, so the
+    // help has to name `data.complete` as the thing to gate on.
+    assert!(
+        run.stdout.contains("Truncation is always reported"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("limits_hit"), "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("GATE ON data.complete, NOT ON payload.code"),
+        "the help must say which field an agent gates on: {}",
+        run.stdout
+    );
+
+    // The candidate-set under-report, in the flag that governs it.
+    assert!(
+        run.stdout
+            .contains("THE DEFAULT CANDIDATE SET CAN MISS A FILE"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("INVISIBLE"),
+        "the warning has to say the file is invisible, not merely unlisted: {}",
+        run.stdout
+    );
+
+    // The dialect assumption, and the flag that lets the operator state it.
+    assert!(run.stdout.contains("--dialect"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("assumption"),
+        "the --dialect help must say the default is an assumption: {}",
+        run.stdout
+    );
+
+    // Every unimplemented flag says so, in the place an operator will read it.
+    for flag in ["--score", "--severity", "--baseline", "--diff"] {
+        assert!(run.stdout.contains(flag), "{flag} is missing from --help");
+    }
+    assert_eq!(
+        run.stdout.matches("NOT IMPLEMENTED YET").count(),
+        4,
+        "all four deferred flags must say so: {}",
+        run.stdout
+    );
 }

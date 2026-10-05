@@ -25,6 +25,7 @@
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
+//! layer 1  scan        a walk turned into a report that admits what it missed
 //! ```
 //!
 //! Three consequences worth stating out loud, because later issues will
@@ -50,25 +51,30 @@
 //! - a human-facing session facade over [`session`] (#10). The composition
 //!   layer landed with #5: [`session`] chains a long command, follows a
 //!   `61 xx` with GET RESPONSE, drains a pending proactive command with FETCH
-//!   and reassembles the response. What is still missing is the CLI surface
-//!   and the rule wiring on top of it,
+//!   and reassembles the response. `sim-doctor scan` drives it end to end since
+//!   #6, but a command an operator can hold a session open in is still #10's,
+//!   and the rule wiring on top of it is #13's,
 //! - the `pcsc`-backed transport beyond opening a reader and moving bytes
 //!   (#10). [`transport::pcsc`] does establish a context, list readers,
 //!   connect and exchange APDUs, which is what issue #4's fixture needs. What
 //!   is still missing is the typed encode/decode that makes a session useful
 //!   for scanning (#5, landed in [`apdu`]), and the human-facing session
 //!   facade (#10, on top of [`session`]).
-//! - the rule layer's view of a walk (#9). [`walk`] walks the tree and
-//!   keeps a file that is not there apart from a file this terminal may not
-//!   read, in the type rather than in a flag. What is missing is a command
-//!   that turns a [`walk::Tree`] into findings,
-//! - turning findings into an exit code (#13). Issue #8 landed SIGINT:
-//!   [`signals`] installs the handler, [`contract`] has the number, and
-//!   `src/main.rs` decides that an interrupted run reports
-//!   `ExitCode::Interrupted` at a checkpoint. What is still missing is the
-//!   half that reads a scan's findings and picks between 0 and 1, which
-//!   needs rules that produce findings.
-//! - the clap command surface beyond `sim-doctor modules` (#6),
+//! - turning findings into an exit code (#13). Issue #6 landed the
+//!   command: `sim-doctor scan` walks a card and reports it, and it exits 0
+//!   whenever the walk finished, because there is nothing to threshold yet.
+//!   What is still missing is the half that reads a scan's findings and picks
+//!   between 0 and 1, which needs rules that produce findings. Until then
+//!   `--score`, `--severity`, `--baseline` and `--diff` exist on the surface
+//!   and refuse with an honest `"implemented": false` rather than pretending,
+//!   which is the AGENTS.md section 3 contract taken literally,
+//! - saving a run and comparing it against a later one (#9). [`scan::Deferred`]
+//!   is where both halves refuse today,
+//! - asking [`scan`] for a candidate set other than the default. The report
+//!   states the default's coverage in three places because it can MISS a file,
+//!   but `--candidates` does not exist yet, so an operator who needs
+//!   certainty has no way to ask for it from the command line. Recorded on
+//!   `--max-children` rather than left to be discovered;
 //! - findings and the rule registry (#13). [`rules`] has the identifiers and
 //!   the severity ladder and no code that produces either,
 //! - anything on the non-TLV side of the crypto stack. Issue #11 landed the
@@ -86,6 +92,7 @@ pub mod der;
 pub mod fcp;
 pub mod fs;
 pub mod rules;
+pub mod scan;
 pub mod session;
 pub mod signals;
 pub mod tlv;
@@ -167,6 +174,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: walk::NAME,
         owns: "The DF-tree walk: select the master file, probe identifiers, descend, and keep absent apart from forbidden.",
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fcp::NAME, fs::NAME, session::NAME],
+    },
+    ModuleInfo {
+        name: scan::NAME,
+        owns: "A walk rendered as JSON or prose, carrying the dialect it ran under and every bound it hit.",
+        depends_on: &[tlv::NAME, apdu::NAME, fcp::NAME, fs::NAME, walk::NAME],
     },
 ];
 

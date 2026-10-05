@@ -21,6 +21,15 @@
 # the tree that comes back. The step asserts on the walker's own log lines, so
 # a green job means the walk happened rather than having been skipped.
 #
+# Finally it runs issue #6's M1 command end to end: `sim-doctor scan --json`
+# as the BUILT BINARY, against the same card, through the same PC/SC transport,
+# exiting 0 with one envelope on stdout. That is the acceptance criterion for
+# the whole M1 path, and a library-level test could not prove it: the argument
+# parsing, the reader choice, the envelope, the stdout purity and the exit
+# status all live in the binary. The step asserts on the log lines the test
+# prints on the way to each of those, so a green job means the assertions
+# behind them ran rather than the process exiting early.
+#
 # Every step sets "set -o pipefail". Both C projects build with -Werror, and a
 # step written as "make ... 2>&1 | tail -40" reports the exit status of tail,
 # so a build that produced no binary at all would look like a pass. Every step
@@ -337,14 +346,36 @@ jobs:
 
           # --ignored against a renamed or deleted test runs nothing and still
           # exits 0, so the log is asserted on rather than the exit code alone.
-          # BOTH card-backed tests must be in it:
+          # ALL THREE card-backed tests must be in it:
           # drives_a_real_card_through_the_pcsc_transport is issue #4's
-          # transport round trip and walks_the_file_system_of_a_real_card is
-          # issue #7's DF-tree walk. Naming one and ignoring the other would
-          # let the walk silently stop being card-verified.
-          grep -q '2 passed' "$log"
+          # transport round trip, walks_the_file_system_of_a_real_card is
+          # issue #7's DF-tree walk, and scans_a_real_card_end_to_end is
+          # issue #6's M1 command run as a real binary. Naming two and ignoring
+          # the third would let the scan silently stop being card-verified.
+          grep -q '3 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
+          grep -q 'scans_a_real_card_end_to_end' "$log"
+
+          # Issue #6's scan, end to end. These are the lines the test prints on
+          # the way to each of the properties issue #6 names, so a green job
+          # means the assertions behind them actually ran rather than the
+          # process having exited before reaching them.
+          #
+          #   - the dialect the walk ran under, named in the output
+          #   - the truncation: a swSIM card describes an unbounded tree, so a
+          #     truncated report is the expected shape and asserting it is the
+          #     point of the test
+          #   - EF.ICCID's size read as ten octets, which is only true under
+          #     the swICC tag table
+          #   - the built binary emitting ONE envelope on stdout and exiting 0
+          grep -q 'scan: using reader' "$log"
+          grep -q 'scan: walked .* nodes, .* selected, .* absent' "$log"
+          grep -q 'scan: report names the dialect' "$log"
+          grep -q 'scan: reported truncated_by' "$log"
+          grep -q 'scan: selected' "$log"
+          grep -q 'the report renders as .* bytes on one line' "$log"
+          grep -q 'the binary emitted one envelope of .* bytes and exited 0' "$log"
 
           # Issue #4's test got as far as the SELECT MF and READ BINARY round
           # trips.

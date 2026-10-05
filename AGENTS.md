@@ -54,9 +54,21 @@ The primary dev loop is a software SIM behind a software PC/SC reader:
 Never make hardware a prerequisite for running the test suite.
 
 **This is standing up, in issue #4.** Both projects are pinned by SHA, built and
-installed in a separate CI workflow, and the card-backed test runs against
+installed in a separate CI workflow, and the card-backed tests run against
 [src/transport/pcsc.rs](src/transport/pcsc.rs), the real `pcsc` implementation of
-[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs).
+[ReaderProvider](src/transport.rs) and [CardSession](src/transport.rs). Three
+tests live behind the gate:
+
+| Test | Proves |
+|---|---|
+| `drives_a_real_card_through_the_pcsc_transport` | the transport round trip: SELECT MF, GET RESPONSE, READ BINARY (issue #4) |
+| `walks_the_file_system_of_a_real_card` | the DF-tree walk against real capabilities templates (issue #7) |
+| `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one envelope, exit 0 (issue #6) |
+
+The third is the M1 acceptance criterion, and it is the only one that runs the
+executable. The argument parsing, the reader choice, the envelope, the stdout
+purity and the exit status all live in the binary, so no library-level test can
+reach them.
 
 The gate keeping the default suite hardware-free is the **`card-fixture` cargo
 feature**, which is off by default; the test additionally carries `#[ignore]`.
