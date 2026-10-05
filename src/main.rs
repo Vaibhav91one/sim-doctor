@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    contract, rules, scan, signals,
+    contract, rules, scan, session, signals, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -165,12 +165,35 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "    capabilities template with the wrong tag table produces a file size the\n",
     "    card never sent. Pass --dialect to declare which table is in use; the\n",
     "    one actually used is named in both output modes.\n",
-    "  * The default candidate set can MISS a file. See --max-children.\n\n",
+    "  * The default candidate set can MISS a file. See --max-children.\n",
+    "  * A default TAR scan does NOT prove MSL != 0. See TAR AND MSL 0.\n\n",
     "GATE ON data.complete, NOT ON payload.code\n",
     "  payload.code is 0 whenever the walk FINISHED, including a walk that was\n",
     "  cut short: a card that describes an unbounded tree is a card we read part\n",
     "  of, and that is not a failed check. An agent gating a build should\n",
     "  require payload.data.complete to be true.\n\n",
+    "TAR AND MSL 0\n",
+    "  A TAR is a three-octet value a network uses to route an SMS payload to one\n",
+    "  application on a card. A card running at MSL 0 accepts ANY command under\n",
+    "  ANY TAR with no cryptographic verification, so the security question is\n",
+    "  which TARs the card will act on. --tar selects them: off (none), focused\n",
+    "  (592 TARs, the default), full (from 000000), range:FIRST-LAST, or\n",
+    "  regex:PATTERN over the six-hex-digit spelling.\n",
+    "  THE PROBE COUNT IS CAPPED AT 4096 WHATEVER YOU ASK FOR. The full TAR\n",
+    "  space is 16 777 216 values and this tool will not send them all to a\n",
+    "  card. A selection larger than the cap stops at it; data.tar.stopped says\n",
+    "  so, and any finding it carries is marked partial rather than read as an\n",
+    "  exhaustive audit of the card's TAR accept-list.\n",
+    "  A TAR is reported as ACCEPTED when the card answers it DIFFERENTLY from\n",
+    "  the way it answers TARs it has no opinion about. That is a measurement,\n",
+    "  not a status word this tool guesses at: no 3GPP TS 31.111 text has been\n",
+    "  read here, and the one card this crate has talked to answers 94 04 for\n",
+    "  something else entirely. data.tar.baseline carries the measurement, and\n",
+    "  every probe's status word is in data.tar.probes.\n",
+    "  A CARD THAT ANSWERS EVERY TAR IDENTICALLY REPORTS NOTHING ACCEPTED. On\n",
+    "  a card with no TAR check that is the correct answer, not a miss. A scan\n",
+    "  whose baseline could not be established says so in data.tar.blind_spot\n",
+    "  and raises nothing.\n\n",
     "SEVERITY AND SCORE\n",
     "  --severity <level> REMOVES findings below that level from the report.\n",
     "  Not marked, not counted, absent from the JSON entirely, so a count or a\n",
@@ -184,17 +207,20 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "  the number of findings scored, so the number can be recomputed from\n",
     "  the report. It scores the findings this report carries, so --severity\n",
     "  and --score compose rather than contradict each other.\n",
-    "  UNTIL A RULE IS IMPLEMENTED the score is 100 with rules_run 0 and a\n",
-    "  warning beside it. That 100 means nothing was checked, not that the\n",
-    "  card is clean, and the output says so in words.\n\n",
+    "  A rules_run OF 0 means no rule was evaluated, and the block then carries\n",
+    "  a warning beside the 100 saying so in words. A rules_run above 0 with a\n",
+    "  score of 100 means a rule looked and found nothing, which is a verdict.\n",
+    "  The two are different numbers wearing the same digits, and warning is\n",
+    "  what tells them apart.\n\n",
     "EXIT CODES\n",
-    "  0  the walk finished. A FINDING DOES NOT CHANGE THIS - gate on\n",
-    "     data.complete and data.score, never on payload.code alone.\n",
+    "  0  the walk finished. A FINDING DOES NOT CHANGE THIS, deliberately: exit\n",
+    "     1 already means a check could not run, and the document reporting that\n",
+    "     carries data.error and no data.findings, so one code would carry two\n",
+    "     document schemas. Gate on data.complete and data.score instead.\n",
     "  1  the walk could not run, or a requested flag is not implemented yet\n",
     "  129  the command line could not be parsed\n",
     "  130  interrupted\n",
 );
-
 /// Everything `sim-doctor scan` takes.
 #[derive(Args)]
 struct ScanArgs {
@@ -321,36 +347,79 @@ struct ScanArgs {
     /// silent no-op. Diffing against a baseline is issue #9.
     #[arg(long, requires = "baseline")]
     diff: bool,
+
+    /// Which TARs to probe for MSL 0, and how many.
+    ///
+    /// Implemented. Defaults to `focused`, which is 592 TARs chosen from
+    /// SIMTester's own ranged-scan bands; `off` probes nothing, `full`
+    /// starts at 000000, `range:FIRST-LAST` scans a band and
+    /// `regex:PATTERN` scans everything matching a pattern over the
+    /// six-hex-digit spelling (SIMTester's `-str` and `-stre`).
+    ///
+    /// THE PROBE COUNT IS BOUNDED AT 4096 WHATEVER YOU ASK FOR. The full TAR
+    /// space is 16 777 216 values; sending them all to a card is not
+    /// something this tool will do behind a flag. A selection larger than the
+    /// bound stops at it and the report says so, under
+    /// `data.tar.stopped`, and the finding it carries is marked partial
+    /// rather than read as an exhaustive audit of the card's TAR accept-list.
+    ///
+    /// A TAR is accepted when the card's answer to it differs from the answer
+    /// it gives to TARs it has no opinion about - the `-stbs` differential
+    /// from SIMTester, reimplemented in src/tar.rs with the reasoning. A card
+    /// that answers every TAR identically therefore reports nothing, which on
+    /// a card with no TAR check is the correct answer rather than a miss.
+    #[arg(long, value_name = "SELECTION", default_value_t = tar::Selection::default())]
+    tar: tar::Selection,
 }
 
 /// Whether a scan that produced findings exits 1.
 ///
-/// **No. It does not, and that is a decision rather than an omission.**
+/// **No. It does not, and after issue #24 that is a decision rather than an
+/// accident: a rule now runs, and the reason it deferred is gone.**
 ///
 /// AGENTS.md section 3 lists exit 1 as "findings present (or checks failed)"
-/// and this run takes the second half only. Three reasons, in the order they
-/// carried weight:
+/// and issue #13 left this half-taken with three reasons. They are not all
+/// still standing, and saying so is the point:
 ///
-/// 1. **No rule runs yet** (issue #13 shipped the vocabulary and no rules),
-///    so there is nothing that can produce a finding today. Wiring the exit
-///    code now would be a behaviour change with no test that could observe
-///    it, which is the shape of a regression that waits.
-/// 2. **`scan --help` already tells an agent what to gate on.** It says
-///    "GATE ON data.complete, NOT ON payload.code", and `payload.code` is 0
-///    for every walk that finished, including a truncated one. Changing what
-///    the code means without changing that sentence would make the help
-///    wrong; changing the sentence too is a contract edit that belongs with
-///    the first rule, not with the scorer.
-/// 3. **Exit 1 currently means "a check failed"** - no reader, no card, an
-///    unwritable stdout. Letting it also mean "the card is dirty" collapses
-///    "you did not check" into "it is dirty", and for a security tool the
-///    first of those two is the more alarming mistake to make.
+/// 1. ~~**No rule runs yet.**~~ **WITHDRAWN by issue #24.** The vocabulary
+///    arrived with #13 and the first rule arrived with this one, so a scan can
+///    produce a finding and this question is observable for the first time.
+///    A reason that has stopped being true must stop being written down, or the
+///    next reader inherits it as a live argument.
+/// 2. **`payload.code` already means something else.** Still true and still
+///    independent of the first: it is 0 whenever the walk *finished*, including
+///    a walk that was cut short, and `scan --help` has said `GATE ON
+///    data.complete, NOT ON payload.code` since issue #6. Spending code 1 on
+///    "the card is dirty" makes that sentence wrong unless it is reworded in
+///    the same commit, which is a contract edit, not a constant.
+/// 3. **The two meanings have two different documents.** **This is the
+///    decisive one and it was not written down before.** Exit 1 is reachable
+///    today from six conditions - no reader, unknown reader, reader
+///    unavailable, walk failed, rule misattribution, a deferred flag - plus an
+///    unwritable stdout. Every one of them emits a *refusal* document:
+///    `data.error` and `data.card_touched`, and **no `data.findings`
+///    key at all**. A scan that found something would emit the opposite shape:
+///    `data.findings` and `data.score`, and **no `data.error` key at
+///    all**. So flipping this does not add a meaning to an exit code; it gives
+///    one code two mutually exclusive document schemas, and an agent that
+///    branches on the status has to read the body to pick one. For a tool whose
+///    whole promise is that an agent can branch on the status, that is the
+///    wrong trade to make in the same release that first produces a finding.
 ///
-/// The primitive for the change is already written and tested:
-/// [`rules::Findings::reaches`] over [`Verdict::findings`](scan::Verdict), at
-/// the `Ok(()) => contract::ExitCode::Success` arm of [`run_scan`]. Flip this
-/// to `true` and move that line; [`findings_do_not_fail_a_scan_yet`] fails
-/// until the constant and its test agree.
+/// **What to gate on instead, which is already in the document:** a CI gate
+/// reads `data.complete` (was the whole card read?) and
+/// `data.score.value` (is it under the threshold?). Both are per-field,
+/// neither collides with the exit code, and `data.score.warning` is null
+/// now that a rule runs - which is exactly the three-way distinction the exit
+/// code could never carry: *checked and clean*, *checked and dirty*, *not
+/// checked*.
+///
+/// **When to revisit.** When #9 lands `--baseline` and `--diff`, both
+/// of which are already designed to exit 1, a gate has a threshold to fail
+/// against rather than a bare "something is wrong". That is the moment
+/// findings-fail-a-scan can be attached to a number an operator chose, instead
+/// of being smeared across every way a scan can go wrong. Recorded in
+/// CONTEXT.md section 3.
 const FINDINGS_FAIL_A_SCAN: bool = false;
 
 impl ScanArgs {
@@ -751,18 +820,49 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         }
     };
 
-    // The second and last checkpoint. Everything the tree knows is still only
+    // The second of three checkpoints. Everything the tree knows is still only
     // in memory here, so stopping now costs the whole run rather than emitting
     // something a caller could mistake for a result.
     if checkpoint() {
         return report_interrupted(scan::KIND, args.json);
     }
 
-    // The rules, over the tree that is still in memory. Zero of them are
-    // implemented - issue #13 shipped the vocabulary a rule needs and no rule -
-    // so this is an empty set today and `rules_run` is what says so in the
-    // output rather than letting an empty findings list read as a clean card.
-    let found = match scan::findings(&tree) {
+    // The TAR audit, over the same live session. It is the longest part of a
+    // scan after the walk, so `tar::audit` polls signals::interrupted()
+    // before every probe: a Ctrl-C during a full sweep is acted on rather than
+    // queued. A TAR probe is an ENVELOPE, and swSIM answers every one with
+    // `61 Lc` before reading a byte of it, so the default selection is
+    // 592 probes of two exchanges each - see src/tar.rs, which is where the
+    // wire sequence, the bound and the differential are argued.
+    let audit = match tar::audit(
+        &mut session,
+        &args.tar,
+        &session::Policy::default(),
+        &mut || signals::interrupted(),
+    ) {
+        Ok(audit) => audit,
+        Err(err) => {
+            return report_failure(
+                &scan::Failure::new("tar-audit-failed", err.to_string()),
+                args.json,
+            )
+        }
+    };
+
+    // The third and last checkpoint, and it exists because of the line above:
+    // an interrupted TAR scan must be reported as interrupted, never rendered
+    // as a shorter audit. A report that says "8 of 4096 TARs probed" and exits
+    // 0 is a card reported as having passed 4096 probes never made.
+    if checkpoint() {
+        return report_interrupted(scan::KIND, args.json);
+    }
+
+    // The rules, over both halves of the scan: the tree that is still in
+    // memory, and the TAR evidence that was just measured.
+    let found = match scan::findings(&scan::Subject {
+        tree: &tree,
+        tar: &audit,
+    }) {
         Ok(found) => found,
         Err(err) => {
             return report_failure(
@@ -775,6 +875,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // Filtered before it is scored, and the score taken from what is left:
     // the number in the report is a function of the findings in the report.
     let verdict = scan::Verdict::new(found, scan::rules_run())
+        .tar_audit(audit)
         .at_least(args.severity)
         .scored(args.score);
 
@@ -825,6 +926,16 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             } else {
                 hit.join(", ")
             }
+        );
+    }
+
+    // One line on stderr for a TAR scan that did not finish, in BOTH modes,
+    // for the same reason the walk has one: under --json stdout is the
+    // envelope, and an agent reading it has to be able to see that the TAR
+    // audit stopped early without piping it through a formatter first.
+    if let Some(reason) = verdict.tar().stopped.as_deref() {
+        eprintln!(
+            "sim-doctor: warning: the TAR scan did not finish, so its findings are partial: {reason}"
         );
     }
 
@@ -1035,6 +1146,7 @@ mod tests {
             severity: Some(rules::Severity::High),
             baseline: Some("saved.json".to_owned()),
             diff: true,
+            tar: tar::Selection::default(),
         };
 
         // With a baseline in the list, that is what refuses - the two

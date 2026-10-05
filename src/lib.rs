@@ -101,6 +101,7 @@ pub mod rules;
 pub mod scan;
 pub mod session;
 pub mod signals;
+pub mod tar;
 pub mod tlv;
 pub mod transport;
 pub mod walk;

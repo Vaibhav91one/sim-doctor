@@ -1969,6 +1969,7 @@ dependencies = [
  "pcsc",
  "rand 0.10.3",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
