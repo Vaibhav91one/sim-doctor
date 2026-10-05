@@ -2555,6 +2555,13 @@ mod finding_tests {
 mod score_tests {
     use super::*;
 
+    /// AGENTS.md section 3, read at compile time.
+    ///
+    /// `include_str!` rather than a path walked at runtime: a test that
+    /// silently stops finding the file is a test that quietly stops checking
+    /// anything, and this one has to fail loudly if the document moves.
+    const AGENTS: &str = include_str!("../AGENTS.md");
+
     /// One finding at an arbitrary severity, with a rule ID derived from it so
     /// a test can prove which finding survived by name.
     fn at(severity: Severity) -> Finding {
@@ -2571,6 +2578,49 @@ mod score_tests {
     /// The same, `count` times over, as one set.
     fn set_of(severity: Severity, count: usize) -> Findings {
         Findings::complete((0..count).map(|_| at(severity)).collect())
+    }
+
+    /// The formula is published in three places, and this is the test that
+    /// keeps them from drifting apart.
+    ///
+    /// `SCORE_FORMULA` in this file, the `score` block of every JSON report,
+    /// and AGENTS.md section 3. The issue said a score nobody can reproduce is
+    /// worse than no score, and a formula that lives only in the source is
+    /// exactly that - so the document is not a copy somebody can forget to
+    /// update, it is asserted against the constant that computes the number.
+    #[test]
+    fn the_three_copies_of_the_formula_say_the_same_thing() {
+        // One: the constant, verbatim, in a fenced block. Quoted as a line of
+        // its own rather than as a substring of prose so a reworded paragraph
+        // cannot satisfy it.
+        assert!(
+            AGENTS.contains(&format!("```text\n{SCORE_FORMULA}\n```")),
+            "AGENTS.md section 3 no longer quotes SCORE_FORMULA verbatim. \\
+            The formula is {SCORE_FORMULA:?}"
+        );
+
+        // Two: the penalty table, one row per rung, built from the ladder so a
+        // severity added to the ladder without a row fails rather than being
+        // silently absent from the document.
+        for severity in Severity::LADDER {
+            let row = format!(
+                "| `{}` | {} | {} |",
+                severity.id(),
+                severity.rank(),
+                SCORE_PENALTY[severity.rank() as usize]
+            );
+            assert!(
+                AGENTS.contains(&row),
+                "AGENTS.md section 3 does not carry the penalty row {row:?}"
+            );
+        }
+
+        // And the ceiling, so a document that says 0-99 beside a constant that
+        // says 100 is caught.
+        assert!(
+            AGENTS.contains(&format!("`value` | the score, 0 to {SCORE_MAX}")),
+            "AGENTS.md section 3 does not state the scale as 0 to {SCORE_MAX}"
+        );
     }
 
     #[test]

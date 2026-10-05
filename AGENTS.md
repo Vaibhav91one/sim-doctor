@@ -160,6 +160,38 @@ the reference implementation for agent-friendly terminal UX.
 Every one of the four is proved by a test that spawns the built binary and reads its
 real exit status, not by asserting the enum: [tests/process_contract.rs](tests/process_contract.rs).
 
+#### A scan that PRODUCES findings exits 0, and that is a decision [V]
+
+**The table above permits exit 1 for findings. `scan` does not use it yet, and says so
+in the output instead.** The second half - "or checks failed" - is what a scan currently
+returns 1 for: no reader, no card, a walk that could not run, a deferred flag. A scan that
+ran to the end and found something to report exits **0** whatever it found.
+
+Three reasons, in the order they carried weight:
+
+1. **No rule runs yet.** Issue #13 shipped the vocabulary a rule needs - the ID, the
+   severity, the registry - and no rule, because a rule that guessed would manufacture
+   findings this repository cannot justify. So there is nothing that can produce a
+   finding today and the question is not yet observable.
+2. **`payload.code` already means something else.** It is 0 whenever the walk *finished*,
+   including a walk that was cut short, and `scan --help` has said
+   `GATE ON data.complete, NOT ON payload.code` since issue #6. Spending code 1 on
+   "the card is dirty" without rewording that sentence would make the help wrong.
+3. **Collapsing the two is the more dangerous mistake.** Today exit 1 means *a check did
+   not run*. If it also meant *the card is dirty*, then an agent that gated on the exit
+   code would have to tell those two apart from the status alone, and for a security tool
+   "we did not check" is the one that must never be mistaken for "it is fine".
+
+The primitive for the change is already written and tested:
+[`Findings::reaches`](src/rules.rs) over the rendered set, at the `Ok(())` arm of
+`run_scan`. The switch is the single constant `FINDINGS_FAIL_A_SCAN` in
+[src/main.rs](src/main.rs), and `findings_do_not_fail_a_scan_yet` fails the moment it is
+flipped to `true`. **Flipping it is a contract change and is not a one-line edit**: the
+table above, the `GATE ON data.complete` sentence in `scan --help`, and the
+`scans_a_real_card_end_to_end` assertion in [tests/card_fixture.rs](tests/card_fixture.rs)
+which currently expects exit 0 against a live swSIM card all have to move in the same
+commit. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
+
 **SIGINT is handled, not inherited.** The handler sets one atomic flag and returns;
 ordinary code notices at a checkpoint and exits 130 itself, so a handled interrupt
 reports `code() == Some(130)` and never `signal() == Some(SIGINT)`. An interrupted run
@@ -170,10 +202,17 @@ finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 
 ### Flags
 
-- `--json` - structured output on stdout, nothing else on stdout
-- `--score` - single numeric quality score for CI gating
-- `--severity <level>` - filter to a minimum severity
-- `--baseline <file>` / `--diff` - regression gating against a saved run
+| Flag | State | |
+|---|---|---|
+| `--json` | implemented | structured output on stdout, nothing else on stdout |
+| `--score` | implemented | single numeric quality score for CI gating, with its formula beside it |
+| `--severity <level>` | implemented | remove findings below a minimum severity |
+| `--baseline <file>` / `--diff` | **deferred** | regression gating against a saved run; exits 1 with `"implemented": false` before a reader is opened |
+
+A deferred flag refuses honestly rather than returning a plausible-looking number. It emits
+one envelope carrying `"implemented": false`, `"scanned": false` and `"card_touched": false`
+so an agent finds out in milliseconds rather than after a walk, and it never returns 0 for
+something it did not do. The scoring and severity contract is [Severity and score](#severity-and-score).
 
 ### Rule IDs
 
@@ -230,6 +269,96 @@ exists because getting it wrong breaks somebody downstream:
 ```
 sim-doctor scan --json | jq '.data.findings[] | select(.rule == "gsma/msl-zero-allowed")'
 ```
+
+### Severity and score
+
+`--severity <level>` and `--score <flag>` are implemented (issue #14) and both land in
+`payload.data`. The order they are applied in is part of the contract: **the filter runs
+first, and the score is taken from what is reported.** `scan --severity high --score`
+scores the high and critical findings and nothing else, and says so in
+`data.score.scored_findings`. That ordering is the whole of "a score must not hide a
+finding" - the number in the report is a function of the `findings` array beside it, so the
+two can never disagree about what was found.
+
+#### The filter is a filter, not a mask
+
+A finding below the level is **removed**, not marked: no entry, no contribution to
+`data.findings.count`, and **no rule ID anywhere in the document**. Not a zeroed entry, not
+an empty placeholder, not a `"suppressed": true` flag carrying the ID. A consumer that counts
+and a consumer that greps for `gsma/msl-zero-allowed` both see the same set, and a set that
+one of them can still see in the document is a set the other is counting wrong.
+
+The level in force is reported as `data.findings.severity_threshold`, because a short list
+is otherwise indistinguishable from a quiet card. `null` means nothing was filtered, which is
+different from `"info"` - the first is every finding, the second is every finding the ladder
+can spell. Coverage is **recomputed from the survivors** rather than carried over, because
+the filtered value describes a different, smaller set than the one it came from.
+
+It does not filter the **walk**. `data.complete`, `data.truncated`, `data.truncated_by` and
+`data.limits_hit` are untouched, so raising the level can never make a truncated scan look
+like a whole one.
+
+#### The formula
+
+This is the sentence a reader of a scan report needs, and it is published as
+`rules::SCORE_FORMULA` so the formula is *shipped* rather than merely implemented:
+
+```text
+max(0, 100 - sum(penalty[severity] for every finding in this report))
+```
+
+with the penalty table, indexed by `severity_rank` and published as `rules::SCORE_PENALTY`:
+
+| Severity | `severity_rank` | Penalty |
+|---|---|---|
+| `info` | 0 | 1 |
+| `low` | 1 | 3 |
+| `medium` | 2 | 10 |
+| `high` | 3 | 25 |
+| `critical` | 4 | 50 |
+
+The score is an **integer**. Nothing reads a clock, a hash iteration order, a locale or an
+environment variable, so the same findings always produce the same number and a CI threshold
+is an integer comparison. The sum is a `u64` and is **clamped, not truncated**: a penalty at or
+past 100 saturates to exactly 0. A truncating cast would turn a penalty of 256 into 0 and
+report a dirty card as 100, which is the one number this must never be able to say.
+
+**These penalties are a chosen ladder, not measurements.** There is no published
+CVSS-equivalent for a SIM and this project has not derived one. The shape of the choice is
+that each rung costs several times the one below it, so a handful of `info` findings cannot
+bury a `high` one and a `critical` costs half the scale on its own. They are contract: a CI
+threshold written against them stops meaning the same thing if they move, so changing one is
+a decision to record in CONTEXT.md, not a tune.
+
+#### The number a reader can rebuild from the document alone
+
+`--score` does not print a bare number. `payload.data.score` carries:
+
+| Field | |
+|---|---|
+| `value` | the score, 0 to 100 |
+| `max` | the top of the scale, 100, so a reader of `value` alone still knows the ceiling |
+| `penalty` | the total subtracted, so `max - penalty` can be checked without re-deriving it |
+| `scored_findings` | how many findings the score was computed from |
+| `rules_run` | how many rules the scan evaluated |
+| `formula` | the sentence above, verbatim |
+| `penalties` | the whole table, keyed by severity spelling |
+| `warning` | non-null when there was nothing to score - see below |
+
+**`scored_findings: 0` is not a clean card.** It is a scan that produced no findings, which
+today means no rule has been implemented. A score of 100 from an empty set is otherwise
+indistinguishable from a card that passed, which is exactly the failure the field exists to
+prevent - so while `rules_run` is 0 the block carries a warning string saying in words that
+nothing on this card was checked. The human report prints the same warning. A CI gate that
+reads `value` without reading `warning` is still making a mistake, and this is documented
+rather than defended against, because a contract that cannot be broken cannot be relied on.
+
+#### Proving the three copies still agree
+
+The formula lives in three places: `rules::SCORE_FORMULA`, the `score` block of every
+JSON report, and this section. A test reads this file and asserts the other two still say the
+same thing, so a reworded constant cannot leave a reader holding a formula that computes
+something else.
 
 ### JSON envelope
 

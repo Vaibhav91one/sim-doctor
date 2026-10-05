@@ -2037,4 +2037,267 @@ mod tests {
         let path: Path = "3F00/7F20/6F07".parse().expect("a valid path");
         assert_eq!(path.to_string(), "3F00/7F20/6F07");
     }
+
+    // --- The verdict: what --severity and --score render. ---
+    //
+    // Every test below puts a Verdict in front of a real walked tree, because
+    // the two halves are only meaningful together: the question is not "does
+    // the filter work" but "what does the document a reader receives say", and
+    // a document is the walk rendered with a verdict spliced into it.
+
+    /// One finding at `severity`, under a rule ID that names it, so a test can
+    /// prove the finding is gone by grepping for the ID rather than by counting.
+    fn found(severity: rules::Severity) -> rules::Finding {
+        rules::Finding::new(
+            rules::RuleId::new(format!("test/severity-{}", severity.id())).expect("documented ID"),
+            severity,
+            format!("a finding at {severity}"),
+            rules::Location::tar(0x1234),
+            rules::Evidence::text("evidence"),
+        )
+    }
+
+    /// A walked sample card, rendered under `verdict`.
+    fn rendered(verdict: &Verdict) -> Value {
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        to_json(&tree, &context(probe_set(), limits), verdict)
+    }
+
+    /// One finding at each of three rungs, and the ID of the one that must
+    /// disappear.
+    fn mixed() -> rules::Findings {
+        rules::Findings::complete(vec![
+            found(rules::Severity::Critical),
+            found(rules::Severity::Medium),
+            found(rules::Severity::Info),
+        ])
+    }
+
+    #[test]
+    fn a_filtered_finding_leaves_no_trace_anywhere_in_the_document() {
+        // The sharpest form of "filter, not mask", and the one that matters:
+        // a placeholder carrying the ID, a zeroed entry or a `suppressed: true`
+        // flag would all pass a count assertion and all fail this one.
+        let verdict = Verdict::new(mixed(), 3).at_least(Some(rules::Severity::High));
+        let data = rendered(&verdict);
+
+        assert_eq!(data["findings"]["severity_threshold"], json!("high"));
+        assert_eq!(data["findings"]["count"], json!(1));
+        let survivors = json!([found(rules::Severity::Critical).to_json()]);
+        assert_eq!(data["findings"]["findings"], survivors);
+
+        // Not in the findings array, not in the count, and not anywhere else in
+        // the rendered document either - which is why this greps the whole
+        // serialisation rather than one field.
+        let rendered = serde_json::to_string(&data).expect("the report renders");
+        for dropped in [rules::Severity::Medium, rules::Severity::Info] {
+            let id = format!("test/severity-{}", dropped.id());
+            assert!(
+                !rendered.contains(&id),
+                "{id} survived the filter somewhere in the document: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("test/severity-critical"),
+            "the surviving rule ID must still be there: {rendered}"
+        );
+    }
+
+    #[test]
+    fn no_threshold_means_no_filter_and_a_null_one_says_so() {
+        // `null` and `"info"` are different answers and both have to be
+        // reachable: the first is every finding, the second is every finding
+        // the ladder can spell, and a document that cannot tell them apart
+        // cannot say which one it is.
+        let bare = rendered(&Verdict::new(mixed(), 3));
+        assert_eq!(bare["findings"]["severity_threshold"], Value::Null);
+        assert_eq!(bare["findings"]["count"], json!(3));
+
+        let every = rendered(&Verdict::new(mixed(), 3).at_least(Some(rules::Severity::Info)));
+        assert_eq!(every["findings"]["severity_threshold"], json!("info"));
+        assert_eq!(every["findings"]["count"], json!(3));
+    }
+
+    #[test]
+    fn the_filter_does_not_touch_the_walk() {
+        // Raising the level must never be able to make a truncated scan look
+        // like a whole one, which is the only way this flag could lie.
+        let mut card = sample_card();
+        let limits = Limits {
+            max_depth: 1,
+            ..Limits::default()
+        };
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+
+        let unfiltered = to_json(&tree, &context, &Verdict::new(mixed(), 3));
+        let filtered = to_json(
+            &tree,
+            &context,
+            &Verdict::new(mixed(), 3).at_least(Some(rules::Severity::Critical)),
+        );
+
+        for field in [
+            "complete",
+            "truncated",
+            "truncated_by",
+            "limits_hit",
+            "walk",
+            "selected",
+            "files",
+        ] {
+            assert_eq!(
+                filtered[field], unfiltered[field],
+                "--severity changed the walk report field {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_score_block_carries_everything_needed_to_rebuild_the_number() {
+        // The acceptance criterion: not that a number appears, but that a
+        // reader holding only this document can reconstruct it. So the block
+        // is checked by arithmetic, here, from the fields it published.
+        let verdict = Verdict::new(mixed(), 3).scored(true);
+        let data = rendered(&verdict);
+        let score = &data["score"];
+
+        assert_eq!(score["value"], json!(39), "100 - (50 + 10 + 1)");
+        assert_eq!(score["max"], json!(rules::SCORE_MAX));
+        assert_eq!(score["penalty"], json!(61));
+        assert_eq!(score["scored_findings"], json!(3));
+        assert_eq!(score["rules_run"], json!(3));
+        assert_eq!(score["formula"], json!(rules::SCORE_FORMULA));
+
+        // The table, keyed by the ladder's own spellings.
+        let penalties = score["penalties"].as_object().expect("a table");
+        assert_eq!(penalties.len(), rules::SCORE_PENALTY.len());
+        for severity in rules::Severity::LADDER {
+            assert_eq!(
+                penalties[severity.id()],
+                json!(rules::SCORE_PENALTY[severity.rank() as usize]),
+                "the published table disagrees with the constant at {}",
+                severity.id()
+            );
+        }
+
+        // The reader's arithmetic, from the document alone: sum the published
+        // penalties of the severities actually present, and subtract from the
+        // published maximum. No call into Score happens here, which is the
+        // point - this is the reconstruction a reader would do by hand.
+        let from_document: u64 = data["findings"]["findings"]
+            .as_array()
+            .expect("findings is an array")
+            .iter()
+            .map(|finding| {
+                let rank = usize::try_from(finding["severity_rank"].as_u64().expect("a rank"))
+                    .expect("a rank fits a usize");
+                let rung = rules::Severity::LADDER
+                    .get(rank)
+                    .expect("a rank inside the published ladder");
+                penalties[rung.id()].as_u64().expect("a whole penalty")
+            })
+            .sum();
+        assert_eq!(
+            from_document,
+            score["penalty"].as_u64().expect("a total"),
+            "the published total is not the sum of the published table over the published findings"
+        );
+        assert_eq!(
+            u64::from(rules::SCORE_MAX) - from_document,
+            score["value"].as_u64().expect("a whole score"),
+            "the score does not follow from the findings and the table printed beside it"
+        );
+    }
+
+    #[test]
+    fn a_score_with_nothing_to_score_says_so_rather_than_reading_as_a_clean_card() {
+        // The question a 100 cannot answer on its own. Three fields have to
+        // agree before it is answerable at all: rules_run is 0,
+        // scored_findings is 0, and the warning is a string rather than null.
+        let verdict = Verdict::new(rules::Findings::complete(Vec::new()), 0).scored(true);
+        let score = &rendered(&verdict)["score"].clone();
+
+        assert_eq!(score["value"], json!(rules::SCORE_MAX));
+        assert_eq!(score["penalty"], json!(0));
+        assert_eq!(score["scored_findings"], json!(0));
+        assert_eq!(score["rules_run"], json!(0));
+        assert_eq!(score["warning"], json!(NO_RULES_WARNING));
+        assert!(
+            score["warning"]
+                .as_str()
+                .expect("a warning")
+                .contains("NOT because the card is clean"),
+            "the warning has to say what the 100 does not mean: {}",
+            score["warning"]
+        );
+
+        // A 100 from a scan that RAN rules is a different claim, and it does
+        // not carry the warning - otherwise the warning stops meaning
+        // anything.
+        let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2).scored(true);
+        let ran = rendered(&ran)["score"].clone();
+        assert_eq!(ran["value"], json!(rules::SCORE_MAX));
+        assert_eq!(ran["rules_run"], json!(2));
+        assert_eq!(ran["warning"], Value::Null);
+    }
+
+    #[test]
+    fn the_filter_runs_before_the_score_so_the_two_cannot_disagree() {
+        // --severity high --score. The score is a function of the array
+        // printed beside it, so the number and the document cannot come apart.
+        let verdict = Verdict::new(mixed(), 3)
+            .at_least(Some(rules::Severity::High))
+            .scored(true);
+        let data = rendered(&verdict);
+
+        assert_eq!(data["findings"]["count"], json!(1));
+        assert_eq!(data["score"]["scored_findings"], json!(1));
+        assert_eq!(
+            data["score"]["value"],
+            json!(50),
+            "the two critical and medium findings were discounted, which is the bug"
+        );
+    }
+
+    #[test]
+    fn the_human_report_prints_the_score_its_formula_and_its_warning() {
+        // The human mode is a view over the same data, so a score a person
+        // cannot check is the same defect in a different font.
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+
+        let scored = to_human(
+            &tree,
+            &context,
+            &Verdict::new(rules::Findings::complete(Vec::new()), 0).scored(true),
+        );
+        assert!(scored.contains(&rules::SCORE_FORMULA), "{scored}");
+        assert!(scored.contains("SCORE 100/100"), "{scored}");
+        assert!(scored.contains(NO_RULES_WARNING), "{scored}");
+
+        // The findings block names the threshold and the count it applied to.
+        let filtered = to_human(
+            &tree,
+            &context,
+            &Verdict::new(mixed(), 3).at_least(Some(rules::Severity::High)),
+        );
+        assert!(
+            filtered.contains("FINDINGS: 1 at or above high"),
+            "{filtered}"
+        );
+        assert!(
+            !filtered.contains("test/severity-info"),
+            "a dropped rule reached the human report: {filtered}"
+        );
+
+        // And with no --score there is no score at all: it is a deliberate
+        // act, not something every report carries.
+        let bare = to_human(&tree, &context, &Verdict::new(mixed(), 3));
+        assert!(!bare.contains("SCORE "), "{bare}");
+    }
 }

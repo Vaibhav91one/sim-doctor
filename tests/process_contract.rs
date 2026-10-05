@@ -658,19 +658,22 @@ fn an_unparsable_scan_command_line_exits_129() {
     );
 }
 
-/// The four AGENTS.md section 3 flags that exist before their behaviour does
-/// must refuse, and refuse honestly.
+/// The AGENTS.md section 3 flags whose behaviour does not exist yet must
+/// refuse, and refuse honestly.
+///
+/// **Two flags, not four.** --score and --severity are implemented as of issue
+/// #14 and reach the envelope; `implemented_flags_are_no_longer_deferred` is
+/// the test that pins that they are not on this list, because a `--score` that
+/// refused would make this one pass for the wrong reason.
 ///
 /// What is pinned here is the refusal itself: exit 1 (a check that could not
 /// run, not a card that passed), one envelope under --json, and a `data` block
 /// saying `"implemented": false` and `"card_touched": false`. The failure mode
-/// these rules out is a --score that returned 0 because the scorer is
+/// these rules out is a --baseline that returned 0 because the comparison is
 /// unwritten, which would be indistinguishable from a clean card.
 #[test]
 fn every_deferred_scan_flag_refuses_without_touching_a_card() {
-    let cases: [(&[&str], &str); 4] = [
-        (&["scan", "--score", "--json"], "--score"),
-        (&["scan", "--severity", "high", "--json"], "--severity high"),
+    let cases: [(&[&str], &str); 2] = [
         (
             &["scan", "--baseline", "saved.json", "--json"],
             "--baseline saved.json",
@@ -720,15 +723,84 @@ fn every_deferred_scan_flag_refuses_without_touching_a_card() {
 /// being a half-written result on stdout.
 #[test]
 fn a_deferred_scan_flag_without_json_writes_nothing_to_stdout() {
-    let run = run_piped(&["scan", "--score"]);
+    let run = run_piped(&["scan", "--baseline", "saved.json"]);
 
     assert_eq!(run.code(), 1);
     assert_eq!(run.stdout, "", "{:?}", run.stdout);
     assert!(
-        run.stderr.contains("--score is not implemented yet"),
+        run.stderr
+            .contains("--baseline saved.json is not implemented yet"),
         "{:?}",
         run.stderr
     );
+}
+
+/// --score and --severity are implemented, and the process says so.
+///
+/// Before issue #14 both refused with `"implemented": false` in one envelope.
+/// That is the honest answer for a flag whose behaviour is unwritten, and it
+/// is now the WRONG answer for these two: what they say is about a card, so
+/// they need a reader, and on a machine with no card the run fails at
+/// `pick_reader` instead of at the flag check.
+///
+/// What is asserted is the difference in KIND, not the exit code - both are 1
+/// here, and on a machine with a reader the implemented pair is 0. A refusal
+/// carries `"implemented": false`; a failed scan carries `"card_touched":
+/// false` and an `error.kind`. Asserting that `--score --json` is not one of
+/// the refusals is what would fail if somebody re-deferred the flag, and it
+/// fails identically whether this machine has a card in it or not.
+#[test]
+fn implemented_flags_are_no_longer_deferred() {
+    for args in [
+        &["scan", "--score", "--json"][..],
+        &["scan", "--severity", "high", "--json"][..],
+        &["scan", "--severity", "info", "--score", "--json"][..],
+    ] {
+        let run = run_piped(args);
+        let envelope = assert_exactly_one_envelope_for(args, &run.stdout);
+        let data = envelope.payload().data();
+
+        assert!(
+            data.get("implemented").is_none(),
+            "{args:?} is refusing, so the flag went back to deferred: {data}"
+        );
+        assert_eq!(
+            data["card_touched"],
+            serde_json::Value::Bool(false),
+            "{args:?} claimed it contacted a card"
+        );
+        assert_eq!(
+            envelope.payload().code().process_code(),
+            u8::try_from(run.code()).expect("an exit code fits in a byte"),
+            "{args:?}: payload.code must stay the number the process exits with"
+        );
+    }
+}
+
+/// Asserts one envelope on stdout and returns it, without pinning the code.
+///
+/// The purity half of [`assert_exactly_one_envelope`] on its own, for the
+/// tests whose point is WHICH envelope rather than that there is exactly one.
+fn assert_exactly_one_envelope_for(args: &[&str], raw: &str) -> contract::Envelope {
+    assert!(
+        raw.ends_with('\n'),
+        "{args:?}: stdout must end with the one newline that terminates the envelope: {raw:?}"
+    );
+    assert_eq!(
+        raw.matches('\n').count(),
+        1,
+        "{args:?}: stdout is not a single line, so it is not a single envelope: {raw:?}"
+    );
+
+    let body = raw.strip_suffix('\n').expect("checked above");
+    let envelope: contract::Envelope = serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("{args:?}: stdout is not one JSON envelope: {e}\n{body:?}"));
+    assert_eq!(
+        envelope.to_json().unwrap(),
+        body,
+        "{args:?}: the envelope does not re-serialise to the bytes that are on stdout"
+    );
+    envelope
 }
 
 /// A SIGINT on `scan` exits 130 with one interrupted envelope and no partial
@@ -910,14 +982,155 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
         run.stdout
     );
 
-    // Every unimplemented flag says so, in the place an operator will read it.
+    // Every flag is on the surface, whatever its state.
     for flag in ["--score", "--severity", "--baseline", "--diff"] {
         assert!(run.stdout.contains(flag), "{flag} is missing from --help");
     }
+
+    // **Two** unimplemented flags, not four. --score and --severity shipped in
+    // issue #14, and the count is the assertion that would fail if one of them
+    // quietly went back to refusing.
     assert_eq!(
         run.stdout.matches("NOT IMPLEMENTED YET").count(),
-        4,
-        "all four deferred flags must say so: {}",
+        2,
+        "only --baseline and --diff defer: {}",
         run.stdout
     );
+
+    // An implemented flag says what it does, and - the point of issue #14 - it
+    // publishes the formula rather than asking the reader to find the source.
+    for phrase in [
+        "max(0, 100 - sum of one penalty per finding)",
+        "info 1, low 3, medium 10, high 25, critical 50",
+        "data.findings.severity_threshold",
+    ] {
+        assert!(
+            run.stdout.contains(phrase),
+            "the --score/--severity help must state {phrase:?}: {}",
+            run.stdout
+        );
+    }
+}
+
+/// Issue #14 acceptance criterion 4: stdout purity holds across the flag
+/// matrix, asserted against the real binary.
+///
+/// The rule is one sentence: under `--json`, stdout carries one envelope and
+/// not one byte else, and `payload.code` is the number the process exits with.
+/// The matrix is the whole of `scan`'s AGENTS.md section 3 flag surface,
+/// because purity is a property of the COMBINATION and not of any one flag -
+/// a score printed to stderr, or a severity echoed to stdout by a path that
+/// only runs when both are present, is exactly the regression a single-flag
+/// test cannot see.
+///
+/// Every combination is expected to exit 1 on a machine with no reader, and
+/// that is not asserted against: the code differs legitimately between a
+/// machine with a card, a deferred flag and a failed walk. What IS asserted
+/// is the same three things for all of them, which is what makes this a
+/// matrix rather than a list of cases - one newline, one parseable envelope
+/// that round-trips to the same bytes, and a code that matches the process.
+#[test]
+fn json_stdout_is_one_envelope_across_the_whole_flag_matrix() {
+    let severities = ["info", "low", "medium", "high", "critical"];
+    let matrix: [(&[&str], &str); 15] = [
+        (&["--json"], "bare"),
+        (&["--json", "--score"], "score"),
+        (&["--json", "--severity", "high"], "one severity"),
+        (&["--json", "--severity", "info"], "lowest severity"),
+        (&["--json", "--severity", "critical"], "highest severity"),
+        (
+            &["--json", "--score", "--severity", "high"],
+            "score and severity",
+        ),
+        (
+            &["--json", "--score", "--severity", "info"],
+            "score over everything",
+        ),
+        (
+            &["--json", "--score", "--severity", "critical"],
+            "score over the worst",
+        ),
+        (
+            &["--json", "--dialect", "iec-7816-4-table-42", "--score"],
+            "a declared dialect and a score",
+        ),
+        (
+            &["--json", "--max-depth", "1", "--score"],
+            "a bound and a score",
+        ),
+        (
+            &["--json", "--max-children", "16", "--severity", "medium"],
+            "a bound and a severity",
+        ),
+        (
+            &[
+                "--json",
+                "--score",
+                "--severity",
+                "high",
+                "--max-nodes",
+                "4",
+                "--max-directories",
+                "2",
+            ],
+            "everything at once",
+        ),
+        (&["--json", "--baseline", "saved.json"], "a deferred flag"),
+        (
+            &["--json", "--baseline", "saved.json", "--diff"],
+            "both deferred flags",
+        ),
+        (
+            &["--json", "--score", "--baseline", "saved.json"],
+            "an implemented flag beside a deferred one",
+        ),
+    ];
+    debug_assert_eq!(matrix.len(), severities.len() + 10);
+
+    for (flags, what) in matrix {
+        let mut args = vec!["scan"];
+        args.extend_from_slice(flags);
+        let run = run_piped(&args);
+        let envelope = assert_exactly_one_envelope_for(&args, &run.stdout);
+
+        assert_eq!(
+            envelope.kind(),
+            sim_doctor::scan::KIND,
+            "{what}: the envelope must identify itself as a scan"
+        );
+        assert_eq!(
+            envelope.payload().code().process_code(),
+            u8::try_from(run.code()).expect("an exit code fits in a byte"),
+            "{what}: payload.code must stay the number the process exits with"
+        );
+    }
+}
+
+/// The same matrix, in the human mode, keeps stdout a report and diagnostics
+/// on stderr.
+///
+/// A scan that cannot run has no report to print, so the human mode of a
+/// failing combination writes nothing at all to stdout. That is the rule; it
+/// is here so that the --json matrix above is not the only one being checked,
+/// and so that a `println!` added to the human path is caught by the same
+/// failure message an operator would see.
+#[test]
+fn the_human_modes_of_the_same_matrix_print_no_report_when_the_scan_cannot_run() {
+    for flags in [
+        &["--score"][..],
+        &["--severity", "high"],
+        &["--score", "--severity", "high"],
+        &["--baseline", "saved.json"],
+    ] {
+        let mut args = vec!["scan"];
+        args.extend_from_slice(flags);
+        let run = run_piped(&args);
+
+        assert_eq!(run.code(), 1, "{args:?}");
+        assert_eq!(run.stdout, "", "{args:?} wrote a report: {:?}", run.stdout);
+        assert!(
+            !run.stderr.is_empty(),
+            "{args:?} failed silently: nothing on stderr either"
+        );
+    }
 }
