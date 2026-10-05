@@ -181,6 +181,56 @@ Use the `plugin/rule` namespaced form, e.g. `filesystem/unreadable-ef`,
 `auth/scp03-missing-mac`, `gsma/msl-zero-allowed`. Stable and greppable. Rules are
 addressable by agents, so an ID must never be renamed casually.
 
+### Findings
+
+One thing a rule found. The body below is fixed by [src/rules.rs](src/rules.rs) and
+pinned byte for byte by a test; **the envelope around it does not change to accommodate
+it**, because a finding is serialized *into* `payload.data`, not wrapped by it.
+
+```json
+{
+  "rule": "filesystem/unreadable-ef",
+  "severity": "high",
+  "severity_rank": 3,
+  "message": "EF.ICCID could not be selected: 9804",
+  "location": { "kind": "file", "path": "3F00/2F00/6F07", "access": "forbidden", "status": "9804" },
+  "evidence": { "kind": "bytes", "octets": "a4000a4f", "omitted": 0 },
+  "coverage": { "status": "complete" }
+}
+```
+
+Key order is not contract. `serde_json` orders an object's keys itself; only the names
+are.
+
+Four things about that object are contract rather than implementation detail, and each
+exists because getting it wrong breaks somebody downstream:
+
+- **`rule` is the address.** It is validated at construction *and re-validated on the
+  way back in from a baseline file*, so a hand-edited baseline cannot inject an ID
+  that could never have been registered. Two rules may never share one ID, and a rule
+  may only emit its own; `rules::Registry` refuses both, at registration and at
+  evaluation.
+- **`location.access` keeps absent, forbidden and refused apart**, using the four
+  spellings `walk` already reports: `selected`, `absent`, `forbidden`,
+  `refused`. A finding produced from a forbidden file and one produced from an
+  absent file are different findings - an access control versus an empty card - and a
+  consumer must be able to tell them apart without reading `message`.
+- **`coverage` says whether the scan that raised it finished.** A finding from a
+  truncated scan may still be entirely true; what cannot be claimed is that the card
+  holds no others. `{"status": "partial", "reason": "..."}` means **the list may be
+  short**, not that anything in it is wrong. Read it before treating findings as
+  exhaustive, and note it travels on each finding rather than only on the report,
+  because an agent that greps one rule ID reads one object.
+- **Evidence is bounded.** `MAX_EVIDENCE_BYTES` (64 octets of card data) and
+  `MAX_EVIDENCE_CHARS` (64 characters of rule text), enforced at construction by types
+  with private fields so naming a variant cannot bypass them, and `omitted` reports
+  whatever was dropped. A rule must not be able to fill a terminal or an agent's
+  stdout with a 64 KB elementary file.
+
+```
+sim-doctor scan --json | jq '.data.findings[] | select(.rule == "gsma/msl-zero-allowed")'
+```
+
 ### JSON envelope
 
 The best existing model is `lpac`, which returns a single envelope for everything:
