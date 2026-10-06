@@ -1494,23 +1494,23 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
 /// exit status a gate branches on comes out of the real process.
 ///
 /// **What this proves and what it cannot.** It proves that saving a run writes
-/// a file a later run reads back, that a second run of the SAME card produces a
-/// diff with nothing new and nothing fixed and exits 0, and that the baseline
-/// records what the run did. It cannot prove a regression, because that needs a
-/// card that changes between two scans and this fixture is deterministic - the
-/// new/fixed classification is proved in `src/baseline.rs` against synthesised
-/// finding sets, which is the only place it can be proved without a card that
-/// is a different card tomorrow.
+/// a file a later run reads back, that the file records what the run did, and
+/// that `--diff` against a baseline whose walk did not finish is REFUSED with
+/// `baseline-truncated`, exit 1 and the card untouched. The swSIM walk stops at
+/// a bound (a truncated report is this fixture's normal shape), so a clean
+/// same-card diff is not reachable here: a truncated walk did not see the whole
+/// card, and diffing it would call almost every finding new. It cannot prove a
+/// clean diff or a regression; the new/fixed/persisting classification and the
+/// clean path are proved in `src/baseline.rs` against synthesised finding sets,
+/// which is the only place they can be proved without a card that completes.
 ///
-/// **The exit status is the point of putting it here.** `--diff` exiting 1 on a
-/// regression is a decision recorded in AGENTS.md section 3 and in CONTEXT.md,
+/// **The exit status is the point of putting it here.** A refused `--diff`
+/// exiting 1 is a decision recorded in AGENTS.md section 3 and in CONTEXT.md,
 /// and like every other claim about a process it can only be proved by spawning
-/// the process. On this card the answer is 0, because the card did not change;
-/// the refusal and the rejection paths are proved in `src/baseline.rs` and in
-/// `tests/process_contract.rs`.
+/// the process.
 #[test]
 #[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
-fn a_baseline_saves_and_a_later_scan_diffs_cleanly_against_it() {
+fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
     let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
     let reader = readers
         .iter()
@@ -1627,41 +1627,29 @@ fn a_baseline_saves_and_a_later_scan_diffs_cleanly_against_it() {
         );
     }
 
-    // The second run, same card, same flags: a clean diff and exit 0.
+    // The second run, same card, same flags, with --diff. This card's walk
+    // stops at a bound, so the baseline it just wrote is truncated and the diff
+    // must refuse rather than call almost every finding new.
     let mut diff = vec!["scan", "--json", "--reader", reader.as_str()];
     diff.extend_from_slice(&["--baseline", &path, "--diff"]);
     let (code, compared) = scan(&diff);
-    println!("baseline/diff: diffed a second run of the same card against it");
+    println!("baseline/diff: diffed a second run against the truncated baseline");
+    assert_eq!(code, 1, "a refused diff is a failed run: {compared:#}");
+    let data = &compared["payload"]["data"];
     assert_eq!(
-        code, 0,
-        "a card that did not change must not fail a build: {compared:#}"
+        data["error"]["kind"],
+        serde_json::json!("baseline-truncated"),
+        "a baseline whose walk did not finish cannot be diffed against: {compared:#}"
     );
-
-    let block = &compared["payload"]["data"]["diff"];
+    assert_eq!(data["scanned"], serde_json::json!(false), "{compared:#}");
     assert_eq!(
-        block["regressed"],
+        data["card_touched"],
         serde_json::json!(false),
-        "the same card twice is not a regression"
-    );
-    assert_eq!(block["counts"]["new"], serde_json::json!(0));
-    assert_eq!(block["counts"]["fixed"], serde_json::json!(0));
-    assert_eq!(
-        block["counts"]["persisting"].as_u64().expect("a count"),
-        compared["payload"]["data"]["findings"]["count"]
-            .as_u64()
-            .expect("a count"),
-        "everything the first run found is still there"
+        "the refusal comes before the card is read: {compared:#}"
     );
     assert!(
-        block["rules"]["warning"].is_null(),
-        "no rule ID drifted, so there is nothing to warn about: {block:#}"
-    );
-
-    // And the refusal shape is still what a gate can rely on: a run that
-    // compared something has data.findings and no data.error.
-    assert!(
-        compared["payload"]["data"].get("error").is_none(),
-        "a run that compared is not a refusal: {compared:#}"
+        data.get("diff").is_none(),
+        "a refusal carries no diff block at all: {compared:#}"
     );
 
     let _ = std::fs::remove_dir_all(&directory);

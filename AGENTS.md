@@ -65,7 +65,7 @@ tests live behind the gate:
 | `walks_the_file_system_of_a_real_card` | the DF-tree walk against real capabilities templates (issue #7) |
 | `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one envelope, exit 0 (issue #6) |
 | `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula, and the difference between an earned 100 and an unearned one on real stdout (issue #14, rewritten by #24) |
-| `a_baseline_saves_and_a_later_scan_diffs_cleanly_against_it` | `--baseline` writes a file a later run reads back, that file records what the run did, and a second run of the same card diffs clean and exits 0 (issue #12) |
+| `a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused` | `--baseline` writes a file a later run reads back, that file records what the run did, and `--diff` against a baseline whose walk stopped at a bound is refused with `baseline-truncated` and exits 1, because this fixture's walk is always truncated (issue #12) |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
 executable. The argument parsing, the reader choice, the envelope, the stdout
