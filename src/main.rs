@@ -1249,6 +1249,22 @@ fn limits_from(args: &ScanArgs) -> Limits {
 
 const RULES_KIND: &str = "rules";
 
+/// The largest saved envelope `why` will read: 16 MiB.
+const MAX_WHY_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Escapes control characters so untrusted file text cannot drive the terminal.
+fn printable(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
 /// One rule's page, as JSON.
 fn rule_json(spec: &sim_doctor::rules::RuleSpec) -> serde_json::Value {
     serde_json::json!({
@@ -1368,9 +1384,8 @@ fn run_why_rule(id: &str, json: bool) -> contract::ExitCode {
 
 /// Explains a rule id, or every rule in a saved scan envelope.
 fn run_why(target: &str, json: bool) -> contract::ExitCode {
-    if !std::path::Path::new(target).is_file() {
-        return run_why_rule(target, json);
-    }
+    let path = std::path::Path::new(target);
+    let looks_like_path = target.contains(['/', '\\']) || target.ends_with(".json");
     let refuse = |message: String| {
         report_refusal(
             RULES_KIND,
@@ -1379,7 +1394,23 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
             json,
         )
     };
-    let raw = match std::fs::read_to_string(target) {
+    if !path.is_file() && !looks_like_path && !path.exists() {
+        return run_why_rule(target, json);
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => return refuse(format!("cannot read {target}: {err}")),
+    };
+    if !meta.is_file() {
+        return refuse(format!("{target} is not a file"));
+    }
+    if meta.len() > MAX_WHY_FILE_BYTES {
+        return refuse(format!(
+            "{target} is {} bytes, over the {MAX_WHY_FILE_BYTES}-byte limit for a saved envelope",
+            meta.len()
+        ));
+    }
+    let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) => return refuse(format!("cannot read {target}: {err}")),
     };
@@ -1415,7 +1446,11 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
     let mut text = String::new();
     let mut rules = Vec::new();
     for (id, severity, count) in &seen {
-        text.push_str(&format!("{id}  [{severity}]  {count} finding(s)\n"));
+        text.push_str(&format!(
+            "{}  [{}]  {count} finding(s)\n",
+            printable(id),
+            printable(severity)
+        ));
         let spec = specs.iter().find(|spec| spec.id().as_str() == id);
         match spec {
             Some(spec) => text.push_str(&rule_page(spec)),

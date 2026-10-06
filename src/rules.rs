@@ -1818,7 +1818,7 @@ impl<S> Registry<S> {
         // summary explains nothing: both are bugs in the rule, not features the
         // caller can work around, so they are refused at registration rather than
         // rendered as blanks later by `rules explain` / `why`.
-        if spec.remediation().is_none() {
+        if spec.remediation().is_none_or(|text| text.trim().is_empty()) {
             return Err(RegistryError::MissingRemediation {
                 id: spec.id().clone(),
             });
@@ -2565,6 +2565,28 @@ mod finding_tests {
             registry.is_empty(),
             "the refused rule must not have been registered"
         );
+    }
+
+    /// An empty or whitespace-only remediation is as blank as none.
+    #[test]
+    fn the_registry_refuses_a_blank_remediation() {
+        for blank in ["", "   "] {
+            let mut registry: Registry<NoSubject> = Registry::new();
+            let spec = RuleSpec::new(
+                RuleId::new("gsma/msl-zero-allowed").unwrap(),
+                Severity::Critical,
+                "the card accepted TAR 000000",
+            )
+            .with_remediation(blank);
+            let error = registry
+                .register(spec, |_: &NoSubject| Vec::new(), |_: &NoSubject| true)
+                .expect_err("a blank remediation must be refused");
+            assert!(
+                matches!(error, RegistryError::MissingRemediation { .. }),
+                "{blank:?}: got {error}"
+            );
+            assert!(registry.is_empty());
+        }
     }
 
     /// A spec with an empty summary explains nothing and is refused.

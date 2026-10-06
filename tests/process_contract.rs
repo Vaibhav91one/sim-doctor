@@ -1214,8 +1214,19 @@ mod rule_catalog {
         assert_eq!(run.code(), 0, "{:?}", run.stderr);
         let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Success);
         assert_eq!(envelope.kind(), "rules");
-        let listed = envelope.payload().data()["rules"].to_string();
-        assert!(listed.contains(RULE), "{listed}");
+        let rules = envelope.payload().data()["rules"]
+            .as_array()
+            .expect("rules array");
+        let rule = rules
+            .iter()
+            .find(|rule| rule["id"] == RULE)
+            .unwrap_or_else(|| panic!("{RULE} not listed: {rules:?}"));
+        assert!(
+            rule["remediation"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "{rule}"
+        );
     }
 
     #[test]
@@ -1257,5 +1268,66 @@ mod rule_catalog {
         let _ = std::fs::remove_file(&path);
         assert_eq!(run.code(), 1, "{:?}", run.stderr);
         assert_eq!(run.stdout, "");
+    }
+
+    fn saved_with_rule(name: &str, rule: &str) -> std::path::PathBuf {
+        let body = serde_json::json!({"type":"scan","payload":{"code":0,"message":"ok","data":{
+            "findings":{"findings":[{"rule":rule,"severity":"high","message":"m"}]}}}});
+        saved_envelope(name, &body.to_string())
+    }
+
+    #[test]
+    fn why_json_success_is_one_envelope() {
+        let path = saved_with_rule("why-json-ok", RULE);
+        let run = run_piped(&["why", path.to_str().unwrap(), "--json"]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Success);
+        assert_eq!(envelope.kind(), "rules");
+        assert_eq!(envelope.payload().data()["rules"][0]["id"], RULE);
+    }
+
+    #[test]
+    fn why_json_refusal_is_one_envelope() {
+        let path = saved_envelope("why-json-bad", "garbage");
+        let run = run_piped(&["why", path.to_str().unwrap(), "--json"]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 1, "{:?}", run.stderr);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        assert!(envelope.payload().data()["error"].is_string());
+    }
+
+    #[test]
+    fn why_a_missing_file_or_a_directory_names_the_path() {
+        let missing = std::env::temp_dir().join("sim-doctor-no-such-scan.json");
+        let dir = std::env::temp_dir();
+        for target in [missing.to_str().unwrap(), dir.to_str().unwrap()] {
+            let run = run_piped(&["why", target]);
+            assert_eq!(run.code(), 1, "{target}: {:?}", run.stderr);
+            assert!(run.stderr.contains(target), "{target}: {}", run.stderr);
+            assert!(!run.stderr.contains("unknown rule"), "{}", run.stderr);
+        }
+        let run = run_piped(&["why", "scan.jsn.json"]);
+        assert_eq!(run.code(), 1);
+        assert!(run.stderr.contains("scan.jsn.json") && !run.stderr.contains("unknown rule"));
+    }
+
+    #[test]
+    fn why_a_rule_this_build_does_not_know_says_so() {
+        let path = saved_with_rule("why-unknown", "other/not-here");
+        let run = run_piped(&["why", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        assert!(run.stdout.contains("other/not-here"), "{}", run.stdout);
+        assert!(run.stdout.contains("no catalog entry"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn why_never_prints_control_characters_from_the_file() {
+        let path = saved_with_rule("why-esc", "gsma/\u{1b}[2Jx");
+        let run = run_piped(&["why", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        assert!(!run.stdout.as_bytes().contains(&0x1b), "{:?}", run.stdout);
     }
 }
