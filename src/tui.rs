@@ -375,10 +375,10 @@ impl Drop for Restore {
     }
 }
 
-/// Runs the interactive view until the user quits or SIGINT is seen.
+/// Runs the interactive view until the user quits or SIGINT or SIGTERM is seen.
 ///
-/// SIGTERM is not handled: `signals` only installs SIGINT, and a SIGTERM
-/// kills the process with the terminal still in raw mode.
+/// Both signals set the `signals` flag, polled every 250 ms; the loop then returns
+/// and the Drop guard restores the terminal.
 pub fn run(data: &Value) -> std::io::Result<()> {
     use crossterm::event::{self, Event, KeyEventKind};
     use std::time::Duration;

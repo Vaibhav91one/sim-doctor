@@ -99,12 +99,12 @@ fn record_interrupt() -> Reaction {
     }
 }
 
-/// The installed SIGINT handler.
+/// The installed SIGINT and SIGTERM handler (one flag for both).
 ///
 /// Async-signal-safe: it calls `record_interrupt`, which is two atomic loads
 /// and stores and nothing else, and on a repeat interrupt two POSIX
 /// async-signal-safe calls. No allocation, no lock, no I/O, no unwinding.
-extern "C" fn handle_sigint(signal: libc::c_int) {
+extern "C" fn handle_signal(signal: libc::c_int) {
     match record_interrupt() {
         Reaction::Recorded => {}
         Reaction::Reraise => unsafe { re_raise_with_default_disposition(signal) },
@@ -154,7 +154,7 @@ unsafe fn re_raise_with_default_disposition(signal: libc::c_int) {
     unsafe { libc::raise(signal) };
 }
 
-/// Installs the SIGINT handler for this process.
+/// Installs the SIGINT and SIGTERM handlers for this process.
 ///
 /// Call once, early, from `main`. Until it is called SIGINT keeps its default
 /// disposition and terminates the process; after it is called SIGINT sets a
@@ -178,23 +178,26 @@ pub fn install() -> Result<(), Error> {
     // disagreeing about which command is in flight. Finishing the transaction
     // and then noticing the flag at the next checkpoint is the safe order.
     let action = disposition(
-        handle_sigint as *const () as libc::sighandler_t,
+        handle_signal as *const () as libc::sighandler_t,
         libc::SA_RESTART,
     );
 
     // SAFETY: `action` is fully initialised, its mask is a valid empty set,
     // and a null third argument means libc writes nothing back. `sigaction`
     // returning non-zero becomes `Error::Install` below, and the only errno a
-    // well-formed SIGINT disposition produces is EFAULT from a bad handler
-    // pointer, which a plain `extern "C" fn` cannot be.
-    if unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) } == 0 {
-        Ok(())
-    } else {
-        Err(Error::Install(std::io::Error::last_os_error()))
+    // well-formed disposition produces is EFAULT from a bad handler pointer,
+    // which a plain `extern "C" fn` cannot be. SIGTERM shares the handler and the
+    // flag: a killed TUI then leaves through its Drop guard and restores the
+    // terminal, and a scan checkpoints to exit 130 exactly as for SIGINT.
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(Error::Install(std::io::Error::last_os_error()));
+        }
     }
+    Ok(())
 }
 
-/// Whether a SIGINT has been delivered since [`install`] was called.
+/// Whether a SIGINT or SIGTERM has been delivered since [`install`] was called.
 ///
 /// This is the checkpoint call. Every loop that can run for a while (today's
 /// `modules`, tomorrow issue #9's `scan` walk) calls it where stopping is
@@ -209,7 +212,7 @@ pub fn interrupted() -> bool {
 #[non_exhaustive]
 pub enum Error {
     /// The kernel refused the SIGINT disposition.
-    #[error("the SIGINT handler could not be installed: {0}")]
+    #[error("the SIGINT/SIGTERM handlers could not be installed: {0}")]
     Install(#[source] std::io::Error),
 }
 
@@ -251,5 +254,14 @@ mod tests {
 
         reset();
         assert!(!interrupted());
+
+        // The wiring half for SIGTERM: a real signal, delivered to this process,
+        // must set the same flag. (Same test on purpose: the flag is global.)
+        install().expect("install the handlers");
+        assert!(!interrupted());
+        // SAFETY: raising a signal this module has just installed a handler for.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert!(interrupted(), "SIGTERM must set the interrupt flag");
+        reset();
     }
 }
