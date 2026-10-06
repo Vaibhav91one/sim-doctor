@@ -69,19 +69,30 @@ jobs:
           files: artifacts/sim-doctor-*
 
   crates:
+    # Trusted publishing: crates.io checks this workflow's OIDC identity against the publisher
+    # configured on the crate (Vaibhav91one/sim-doctor, release.yml) and hands back a short-lived
+    # token. CARGO_REGISTRY_TOKEN stays only as a fallback until an OIDC release has succeeded;
+    # delete the secret and the fallback after that.
     needs: verify
     runs-on: ubuntu-latest
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write # trusted publishing
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Install libpcsclite
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config
+      - name: Exchange the OIDC identity for a short-lived crates.io token
+        id: auth
+        continue-on-error: true # not configured yet: fall back to the secret below
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set; skipped publishing to crates.io"
+            echo "::notice::no crates.io token (OIDC not configured, CARGO_REGISTRY_TOKEN not set); skipped publishing to crates.io"
             exit 0
           fi
           version="${GITHUB_REF_NAME#v}"
@@ -93,13 +104,14 @@ jobs:
           cargo publish
 
   npm:
+    # Trusted publishing: npm checks this workflow's OIDC identity against the publisher
+    # configured on the package (Vaibhav91one/sim-doctor, release.yml). Needs npm 11.5.1 or
+    # later. NPM_TOKEN stays only as a fallback until an OIDC release has succeeded.
     needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # provenance
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      id-token: write # trusted publishing (and provenance)
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
@@ -111,14 +123,21 @@ jobs:
         run: npm test
       - name: Publish the launcher
         working-directory: npm
+        env:
+          FALLBACK_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::notice::NPM_TOKEN is not set; skipped publishing to npm"
-            exit 0
-          fi
+          npm install -g npm@latest
           version=$(node -p "require('./package.json').version")
           if [ "$(npm view "sim-doctor@$version" version 2>/dev/null)" = "$version" ]; then
             echo "::notice::sim-doctor@$version is already on npm; nothing to publish"
             exit 0
           fi
-          npm publish --access public --provenance
+          if npm publish --access public; then
+            exit 0
+          fi
+          if [ -z "$FALLBACK_NPM_TOKEN" ]; then
+            echo "::error::trusted publishing failed and no NPM_TOKEN fallback is set"
+            exit 1
+          fi
+          echo "::warning::trusted publishing failed; retrying with the NPM_TOKEN secret"
+          NODE_AUTH_TOKEN="$FALLBACK_NPM_TOKEN" npm publish --access public --provenance
