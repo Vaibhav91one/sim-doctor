@@ -113,6 +113,7 @@ built-in PCSC framework.
 | `modules [--json]` | describe the crate's module roots and layering |
 | `completions <shell>` | shell completion script for the whole flag surface |
 | `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
+| `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 
@@ -166,7 +167,6 @@ locations, bounded evidence, a registry that refuses a duplicate ID) and a singl
 real SIM/UICC/eUICC rules that make `--score` meaningful ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)),
 an MCP server ([#41](https://github.com/Vaibhav91one/sim-doctor/issues/41)),
 a CI action ([#43](https://github.com/Vaibhav91one/sim-doctor/issues/43)),
-`fix` ([#44](https://github.com/Vaibhav91one/sim-doctor/issues/44)),
 `ci install` ([#45](https://github.com/Vaibhav91one/sim-doctor/issues/45)),
 `why` / `rules explain` ([#46](https://github.com/Vaibhav91one/sim-doctor/issues/46)) and
 a corpus/precision gate ([#47](https://github.com/Vaibhav91one/sim-doctor/issues/47)).
