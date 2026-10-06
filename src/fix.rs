@@ -10,7 +10,7 @@ pub const NAME: &str = "fix";
 /// The longest cleaned field, in characters. Argv limits are real.
 const MAX_FIELD: usize = 300;
 /// The most findings put in one prompt.
-const MAX_FINDINGS: usize = 20;
+pub const MAX_FINDINGS: usize = 20;
 
 /// A coding agent this tool can start.
 pub struct Agent {
@@ -63,18 +63,24 @@ pub fn clean_with_limit(text: &str, limit: usize) -> String {
     text.chars()
         .map(|c| match c {
             '`' => '\'',
-            c if c.is_control()
-                || matches!(c,
-                    '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
-                    | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2069}'
-                    | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}') =>
-            {
-                ' '
-            }
+            c if c.is_control() || is_invisible(c) => ' ',
             c => c,
         })
         .take(limit)
         .collect()
+}
+
+/// Format (Cf), line/paragraph separator, private-use and default-ignorable characters.
+///
+/// std has no general-category lookup and no new crate is allowed, so this is an
+/// explicit table. Unassigned code points (Cn) are NOT covered beyond the ranges below.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+        | '\u{180b}'..='\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}'
+        | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}'
+        | '\u{e0100}'..='\u{e01ef}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{10ffff}')
 }
 
 /// The prompt for one rule. `findings` are `(severity, message)` pairs from a saved scan.
@@ -147,6 +153,63 @@ mod tests {
         let dirty = "a\u{1b}b\u{202e}c\u{200b}d\u{e0041}e\u{61c}f\u{fe0f}g\u{ad}h`i";
         assert_eq!(clean(dirty), "a b c d e f g h'i");
         assert_eq!(clean(&"x".repeat(500)).chars().count(), 300);
+    }
+
+    #[test]
+    fn clean_strips_every_listed_invisible_and_keeps_real_text() {
+        let single = [
+            0xad, 0x34f, 0x61c, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x3164, 0xfeff, 0xffa0, 0x85,
+        ];
+        let ranges = [
+            (0x180b, 0x180e),
+            (0x200b, 0x200f),
+            (0x2028, 0x202e),
+            (0x2060, 0x206f),
+            (0xfe00, 0xfe0f),
+            (0xfff9, 0xfffb),
+            (0xe0000, 0xe007f),
+            (0xe0100, 0xe01ef),
+            (0xe000, 0xf8ff),
+            (0xf0000, 0x10ffff),
+        ];
+        let all = single
+            .iter()
+            .copied()
+            .chain(ranges.iter().flat_map(|&(a, b)| a..=b))
+            .filter_map(char::from_u32);
+        for c in all {
+            assert_eq!(clean(&format!("a{c}b")), "a b", "U+{:04X}", c as u32);
+        }
+        let legit = "caf\u{e9} e\u{301} \u{65e5}\u{672c}\u{8a9e} \u{645}\u{631}\u{62d}\u{628}\u{627} \u{1f600} 0123 a-b.c,d!?";
+        assert_eq!(clean(legit), legit);
+    }
+
+    #[test]
+    fn clean_literal_cases_not_derived_from_the_table() {
+        for c in [
+            "\u{ad}",
+            "\u{34f}",
+            "\u{200b}",
+            "\u{202e}",
+            "\u{2028}",
+            "\u{2066}",
+            "\u{feff}",
+            "\u{e0041}",
+            "\u{e000}",
+            "\u{85}",
+        ] {
+            assert_eq!(clean(&format!("a{c}b")), "a b", "{c:?}");
+        }
+        for keep in [
+            "\u{e9}",
+            "e\u{301}",
+            "\u{4e2d}\u{6587}",
+            "\u{628}",
+            "\u{93f}",
+            "0123456789",
+        ] {
+            assert_eq!(clean(keep), keep);
+        }
     }
 
     #[test]

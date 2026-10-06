@@ -185,6 +185,12 @@ const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the binary is its pid.
 #[cfg(unix)]
 fn interrupt(args: &[&str]) -> Run {
+    interrupt_with(args, libc::SIGINT)
+}
+
+/// [`interrupt`] with a chosen signal.
+#[cfg(unix)]
+fn interrupt_with(args: &[&str], signal: libc::c_int) -> Run {
     let _guard = spawn_lock();
     let mut child = Command::new(binary())
         .args(args)
@@ -208,8 +214,8 @@ fn interrupt(args: &[&str]) -> Run {
     // not yet reaped. A non-zero return would mean the signal was not
     // delivered at all, which the status assertions below report far more
     // usefully than an ignored errno would.
-    let delivered = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
-    assert_eq!(delivered, 0, "SIGINT could not be delivered");
+    let delivered = unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+    assert_eq!(delivered, 0, "signal {signal} could not be delivered");
 
     // Safe to drain stderr to EOF before stdout: this process writes at most
     // one envelope, far below a pipe buffer, so the child cannot block writing
@@ -867,6 +873,16 @@ fn interrupting_a_scan_exits_130_and_emits_no_partial_tree() {
     assert!(run.stderr.contains("interrupted"), "{:?}", run.stderr);
 }
 
+/// Issue #59: SIGTERM is treated like SIGINT by a scan: checkpoint, exit 130.
+#[test]
+#[cfg(unix)]
+fn sigterm_on_a_scan_exits_130_like_sigint() {
+    let run = interrupt_with(&["scan", "--json"], libc::SIGTERM);
+    assert_eq!(run.status.signal(), None, "{:?}", run.status);
+    assert_eq!(run.code(), 130);
+    assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
+}
+
 /// Issue #6's third acceptance criterion: generated completions build cleanly.
 ///
 /// "Build cleanly" is asserted two ways. Every shell `clap_complete` supports
@@ -1424,6 +1440,223 @@ mod fix_handoff {
         assert!(stderr.contains("already inside a coding agent"), "{stderr}");
         assert!(!stderr.contains("$ claude"), "{stderr}");
     }
+
+    /// Runs `fix --agent claude` with `PATH` set to `dir` only and no agent marker
+    /// variable, so the result does not depend on who runs the tests.
+    #[cfg(unix)]
+    fn fix_launch(
+        name: &str,
+        dir: &std::path::Path,
+        extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let path = saved(name, RULE);
+        let mut cmd = Command::new(binary());
+        cmd.args([
+            "fix",
+            RULE,
+            "--from",
+            path.to_str().unwrap(),
+            "--agent",
+            "claude",
+        ])
+        .args(extra)
+        .env("PATH", dir)
+        .stdin(Stdio::null());
+        for key in [
+            "CLAUDECODE",
+            "CODEX_THREAD_ID",
+            "CODEX_SANDBOX",
+            "CURSOR_SANDBOX",
+            "SIM_DOCTOR_AGENT",
+            "SIM_DOCTOR_HANDOFF_SKIP_APPROVALS",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.envs(env.iter().copied());
+        let out = {
+            let _guard = spawn_lock();
+            cmd.output().expect("run the binary")
+        };
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    /// A temp dir holding an executable `claude` shell script with `body`.
+    #[cfg(unix)]
+    fn fake_agent(name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sim-doctor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_agent_is_not_installed_and_exits_1() {
+        let dir = fake_agent("missing", "exit 0");
+        std::fs::remove_file(dir.join("claude")).unwrap();
+        let out = fix_launch("fix-missing", &dir, &[], &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("claude is not installed"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_error_other_than_not_found_is_a_message_and_exit_1() {
+        // A `claude` that exists but is not executable: spawn fails with PermissionDenied.
+        // root ignores the mode bits, so the case cannot be built there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a 0644 file is still executable");
+            return;
+        }
+        let dir = fake_agent("noexec", "exit 0");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("claude"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        let out = fix_launch("fix-noexec", &dir, &[], &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("could not launch claude"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_killed_agent_exits_128_plus_the_signal() {
+        let dir = fake_agent("killed", "kill -TERM $$");
+        let out = fix_launch("fix-killed", &dir, &[], &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(128 + libc::SIGTERM), "{stderr}");
+        assert!(
+            stderr.contains(&format!("signal {}", libc::SIGTERM)),
+            "{stderr}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skip_approvals_reaches_the_agent_argv_by_flag_and_by_env() {
+        let dir = fake_agent("argv", "printf '%s\\n' \"$@\" > \"$ARGV_OUT\"");
+        let out_file = dir.join("argv.txt");
+        let out_str = out_file.to_str().unwrap();
+        let first_arg = |extra: &[&str], env: &[(&str, &str)]| {
+            let mut env = env.to_vec();
+            env.push(("ARGV_OUT", out_str));
+            let out = fix_launch("fix-argv", &dir, extra, &env);
+            assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+            let text = std::fs::read_to_string(&out_file).unwrap();
+            std::fs::remove_file(&out_file).unwrap();
+            text.lines().next().unwrap().to_owned()
+        };
+        assert!(first_arg(&[], &[]).starts_with("You are fixing"));
+        assert_eq!(
+            first_arg(&["--skip-approvals"], &[]),
+            "--dangerously-skip-permissions"
+        );
+        assert_eq!(
+            first_arg(&[], &[("SIM_DOCTOR_HANDOFF_SKIP_APPROVALS", "1")]),
+            "--dangerously-skip-permissions"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_while_the_agent_runs_ends_sim_doctor_promptly() {
+        let dir = fake_agent("sleeper", "echo $$ > \"$MARKER\"\nexec sleep 30");
+        let marker = dir.join("started");
+        let path = saved("fix-sleeper", RULE);
+        let mut cmd = Command::new(binary());
+        cmd.args([
+            "fix",
+            RULE,
+            "--from",
+            path.to_str().unwrap(),
+            "--agent",
+            "claude",
+        ])
+        .env("PATH", format!("{}:/bin:/usr/bin", dir.display()))
+        .env("MARKER", &marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        for key in [
+            "CLAUDECODE",
+            "CODEX_THREAD_ID",
+            "CODEX_SANDBOX",
+            "CURSOR_SANDBOX",
+            "SIM_DOCTOR_AGENT",
+        ] {
+            cmd.env_remove(key);
+        }
+        let _guard = spawn_lock();
+        let mut child = cmd.spawn().expect("run the binary");
+        let start = Instant::now();
+        // `exec sleep`: the agent pid written to the marker is the sleeper itself.
+        let agent_pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the agent never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let sent = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Some(status);
+            }
+            if sent.elapsed() > Duration::from_secs(5) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        unsafe { libc::kill(agent_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = status.expect("sim-doctor ignored SIGTERM while the agent ran");
+        assert_ne!(status.code(), Some(0), "{status:?}");
+    }
+
+    #[test]
+    fn a_hundred_findings_list_twenty() {
+        let findings: Vec<_> = (0..100)
+            .map(|i| serde_json::json!({"rule":RULE,"severity":"low","message":format!("m{i}")}))
+            .collect();
+        let body = serde_json::json!({"type":"scan","payload":{"code":0,"message":"ok","data":{
+            "findings":{"findings":findings}}}});
+        let path =
+            std::env::temp_dir().join(format!("sim-doctor-fix-100-{}.json", std::process::id()));
+        std::fs::write(&path, body.to_string()).unwrap();
+        let run = run_piped(&["fix", RULE, "--from", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        assert_eq!(
+            run.stdout.lines().filter(|l| l.starts_with("LOW ")).count(),
+            20
+        );
+    }
 }
 
 mod mcp_server {
@@ -1564,6 +1797,47 @@ mod mcp_server {
         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
         let status = child.wait().expect("wait");
         assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+        drop(stdin);
+    }
+
+    /// Chosen deliberately: the MCP server never polls the interrupt flag, so it
+    /// takes the default SIGTERM disposition (dies of the signal, promptly), exactly
+    /// like SIGINT above. A handler that only set a flag would leave it running.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_ends_the_mcp_server_promptly() {
+        let _guard = spawn_lock();
+        let mut child = Command::new(binary())
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run the binary");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .unwrap();
+        let mut first = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+            &mut first,
+        )
+        .unwrap();
+        assert!(first.contains("result"), "{first}");
+        let sent = Instant::now();
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            if sent.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                panic!("the mcp server ignored SIGTERM for 5 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
         drop(stdin);
     }
 }

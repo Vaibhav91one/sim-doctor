@@ -110,7 +110,7 @@ wrote ./AGENTS.md
 `sim-doctor scan --tui` shows the findings in an interactive terminal view: the count per severity, the score
 when `--score` is on, a list (severity, rule id, message; critical and high red, medium yellow, low blue, info
 grey) and a detail pane for the selected finding (location, coverage reason when partial, evidence), plus the
-coverage and TAR-stop notes. The status area at the top always shows the score warning, walk-stop and truncation notes, candidate warning and diff counts when the JSON has them. Keys: up/down or j/k, PgUp/PgDn, Home/End, Tab to scroll the detail pane, q, Esc or Ctrl-C to quit. SIGINT also exits cleanly; SIGTERM is not handled and can leave the terminal in raw mode.
+coverage and TAR-stop notes. The status area at the top always shows the score warning, walk-stop and truncation notes, candidate warning and diff counts when the JSON has them. Keys: up/down or j/k, PgUp/PgDn, Home/End, Tab to scroll the detail pane, q, Esc or Ctrl-C to quit. SIGINT and SIGTERM also exit cleanly and restore the terminal (`sim-doctor mcp` and a launched `fix` agent keep the default disposition for both and just end).
 
 It is a view over the data `--json` carries and never shows anything the envelope lacks. It cannot be combined
 with `--json` (usage error, exit 129). When stdin or stdout is not a terminal it prints the normal report and
@@ -140,7 +140,7 @@ built-in PCSC framework.
 | `modules [--json]` | describe the crate's module roots and layering |
 | `completions <shell>` | shell completion script for the whole flag surface |
 | `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
-| `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
+| `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; `fix` strips zero-width joiners (U+200C/U+200D), the combining grapheme joiner and variation selectors from agent-bound text, so emoji ZWJ sequences and Persian/Indic shaping marks are removed; unassigned code points and some other Cf characters (e.g. U+0600-0605, U+06DD) are NOT stripped. card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent; `SIM_DOCTOR_HANDOFF_SKIP_APPROVALS=1` is the same as `--skip-approvals`; an agent that is not installed exits 1, and one killed by a signal exits 128+signal. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 
@@ -162,7 +162,7 @@ built-in PCSC framework.
 | `0` | the walk finished (findings do not change this; AGENTS.md section 3 says why) |
 | `1` | the scan could not run: no reader, no card, or a flag not implemented yet |
 | `129` | the command line could not be parsed |
-| `130` | interrupted |
+| `130` | interrupted by SIGINT or SIGTERM (SIGTERM exits 130 too, not 143) |
 
 ## Agent integration
 

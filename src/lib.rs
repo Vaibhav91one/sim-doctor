@@ -20,7 +20,7 @@
 //! layer 0  rules      plugin/rule identifiers and the severity ladder
 //! layer 0  contract   JSON envelope and process exit codes
 //! layer 0  mcp        the stdio MCP server; runs the binary itself, imports nothing
-//! layer 0  signals    the SIGINT flag, and when it may be acted on
+//! layer 0  signals    the SIGINT/SIGTERM flag, and when it may be acted on
 //! layer 1  ci         the pull-request workflow that runs the action (rules only)
 //! layer 1  fcp        the caller-supplied tag table of a file capabilities
 //!                template, and the file metadata read through it
@@ -173,7 +173,7 @@ pub const MODULES: &[ModuleInfo] = &[
     },
     ModuleInfo {
         name: signals::NAME,
-        owns: "The SIGINT handler: one atomic flag, checked at a checkpoint, that becomes exit code 130.",
+        owns: "The SIGINT and SIGTERM handler: one atomic flag, checked at a checkpoint, that becomes exit code 130.",
         depends_on: &[],
     },
     ModuleInfo {

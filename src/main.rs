@@ -1046,7 +1046,7 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 
 /// Runs `sim-doctor scan` and returns the exit code for it.
 ///
-/// **The shape of this function is the whole SIGINT contract.** Two
+/// **The shape of this function is the whole SIGINT/SIGTERM contract (both exit 130).** Two
 /// checkpoints, both before anything is written to stdout:
 ///
 /// 1. before a reader is opened, so an operator who hits Ctrl-C while the tool
@@ -1519,12 +1519,14 @@ fn emit_rules(json: bool, data: serde_json::Value, text: String) -> contract::Ex
 
 /// `sim-doctor mcp`: the stdio server, handed the real clap `scan` command.
 fn run_mcp() -> contract::ExitCode {
-    // main() installed the SIGINT flag handler, which this server never polls and
-    // which would swallow Ctrl-C; restore the default so it ends the server. Each
-    // child scan installs its own handler.
-    // SAFETY: SIG_DFL is a valid disposition for SIGINT; no handler pointer is involved.
+    // main() installed the SIGINT/SIGTERM flag handler, which this server never polls
+    // and which would swallow Ctrl-C and `kill`; restore the default for both so either
+    // ends the server (chosen deliberately for SIGTERM: no cleanup is owed). Each child
+    // scan installs its own handler.
+    // SAFETY: SIG_DFL is a valid disposition for these signals; no handler pointer is involved.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
     let cli = <Cli as CommandFactory>::command();
     let scan = cli.find_subcommand("scan").expect("scan subcommand exists");
@@ -1689,25 +1691,6 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
     emit_rules(json, serde_json::json!({ "rules": rules }), text)
 }
 
-/// The first executable called `bin` on PATH.
-fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(candidate)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                candidate.is_file()
-            }
-        })
-}
-
 /// Runs `sim-doctor fix`: print the prompt, and with `--agent` launch that agent.
 fn run_fix(args: &FixArgs) -> contract::ExitCode {
     let specs = scan::specs();
@@ -1735,6 +1718,8 @@ fn run_fix(args: &FixArgs) -> contract::ExitCode {
     let findings: Vec<(String, String)> = all
         .iter()
         .filter(|f| f["rule"].as_str() == Some(spec.id().as_str()))
+        // Cap before collecting: a 16 MiB file of matches must not allocate per finding.
+        .take(fix::MAX_FINDINGS)
         .map(|f| {
             (
                 f["severity"].as_str().unwrap_or("?").to_owned(),
@@ -1772,18 +1757,44 @@ fn run_fix(args: &FixArgs) -> contract::ExitCode {
         .iter()
         .find(|a| a.name == name)
         .expect("clap restricts --agent to the table");
-    let Some(bin) = find_on_path(agent.bin) else {
-        eprintln!("sim-doctor: {} is not on PATH", agent.bin);
-        return contract::ExitCode::Findings;
-    };
     let skip = args.skip_approvals
         || std::env::var("SIM_DOCTOR_HANDOFF_SKIP_APPROVALS").is_ok_and(|v| v == "1");
     let argv = fix::launch_argv(agent, &prompt, skip);
     eprintln!("$ {} <prompt>", argv[..argv.len() - 1].join(" "));
-    match std::process::Command::new(bin).args(&argv[1..]).status() {
+    // `.status()` blocks while the agent runs and the flag handler would swallow
+    // Ctrl-C and `kill`; restore the default for both, as run_mcp does, so either
+    // ends this process (the agent shares the terminal's process group for Ctrl-C).
+    // SAFETY: SIG_DFL is a valid disposition for these signals; no handler pointer is involved.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
+    // Spawned directly: the OS resolves PATH, so the path run is the path checked.
+    match std::process::Command::new(agent.bin)
+        .args(&argv[1..])
+        .status()
+    {
         Ok(status) if status.success() => contract::ExitCode::Success,
         Ok(status) => {
             eprintln!("sim-doctor: {} exited with {status}", agent.bin);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(signal) = status.signal() {
+                    // The shell convention (130 for SIGINT); the child's own code is
+                    // lost to the kernel here, so report the signal instead.
+                    eprintln!("sim-doctor: {} was killed by signal {signal}", agent.bin);
+                    process::exit(128 + signal);
+                }
+            }
+            contract::ExitCode::Findings
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "sim-doctor: {} is not installed (not found on PATH)",
+                agent.bin
+            );
             contract::ExitCode::Findings
         }
         Err(err) => {
