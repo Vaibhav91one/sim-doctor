@@ -948,7 +948,7 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 
 /// Runs `sim-doctor scan` and returns the exit code for it.
 ///
-/// **The shape of this function is the whole SIGINT contract.** Two
+/// **The shape of this function is the whole SIGINT/SIGTERM contract (both exit 130).** Two
 /// checkpoints, both before anything is written to stdout:
 ///
 /// 1. before a reader is opened, so an operator who hits Ctrl-C while the tool
@@ -1663,6 +1663,15 @@ fn run_fix(args: &FixArgs) -> contract::ExitCode {
         || std::env::var("SIM_DOCTOR_HANDOFF_SKIP_APPROVALS").is_ok_and(|v| v == "1");
     let argv = fix::launch_argv(agent, &prompt, skip);
     eprintln!("$ {} <prompt>", argv[..argv.len() - 1].join(" "));
+    // `.status()` blocks while the agent runs and the flag handler would swallow
+    // Ctrl-C and `kill`; restore the default for both, as run_mcp does, so either
+    // ends this process (the agent shares the terminal's process group for Ctrl-C).
+    // SAFETY: SIG_DFL is a valid disposition for these signals; no handler pointer is involved.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
     // Spawned directly: the OS resolves PATH, so the path run is the path checked.
     match std::process::Command::new(agent.bin)
         .args(&argv[1..])

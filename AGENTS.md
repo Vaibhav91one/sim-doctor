@@ -178,7 +178,7 @@ the reference implementation for agent-friendly terminal UX.
 |---|---|
 | 0 | Success, no findings above threshold |
 | 1 | Findings present (or checks failed) |
-| 130 | Interrupted by user (SIGINT) |
+| 130 | Interrupted by user (SIGINT or SIGTERM; SIGTERM exits 130 too, not 143) |
 | 129 | Invalid usage / bad arguments |
 
 Every one of the four is proved by a test that spawns the built binary and reads its
@@ -279,7 +279,7 @@ edit**: the table above, the `GATE ON data.complete` sentence in `scan --help`, 
 currently expects exit 0 against a live swSIM card all have to move in the same commit. Full
 reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 
-**SIGINT is handled, not inherited.** The handler sets one atomic flag and returns;
+**SIGINT and SIGTERM are handled, not inherited.** The handler sets one atomic flag and returns;
 ordinary code notices at a checkpoint and exits 130 itself, so a handled interrupt
 reports `code() == Some(130)` and never `signal() == Some(SIGINT)`. An interrupted run
 still emits **one** envelope carrying code 130 and an empty `data` - never a partial

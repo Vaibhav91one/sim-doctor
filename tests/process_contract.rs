@@ -1511,6 +1511,11 @@ mod fix_handoff {
     #[test]
     fn a_spawn_error_other_than_not_found_is_a_message_and_exit_1() {
         // A `claude` that exists but is not executable: spawn fails with PermissionDenied.
+        // root ignores the mode bits, so the case cannot be built there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a 0644 file is still executable");
+            return;
+        }
         let dir = fake_agent("noexec", "exit 0");
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1564,6 +1569,74 @@ mod fix_handoff {
             "--dangerously-skip-permissions"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_while_the_agent_runs_ends_sim_doctor_promptly() {
+        let dir = fake_agent("sleeper", "echo $$ > \"$MARKER\"\nexec sleep 30");
+        let marker = dir.join("started");
+        let path = saved("fix-sleeper", RULE);
+        let mut cmd = Command::new(binary());
+        cmd.args([
+            "fix",
+            RULE,
+            "--from",
+            path.to_str().unwrap(),
+            "--agent",
+            "claude",
+        ])
+        .env("PATH", format!("{}:/bin:/usr/bin", dir.display()))
+        .env("MARKER", &marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        for key in [
+            "CLAUDECODE",
+            "CODEX_THREAD_ID",
+            "CODEX_SANDBOX",
+            "CURSOR_SANDBOX",
+            "SIM_DOCTOR_AGENT",
+        ] {
+            cmd.env_remove(key);
+        }
+        let _guard = spawn_lock();
+        let mut child = cmd.spawn().expect("run the binary");
+        let start = Instant::now();
+        // `exec sleep`: the agent pid written to the marker is the sleeper itself.
+        let agent_pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the agent never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let sent = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Some(status);
+            }
+            if sent.elapsed() > Duration::from_secs(5) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        unsafe { libc::kill(agent_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = status.expect("sim-doctor ignored SIGTERM while the agent ran");
+        assert_ne!(status.code(), Some(0), "{status:?}");
     }
 
     #[test]
