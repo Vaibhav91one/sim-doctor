@@ -1394,6 +1394,13 @@ fn emit_rules(json: bool, data: serde_json::Value, text: String) -> contract::Ex
 
 /// `sim-doctor mcp`: the stdio server, handed the real clap `scan` command.
 fn run_mcp() -> contract::ExitCode {
+    // main() installed the SIGINT flag handler, which this server never polls and
+    // which would swallow Ctrl-C; restore the default so it ends the server. Each
+    // child scan installs its own handler.
+    // SAFETY: SIG_DFL is a valid disposition for SIGINT; no handler pointer is involved.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+    }
     let cli = <Cli as CommandFactory>::command();
     let scan = cli.find_subcommand("scan").expect("scan subcommand exists");
     match sim_doctor::mcp::serve(scan) {

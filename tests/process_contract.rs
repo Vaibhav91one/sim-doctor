@@ -1486,4 +1486,84 @@ mod mcp_server {
         let envelope: serde_json::Value = serde_json::from_str(text).expect("the rules envelope");
         assert!(envelope["payload"]["data"]["rules"].is_array(), "{text}");
     }
+
+    /// Sends `input` to a real `sim-doctor mcp`, closes stdin, returns the response lines.
+    fn mcp_session(input: &str) -> Vec<serde_json::Value> {
+        let _guard = spawn_lock();
+        let mut child = Command::new(binary())
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the binary");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().expect("wait");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_real_server_refuses_file_flags_without_starting_a_scan() {
+        let call = |args: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"scan\",\"arguments\":{args}}}}}\n"
+            )
+        };
+        let input = format!(
+            "{}{}{}",
+            call(r#"{"baseline":"x.json"}"#),
+            call(r#"{"reader":"--baseline=x"}"#),
+            "\u{ff}not json\n"
+        );
+        let lines = mcp_session(&input);
+        assert_eq!(lines.len(), 3);
+        for l in &lines[..2] {
+            assert_eq!(l["result"]["isError"], true, "{l}");
+            // A started scan would have said something about a reader or a card.
+            let text = l["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("baseline") || text.contains("start with"),
+                "{text}"
+            );
+        }
+        assert_eq!(lines[2]["error"]["code"], -32700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_ends_the_mcp_server() {
+        let _guard = spawn_lock();
+        let mut child = Command::new(binary())
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run the binary");
+        // Round-trip one request so the server has certainly run past its startup.
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .unwrap();
+        let mut first = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+            &mut first,
+        )
+        .unwrap();
+        assert!(first.contains("result"), "{first}");
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+        drop(stdin);
+    }
 }

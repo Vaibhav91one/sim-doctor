@@ -13,9 +13,10 @@
 //! tested without spawning anything. The clap `scan` command is passed in by
 //! the binary, which keeps this module a leaf with no dependency on `main.rs`.
 //!
-//! GitHub / agent-client acceptance beyond the handshake is unverified.
-use std::io::{self, BufRead, Write};
+//! Acceptance by agent clients beyond the handshake is unverified.
+use std::io::{self, BufRead, Read, Write};
 use std::process::{Command as Process, Stdio};
+use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Command};
 use serde_json::{json, Map, Value};
@@ -30,6 +31,11 @@ const EXCLUDED: &[&str] = &[
     "baseline", "diff", "sarif", "tui", "json", "help", "version",
 ];
 
+/// A call's default wall-clock limit; `SIM_DOCTOR_MCP_TIMEOUT_SECONDS` overrides it.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Most bytes kept from each of a child's stdout and stderr.
+const OUTPUT_CAP: usize = 16 * 1024 * 1024;
+
 /// What running one tool as a child process produced.
 pub struct ToolOutcome {
     /// Exit code, or `None` when the child could not be spawned or was killed.
@@ -38,6 +44,8 @@ pub struct ToolOutcome {
     pub stdout: String,
     /// Captured stderr of the child.
     pub stderr: String,
+    /// Whether stdout or stderr was cut at the capture cap.
+    pub truncated: bool,
 }
 
 /// The scan flags exposed to agents: (long name, help, kind).
@@ -162,6 +170,10 @@ fn build_argv(scan: &Command, name: &str, args: &Value) -> Result<Vec<String>, S
 /// Map a child's outcome to an MCP tool result. 0 and 1 (findings, regressed)
 /// carry the envelope; everything else is an error with the child's stderr.
 fn tool_result(out: ToolOutcome) -> Value {
+    if out.truncated {
+        let text = format!("{}\n[output truncated at {OUTPUT_CAP} bytes]", out.stdout);
+        return json!({ "content": [{ "type": "text", "text": text }], "isError": true });
+    }
     let (text, is_error) = match out.code {
         Some(0) | Some(1) => (out.stdout, false),
         Some(c) => (error_text(&format!("exit code {c}"), &out.stderr), true),
@@ -195,15 +207,32 @@ pub fn handle(
     scan: &Command,
     runner: &dyn Fn(&[String]) -> ToolOutcome,
 ) -> Option<Value> {
-    let method = req.get("method").and_then(Value::as_str)?;
+    let Some(obj) = req.as_object() else {
+        return Some(error(Value::Null, -32600, "invalid request: not an object"));
+    };
+    // Only a string or integer id can be echoed; anything else (null included)
+    // is an invalid request answered with a null id.
+    let id = match obj.get("id") {
+        None => None,
+        Some(v) if v.is_string() || v.is_i64() || v.is_u64() => Some(v.clone()),
+        Some(_) => return Some(error(Value::Null, -32600, "invalid request: bad id")),
+    };
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        return Some(error(
+            id.unwrap_or(Value::Null),
+            -32600,
+            "invalid request: no string method",
+        ));
+    };
     // A request without an id is a notification and is never answered.
-    let id = req.get("id").cloned()?;
+    let id = id?;
     let result = match method {
         "initialize" => json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "sim-doctor", "version": env!("CARGO_PKG_VERSION") },
         }),
+        "ping" => json!({}),
         "tools/list" => tool_list(scan),
         "tools/call" => {
             let name = req
@@ -224,54 +253,130 @@ pub fn handle(
 /// One input line to at most one response line. Malformed JSON is a -32700
 /// with a null id, never a crash, so the loop carries on.
 pub fn process_line(
-    line: &str,
+    line: &[u8],
     scan: &Command,
     runner: &dyn Fn(&[String]) -> ToolOutcome,
 ) -> Option<Value> {
-    if line.trim().is_empty() {
+    if line.iter().all(u8::is_ascii_whitespace) {
         return None;
     }
-    match serde_json::from_str::<Value>(line) {
+    // Invalid UTF-8 is a parse error like any other malformed line.
+    match serde_json::from_slice::<Value>(line) {
         Ok(req) => handle(&req, scan, runner),
         Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
     }
 }
 
-/// Run this binary with `argv`, capturing both streams. Stdin is closed so a
-/// child can never read the JSON-RPC stream.
-fn run_self(argv: &[String]) -> ToolOutcome {
-    let spawned = std::env::current_exe().and_then(|exe| {
-        Process::new(exe)
-            .args(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-    });
-    match spawned {
-        Ok(o) => ToolOutcome {
-            code: o.status.code(),
-            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+/// `SIM_DOCTOR_MCP_TIMEOUT_SECONDS`, or the default when unset, 0 or not a number.
+fn timeout_from(var: Option<&str>) -> Duration {
+    match var.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(n) if n > 0 => Duration::from_secs(n),
+        _ => DEFAULT_TIMEOUT,
+    }
+}
+
+/// Read a pipe to its end, keeping at most `cap` bytes. The rest is read and
+/// dropped so the child never blocks on a full pipe.
+fn capture(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let (mut kept, mut cut, mut buf) = (Vec::new(), false, [0u8; 8192]);
+    while let Ok(n) = pipe.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        let room = cap - kept.len();
+        kept.extend_from_slice(&buf[..n.min(room)]);
+        cut |= n > room;
+    }
+    (kept, cut)
+}
+
+/// Run `cmd` with captured, capped output and a hard deadline; kill it when
+/// the deadline passes. Stdin is closed so a child can never read the
+/// JSON-RPC stream.
+fn run_with_deadline(mut cmd: Process, timeout: Duration, cap: usize) -> ToolOutcome {
+    let failed = |stderr: String| ToolOutcome {
+        code: None,
+        stdout: String::new(),
+        stderr,
+        truncated: false,
+    };
+    let mut child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return failed(format!("could not run sim-doctor: {e}")),
+    };
+    let out = child.stdout.take().expect("piped");
+    let err = child.stderr.take().expect("piped");
+    let out_t = std::thread::spawn(move || capture(out, cap));
+    let err_t = std::thread::spawn(move || capture(err, cap));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return failed(format!("could not wait for sim-doctor: {e}")),
+        }
+    };
+    let (stdout, cut_out) = out_t.join().unwrap_or_default();
+    let (stderr, cut_err) = err_t.join().unwrap_or_default();
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+    match status {
+        Ok(status) => ToolOutcome {
+            code: status.code(),
+            stdout: text(stdout),
+            stderr: text(stderr),
+            truncated: cut_out || cut_err,
         },
+        Err(()) => failed(format!(
+            "timed out after {} s; the child was killed",
+            timeout.as_secs()
+        )),
+    }
+}
+
+/// Run this binary with `argv` under the timeout and output cap.
+fn run_self(argv: &[String]) -> ToolOutcome {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let mut cmd = Process::new(exe);
+            cmd.args(argv);
+            let var = std::env::var("SIM_DOCTOR_MCP_TIMEOUT_SECONDS").ok();
+            run_with_deadline(cmd, timeout_from(var.as_deref()), OUTPUT_CAP)
+        }
         Err(e) => ToolOutcome {
             code: None,
             stdout: String::new(),
             stderr: format!("could not run sim-doctor: {e}"),
+            truncated: false,
         },
     }
 }
 
-/// Serve JSON-RPC over stdin/stdout until EOF.
+/// Serve JSON-RPC over stdin/stdout until EOF. Calls are handled one at a time.
 pub fn serve(scan: &Command) -> io::Result<()> {
     let mut stdout = io::stdout();
-    for line in io::stdin().lock().lines() {
-        if let Some(resp) = process_line(&line?, scan, &run_self) {
+    let mut stdin = io::stdin().lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Bytes, not `lines()`: a non-UTF-8 line must be a parse error, not the end of the server.
+        if stdin.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if let Some(resp) = process_line(&line, scan, &run_self) {
             writeln!(stdout, "{resp}")?;
             stdout.flush()?;
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -311,6 +416,7 @@ mod tests {
                 code: Some(code),
                 stdout: "ENVELOPE".into(),
                 stderr: "BOOM".into(),
+                truncated: false,
             }
         };
         let req = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":name,"arguments":args}});
@@ -382,7 +488,119 @@ mod tests {
             &never
         )
         .is_none());
-        assert!(handle(&json!({"jsonrpc":"2.0","id":1}), &fake_scan(), &never).is_none());
+    }
+
+    #[test]
+    fn invalid_requests_are_32600_and_echo_a_usable_id() {
+        let scan = fake_scan();
+        let code = |v: Value| handle(&v, &scan, &never).unwrap();
+        let r = code(json!([{"jsonrpc":"2.0","id":1,"method":"ping"}]));
+        assert_eq!(
+            (r["error"]["code"].clone(), r["id"].clone()),
+            (json!(-32600), Value::Null)
+        );
+        assert_eq!(code(json!(5))["error"]["code"], -32600);
+        let r = code(json!({"jsonrpc":"2.0","id":4,"method":7}));
+        assert_eq!(
+            (r["error"]["code"].clone(), r["id"].clone()),
+            (json!(-32600), json!(4))
+        );
+        let r = code(json!({"jsonrpc":"2.0","id":"abc"}));
+        assert_eq!(
+            (r["error"]["code"].clone(), r["id"].clone()),
+            (json!(-32600), json!("abc"))
+        );
+        let r = code(json!({"jsonrpc":"2.0","id":null,"method":"ping"}));
+        assert_eq!(
+            (r["error"]["code"].clone(), r["id"].clone()),
+            (json!(-32600), Value::Null)
+        );
+        let r = code(json!({"jsonrpc":"2.0","id":{"a":1},"method":"ping"}));
+        assert_eq!(
+            (r["error"]["code"].clone(), r["id"].clone()),
+            (json!(-32600), Value::Null)
+        );
+    }
+
+    #[test]
+    fn ping_answers_an_empty_result() {
+        let r = handle(&req("ping", Some(9)), &fake_scan(), &never).unwrap();
+        assert_eq!(r["result"], json!({}));
+    }
+
+    #[test]
+    fn non_utf8_input_is_32700_and_the_loop_continues() {
+        let scan = fake_scan();
+        let bad = process_line(b"\xff\xfe", &scan, &never).unwrap();
+        assert_eq!(bad["error"]["code"], -32700);
+        assert!(bad["id"].is_null());
+        let ok = process_line(
+            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &scan,
+            &never,
+        );
+        assert_eq!(ok.unwrap()["result"], json!({}));
+    }
+
+    #[test]
+    fn a_timed_out_or_truncated_child_is_an_error() {
+        let t = tool_result(ToolOutcome {
+            code: None,
+            stdout: String::new(),
+            stderr: "timed out after 5 s; the child was killed".into(),
+            truncated: false,
+        });
+        assert_eq!(t["isError"], true);
+        assert!(t["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("timed out after 5 s"));
+        let t = tool_result(ToolOutcome {
+            code: Some(0),
+            stdout: "x".into(),
+            stderr: String::new(),
+            truncated: true,
+        });
+        assert_eq!(t["isError"], true);
+        assert!(t["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+    }
+
+    #[test]
+    fn the_timeout_env_falls_back_on_zero_and_junk() {
+        assert_eq!(timeout_from(None), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("0")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("abc")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("7")), Duration::from_secs(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_child_is_killed_at_the_deadline() {
+        let mut p = Process::new("sleep");
+        p.arg("30");
+        let start = std::time::Instant::now();
+        let out = run_with_deadline(p, Duration::from_millis(300), 1024);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(out.code, None);
+        assert!(
+            out.stderr.contains("the child was killed"),
+            "{}",
+            out.stderr
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_is_capped_and_flagged() {
+        let mut p = Process::new("sh");
+        p.args(["-c", "head -c 100000 /dev/zero | tr '\\0' a"]);
+        let out = run_with_deadline(p, Duration::from_secs(20), 1000);
+        assert_eq!(out.stdout.len(), 1000);
+        assert!(out.truncated);
+        assert_eq!(out.code, Some(0));
     }
 
     #[test]
@@ -454,6 +672,7 @@ mod tests {
             code: None,
             stdout: String::new(),
             stderr: String::new(),
+            truncated: false,
         });
         assert_eq!(spawn_failed["isError"], true);
     }
@@ -461,15 +680,15 @@ mod tests {
     #[test]
     fn a_malformed_line_is_32700_and_the_next_line_still_works() {
         let scan = fake_scan();
-        let bad = process_line("{not json", &scan, &never).unwrap();
+        let bad = process_line(b"{not json", &scan, &never).unwrap();
         assert_eq!(bad["error"]["code"], -32700);
         assert!(bad["id"].is_null());
         let good = process_line(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
             &scan,
             &never,
         );
         assert!(good.is_some());
-        assert!(process_line("   ", &scan, &never).is_none());
+        assert!(process_line(b"   ", &scan, &never).is_none());
     }
 }
