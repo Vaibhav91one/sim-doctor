@@ -1632,7 +1632,10 @@ fn a_baseline_saves_and_a_later_scan_diffs_cleanly_against_it() {
     diff.extend_from_slice(&["--baseline", &path, "--diff"]);
     let (code, compared) = scan(&diff);
     println!("baseline/diff: diffed a second run of the same card against it");
-    assert_eq!(code, 0, "a card that did not change must not fail a build");
+    assert_eq!(
+        code, 0,
+        "a card that did not change must not fail a build: {compared:#}"
+    );
 
     let block = &compared["payload"]["data"]["diff"];
     assert_eq!(
