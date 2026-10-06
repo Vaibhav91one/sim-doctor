@@ -104,6 +104,18 @@ wrote ./.cursor/rules/sim-doctor.mdc
 wrote ./AGENTS.md
 ```
 
+## Terminal view
+
+`sim-doctor scan --tui` shows the findings in an interactive terminal view: the count per severity, the score
+when `--score` is on, a list (severity, rule id, message; critical and high red, medium yellow, low blue, info
+grey) and a detail pane for the selected finding (location, coverage reason when partial, evidence), plus the
+coverage and TAR-stop notes. Keys: up/down or j/k, PgUp/PgDn, Home/End, q or Esc to quit.
+
+It is a view over the data `--json` carries and never shows anything the envelope lacks. It cannot be combined
+with `--json` (usage error, exit 129). When stdin or stdout is not a terminal it prints the normal report and
+writes `sim-doctor: --tui needs a terminal; showing the plain report` to stderr. The rendering is unit-tested
+against an in-memory backend; the interactive loop is **not** tested against a real terminal in CI.
+
 ## Install
 
 | Way | Command |

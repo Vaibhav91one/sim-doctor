@@ -30,6 +30,7 @@
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
 //! layer 1  baseline     a saved run, and the rules for comparing a later
 //!                one against it honestly
+//! layer 1  tui        a terminal view over the scan data (reads JSON only)
 //! layer 1  scan        a card turned into a report that admits what it missed
 //! ```
 //!
@@ -114,6 +115,7 @@ pub mod skill;
 pub mod tar;
 pub mod tlv;
 pub mod transport;
+pub mod tui;
 pub mod walk;
 
 /// One module root: what it is called, what it owns, and what it may use.
@@ -221,6 +223,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: sarif::NAME,
         owns: "A scan's findings rendered as a SARIF 2.1.0 document, with logical locations and partial coverage stated in run properties.",
         depends_on: &[rules::NAME],
+    },
+    ModuleInfo {
+        name: tui::NAME,
+        owns: "A ratatui view over a scan's findings, rendering only fields present in the --json data.",
+        depends_on: &[],
     },
     ModuleInfo {
         name: scan::NAME,
