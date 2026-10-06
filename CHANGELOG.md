@@ -12,6 +12,11 @@ All notable changes to this project are documented here. The format follows
   `.claude/skills/sim-doctor/SKILL.md`, `.cursor/rules/sim-doctor.mdc`, and a marked block in `AGENTS.md`
   that is replaced in place on re-run.
 - Prebuilt binaries on tagged releases (macOS aarch64 and x86_64, Linux x86_64) and an `npx sim-doctor` launcher.
+- Tagged-release publishing: the release workflow checks that the tag, `Cargo.toml` and `npm/package.json` agree,
+  attaches binaries plus `.sha256` files to the GitHub release, then publishes to crates.io and npm (with provenance),
+  skipping with a notice when a token is unset or the version already exists. crates.io package metadata added.
+- The `npx` launcher verifies the downloaded binary's SHA-256 and has no-network tests (`npm test`).
+- Illustrated logo (SIM card with a pulse line) as `docs/assets/logo-{light,dark}.svg` and `mark.svg`.
 - README install section, CLI reference and logo; this changelog.
 
 ## [0.1.0] - 2026-10-06

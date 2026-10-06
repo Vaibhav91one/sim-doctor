@@ -5,6 +5,7 @@
 "use strict";
 
 const { spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const https = require("node:https");
 const os = require("node:os");
@@ -17,6 +18,14 @@ const targets = {
   "linux-x64": "x86_64-unknown-linux-gnu",
 };
 const target = targets[`${process.platform}-${process.arch}`];
+const REPO = "https://github.com/Vaibhav91one/sim-doctor";
+
+// Release asset names, as published by .github/workflows/release.yml. Exported for the tests.
+const assetName = (t) => `sim-doctor-${t}.tar.gz`;
+const assetUrl = (t, v) => `${REPO}/releases/download/v${v}/${assetName(t)}`;
+const sha256 = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+// A `.sha256` asset is `<hex>  <file name>` (shasum output); take the hex.
+const parseChecksum = (text) => (/^([0-9a-f]{64})\b/i.exec(text.trim()) || [])[1]?.toLowerCase();
 const cache =
   process.env.SIM_DOCTOR_CACHE ||
   path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "sim-doctor", version);
@@ -49,25 +58,35 @@ function download(url, to, redirects = 5) {
 }
 
 async function install() {
-  const name = `sim-doctor-${target}.tar.gz`;
-  const url = `https://github.com/Vaibhav91one/sim-doctor/releases/download/v${version}/${name}`;
+  const name = assetName(target);
+  const url = assetUrl(target, version);
   fs.mkdirSync(cache, { recursive: true });
   const tarball = path.join(cache, name);
   console.error(`sim-doctor (npm): downloading ${url}`);
   await download(url, tarball);
+  await download(`${url}.sha256`, `${tarball}.sha256`);
+  const want = parseChecksum(fs.readFileSync(`${tarball}.sha256`, "utf8"));
+  fs.rmSync(`${tarball}.sha256`, { force: true });
+  if (!want || sha256(tarball) !== want) {
+    fs.rmSync(tarball, { force: true });
+    throw new Error(`checksum mismatch for ${name}; refusing to run it`);
+  }
   const untar = spawnSync("tar", ["xzf", tarball, "-C", cache], { stdio: "inherit" });
   fs.rmSync(tarball, { force: true });
   if (untar.status !== 0 || !fs.existsSync(bin)) fail(`cannot extract ${name}`);
   fs.chmodSync(bin, 0o755);
 }
 
+module.exports = { assetName, assetUrl, parseChecksum, sha256, targets };
+
+if (require.main === module)
 (async () => {
   if (!target) fail(`no prebuilt binary for ${process.platform}-${process.arch}; use cargo install`);
   if (!fs.existsSync(bin)) {
     try {
       await install();
     } catch (error) {
-      fail(`${error.message}. Or: cargo install --git https://github.com/Vaibhav91one/sim-doctor`);
+      fail(`${error.message}. Or: cargo install sim-doctor`);
     }
   }
   const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
