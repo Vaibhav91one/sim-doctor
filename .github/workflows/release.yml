@@ -8,7 +8,21 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag, Cargo.toml and npm/package.json name the same version
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          npm_version=$(node -p "require('./npm/package.json').version")
+          if [ "v$cargo_version" != "$GITHUB_REF_NAME" ] || [ "$npm_version" != "$cargo_version" ]; then
+            echo "tag $GITHUB_REF_NAME, Cargo.toml $cargo_version and npm/package.json $npm_version must agree"
+            exit 1
+          fi
+
   build:
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,11 +43,13 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
-        run: tar czf sim-doctor-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release sim-doctor
+        run: |
+          tar czf sim-doctor-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release sim-doctor
+          shasum -a 256 sim-doctor-${{ matrix.target }}.tar.gz > sim-doctor-${{ matrix.target }}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}
-          path: sim-doctor-${{ matrix.target }}.tar.gz
+          path: sim-doctor-${{ matrix.target }}.tar.gz*
 
   release:
     needs: build
@@ -47,7 +63,62 @@ jobs:
       - name: Flatten artifacts
         run: |
           cd artifacts
-          for f in */*.tar.gz; do mv "$f" "$(basename "$f")"; done
+          for f in */*.tar.gz*; do mv "$f" "$(basename "$f")"; done
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: artifacts/sim-doctor-*
+
+  crates:
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libpcsclite
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config
+      - name: Publish to crates.io
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set; skipped publishing to crates.io"
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A "sim-doctor-release (github.com/Vaibhav91one/sim-doctor)" "https://crates.io/api/v1/crates/sim-doctor/$version")
+          if [ "$code" = "200" ]; then
+            echo "::notice::sim-doctor $version is already on crates.io; nothing to publish"
+            exit 0
+          fi
+          cargo publish
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # provenance
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Launcher tests
+        working-directory: npm
+        run: npm test
+      - name: Publish the launcher
+        working-directory: npm
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN is not set; skipped publishing to npm"
+            exit 0
+          fi
+          version=$(node -p "require('./package.json').version")
+          if [ "$(npm view "sim-doctor@$version" version 2>/dev/null)" = "$version" ]; then
+            echo "::notice::sim-doctor@$version is already on npm; nothing to publish"
+            exit 0
+          fi
+          npm publish --access public --provenance

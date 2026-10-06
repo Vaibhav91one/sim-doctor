@@ -7,6 +7,8 @@
 
 <p align="center">
   <a href="https://github.com/Vaibhav91one/sim-doctor/actions/workflows/ci.yml"><img src="https://github.com/Vaibhav91one/sim-doctor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.npmjs.com/package/sim-doctor"><img src="https://img.shields.io/npm/v/sim-doctor?style=flat&color=000000&labelColor=000000&label=npm" alt="npm"></a>
+  <a href="https://crates.io/crates/sim-doctor"><img src="https://img.shields.io/crates/v/sim-doctor?style=flat&color=000000&labelColor=000000&label=crates.io" alt="crates.io"></a>
   <img src="https://img.shields.io/badge/Rust-1.82%2B-000000?style=flat&color=000000&labelColor=000000" alt="Rust 1.82+">
   <img src="https://img.shields.io/badge/license-MIT-000000?style=flat&color=000000&labelColor=000000" alt="license MIT">
   <img src="https://img.shields.io/badge/telemetry-none-000000?style=flat&color=000000&labelColor=000000" alt="telemetry none">
@@ -44,7 +46,7 @@ sim-doctor install
 ### 1. Install
 
 ```sh
-cargo install --git https://github.com/Vaibhav91one/sim-doctor
+cargo install sim-doctor
 ```
 
 More ways in [Install](#install). You also need a PC/SC reader and a card, or the
@@ -92,12 +94,13 @@ wrote ./AGENTS.md
 
 | Way | Command |
 | --- | --- |
-| cargo | `cargo install --git https://github.com/Vaibhav91one/sim-doctor` |
-| Prebuilt binary | download `sim-doctor-<target>.tar.gz` from [Releases](https://github.com/Vaibhav91one/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` |
-| npx | `npx sim-doctor <args>` downloads the matching release binary once into `~/.cache/sim-doctor` |
+| npx | `npx sim-doctor <args>` downloads the matching release binary once into `~/.cache/sim-doctor` and checks its SHA-256 |
+| cargo | `cargo install sim-doctor` |
+| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/Vaibhav91one/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` |
 
-The npm launcher and the prebuilt binaries are published from a tagged release
-(`v0.1.0`); until a release is cut, use cargo. From a checkout: `cargo build --release`.
+The npm package, the crate and the binaries are all published by the tagged-release workflow;
+until the first release is out, use `cargo install --git https://github.com/Vaibhav91one/sim-doctor`
+or, from a checkout, `cargo build --release`.
 
 Linux needs `libpcsclite` (build: `libpcsclite-dev`, run: `pcscd`). macOS uses the
 built-in PCSC framework.
