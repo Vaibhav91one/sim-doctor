@@ -20,7 +20,7 @@
 //!   See [`report_interrupted`] and `contract::INTERRUPTED_MESSAGE`.
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -264,6 +264,15 @@ struct ScanArgs {
     /// diagnostic goes to stderr in this mode and in every other.
     #[arg(long)]
     json: bool,
+
+    /// Show the findings in an interactive terminal view instead of the report.
+    ///
+    /// A view over the same data `--json` carries: nothing is shown that the
+    /// envelope does not contain. Needs a terminal on stdin and stdout; without
+    /// one the plain report is printed and a line on stderr says so. Keys:
+    /// up/down or j/k, PgUp/PgDn, Home/End, q or Esc to quit.
+    #[arg(long, conflicts_with = "json")]
+    tui: bool,
 
     /// Which FCP tag table this card answers SELECT with.
     ///
@@ -1170,6 +1179,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
 
     // Assembled, then written once, so a failure halfway through cannot put
     // half an envelope on stdout. See emit_stdout.
+    let mut shown_in_tui = false;
     let rendered = if args.json {
         let envelope = contract::Envelope::new(
             scan::KIND,
@@ -1184,7 +1194,20 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
                 return contract::ExitCode::Findings;
             }
         }
+    } else if args.tui && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        // The view is the output: nothing goes to stdout but the terminal UI.
+        let data = scan::to_json(&tree, &context, &verdict);
+        // A failed view must not skip the SARIF file or the stderr warnings
+        // below, and must not change the exit status: say so and carry on.
+        if let Err(err) = sim_doctor::tui::run(&data) {
+            eprintln!("sim-doctor: tui: {err}");
+        }
+        shown_in_tui = true;
+        String::new()
     } else {
+        if args.tui {
+            eprintln!("sim-doctor: --tui needs a terminal; showing the plain report");
+        }
         scan::to_human(&tree, &context, &verdict)
     };
 
@@ -1225,7 +1248,11 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     } else {
         "the scan report"
     };
-    let emitted = emit_stdout(rendered.trim_end_matches('\n'), what);
+    let emitted = if shown_in_tui {
+        Ok(())
+    } else {
+        emit_stdout(rendered.trim_end_matches('\n'), what)
+    };
 
     // After the report, so a SARIF failure never costs the caller the report.
     // Nothing about the file goes to stdout: that stays one envelope.
@@ -1781,6 +1808,7 @@ mod tests {
     fn no_scan_flag_refuses_as_unimplemented() {
         let args = ScanArgs {
             json: false,
+            tui: false,
             dialect: scan::Dialect::Swicc,
             reader: None,
             max_depth: None,
