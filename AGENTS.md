@@ -65,7 +65,7 @@ tests live behind the gate:
 | `walks_the_file_system_of_a_real_card` | the DF-tree walk against real capabilities templates (issue #7) |
 | `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one envelope, exit 0 (issue #6) |
 | `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula, and the difference between an earned 100 and an unearned one on real stdout (issue #14, rewritten by #24) |
-| `the_tar_audit_meets_a_card_with_no_tar_check` | the TAR scanner against a live card: the ENVELOPE exchange, the measured baseline, and the fact that swSIM has no TAR check to find (issue #24) |
+| `a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused` | `--baseline` writes a file a later run reads back, that file records what the run did, and `--diff` against a baseline whose walk stopped at a bound is refused with `baseline-truncated` and exits 1, because this fixture's walk is always truncated (issue #12) |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
 executable. The argument parsing, the reader choice, the envelope, the stdout
@@ -74,10 +74,25 @@ reach them. The fourth exists for the same reason and for one more:
 `--score` and `--severity` need a card before they produce anything at all, so
 on a cardless machine the process tests can only prove they are no longer
 **deferred**. Whether the score block reaches stdout, carrying its formula and
-its penalty table, is card-only. The fifth is the one that made the difference between an
-earned score and an absent check meaningful: with a rule registered, `rules_run` is 1 and
-the warning is null, so the 100 on a real card now means a rule looked and found nothing
-rather than that nothing looked.
+its penalty table, is card-only. It is also the one that made the difference between an earned
+score and an absent check meaningful: with a rule registered, `rules_run` is 1 and the warning
+is null, so the 100 on a real card means a rule looked and found nothing rather than that nothing
+looked. The fifth is the baseline round trip: a file written by one run and read by the next, on
+a real card, with the record of what the run did checked field by field against the report beside
+it - and **not** the regression, because this fixture is deterministic and a card that does not
+change cannot regress. The new/fixed classification is proved in
+[src/baseline.rs](src/baseline.rs) against synthesised finding sets instead.
+
+**The TAR scanner has NO card test, and that is a cost recorded rather than worked around.**
+There was one. It was deleted because a TAR probe is an ENVELOPE, and an ENVELOPE leaves
+swicc-pcsc unable to start a transaction for any later process - it poisoned every card test that
+ran after it, which is the same hazard `tar::Selection::default` being `Off` is about. The facts
+it established were kept and the wire capture was not: swSIM recognises one envelope root tag,
+`D3` [V], has no notion of `D1`, no notion of a TAR and no notion of an MSL, so it answers every
+SMS-PP-DOWNLOAD with `90 00`. The differential absorbs that, the modal response is `90 00`, and
+nothing is raised - the correct answer on a card with no TAR check rather than a miss. See
+[TAR scanning and MSL 0](#tar-scanning-and-msl0) for the argument and `src/tar.rs` for the
+algorithm.
 
 The gate keeping the default suite hardware-free is the **`card-fixture` cargo
 feature**, which is off by default; the test additionally carries `#[ignore]`.
@@ -214,22 +229,55 @@ actually produce a finding.**
 the threshold?). Both are per-field, neither collides with the exit code, and
 neither can be mistaken for the other.
 
-**When to revisit.** When #9 lands `--baseline` and `--diff`, both of which are
-already designed to exit 1, a gate has a *threshold* to fail against rather
-than a bare "something is wrong". That is the moment findings-fail-a-scan can
-be attached to a number an operator chose, instead of being smeared across
-every way a scan can go wrong.
+**The revisit condition has been met, and issue #12 answered it. The answer is yes for a
+DIFF and no for a PLAIN SCAN, and those are two different decisions.**
 
-The primitive for the change is already written and tested:
+The condition this section set was: "when #9 lands `--baseline` and `--diff`, both of which are
+already designed to exit 1, a gate has a *threshold* to fail against rather than a bare
+'something is wrong'." That is exactly what `--diff` plus `--severity` is - a number the operator
+chose, evaluated against a baseline these two runs have already been checked as entitled to be
+compared on. **So `--diff` regressing exits 1**, and `FINDINGS_FAIL_A_SCAN` stays `false`.
+
+#### Is a regressed diff a SEVENTH meaning smearing across the exit code? No, and here is the test
+
+Reason 3 above was never "code 1 is shared" - the table says so in so many words, deliberately,
+because a gate cares whether the card passed and not why it did not. Reason 3 was that sharing it
+would give one code two **mutually exclusive document schemas**, so an agent branching on the
+status would have to read the body to pick one. **A regressed diff is not a second schema.** The
+three documents are mutually exclusive:
+
+- a **refusal** carries `data.error` and **no** `data.diff`,
+- a **regressed diff** carries `data.diff` and **no** `data.error`,
+- a **clean scan** carries neither and exits 0.
+
+So `data.error` remains the refusal marker - the field AGENTS.md tells an agent to read - and
+code 1 keeps meaning **the thing you asked for was not delivered**, which is what it already
+meant for "a check failed". A diff that reports a regression did not deliver what was asked for.
+Every refusal this issue adds - an unreadable baseline, an incomparable pair - lands on the
+refusal side of that line, so the rule reason 3 was defending survives intact.
+
+**The honest cost, stated rather than hidden.** An agent that reads `data.error.message` on
+code 1 without checking the key first now has to check. That is one extra key read against a
+contract that was going to need one the moment a gate existed at all, and it is the price of a
+gate that is a gate. An agent branching on the status *alone* still fails the build, which is
+the correct answer in both cases.
+
+**What a diff does NOT exit 1 for, and the reasons.** A **fix** never fails a build: a card that
+improved is not a regression and a gate that punishes improvement is a gate nobody turns on.
+**Saving a baseline without `--diff` never fails a build either** - a baseline has to be
+takeable from a dirty card, which is the entire point of having taken one.
+
+**Reasons 2 and 3 still hold for a plain scan**, and nothing here gives code 1 a meaning to an
+operator who did not ask for a comparison. `--score` remains the per-field threshold a CI gate
+reads. The primitive for the other decision is still written and tested:
 [
 `Findings::reaches`](src/rules.rs) over the rendered set, at the `Ok(())` arm of
 `run_scan`. The switch is the single constant `FINDINGS_FAIL_A_SCAN` in
-[src/main.rs](src/main.rs). **Flipping it is a contract change and is not a
-one-line edit**: the table above, the `GATE ON data.complete` sentence in
-`scan --help`, and the `scans_a_real_card_end_to_end` assertion in
-[tests/card_fixture.rs](tests/card_fixture.rs) which currently expects exit 0
-against a live swSIM card all have to move in the same commit. Full reasoning
-in [CONTEXT.md](CONTEXT.md) section 3.
+[src/main.rs](src/main.rs). **Flipping IT is still a contract change and is still not a one-line
+edit**: the table above, the `GATE ON data.complete` sentence in `scan --help`, and the
+`scans_a_real_card_end_to_end` assertion in [tests/card_fixture.rs](tests/card_fixture.rs) which
+currently expects exit 0 against a live swSIM card all have to move in the same commit. Full
+reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 
 **SIGINT is handled, not inherited.** The handler sets one atomic flag and returns;
 ordinary code notices at a checkpoint and exits 130 itself, so a handled interrupt
@@ -247,12 +295,76 @@ finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 | `--score` | implemented | single numeric quality score for CI gating, with its formula beside it |
 | `--severity <level>` | implemented | remove findings below a minimum severity |
 | `--tar <selection>` | implemented | which TARs to probe for MSL 0: `off`, `focused`, `full`, `range:FIRST-LAST`, `regex:PATTERN`; capped at 4096 probes |
-| `--baseline <file>` / `--diff` | **deferred** | regression gating against a saved run; exits 1 with `"implemented": false` before a reader is opened |
+| `--baseline <file>` | implemented | save this run, so a later scan can be compared against it |
+| `--diff` | implemented | compare this run against `--baseline`; **exits 1 when the diff regresses** |
 
-A deferred flag refuses honestly rather than returning a plausible-looking number. It emits
-one envelope carrying `"implemented": false`, `"scanned": false` and `"card_touched": false`
-so an agent finds out in milliseconds rather than after a walk, and it never returns 0 for
-something it did not do. The scoring and severity contract is [Severity and score](#severity-and-score).
+No flag on the surface is deferred any more. The rule that a flag must exist from day one and
+refuse honestly until it is built is unchanged and is kept here because the pattern was right
+for `--score`, `--severity`, `--baseline` and `--diff`, but the refusal shape it produced -
+one envelope carrying `"implemented": false`, `"scanned": false` and `"card_touched": false` -
+is now reached from nothing on the command surface, and what replaced it is described below.
+The scoring and severity contract is [Severity and score](#severity-and-score).
+
+### Baseline and diff
+
+`--baseline <file>` writes the findings the report carries, after `--severity`, plus **a record
+of what the run did**. `--diff` reads that file back before a reader is opened and compares.
+
+#### What a baseline records, and why refusing is the whole design
+
+A diff is only as good as its baseline. If the baseline was written by a **truncated** scan, or
+by one that ran **fewer rules**, then almost everything reads as NEW and nothing reads as
+FIXED, and neither word means anything - a gate wired to that does not fail, it fails
+*randomly*, which is worse. So a baseline records six things, and a diff **refuses** against a
+baseline it cannot honestly compare with:
+
+| Recorded | The lie it prevents |
+|---|---|
+| `complete`, `truncated_by`, `limits_hit` | a truncated walk did not see the whole card, so a finding absent from it may simply be below where it stopped |
+| `rules`, each with an **evidence** flag | a rule that ran with **nothing to look at** cannot have found nothing. `--tar off` is the default, so the usual baseline never checked MSL 0 |
+| `severity_threshold` | the two runs filtered different sets, so a finding one never held is not new and one the other dropped is not fixed |
+| `dialect` | two tag tables read the same bytes differently, so the findings are not about the same things |
+| `candidates`, with how many identifiers it actually yielded | a file one run never probed is neither new nor fixed |
+| `tar_selection`, band and class byte both | the MSL 0 rule answers about the TARs it probed |
+
+**A truncated CURRENT run refuses too**, and that direction is the dangerous one: everything the
+baseline found and this run does not have would otherwise read as fixed, which tells an operator
+a card got better when the walk never got there.
+
+Every one of these is a **refusal**, not a warning: `data.error` with its own `error.kind`, exit 1,
+and no `data.findings` and no `data.diff`. Same shape as "no reader attached", for the same
+reason - a comparison this tool cannot make honestly is a check that could not run.
+
+#### A rule ID is the address, and a rename reads as a rename
+
+Findings are matched across runs by rule ID **plus location**, because a rule may fire once per
+TAR or once per file and the ID alone is not a finding. An ID in exactly one of the two runs is
+**counted as neither new nor fixed**: it appears under `data.diff.rules` with the findings it
+carried and a `warning` saying an ID that leaves and one that arrives together is what a **rename**
+looks like - and also what a withdrawn rule plus an unrelated new one looks like, which two files
+cannot tell apart. That is where AGENTS.md's "an ID must never be renamed casually" gets
+enforced, because a baseline outlives the release that wrote it.
+
+#### Evidence is bounded on the way IN as well as out
+
+A baseline file is **untrusted input**. A finding's `message` is an unbounded `String` in the wire
+type, so a hand-edited file could otherwise put a megabyte of prose into a CI log. `parse` walks
+the whole parsed document and refuses any string over **1024 characters** or any array over
+**4096 items**, before the typed parse; the file is read through a `take` with a **1 MiB** ceiling
+rather than `fs::read`, so the ceiling holds while reading. `RuleId` re-validates itself on the way
+in, which is issue #13's deliberate choice and the reason reading one back is safe at all.
+
+A finding too long to record is **refused on the way out** rather than truncated: a baseline that
+cannot be reloaded is not a baseline, and a shortened message would be compared against text the
+file does not contain. Saves go through a temporary file and a rename, so a machine that dies
+mid-write cannot leave a half-written baseline the next `--diff` reads as though somebody chose it.
+
+#### What a baseline does not contain
+
+Findings and comparability facts. **Not the ATR, not the file tree, not the notes, not the APDU
+log** - a baseline is a local artifact that lands in a CI workspace, and the narrower it is the
+less of the card it carries around. A test asserts the key set. `*.baseline.json`, `baseline.json`,
+`baseline-*.json`, `*-baseline.json` and `.baselines/` are all in `.gitignore`.
 
 ### Rule IDs
 

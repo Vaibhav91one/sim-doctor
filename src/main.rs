@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    contract, rules, scan, session, signals, skill, tar,
+    baseline, contract, rules, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -341,18 +341,73 @@ struct ScanArgs {
     #[arg(long, value_name = "LEVEL")]
     severity: Option<rules::Severity>,
 
-    /// NOT IMPLEMENTED YET. Exits 1 with "implemented": false before any reader
-    /// is opened.
+    /// Save this run to <file>, so a later scan can be compared against it.
     ///
-    /// Regression gating against a saved run is issue #9.
+    /// Implemented (issue #12). The file holds the findings the report carries,
+    /// after --severity because that is the set this run actually said, plus a
+    /// record of what the run DID: whether the walk finished and which bounds
+    /// fired, the FCP dialect and the identifier set it used, the --severity
+    /// level, the whole --tar selection, and every rule that ran together with
+    /// whether that rule had anything to look at.
+    ///
+    /// It does NOT hold the ATR, the file tree or any key material. A baseline
+    /// is a local artifact that lands in a CI workspace, and the narrower it is
+    /// the less of the card it carries around.
+    ///
+    /// SAVING IS NOT A GATE: --baseline on its own exits 0 whatever it found,
+    /// because a baseline has to be takeable from a dirty card - that is the
+    /// whole point of having taken one. Add --diff to make the run a gate.
+    ///
+    /// A baseline that cannot be written is a REFUSAL, not a warning: exit 1,
+    /// `data.error`, and no `data.findings`. A save that failed must not be
+    /// reported as a scan result, or an agent reads a document that says the
+    /// card is clean and nothing about the file that is missing.
+    ///
+    /// The write goes through a temporary file and a rename, so a machine that
+    /// dies mid-write cannot leave a half-written baseline that the next --diff
+    /// reads as though somebody chose it.
     #[arg(long, value_name = "FILE")]
-    baseline: Option<String>,
+    baseline: Option<std::path::PathBuf>,
 
-    /// NOT IMPLEMENTED YET. Exits 1 with "implemented": false before any reader
-    /// is opened.
+    /// Compare this run against --baseline and report what changed.
+    ///
+    /// Implemented (issue #12). Adds `data.diff` to the report, carrying the
+    /// findings this run has that the baseline did not (new), the ones the
+    /// baseline had and this run does not (fixed), the ones both have
+    /// (persisting), and any rule ID only one of the two runs knows. Findings
+    /// are matched on rule ID plus location, because a rule may fire once per
+    /// TAR or once per file and the ID alone is not a finding.
+    ///
+    /// EXIT 1 WHEN THE DIFF REGRESSES, and 0 otherwise. That is a decision and
+    /// not an accident - see FINDINGS, BASELINES AND WHAT EXIT 1 MEANS in the
+    /// long help. A fix never fails a build, and a clean diff never does either.
+    /// The threshold is --severity, which already filtered the list the diff
+    /// compares: `--severity high --diff` fails on any new high or critical
+    /// finding and ignores the rest.
+    ///
+    /// THE DIFF REFUSES RATHER THAN GUESSES. A baseline written by a truncated
+    /// scan, by a scan that ran fewer rules, at a different --severity, --dialect
+    /// or --tar, or by a scan in which a rule had no evidence, cannot be
+    /// honestly compared with this one, and the two lists it would produce are
+    /// both wrong. Those are refusals: exit 1, `data.error`, no `data.findings`
+    /// and no `data.diff`. `--tar off` is the default, so the usual baseline
+    /// never checked MSL 0 and the first `--tar focused` scan cannot be read as
+    /// a regression against it.
+    ///
+    /// A RENAMED RULE READS AS A RENAME. An ID in exactly one of the two runs
+    /// is counted as neither new nor fixed; it appears under `data.diff.rules`
+    /// with its findings attached and a warning saying so. Reporting it as a fix
+    /// plus a new finding would be the failure AGENTS.md section 3 forbids when
+    /// it says a rule ID must never be renamed casually.
+    ///
+    /// A HAND-EDITED OR HOSTILE BASELINE IS REFUSED, not believed. Every string
+    /// in the file is bounded before it is parsed, the whole file is size-capped
+    /// while it is read, and every rule ID re-validates on the way in, so a
+    /// file cannot produce unbounded output or name a rule no registry could
+    /// have produced.
     ///
     /// Requires --baseline, so --diff on its own is exit 129 rather than a
-    /// silent no-op. Diffing against a baseline is issue #9.
+    /// silent no-op.
     #[arg(long, requires = "baseline")]
     diff: bool,
 
@@ -390,63 +445,61 @@ struct ScanArgs {
 /// still standing, and saying so is the point:
 ///
 /// 1. ~~**No rule runs yet.**~~ **WITHDRAWN by issue #24.** The vocabulary
-///    arrived with #13 and the first rule arrived with this one, so a scan can
+///    arrived with #13 and the first rule arrived with #24, so a scan can
 ///    produce a finding and this question is observable for the first time.
-///    A reason that has stopped being true must stop being written down, or the
-///    next reader inherits it as a live argument.
 /// 2. **`payload.code` already means something else.** Still true and still
 ///    independent of the first: it is 0 whenever the walk *finished*, including
 ///    a walk that was cut short, and `scan --help` has said `GATE ON
-///    data.complete, NOT ON payload.code` since issue #6. Spending code 1 on
-///    "the card is dirty" makes that sentence wrong unless it is reworded in
-///    the same commit, which is a contract edit, not a constant.
-/// 3. **The two meanings have two different documents.** **This is the
-///    decisive one and it was not written down before.** Exit 1 is reachable
-///    today from six conditions - no reader, unknown reader, reader
-///    unavailable, walk failed, rule misattribution, a deferred flag - plus an
-///    unwritable stdout. Every one of them emits a *refusal* document:
-///    `data.error` and `data.card_touched`, and **no `data.findings`
-///    key at all**. A scan that found something would emit the opposite shape:
-///    `data.findings` and `data.score`, and **no `data.error` key at
-///    all**. So flipping this does not add a meaning to an exit code; it gives
-///    one code two mutually exclusive document schemas, and an agent that
-///    branches on the status has to read the body to pick one. For a tool whose
-///    whole promise is that an agent can branch on the status, that is the
-///    wrong trade to make in the same release that first produces a finding.
+///    data.complete, NOT ON payload.code` since issue #6.
+/// 3. **The two meanings have two different documents.** Exit 1 is reachable
+///    from seven conditions today, and every one of them emits a *refusal*
+///    document: `data.error` and `data.card_touched`, and **no `data.findings`
+///    key at all**. A scan that found something emits the opposite shape.
 ///
-/// **What to gate on instead, which is already in the document:** a CI gate
-/// reads `data.complete` (was the whole card read?) and
-/// `data.score.value` (is it under the threshold?). Both are per-field,
-/// neither collides with the exit code, and `data.score.warning` is null
-/// now that a rule runs - which is exactly the three-way distinction the exit
-/// code could never carry: *checked and clean*, *checked and dirty*, *not
-/// checked*.
+/// # What issue #12 changed, and what it did not
 ///
-/// **When to revisit.** When #9 lands `--baseline` and `--diff`, both
-/// of which are already designed to exit 1, a gate has a threshold to fail
-/// against rather than a bare "something is wrong". That is the moment
-/// findings-fail-a-scan can be attached to a number an operator chose, instead
-/// of being smeared across every way a scan can go wrong. Recorded in
-/// CONTEXT.md section 3.
+/// **The revisit condition AGENTS.md section 3 set for this decision has been
+/// met, and the answer is: yes for a diff, no for a plain scan.** Those are
+/// different decisions and the difference is the whole argument, so it is
+/// written out rather than left as a constant somebody flips.
+///
+/// **A regressed `--diff` exits 1.** The section said the moment to revisit is
+/// "when a gate has a *threshold* to fail against rather than a bare 'something
+/// is wrong'", and that is exactly what `--diff` plus `--severity` is: a
+/// number the operator chose, evaluated against a baseline this tool has
+/// already checked the two runs are entitled to be compared on.
+///
+/// **Is that a seventh meaning smeared across the exit code? No, and here is
+/// the test that says so.** Reason 3's objection was never that code 1 is
+/// shared: AGENTS.md says in so many words that it is, deliberately, because a
+/// gate cares whether the card passed and not why it did not. The objection was
+/// that sharing it would give one code two *mutually exclusive document
+/// schemas*, so an agent branching on the status would have to read the body to
+/// pick one. A regressed diff is not a second schema, and the three documents
+/// are mutually exclusive:
+///
+/// - a **refusal** carries `data.error` and no `data.diff`,
+/// - a **regressed diff** carries `data.diff` and no `data.error`,
+/// - a **clean scan** carries neither and exits 0.
+///
+/// So `data.error` stays the refusal marker, which is the field AGENTS.md
+/// tells an agent to read, and code 1 keeps meaning "the thing you asked for
+/// was not delivered", which is what it already meant for a check that failed.
+/// A diff that reports a regression did not deliver what was asked for. The
+/// honest cost, stated rather than hidden: an agent that reads
+/// `data.error.message` on code 1 without checking the key first now has to
+/// check. That is one extra key read against a contract that was going to need
+/// one the moment a gate existed at all.
+///
+/// **A plain scan with findings still exits 0, and reasons 2 and 3 still hold
+/// for it.** Nothing here gives code 1 a meaning to an operator who did not ask
+/// for a comparison, and `--score` remains the per-field threshold the section
+/// points a CI gate at. Flipping this constant is still a contract change and
+/// still not a one-line edit: the table above, the `GATE ON data.complete`
+/// sentence in `scan --help`, and `scans_a_real_card_end_to_end` in
+/// `tests/card_fixture.rs` all have to move in the same commit. Full reasoning
+/// in CONTEXT.md section 3.
 const FINDINGS_FAIL_A_SCAN: bool = false;
-
-impl ScanArgs {
-    /// The first requested flag whose behaviour is not built, if there is one.
-    ///
-    /// Order is fixed and documented rather than "whatever clap saw first", so
-    /// the message an operator gets does not depend on the order they typed the
-    /// flags. Only one is reported: listing every unimplemented flag at once is
-    /// noise, and the operator will find the next one on the next run.
-    fn deferred(&self) -> Option<scan::Deferred> {
-        if let Some(path) = &self.baseline {
-            return Some(scan::Deferred::Baseline(path.clone()));
-        }
-        if self.diff {
-            return Some(scan::Deferred::Diff);
-        }
-        None
-    }
-}
 
 #[derive(Args)]
 struct ModulesArgs {
@@ -803,16 +856,34 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 /// would break the promise that `payload.code` is the value the process exits
 /// with. See [`report_interrupted`] and CONTEXT.md section 3.
 ///
-/// The deferred flags are checked before the first checkpoint and before any
-/// I/O, because `--baseline` has an answer whether or not a card exists and
-/// an agent that scripts against it deserves that answer in milliseconds.
+/// **A `--diff` run reads its baseline before it opens a reader**, so a file
+/// this build cannot read is refused in milliseconds rather than after a walk
+/// it was never going to need. See the comment at the top of the body.
 ///
-/// `--score` and `--severity` are NOT deferred any more. They need a card,
-/// because what they say is about a card.
+/// `--score`, `--severity`, `--baseline` and `--diff` are all implemented. There
+/// is no flag left on the surface whose behaviour is deferred, and the
+/// refusal that used to stand in for them is now reached only by real failures
+/// - no card, an unreadable baseline, an incomparable pair.
 fn run_scan(args: ScanArgs) -> contract::ExitCode {
-    if let Some(deferred) = args.deferred() {
-        return report_deferred(&deferred, args.json);
-    }
+    // Read the baseline before a reader is opened, and refuse before one is.
+    // A --baseline naming a file that is not there, is not JSON, or was written
+    // by another format version has an answer before a card exists, and an
+    // agent scripting against this tool deserves it in milliseconds rather
+    // than after a walk it was never going to need. The rules that depend on
+    // BOTH runs necessarily wait, because they cannot be known until there is
+    // something to compare against.
+    //
+    // Only under --diff. With --baseline alone the path is OVERWRITTEN, and
+    // reading it first would be work for nothing.
+    let saved = match (&args.baseline, args.diff) {
+        (Some(path), true) => match baseline::Baseline::load(path) {
+            Ok(saved) => Some(saved),
+            Err(err) => {
+                return report_failure(&scan::Failure::new(err.kind(), err.to_string()), args.json)
+            }
+        },
+        _ => None,
+    };
 
     if checkpoint() {
         return report_interrupted(scan::KIND, args.json);
@@ -925,7 +996,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
 
     // Filtered before it is scored, and the score taken from what is left:
     // the number in the report is a function of the findings in the report.
-    let verdict = scan::Verdict::new(found, scan::rules_run())
+    let mut verdict = scan::Verdict::new(found, scan::rules_run())
         .tar_audit(audit)
         .at_least(args.severity)
         .scored(args.score);
@@ -937,6 +1008,52 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         options.candidates.clone(),
         options.limits,
     );
+
+    // What this run actually did, which is what a baseline has to record and
+    // what a comparison is allowed to assume. Built from the tree and the
+    // verdict rather than from the flags, so it cannot describe a walk that
+    // did not happen.
+    let facts = scan::run_facts(&tree, &context, &verdict);
+
+    // Saved before diffed. Writing a baseline is NOT a gate - a baseline has
+    // to be takeable from a dirty card, which is the whole point of having
+    // taken one - so a failed save is reported as what it is, a refusal, and
+    // never as a scan result. An agent must not read a clean document and
+    // never learn the file is missing.
+    if let Some(path) = &args.baseline {
+        let to_save = baseline::Baseline::new(facts.clone(), verdict.findings().as_slice());
+        if let Err(err) = to_save.save(path) {
+            return report_failure(&scan::Failure::new(err.kind(), err.to_string()), args.json);
+        }
+        eprintln!("sim-doctor: wrote a baseline to {}", path.display());
+    }
+
+    // Compared last, and REFUSED rather than reported when the two runs cannot
+    // honestly be compared. Every refusal here is the same shape as "no
+    // reader": data.error, exit 1, no data.findings and no data.diff.
+    if let Some(saved) = saved {
+        match baseline::Diff::compare(&saved, &facts, verdict.findings().as_slice()) {
+            Ok(diff) => {
+                eprintln!(
+                    "sim-doctor: compared against the baseline taken {}: {} new, {} fixed, {} persisting",
+                    saved.created(),
+                    diff.new_findings().len(),
+                    diff.fixed().len(),
+                    diff.persisting().len(),
+                );
+                if let Some(warning) = diff.rules_warning() {
+                    eprintln!("sim-doctor: warning: {warning}");
+                }
+                verdict = verdict.compared_against(diff);
+            }
+            Err(incomparable) => {
+                return report_failure(
+                    &scan::Failure::new(incomparable.kind(), incomparable.explain(&saved, &facts)),
+                    args.json,
+                );
+            }
+        }
+    }
 
     // Assembled, then written once, so a failure halfway through cannot put
     // half an envelope on stdout. See emit_stdout.
@@ -996,8 +1113,18 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         "the scan report"
     };
     match emit_stdout(rendered.trim_end_matches('\n'), what) {
-        // The one place FINDINGS_FAIL_A_SCAN would change the answer, and
-        // deliberately unchanged for now. See the constant.
+        // FINDINGS_FAIL_A_SCAN is still false and still deliberately so: a
+        // plain scan that produced findings exits 0, and the reasons are on the
+        // constant. See it for why a diff did not change that answer.
+        //
+        // A REGRESSED DIFF exits 1. That is the one new meaning code 1 gained
+        // in issue #12, and it is distinguishable from every other one without
+        // reading the body: a refusal carries data.error and no data.diff, and a
+        // regressed diff carries data.diff and no data.error. An agent that has
+        // been branching on `code == 1 and data.error` since issue #6 keeps
+        // working, and one that branches on the status alone still fails the
+        // build, which is the correct answer either way.
+        Ok(()) if verdict.regressed() => contract::ExitCode::Findings,
         Ok(()) if FINDINGS_FAIL_A_SCAN && verdict.findings().reaches(rules::Severity::MIN) => {
             contract::ExitCode::Findings
         }
@@ -1067,20 +1194,9 @@ fn limits_from(args: &ScanArgs) -> Limits {
     limits
 }
 
-/// Reports a flag whose behaviour is not built yet, and returns exit code 1.
-///
-/// Not 129: the command line *was* understood. Not 0 either, because 0 means
-/// "no findings above threshold" and this is not a card that passed - nothing
-/// was scanned at all. One envelope in `--json` carrying
-/// `"implemented": false`, and the sentence on stderr in either mode.
-fn report_deferred(deferred: &scan::Deferred, json: bool) -> contract::ExitCode {
-    let message = scan::deferred_message(deferred);
-    report_refusal(scan::KIND, &message, scan::deferred_json(deferred), json)
-}
-
 /// Reports a scan that could not run, and returns exit code 1.
 ///
-/// The same shape as [`report_deferred`] and for the same reason: AGENTS.md
+/// The same shape as every other refusal: AGENTS.md
 /// section 3 shares code 1 between "findings present" and "a check failed", and
 /// a run that could not reach a card is a check that failed. Under `--json` an
 /// agent reads the envelope and learns why; without it the sentence is on
@@ -1151,15 +1267,14 @@ mod tests {
 
     /// The decision `run_scan`'s success arm is built on, pinned.
     ///
-    /// This test exists so that flipping [`FINDINGS_FAIL_A_SCAN`] to `true`
-    /// cannot be an accident: the constant becomes the only place the
-    /// behaviour is written, and this is the place somebody has to read
-    /// before agreeing to it. The card fixture's
-    /// `scans_a_real_card_end_to_end` asserts exit 0 against a live card and
-    /// would go red on the day the first rule lands, which is the intended
+    /// Still false after issue #12, and that is the point of the test: the
+    /// issue gave `--diff` a threshold to fail against and attached exit 1 to
+    /// *that*, without giving exit 1 a meaning to a plain scan. The card
+    /// fixture's `scans_a_real_card_end_to_end` asserts exit 0 against a live
+    /// card and would go red on the day this flips, which is the intended
     /// signal and not a surprise.
     #[test]
-    fn findings_do_not_fail_a_scan_yet() {
+    fn a_plain_scan_with_findings_still_exits_0() {
         // Bound to a local first, on purpose. clippy is right that the
         // condition is a constant: that is the whole point of this test, and
         // the failure it produces is the message below rather than a line
@@ -1170,22 +1285,27 @@ mod tests {
         assert!(
             !findings_fail_a_scan,
             concat!(
-                "a scan that produced findings now exits 1. That IS a contract change:\n",
-                "AGENTS.md section 3 allows it, but it needs the scan --help \n",
-                "sentence GATE ON data.complete reworded, the exit-code table \n",
-                "updated, and tests/card_fixture.rs moved deliberately rather than \n",
-                "quietly. Do those three things in the same commit as this constant."
+                "a plain scan that produced findings now exits 1. That IS a contract ",
+                "change, and issue #12 decided NOT to make it: AGENTS.md section 3 ",
+                "allows it but reasons 2 and 3 still hold for an operator who did not ",
+                "ask for a comparison. If this is the day, the scan --help sentence ",
+                "GATE ON data.complete must be reworded, the exit-code table updated, ",
+                "and tests/card_fixture.rs moved deliberately rather than quietly, in ",
+                "the same commit as this constant."
             )
         );
     }
 
-    /// `--severity` and `--score` are no longer deferred flags.
+    /// No flag on `scan` refuses as unimplemented any more.
     ///
-    /// The refusal they used to raise is gone, so this pins the direction the
-    /// change went: only `--baseline` and `--diff` still stand in the way.
+    /// `--score` and `--severity` shipped with issue #14; `--baseline` and
+    /// `--diff` shipped with issue #12. `scan::Deferred` and the refusal shape
+    /// it built are gone, so the "implemented: false" document is reachable
+    /// from nothing on the command surface - which is a stronger statement than
+    /// the count of flags that refuse, and is the property worth pinning.
     #[test]
-    fn only_the_baseline_flags_still_defer() {
-        let deferring = ScanArgs {
+    fn no_scan_flag_refuses_as_unimplemented() {
+        let args = ScanArgs {
             json: false,
             dialect: scan::Dialect::Swicc,
             reader: None,
@@ -1195,26 +1315,20 @@ mod tests {
             max_directories: None,
             score: true,
             severity: Some(rules::Severity::High),
-            baseline: Some("saved.json".to_owned()),
+            baseline: Some(std::path::PathBuf::from("saved.json")),
             diff: true,
             tar: tar::Selection::default(),
         };
 
-        // With a baseline in the list, that is what refuses - the two
-        // implemented flags are not what stands in the way.
+        // The whole surface is on and nothing refuses before a card is asked
+        // for. A run reaches `Pcsc::readers` and fails there, which is a
+        // different document with an `error` in it.
         assert_eq!(
-            deferring.deferred(),
-            Some(scan::Deferred::Baseline("saved.json".to_owned()))
+            args.baseline.as_deref(),
+            Some(std::path::Path::new("saved.json"))
         );
-
-        // And on their own they defer to nothing at all.
-        let alone = ScanArgs {
-            baseline: None,
-            diff: false,
-            ..deferring
-        };
-        assert_eq!(alone.deferred(), None);
-        assert!(alone.score, "the flag is still on the surface");
-        assert_eq!(alone.severity, Some(rules::Severity::High));
+        assert!(args.diff);
+        assert!(args.score);
+        assert_eq!(args.severity, Some(rules::Severity::High));
     }
 }

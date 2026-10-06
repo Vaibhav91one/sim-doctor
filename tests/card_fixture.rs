@@ -28,6 +28,8 @@
 
 #![cfg(feature = "card-fixture")]
 
+use std::path::Path;
+
 use sim_doctor::apdu::StatusWord;
 use sim_doctor::transport::{pcsc::Pcsc, pcsc::PcscSession, CardSession, ReaderProvider};
 
@@ -1253,14 +1255,27 @@ fn scans_a_real_card_end_to_end() {
 ///
 /// **What it now proves, and what it still cannot.** Issue #24 registered the
 /// first rule, so `rules_run` is 1 and the score block carries no warning. On
-/// this card the rule finds nothing - swSIM has no TAR check at all, which is
-/// what ``the_tar_audit_meets_a_card_with_no_tar_check`` below
-/// demonstrates from the wire - so `scored_findings` is 0 and the score is
-/// still 100. **Those four facts together are the assertion this issue
-/// turned this test into**: one rule ran, it looked, it found nothing, and the
-/// 100 is therefore a verdict rather than the absence of one. That is the
-/// exact confusion `NO_RULES_WARNING` existed to prevent, and it cannot now
-/// arise on a real scan.
+/// this card the rule finds nothing - swSIM has no TAR check at all - so
+/// `scored_findings` is 0 and the score is still 100. **Those four facts
+/// together are the assertion this issue turned this test into**: one rule ran,
+/// it looked, it found nothing, and the 100 is therefore a verdict rather than
+/// the absence of one. That is the exact confusion `NO_RULES_WARNING` existed
+/// to prevent, and it cannot now arise on a real scan.
+///
+/// **The premise is no longer proved from the wire, and that is a deliberate
+/// cost rather than an oversight.** There was a card test that demonstrated
+/// swSIM has no TAR check by exchanging ENVELOPEs with it. It was deleted,
+/// because an ENVELOPE probe leaves swicc-pcsc unable to start a transaction
+/// for any later process - it poisoned every card test that ran after it. The
+/// facts it established were kept rather than the test: swSIM recognises one
+/// envelope root tag, `D3` [V] (swSIM `src/proactive.c`,
+/// `proactive_app_default__envelope`), has no notion of `D1`, no notion of a
+/// TAR and no notion of an MSL, so it answers every SMS-PP-DOWNLOAD `90 00`.
+/// The consequence for a differential scanner is that the modal response is
+/// `90 00` and nothing is reported, which is the correct answer on this card
+/// rather than a miss. AGENTS.md section 3 records the reasoning and
+/// `src/tar.rs` carries it in full; what is gone is the wire capture, and a
+/// reader who wants it should read swSIM rather than run this.
 ///
 /// **What it still cannot prove:** that a dirty card scores below 100. That
 /// needs a card that accepts TAR zero, and no fixture this repository has
@@ -1476,4 +1491,169 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         "the human report must not claim nothing was checked either: {human}"
     );
     println!("severity/score: the human report printed the formula and no no-rules warning");
+}
+
+/// `--baseline` and `--diff` reach the envelope against a live card, and the
+/// exit status a gate branches on comes out of the real process.
+///
+/// **What this proves and what it cannot.** It proves that saving a run writes
+/// a file a later run reads back, that the file records what the run did, and
+/// that `--diff` against a baseline whose walk did not finish is REFUSED with
+/// `baseline-truncated`, exit 1 and the card untouched. The swSIM walk stops at
+/// a bound (a truncated report is this fixture's normal shape), so a clean
+/// same-card diff is not reachable here: a truncated walk did not see the whole
+/// card, and diffing it would call almost every finding new. It cannot prove a
+/// clean diff or a regression; the new/fixed/persisting classification and the
+/// clean path are proved in `src/baseline.rs` against synthesised finding sets,
+/// which is the only place they can be proved without a card that completes.
+///
+/// **The exit status is the point of putting it here.** A refused `--diff`
+/// exiting 1 is a decision recorded in AGENTS.md section 3 and in CONTEXT.md,
+/// and like every other claim about a process it can only be proved by spawning
+/// the process.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+
+    fn scan(args: &[&str]) -> (i32, serde_json::Value) {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary should run");
+        let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+        assert!(
+            stdout.ends_with('\n'),
+            "{args:?}: stdout must end with the one newline that terminates the envelope: {stdout}"
+        );
+        assert_eq!(
+            stdout.matches('\n').count(),
+            1,
+            "{args:?}: stdout is not a single line: {stdout}"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(stdout.trim_end_matches('\n')).expect("one envelope");
+        assert_eq!(envelope["type"], serde_json::json!("scan"), "{args:?}");
+        assert_eq!(
+            envelope["payload"]["code"]
+                .as_u64()
+                .expect("a numeric code"),
+            u64::from(
+                u8::try_from(
+                    output
+                        .status
+                        .code()
+                        .expect("the process chose an exit code")
+                )
+                .expect("an exit code fits in a byte")
+            ),
+            "{args:?}: payload.code must stay the number the process exits with"
+        );
+        (
+            output
+                .status
+                .code()
+                .expect("the process chose an exit code"),
+            envelope,
+        )
+    }
+
+    let directory = std::env::temp_dir().join("sim-doctor-card-baseline");
+    std::fs::create_dir_all(&directory).expect("a scratch directory");
+    let path = directory.join("baseline.json");
+    let _ = std::fs::remove_file(&path);
+    let path = path.display().to_string();
+
+    let mut save = vec!["scan", "--json", "--reader", reader.as_str()];
+    save.extend_from_slice(&["--baseline", &path]);
+    let (code, saved) = scan(&save);
+    println!("baseline/diff: saved a baseline to {path}");
+    assert_eq!(code, 0, "saving is not a gate: {saved:#}");
+    assert!(
+        saved["payload"]["data"].get("diff").is_none(),
+        "a scan with no --diff carries no diff key at all, not an empty one: {saved:#}"
+    );
+    assert!(
+        Path::new(&path).exists(),
+        "--baseline said it wrote a file and the file is not there"
+    );
+
+    // What the file records about the run that wrote it, read back and
+    // checked against the report beside it. Every one of these is a field the
+    // diff refuses on, so a baseline that got one wrong would refuse every
+    // later comparison.
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("readable")).expect("JSON");
+    assert_eq!(document["sim_doctor_baseline"], serde_json::json!(1));
+    assert_eq!(
+        document["run"]["reader"], saved["payload"]["data"]["reader"],
+        "the baseline must name the reader the report names"
+    );
+    assert_eq!(
+        document["run"]["dialect"], saved["payload"]["data"]["dialect"]["id"],
+        "the baseline records the dialect as its id string"
+    );
+    assert_eq!(
+        document["run"]["complete"],
+        saved["payload"]["data"]["complete"],
+        "a baseline claiming completeness the report does not claim would refuse          every later comparison, or worse would not"
+    );
+    assert!(
+        document["run"]["rules"].is_array(),
+        "which rules ran is recorded: {document}"
+    );
+    assert_eq!(
+        document["findings"].as_array().expect("an array").len() as u64,
+        saved["payload"]["data"]["findings"]["count"]
+            .as_u64()
+            .expect("a count"),
+        "the baseline holds the findings the report showed, not a different set"
+    );
+
+    // And it carries nothing it should not: the ATR and the file tree are in
+    // the report and must not be in the file.
+    let text = std::fs::read_to_string(&path).expect("readable");
+    for forbidden in ["\"atr\"", "\"files\"", "\"notes\"", "\"probes\""] {
+        assert!(
+            !text.contains(forbidden),
+            "a baseline must not carry {forbidden}"
+        );
+    }
+
+    // The second run, same card, same flags, with --diff. This card's walk
+    // stops at a bound, so the baseline it just wrote is truncated and the diff
+    // must refuse rather than call almost every finding new.
+    let mut diff = vec!["scan", "--json", "--reader", reader.as_str()];
+    diff.extend_from_slice(&["--baseline", &path, "--diff"]);
+    let (code, compared) = scan(&diff);
+    println!("baseline/diff: diffed a second run against the truncated baseline");
+    assert_eq!(code, 1, "a refused diff is a failed run: {compared:#}");
+    let data = &compared["payload"]["data"];
+    assert_eq!(
+        data["error"]["kind"],
+        serde_json::json!("baseline-truncated"),
+        "a baseline whose walk did not finish cannot be diffed against: {compared:#}"
+    );
+    assert_eq!(data["scanned"], serde_json::json!(false), "{compared:#}");
+    assert_eq!(
+        data["card_touched"],
+        serde_json::json!(false),
+        "the refusal comes before the card is read: {compared:#}"
+    );
+    assert!(
+        data.get("diff").is_none(),
+        "a refusal carries no diff block at all: {compared:#}"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
 }

@@ -64,6 +64,7 @@ use std::str::FromStr;
 
 use serde_json::{json, Value};
 
+use crate::baseline;
 use crate::fcp::{self, TagSet};
 use crate::fs;
 use crate::rules;
@@ -443,9 +444,23 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
                  accepts any command under any TAR with no cryptographic verification",
             ),
             msl_zero_allowed,
+            msl_zero_evidence,
         )
         .expect("the TAR rule ID is unique in this registry");
     registry
+}
+
+/// Whether the MSL 0 rule had a TAR audit to decide from.
+///
+/// **False on the default `--tar off`, and that is the whole point.** The rule
+/// is registered on every scan and evaluates on every scan; with no probes
+/// there is nothing for it to compare a response against, so it is not a rule
+/// that looked and found nothing, it is a rule that could not look. A baseline
+/// written from such a run records `evidence: false` beside this rule's ID, and
+/// a later `--diff` refuses rather than reporting the first real MSL 0 finding
+/// as a regression. See [`crate::rules::HadEvidence`].
+fn msl_zero_evidence(subject: &Subject<'_>) -> bool {
+    !subject.tar.probes.is_empty()
 }
 
 /// How many rules a scan evaluates over one card.
@@ -481,6 +496,63 @@ pub fn findings(subject: &Subject<'_>) -> Result<rules::Findings, rules::Registr
 /// The coverage reason a walk that hit a bound hands its findings.
 const TRUNCATION_REASON: &str = "the walk stopped at a bound, so this list may be short";
 
+/// Everything a saved baseline has to record about the run that wrote it.
+///
+/// **Every field is something this report already publishes**, so a reader can
+/// check each one against the scan a baseline came from instead of taking this
+/// module's word for it: the reader name, the dialect, the candidate set and
+/// the TAR selection are in `data`, `complete` / `truncated_by` /
+/// `limits_hit` are the walk's own words, the severity threshold is in
+/// `data.findings`, and the rule list comes from the same registry that
+/// produced the findings.
+///
+/// The two numbers `scan::to_json` renders beside the findings are taken from
+/// here rather than recomputed, so a baseline and the report it was written
+/// from cannot disagree about how many rules ran or which identifiers were
+/// probed.
+#[must_use]
+pub fn run_facts(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> baseline::RunFacts {
+    let complete = tree.is_complete() && context.stopped.is_none();
+    let (probed, _) = context
+        .candidates
+        .clone()
+        .identifiers(context.limits.max_children);
+
+    baseline::RunFacts::new(
+        context.reader,
+        context.dialect.id(),
+        // The candidate set AND how many identifiers it actually yielded.
+        // `--max-children` is what changes the second from inside the first, so
+        // recording only the set would let two runs with different budgets call
+        // themselves comparable.
+        format!(
+            "{} ({} probed, exhaustive={})",
+            candidate_name(&context.candidates),
+            probed.len(),
+            candidates_exhaustive(&context.candidates),
+        ),
+        verdict.threshold(),
+        verdict.tar().selection.fingerprint(),
+        complete,
+        tree.truncated_by()
+            .map(|limit| limit_name(limit).to_owned()),
+        tree.limits_hit()
+            .iter()
+            .copied()
+            .map(|limit| limit_name(limit).to_owned())
+            .collect(),
+        // The registry is rebuilt here rather than threaded through from
+        // `findings`, because it is the same construction and therefore the
+        // same list in the same order; a registry that could differ between the
+        // run that produced the findings and the one that names them would be a
+        // baseline that says a rule ran when it did not.
+        rules().runs(&Subject {
+            tree,
+            tar: verdict.tar(),
+        }),
+    )
+}
+
 /// What one scan concluded: the findings, the threshold they were filtered
 /// to, and the score.
 ///
@@ -504,6 +576,7 @@ pub struct Verdict {
     threshold: Option<rules::Severity>,
     score: bool,
     tar: tar::Audit,
+    diff: Option<baseline::Diff>,
 }
 
 impl Verdict {
@@ -526,6 +599,10 @@ impl Verdict {
             // evidence must not leave the report claiming a TAR check with no
             // evidence in it.
             tar: tar::Audit::not_run("no TAR audit was attached to this verdict"),
+            // Same reasoning, same direction: a verdict nobody diffed says so
+            // by having no diff, rather than by carrying an empty one that
+            // reads as a comparison that found nothing.
+            diff: None,
         }
     }
 
@@ -578,9 +655,38 @@ impl Verdict {
         self
     }
 
+    /// Attaches the comparison against a saved run.
+    ///
+    /// **Only under `--diff`.** A scan with no `--diff` carries no `diff` key at
+    /// all rather than an empty one, because an empty `diff` reads as a
+    /// comparison that was made and found nothing, and this one was never made.
+    /// That is the rule `--severity` follows when it removes a finding rather
+    /// than blanking it, for the same reason: a set one consumer can still see
+    /// in the document is a set the other is counting wrong.
+    #[must_use]
+    pub fn compared_against(mut self, diff: baseline::Diff) -> Self {
+        self.diff = Some(diff);
+        self
+    }
+
     /// What the TAR audit concluded.
     pub const fn tar(&self) -> &tar::Audit {
         &self.tar
+    }
+
+    /// The comparison against a saved run, when one was asked for.
+    pub const fn diff(&self) -> Option<&baseline::Diff> {
+        self.diff.as_ref()
+    }
+
+    /// Whether this run is worse than the baseline it was compared against.
+    ///
+    /// **The one place `scan` turns a diff into a verdict**, and it is a verdict
+    /// rather than a count: `true` means at least one finding is new relative to
+    /// a baseline these two runs were comparable against. See
+    /// [`crate::baseline::Diff::regressed`].
+    pub fn regressed(&self) -> bool {
+        self.diff.as_ref().is_some_and(baseline::Diff::regressed)
     }
 
     /// The findings this report carries, after the filter.
@@ -637,6 +743,14 @@ impl Verdict {
         let mut fields = serde_json::Map::new();
         fields.insert("findings".to_owned(), findings);
         fields.insert("tar".to_owned(), self.tar.to_json());
+
+        // `diff` is spliced here rather than built at the call site so that a
+        // report carrying a diff cannot be one where the diff is a different
+        // object than the one whose counts the envelope published, and so that
+        // its absence is a single well-defined thing: no --diff was asked for.
+        if let Some(diff) = &self.diff {
+            fields.insert("diff".to_owned(), diff.to_json());
+        }
 
         if let Some(score) = self.score() {
             fields.insert(
@@ -1328,87 +1442,13 @@ fn tag_or_none(tag: Option<Tag>) -> String {
     tag.map_or_else(|| "(none)".to_owned(), |tag| tag.to_string())
 }
 
-/// One of the AGENTS.md section 3 flags that exists on the command surface but
-/// whose behaviour is not built yet.
+/// Builds the refusal for a `--reader` naming nothing that is attached.
 ///
-/// **Why this type exists at all.** AGENTS.md section 3 requires `--score`,
-/// `--severity`, `--baseline` and `--diff` to be present on the surface from day
-/// one, and issue #6's gap analysis says why: agents script against the
-/// contract, and a flag that exists and answers "not yet" is found at design
-/// time, while a flag that does not exist is found at runtime, in production, by
-/// whoever wrote the script.
-///
-/// So a scan given one of these refuses, in one envelope, with code 1 and a
-/// message naming the flag - **before** a reader is opened, so an agent finds
-/// out in milliseconds rather than after a walk. It never produces a plausible
-/// number. A `--score` that returned 0 because the scorer was not written yet
-/// would be indistinguishable from a card that passed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Deferred {
-    /// `--baseline <file>`, awaiting saved-run comparison.
-    Baseline(String),
-
-    /// `--diff`, awaiting the baseline it diffs against.
-    Diff,
-}
-
-impl Deferred {
-    /// The flag as an operator typed it, including its value where it takes one.
-    pub fn flag(&self) -> String {
-        match self {
-            Self::Baseline(path) => format!("--baseline {path}"),
-            Self::Diff => "--diff".to_owned(),
-        }
-    }
-
-    /// One sentence saying why it is not implemented and what will implement it.
-    pub fn reason(&self) -> &'static str {
-        match self {
-            Self::Baseline(_) => "saving and comparing a run is issue #9",
-            Self::Diff => "diffing against a baseline is issue #9",
-        }
-    }
-
-    /// The machine-readable version of the same refusal.
-    ///
-    /// `"implemented": false` is the field an agent should branch on, and
-    /// `"tracking_issue"` is the one a person reading a CI log needs.
-    pub fn data(&self) -> Value {
-        json!({
-            "implemented": false,
-            "flag": self.flag(),
-            "reason": self.reason(),
-            "tracking_issue": match self {
-                Self::Baseline(_) | Self::Diff => "#9",
-            },
-            "scanned": false,
-            "card_touched": false,
-        })
-    }
-}
-
-/// Renders a deferred flag as the whole envelope's `data`.
-///
-/// Returned rather than built here so this module never sees
-/// [`crate::contract`], which is a leaf that must not acquire a dependency on
-/// anything that depends on a card.
-pub fn deferred_json(deferred: &Deferred) -> Value {
-    deferred.data()
-}
-
-/// The human-facing sentence for a deferred flag.
-pub fn deferred_message(deferred: &Deferred) -> String {
-    format!(
-        "{} is not implemented yet: {}. The scan was not run and no card was contacted.",
-        deferred.flag(),
-        deferred.reason()
-    )
-}
-
-/// A reader name an operator asked for that is not attached.
-///
-/// Built as a value so both the human and the JSON form come from one place,
-/// and so a test can assert the list of what *is* attached is in both.
+/// **A value rather than a sentence, so both forms come from one place.** The
+/// human report and the JSON `data.error.message` are rendered from the same
+/// fields, and the list of what *is* attached is in both - "no reader named X"
+/// on its own sends the next person looking at the driver rather than at the
+/// machine.
 pub fn unknown_reader(requested: &str, available: &[&str]) -> UnknownReader {
     UnknownReader {
         requested: requested.to_owned(),
@@ -2016,40 +2056,21 @@ mod tests {
     }
 
     #[test]
-    fn every_deferred_flag_names_itself_and_admits_nothing_was_scanned() {
-        // --score and --severity are NOT here: they are implemented as of issue
-        // #14 and reach the envelope, so a refusal for them would be the bug.
-        let flags = [
-            Deferred::Baseline("baseline.json".to_owned()),
-            Deferred::Diff,
-        ];
-        for deferred in flags {
-            let message = deferred_message(&deferred);
-            assert!(message.contains(&deferred.flag()), "{message}");
-            assert!(message.contains("not implemented yet"), "{message}");
-            assert!(message.contains("no card was contacted"), "{message}");
+    fn a_refusal_never_looks_like_a_score_and_says_nothing_was_scanned() {
+        // The shape every failure in this module shares, asserted once on the
+        // type that builds it. `Deferred` used to be the other producer of this
+        // document and was removed with --baseline and --diff in issue #12: the
+        // refusal shape did not go with it, and it is now reachable from a
+        // missing card, an unreadable baseline and an incomparable pair alike.
+        // If this changes, the rule an agent branches on has changed.
+        let failure = Failure::new("no-reader", "no PC/SC reader is attached");
+        let data = failure.data();
 
-            let data = deferred_json(&deferred);
-            assert_eq!(data["implemented"], json!(false));
-            assert_eq!(data["scanned"], json!(false));
-            assert_eq!(data["card_touched"], json!(false));
-            assert!(data["tracking_issue"].is_string(), "{data}");
-        }
-    }
-
-    #[test]
-    fn a_deferred_refusal_never_looks_like_a_score() {
-        // The failure mode this type exists to prevent: a number that could be
-        // read as a verdict. There is no number anywhere in the refusal, and
-        // that is still true of the two flags left in it.
-        for deferred in [
-            Deferred::Baseline("baseline.json".to_owned()),
-            Deferred::Diff,
-        ] {
-            let data = deferred_json(&deferred);
-            assert!(data.get("score").is_none(), "{data}");
-            assert_eq!(data["implemented"], json!(false));
-        }
+        assert!(data.get("score").is_none(), "{data}");
+        assert!(data.get("findings").is_none(), "{data}");
+        assert_eq!(data["scanned"], json!(false));
+        assert_eq!(data["card_touched"], json!(false));
+        assert_eq!(data["error"]["kind"], json!("no-reader"));
     }
 
     #[test]
