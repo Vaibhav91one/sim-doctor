@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, contract, rules, scan, session, signals, skill, tar,
+    baseline, contract, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -380,6 +380,17 @@ struct ScanArgs {
     /// reads as though somebody chose it.
     #[arg(long, value_name = "FILE")]
     baseline: Option<std::path::PathBuf>,
+
+    /// Also write the findings to FILE as SARIF 2.1.0.
+    ///
+    /// A card has no files on disk, so each result carries a logical location
+    /// (the card path) and never a physical one. Partial coverage is stated in
+    /// the run's properties. Written after the normal output, so a failure to
+    /// write it (exit 1, kind "sarif-unwritable") never costs you the report.
+    /// stdout is unchanged. Whether GitHub code scanning accepts the file is
+    /// not verified.
+    #[arg(long, value_name = "FILE")]
+    sarif: Option<std::path::PathBuf>,
 
     /// Compare this run against --baseline and report what changed.
     ///
@@ -1165,7 +1176,17 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     } else {
         "the scan report"
     };
-    match emit_stdout(rendered.trim_end_matches('\n'), what) {
+    let emitted = emit_stdout(rendered.trim_end_matches('\n'), what);
+
+    // After the report, so a SARIF failure never costs the caller the report.
+    // Nothing about the file goes to stdout: that stays one envelope.
+    if let Some(path) = &args.sarif {
+        if let Err(message) = write_sarif(path, verdict.findings().as_slice()) {
+            return report_failure(&scan::Failure::new("sarif-unwritable", message), args.json);
+        }
+    }
+
+    match emitted {
         // FINDINGS_FAIL_A_SCAN is still false and still deliberately so: a
         // plain scan that produced findings exits 0, and the reasons are on the
         // constant. See it for why a diff did not change that answer.
@@ -1187,6 +1208,25 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             contract::ExitCode::Findings
         }
     }
+}
+
+/// Writes the findings as SARIF through a temporary file and a rename, so a
+/// reader never sees half a document.
+fn write_sarif(path: &std::path::Path, found: &[rules::Finding]) -> Result<(), String> {
+    let mut text = serde_json::to_string_pretty(&sarif::to_sarif(found, &scan::specs()))
+        .map_err(|error| format!("could not render SARIF: {error}"))?;
+    text.push('\n');
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(name);
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&temporary, text.as_bytes())?;
+        std::fs::rename(&temporary, path)
+    };
+    write().map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("could not write SARIF to {}: {error}", path.display())
+    })
 }
 
 /// Picks the reader to scan, or says why there is not one.
@@ -1590,6 +1630,7 @@ mod tests {
             score: true,
             severity: Some(rules::Severity::High),
             baseline: Some(std::path::PathBuf::from("saved.json")),
+            sarif: None,
             diff: true,
             tar: tar::Selection::default(),
         };

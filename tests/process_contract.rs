@@ -1331,3 +1331,11 @@ mod rule_catalog {
         assert!(!run.stdout.as_bytes().contains(&0x1b), "{:?}", run.stdout);
     }
 }
+
+/// `scan --help` lists `--sarif`; no card is needed to see the flag exists.
+#[test]
+fn scan_help_lists_the_sarif_flag() {
+    let run = run_piped(&["scan", "--help"]);
+    assert_eq!(run.code(), 0);
+    assert!(run.stdout.contains("--sarif"), "{}", run.stdout);
+}

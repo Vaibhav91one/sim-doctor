@@ -103,6 +103,7 @@ pub mod der;
 pub mod fcp;
 pub mod fs;
 pub mod rules;
+pub mod sarif;
 pub mod scan;
 pub mod session;
 pub mod signals;
@@ -201,6 +202,11 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: baseline::NAME,
         owns: "A saved run, what it actually did, and the rules for refusing a comparison two runs cannot honestly support.",
+        depends_on: &[rules::NAME],
+    },
+    ModuleInfo {
+        name: sarif::NAME,
+        owns: "A scan's findings rendered as a SARIF 2.1.0 document, with logical locations and partial coverage stated in run properties.",
         depends_on: &[rules::NAME],
     },
     ModuleInfo {
