@@ -12,6 +12,12 @@ inputs:
   baseline:
     description: Path of the committed baseline file written by `sim-doctor scan --baseline`. If it does not exist there is no gate, only a report.
     default: .sim-doctor/baseline.json
+  require-baseline:
+    description: 'When "true" (default) a missing baseline file fails the job: the baseline is part of the contract of a gating action. When "false" the scan reports without gating, with a warning.'
+    default: "true"
+  reader:
+    description: Passed to `sim-doctor scan --reader` (a PC/SC reader name; must not start with a dash). Optional.
+    default: ""
   severity:
     description: Passed to `sim-doctor scan --severity` (info, low, medium, high, critical). Optional.
     default: ""
@@ -124,14 +130,17 @@ runs:
       id: run
       shell: bash
       env:
-        SWSIM: ${{ inputs.swsim }}
+        SWSIM: ${{ inputs.swsim == 'true' && 'true' || 'false' }}
         BASELINE: ${{ inputs.baseline }}
+        REQUIRE_BASELINE: ${{ inputs.require-baseline == 'false' && 'false' || 'true' }}
         SEVERITY: ${{ inputs.severity }}
+        READER: ${{ inputs.reader }} # always set, so a runner-level READER variable cannot leak into --reader
         OUT: ${{ runner.temp }}/sim-doctor
         SIM_DOCTOR: ${{ runner.temp }}/sim-doctor-target/release/sim-doctor
       run: |
         # pcsc-lite serves uid 0 without a polkit authority to ask, which a hosted runner lacks
-        # (same reason card-fixture.yml runs its client as root).
+        # (same reason card-fixture.yml runs its client as root). GitHub-hosted runner users have
+        # passwordless sudo; a self-hosted runner without it must not use swsim.
         if [ "$SWSIM" = true ]; then
           sudo --preserve-env "$GITHUB_ACTION_PATH/scripts/sim-doctor-action.sh"
         else
@@ -148,8 +157,11 @@ runs:
         SUMMARY: ${{ steps.run.outputs.summary }}
       run: |
         # Update this action's own comment (found by its marker) instead of adding one per push.
+        # Only this token's own comment is ever edited. The lookup is guarded: under bash -e a failed
+        # lookup would otherwise abort before the warning below.
         id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-          --jq '.[] | select(.body | startswith("<!-- sim-doctor -->")) | .id' | tail -n 1)
+          --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- sim-doctor -->"))) | .id' \
+          | tail -n 1) || id=""
         if [ -n "$id" ]; then
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$SUMMARY" >/dev/null
         else

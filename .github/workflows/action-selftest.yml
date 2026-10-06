@@ -37,6 +37,7 @@ jobs:
         uses: ./
         with:
           swsim: "true"
+          require-baseline: "false" # no committed baseline here: report without gating
 
       - name: Assert the summary was written
         env:
