@@ -55,6 +55,11 @@ const AGENT_ENV: [&str; 5] = [
 /// Replaces control and invisible characters with a space, a backtick with an apostrophe
 /// (so text cannot close the fence), and caps the length.
 pub fn clean(text: &str) -> String {
+    clean_with_limit(text, MAX_FIELD)
+}
+
+/// [`clean`] with a caller-chosen length cap.
+pub fn clean_with_limit(text: &str, limit: usize) -> String {
     text.chars()
         .map(|c| match c {
             '`' => '\'',
@@ -68,7 +73,7 @@ pub fn clean(text: &str) -> String {
             }
             c => c,
         })
-        .take(MAX_FIELD)
+        .take(limit)
         .collect()
 }
 

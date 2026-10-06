@@ -227,7 +227,7 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: tui::NAME,
         owns: "A ratatui view over a scan's findings, rendering only fields present in the --json data.",
-        depends_on: &[],
+        depends_on: &[fix::NAME, signals::NAME],
     },
     ModuleInfo {
         name: scan::NAME,

@@ -1197,9 +1197,10 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     } else if args.tui && io::stdin().is_terminal() && io::stdout().is_terminal() {
         // The view is the output: nothing goes to stdout but the terminal UI.
         let data = scan::to_json(&tree, &context, &verdict);
+        // A failed view must not skip the SARIF file or the stderr warnings
+        // below, and must not change the exit status: say so and carry on.
         if let Err(err) = sim_doctor::tui::run(&data) {
-            eprintln!("sim-doctor: the terminal view failed: {err}");
-            return contract::ExitCode::Findings;
+            eprintln!("sim-doctor: tui: {err}");
         }
         shown_in_tui = true;
         String::new()
