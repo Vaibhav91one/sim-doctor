@@ -41,6 +41,16 @@ sim-doctor install
 - [Design principles](#design-principles)
 - [License](#license)
 
+## MCP server
+
+`sim-doctor mcp` serves three tools over stdio (JSON-RPC 2.0, MCP protocol 2024-11-05) so a coding agent can call sim-doctor without shelling out:
+
+- `scan`: a card scan; needs a card and a reader. Its arguments are generated from `scan --help`.
+- `rules_list`: the rule catalogue. No card.
+- `rules_explain`: one rule by `id`. No card.
+
+`baseline`, `diff` and `sarif` are deliberately not exposed: they read or write files, and an agent could overwrite one. `json` is always on. Each call runs `sim-doctor` itself as a subprocess and returns its JSON envelope unchanged as the tool text. Exit 0 and 1 (findings) are normal results; 129, 130 or any other exit is a tool error carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything. Only the initialize/list/call handshake is tested; acceptance by specific agent clients is unverified.
+
 ## Get started
 
 ### 1. Install

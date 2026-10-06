@@ -150,6 +150,11 @@ enum Command {
     /// else is. It is not JSON, so --json does not apply to this subcommand.
     Completions(CompletionsArgs),
 
+    /// Serve the scan and the rules as MCP tools over stdio.
+    ///
+    /// Needs no card to start. stdout carries JSON-RPC lines and nothing else.
+    Mcp,
+
     /// List the rules a scan runs, or explain one, without a card.
     ///
     /// With no subcommand this is `rules list`.
@@ -646,6 +651,7 @@ fn main() -> process::ExitCode {
         },
         Command::Why(args) => run_why(&args.target, args.json),
         Command::Fix(args) => run_fix(&args),
+        Command::Mcp => run_mcp(),
     })
 }
 
@@ -1381,6 +1387,19 @@ fn emit_rules(json: bool, data: serde_json::Value, text: String) -> contract::Ex
         Ok(()) => contract::ExitCode::Success,
         Err(message) => {
             eprintln!("sim-doctor: {message}");
+            contract::ExitCode::Findings
+        }
+    }
+}
+
+/// `sim-doctor mcp`: the stdio server, handed the real clap `scan` command.
+fn run_mcp() -> contract::ExitCode {
+    let cli = <Cli as CommandFactory>::command();
+    let scan = cli.find_subcommand("scan").expect("scan subcommand exists");
+    match sim_doctor::mcp::serve(scan) {
+        Ok(()) => contract::ExitCode::Success,
+        Err(err) => {
+            eprintln!("sim-doctor: mcp: {err}");
             contract::ExitCode::Findings
         }
     }

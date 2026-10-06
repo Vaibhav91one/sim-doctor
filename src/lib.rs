@@ -19,6 +19,7 @@
 //! layer 0  transport  bytes to a card and bytes back
 //! layer 0  rules      plugin/rule identifiers and the severity ladder
 //! layer 0  contract   JSON envelope and process exit codes
+//! layer 0  mcp        the stdio MCP server; runs the binary itself, imports nothing
 //! layer 0  signals    the SIGINT flag, and when it may be acted on
 //! layer 1  fcp        the caller-supplied tag table of a file capabilities
 //!                template, and the file metadata read through it
@@ -103,6 +104,7 @@ pub mod der;
 pub mod fcp;
 pub mod fix;
 pub mod fs;
+pub mod mcp;
 pub mod rules;
 pub mod sarif;
 pub mod scan;
@@ -178,6 +180,11 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: fix::NAME,
         owns: "One finding from a saved scan as a prompt for a coding agent, with card text cleaned and fenced as untrusted, and the argv that starts the agent.",
+        depends_on: &[],
+    },
+    ModuleInfo {
+        name: mcp::NAME,
+        owns: "A stdio MCP server exposing scan, rules_list and rules_explain by running this binary as a subprocess.",
         depends_on: &[],
     },
     ModuleInfo {
