@@ -174,6 +174,7 @@ See [CONTEXT.md](CONTEXT.md) for the plan.
 
 `sim-doctor scan --sarif FILE` also writes the findings as SARIF 2.1.0, using logical locations
 because a card has no files on disk and stating partial coverage in `runs[0].properties`;
+it is written only after a completed scan (a refused or interrupted scan leaves any existing file untouched);
 GitHub code-scanning upload of that file is not yet verified.
 
 ## Documentation

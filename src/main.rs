@@ -386,7 +386,9 @@ struct ScanArgs {
     /// A card has no files on disk, so each result carries a logical location
     /// (the card path) and never a physical one. Partial coverage is stated in
     /// the run's properties. Written after the normal output, so a failure to
-    /// write it (exit 1, kind "sarif-unwritable") never costs you the report.
+    /// write it (exit 1, a message on stderr) never costs you the report. The
+    /// file is written only after a completed scan: a refused or interrupted
+    /// scan leaves any existing file untouched. It must not be the --baseline path.
     /// stdout is unchanged. Whether GitHub code scanning accepts the file is
     /// not verified.
     #[arg(long, value_name = "FILE")]
@@ -949,6 +951,21 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         _ => None,
     };
 
+    if let (Some(a), Some(b)) = (&args.sarif, &args.baseline) {
+        if a == b {
+            return report_failure(
+                &scan::Failure::new(
+                    "sarif-baseline-same-path",
+                    format!(
+                        "--sarif and --baseline both name {}; the SARIF file would destroy the baseline",
+                        a.display()
+                    ),
+                ),
+                args.json,
+            );
+        }
+    }
+
     if checkpoint() {
         return report_interrupted(scan::KIND, args.json);
     }
@@ -1181,8 +1198,15 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // After the report, so a SARIF failure never costs the caller the report.
     // Nothing about the file goes to stdout: that stays one envelope.
     if let Some(path) = &args.sarif {
-        if let Err(message) = write_sarif(path, verdict.findings().as_slice()) {
-            return report_failure(&scan::Failure::new("sarif-unwritable", message), args.json);
+        let doc = sarif::to_sarif(verdict.findings().as_slice(), &scan::specs());
+        if let Err(error) = sarif::write(path, &doc) {
+            // stderr only: the scan envelope is already on stdout, and a
+            // second one would make stdout two documents.
+            eprintln!(
+                "sim-doctor: sarif-unwritable: could not write SARIF to {}: {error}",
+                path.display()
+            );
+            return contract::ExitCode::Findings;
         }
     }
 
@@ -1208,25 +1232,6 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             contract::ExitCode::Findings
         }
     }
-}
-
-/// Writes the findings as SARIF through a temporary file and a rename, so a
-/// reader never sees half a document.
-fn write_sarif(path: &std::path::Path, found: &[rules::Finding]) -> Result<(), String> {
-    let mut text = serde_json::to_string_pretty(&sarif::to_sarif(found, &scan::specs()))
-        .map_err(|error| format!("could not render SARIF: {error}"))?;
-    text.push('\n');
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
-    let temporary = path.with_file_name(name);
-    let write = || -> std::io::Result<()> {
-        std::fs::write(&temporary, text.as_bytes())?;
-        std::fs::rename(&temporary, path)
-    };
-    write().map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("could not write SARIF to {}: {error}", path.display())
-    })
 }
 
 /// Picks the reader to scan, or says why there is not one.

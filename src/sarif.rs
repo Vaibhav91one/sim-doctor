@@ -36,7 +36,9 @@ const fn security_severity(severity: Severity) -> &'static str {
 /// FNV-1a 64-bit over the finding's identity, as 16 lowercase hex digits.
 ///
 /// Digits in the message are masked so a count in the prose cannot change
-/// which finding this is.
+/// which finding this is: findings differing only in digits share a
+/// fingerprint by design. Fields are length-prefixed so no separator inside
+/// one of them can be mistaken for a boundary.
 fn fingerprint(finding: &Finding) -> String {
     let mut masked = String::new();
     let mut in_digits = false;
@@ -51,17 +53,33 @@ fn fingerprint(finding: &Finding) -> String {
             masked.push(c);
         }
     }
-    let identity = format!(
-        "{}\n{}\n{masked}",
-        finding.rule().as_str(),
-        finding.location()
-    );
+    let location = finding.location().to_string();
+    let identity: String = [finding.rule().as_str(), location.as_str(), masked.as_str()]
+        .iter()
+        .map(|field| format!("{}:{field}", field.len()))
+        .collect();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in identity.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// Writes `doc` (pretty, trailing newline) to `path` through a temporary file
+/// in the same directory and a rename; the temporary file is removed on error.
+pub fn write(path: &std::path::Path, doc: &Value) -> std::io::Result<()> {
+    let mut text = serde_json::to_string_pretty(doc).map_err(std::io::Error::other)?;
+    text.push('\n');
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(name);
+    let result = std::fs::write(&temporary, text.as_bytes())
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// The findings as a SARIF 2.1.0 document, with one rule per spec.
@@ -74,7 +92,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec]) -> Value {
                 "name": spec.id().as_str(),
                 "shortDescription": {"text": spec.summary()},
                 "defaultConfiguration": {"level": level(spec.severity())},
-                "properties": {"security-severity": security_severity(spec.severity())},
+                "properties": {"security-severity": security_severity(spec.severity()), "tags": ["security"]},
             });
             if let Some(remediation) = spec.remediation() {
                 rule["help"] = json!({"text": remediation});
@@ -95,7 +113,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec]) -> Value {
                 "name": id,
                 "shortDescription": {"text": finding.message()},
                 "defaultConfiguration": {"level": level(finding.severity())},
-                "properties": {"security-severity": security_severity(finding.severity())},
+                "properties": {"security-severity": security_severity(finding.severity()), "tags": ["security"]},
             }));
             ids.len() - 1
         });
@@ -113,7 +131,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec]) -> Value {
             "message": {"text": finding.message()},
             "locations": [{"logicalLocations": [{
                 "name": finding.location().to_string(),
-                "kind": "file",
+                "kind": "resource",
             }]}],
             "partialFingerprints": {"simDoctorFinding/v1": fingerprint(finding)},
             "properties": properties,
@@ -223,7 +241,7 @@ mod tests {
     fn logical_locations_and_no_physical_location() {
         let doc = to_sarif(&[finding(Severity::High, "m")], &specs());
         let loc = &doc["runs"][0]["results"][0]["locations"][0]["logicalLocations"][0];
-        assert_eq!(loc["kind"], "file");
+        assert_eq!(loc["kind"], "resource");
         assert!(loc["name"].as_str().unwrap().contains("3F00/2F00/6F07"));
         assert!(!serde_json::to_string(&doc)
             .unwrap()
@@ -308,5 +326,69 @@ mod tests {
             .unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(doc["runs"][0]["results"][0]["ruleIndex"], 0);
+    }
+
+    #[test]
+    fn fingerprint_golden_and_field_sensitive() {
+        let base = finding(Severity::Critical, "the card accepted TAR 000000");
+        assert_eq!(fp(&base), "f405c45b121ae11d");
+        let other_rule = Finding::new(
+            RuleId::new("gsma/other").unwrap(),
+            Severity::Critical,
+            "the card accepted TAR 000000",
+            Location::forbidden_file("3F00/2F00/6F07", Status::new(0x98, 0x04)),
+            Evidence::bytes([0xa4]),
+        );
+        let other_location = Finding::new(
+            RuleId::new("gsma/msl-zero-allowed").unwrap(),
+            Severity::Critical,
+            "the card accepted TAR 000000",
+            Location::forbidden_file("3F00/2F00/6F08", Status::new(0x98, 0x04)),
+            Evidence::bytes([0xa4]),
+        );
+        assert_ne!(fp(&base), fp(&other_rule));
+        assert_ne!(fp(&base), fp(&other_location));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sarif-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn write_creates_then_overwrites_without_leftovers() {
+        let dir = scratch("ok");
+        let path = dir.join("out.sarif");
+        write(&path, &json!({"a": 1})).unwrap();
+        write(&path, &json!({"a": 2})).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'));
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["a"], 2);
+        assert_eq!(entries(&dir), ["out.sarif"]);
+    }
+
+    #[test]
+    fn write_to_a_missing_parent_fails_cleanly() {
+        let dir = scratch("noparent");
+        assert!(write(&dir.join("missing/out.sarif"), &json!({})).is_err());
+        assert!(entries(&dir).is_empty());
+    }
+
+    #[test]
+    fn write_onto_a_directory_fails_and_leaves_no_temp() {
+        let dir = scratch("isdir");
+        let target = dir.join("out.sarif");
+        std::fs::create_dir(&target).unwrap();
+        assert!(write(&target, &json!({})).is_err());
+        assert_eq!(entries(&dir), ["out.sarif"]);
     }
 }
