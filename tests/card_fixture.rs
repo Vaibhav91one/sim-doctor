@@ -1597,8 +1597,9 @@ fn a_baseline_saves_and_a_later_scan_diffs_cleanly_against_it() {
         "the baseline must name the reader the report names"
     );
     assert_eq!(
-        document["run"]["dialect"]["id"],
-        saved["payload"]["data"]["dialect"]["id"]
+        document["run"]["dialect"],
+        saved["payload"]["data"]["dialect"]["id"],
+        "the baseline records the dialect as its id string"
     );
     assert_eq!(
         document["run"]["complete"],
