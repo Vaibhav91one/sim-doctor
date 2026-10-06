@@ -165,13 +165,17 @@ locations, bounded evidence, a registry that refuses a duplicate ID) and a singl
 `gsma/msl-zero-allowed`, runs behind `--tar`. Everything else is deferred:
 real SIM/UICC/eUICC rules that make `--score` meaningful ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)),
 an MCP server ([#41](https://github.com/Vaibhav91one/sim-doctor/issues/41)),
-SARIF ([#42](https://github.com/Vaibhav91one/sim-doctor/issues/42)),
 a CI action ([#43](https://github.com/Vaibhav91one/sim-doctor/issues/43)),
 `fix` ([#44](https://github.com/Vaibhav91one/sim-doctor/issues/44)),
 `ci install` ([#45](https://github.com/Vaibhav91one/sim-doctor/issues/45)),
 `why` / `rules explain` ([#46](https://github.com/Vaibhav91one/sim-doctor/issues/46)) and
 a corpus/precision gate ([#47](https://github.com/Vaibhav91one/sim-doctor/issues/47)).
 See [CONTEXT.md](CONTEXT.md) for the plan.
+
+`sim-doctor scan --sarif FILE` also writes the findings as SARIF 2.1.0, using logical locations
+because a card has no files on disk and stating partial coverage in `runs[0].properties`;
+it is written only after a completed scan (a refused or interrupted scan leaves any existing file untouched);
+GitHub code-scanning upload of that file is not yet verified.
 
 ## Documentation
 

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, contract, rules, scan, session, signals, skill, tar,
+    baseline, contract, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -380,6 +380,19 @@ struct ScanArgs {
     /// reads as though somebody chose it.
     #[arg(long, value_name = "FILE")]
     baseline: Option<std::path::PathBuf>,
+
+    /// Also write the findings to FILE as SARIF 2.1.0.
+    ///
+    /// A card has no files on disk, so each result carries a logical location
+    /// (the card path) and never a physical one. Partial coverage is stated in
+    /// the run's properties. Written after the normal output, so a failure to
+    /// write it (exit 1, a message on stderr) never costs you the report. The
+    /// file is written only after a completed scan: a refused or interrupted
+    /// scan leaves any existing file untouched. It must not be the --baseline path.
+    /// stdout is unchanged. Whether GitHub code scanning accepts the file is
+    /// not verified.
+    #[arg(long, value_name = "FILE")]
+    sarif: Option<std::path::PathBuf>,
 
     /// Compare this run against --baseline and report what changed.
     ///
@@ -938,6 +951,21 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         _ => None,
     };
 
+    if let (Some(a), Some(b)) = (&args.sarif, &args.baseline) {
+        if a == b {
+            return report_failure(
+                &scan::Failure::new(
+                    "sarif-baseline-same-path",
+                    format!(
+                        "--sarif and --baseline both name {}; the SARIF file would destroy the baseline",
+                        a.display()
+                    ),
+                ),
+                args.json,
+            );
+        }
+    }
+
     if checkpoint() {
         return report_interrupted(scan::KIND, args.json);
     }
@@ -1165,7 +1193,24 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     } else {
         "the scan report"
     };
-    match emit_stdout(rendered.trim_end_matches('\n'), what) {
+    let emitted = emit_stdout(rendered.trim_end_matches('\n'), what);
+
+    // After the report, so a SARIF failure never costs the caller the report.
+    // Nothing about the file goes to stdout: that stays one envelope.
+    if let Some(path) = &args.sarif {
+        let doc = sarif::to_sarif(verdict.findings().as_slice(), &scan::specs());
+        if let Err(error) = sarif::write(path, &doc) {
+            // stderr only: the scan envelope is already on stdout, and a
+            // second one would make stdout two documents.
+            eprintln!(
+                "sim-doctor: sarif-unwritable: could not write SARIF to {}: {error}",
+                path.display()
+            );
+            return contract::ExitCode::Findings;
+        }
+    }
+
+    match emitted {
         // FINDINGS_FAIL_A_SCAN is still false and still deliberately so: a
         // plain scan that produced findings exits 0, and the reasons are on the
         // constant. See it for why a diff did not change that answer.
@@ -1590,6 +1635,7 @@ mod tests {
             score: true,
             severity: Some(rules::Severity::High),
             baseline: Some(std::path::PathBuf::from("saved.json")),
+            sarif: None,
             diff: true,
             tar: tar::Selection::default(),
         };
