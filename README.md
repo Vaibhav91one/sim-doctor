@@ -33,6 +33,7 @@ sim-doctor install
 - [Install](#install)
 - [CLI reference](#cli-reference)
 - [Exit codes](#exit-codes)
+- [GitHub Action](#github-action)
 - [Agent integration](#agent-integration)
 - [What it will not tell you](#what-it-will-not-tell-you)
 - [Status](#status)
@@ -202,6 +203,45 @@ See [CONTEXT.md](CONTEXT.md) for the plan.
 because a card has no files on disk and stating partial coverage in `runs[0].properties`;
 it is written only after a completed scan (a refused or interrupted scan leaves any existing file untouched);
 GitHub code-scanning upload of that file is not yet verified.
+
+## GitHub Action
+
+A composite action (`action.yml` at the repo root) runs `sim-doctor scan`, fails the job only on findings that are
+new since a committed baseline, comments once on the pull request and uploads SARIF to code scanning.
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+steps:
+  - uses: actions/checkout@v5
+  - uses: Vaibhav91one/sim-doctor@<tag> # a release tag; none exists until a release is cut
+    with:
+      swsim: "true"   # build the pinned software card; omit when the runner has a real reader
+```
+
+| Input | Default | Meaning |
+|---|---|---|
+| `swsim` | `false` | `true` builds the pinned swSIM + swicc-pcsc and starts pcscd (same pins as `card-fixture.yml`, see [docs/swsim-fixture.md](docs/swsim-fixture.md)). `false` needs a reader already on the runner. |
+| `baseline` | `.sim-doctor/baseline.json` | Committed file written by `sim-doctor scan --baseline FILE`. With `require-baseline: "false"` and no file there is no gate. (This repo's `.gitignore` ignores `baseline.json`; use another path or `git add -f`.) |
+| `require-baseline` | `true` | A missing baseline file (typo, directory, not committed) fails the job with an error naming the path: the baseline is part of the contract of a gating action. `false` scans and reports without gating, with a warning and a NOT GATED row in the summary. |
+| `reader` | none | Passed to `--reader` (must not start with a dash). |
+| `severity` | none | Passed to `--severity`. |
+| `comment` | `true` | One PR comment, updated in place (found by a hidden marker); a missing permission does not fail the job. |
+| `upload-sarif` | `true` | Upload `sim-doctor.sarif` (category `sim-doctor`); non-fatal, private repositories need code scanning enabled. |
+
+Output: `summary`, the path of the markdown summary.
+
+The card is the subject, so there is no per-capture file: the baseline is a committed file. Gate contract: a regressed
+`--diff` exits 1 (the job fails, "GATE FAILED"); a refusal, exit 129/130, an unreadable envelope, or a gated run whose envelope carries no `diff` is a tool failure
+(script exit 2) and shows the sanitised error text; exit 0 passes.
+
+What is verified: the script logic (gate mapping, argv, summary, sanitising of card/tool text) locally against a fake
+`sim-doctor` in `tests/action_script.rs`. The software-card build, install, scan and SARIF upload are exercised only by the
+`action-selftest` workflow on a hosted runner, with no baseline (so it reports, it does not gate). A gating run against a
+real baseline, and acceptance of the SARIF by code scanning, are not verified. The `@<tag>` ref above exists only once a
+release is cut.
 
 ## Documentation
 

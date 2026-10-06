@@ -1,0 +1,177 @@
+name: sim-doctor
+description: Scan a SIM/UICC card with sim-doctor, fail only on findings that are new since a committed baseline, and upload SARIF.
+author: Vaibhav91one
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  swsim:
+    description: 'Build the pinned swSIM + swicc-pcsc and start pcscd so the runner has a software card ("true"). When "false" the runner must already have a PC/SC reader.'
+    default: "false"
+  baseline:
+    description: Path of the committed baseline file written by `sim-doctor scan --baseline`. If it does not exist there is no gate, only a report.
+    default: .sim-doctor/baseline.json
+  require-baseline:
+    description: 'When "true" (default) a missing baseline file fails the job: the baseline is part of the contract of a gating action. When "false" the scan reports without gating, with a warning.'
+    default: "true"
+  reader:
+    description: Passed to `sim-doctor scan --reader` (a PC/SC reader name; must not start with a dash). Optional.
+    default: ""
+  severity:
+    description: Passed to `sim-doctor scan --severity` (info, low, medium, high, critical). Optional.
+    default: ""
+  comment:
+    description: Post or update one summary comment on the pull request (needs pull-requests write).
+    default: "true"
+  upload-sarif:
+    description: Upload the findings to GitHub code scanning (needs security-events write).
+    default: "true"
+
+outputs:
+  summary:
+    description: Path of the markdown summary.
+    value: ${{ steps.run.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    # pcsc-sys's build script needs libpcsclite-dev, with or without a software card.
+    - name: Install the PC/SC build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -q
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+          gcc make cmake pkg-config libpcsclite1 libpcsclite-dev pcscd pcsc-tools
+
+    # Same pinned commits and asserted artifacts as .github/workflows/card-fixture.yml (see docs/swsim-fixture.md).
+    - name: Build and start the software card (swSIM + swicc-pcsc)
+      if: inputs.swsim == 'true'
+      shell: bash
+      env:
+        SWSIM_SHA: 281da8c63398ece9a5126cad969674f4f413ab63
+        SWICC_PCSC_SHA: 0496740fc96ffc777cbcf1dc758892e2ff487973
+        FIXTURE_PORT: "37324"
+        FIXTURE_IP: "127.0.0.1"
+      run: |
+        set -euo pipefail
+        sudo systemctl mask pcscd.socket pcscd.service 2>/dev/null || true
+        sudo systemctl stop pcscd.socket pcscd.service 2>/dev/null || true
+        pkill -x pcscd || true
+        sleep 1
+        if pgrep -x pcscd; then echo "pcscd is still running"; exit 1; fi
+
+        mkdir -p "$RUNNER_TEMP/fixture"
+        cd "$RUNNER_TEMP/fixture"
+        rm -rf swsim swicc-pcsc
+
+        git init -q swsim
+        cd swsim
+        git remote add origin https://github.com/tomasz-lisowski/swsim.git
+        git fetch --depth 1 origin "$SWSIM_SHA"
+        git checkout -q --detach FETCH_HEAD
+        git submodule update --init --recursive
+        echo "swsim at $(git rev-parse HEAD)"
+        test -f lib/swicc/src/apduh.c
+        test -f lib/tau/Makefile
+        make main-dbg -j"$(nproc)"
+        test -f build/swsim.elf
+
+        cd "$RUNNER_TEMP/fixture"
+        git init -q swicc-pcsc
+        cd swicc-pcsc
+        git remote add origin https://github.com/tomasz-lisowski/swicc-pcsc.git
+        git fetch --depth 1 origin "$SWICC_PCSC_SHA"
+        git checkout -q --detach FETCH_HEAD
+        git submodule update --init --recursive
+        echo "swicc-pcsc at $(git rev-parse HEAD)"
+        test -f lib/swicc/src/apdu.c
+        make main-dbg -j"$(nproc)"
+        test -f build/libswicc-pcsc.so.1.2.0
+        sudo make install
+        test -f /etc/reader.conf.d/libswicc-pcsc
+        test -f /usr/lib/pcsc/drivers/serial/libswicc-pcsc.so.1.2.0
+
+        # The driver is the listener, swSIM the client: pcscd first, then swSIM.
+        pcscd_flags=()
+        if pcscd --help 2>&1 | grep -q -- '--disable-polkit'; then pcscd_flags+=(--disable-polkit); fi
+        sudo pcscd --foreground --debug ${pcscd_flags[@]+"${pcscd_flags[@]}"} > "$RUNNER_TEMP/pcscd.log" 2>&1 &
+        sleep 2
+        if ! pgrep -x pcscd; then cat "$RUNNER_TEMP/pcscd.log"; exit 1; fi
+        "$RUNNER_TEMP/fixture/swsim/build/swsim.elf" \
+          --ip "$FIXTURE_IP" --port "$FIXTURE_PORT" \
+          --fs "$RUNNER_TEMP/fixture/filesystem.swiccfs" \
+          --fs-gen "$RUNNER_TEMP/fixture/swsim/data/usim.json" \
+          > "$RUNNER_TEMP/swsim.log" 2>&1 &
+        sleep 2
+        if ! pgrep -f swsim.elf; then cat "$RUNNER_TEMP/swsim.log"; exit 1; fi
+
+        # The card must be visible to pcscd before sim-doctor runs (pcsc_scan needs no part of this crate).
+        ready=0
+        for _ in $(seq 1 20); do
+          scan="$(sudo timeout 20 pcsc_scan -t 3 2>&1 || true)"
+          if printf '%s' "$scan" | grep -qi swicc && printf '%s' "$scan" | grep -qi 'ATR:'; then ready=1; break; fi
+          sleep 1
+        done
+        printf '%s\n' "$scan"
+        if [ "$ready" -ne 1 ]; then echo "::error::no swICC reader with a card appeared"; exit 1; fi
+
+    - name: Install sim-doctor from this action's ref
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo build --release --locked --manifest-path "$GITHUB_ACTION_PATH/Cargo.toml" \
+          --target-dir "$RUNNER_TEMP/sim-doctor-target"
+        test -x "$RUNNER_TEMP/sim-doctor-target/release/sim-doctor"
+        echo "$RUNNER_TEMP/sim-doctor-target/release" >> "$GITHUB_PATH"
+
+    - name: Scan
+      id: run
+      shell: bash
+      env:
+        SWSIM: ${{ inputs.swsim == 'true' && 'true' || 'false' }}
+        BASELINE: ${{ inputs.baseline }}
+        REQUIRE_BASELINE: ${{ inputs.require-baseline == 'false' && 'false' || 'true' }}
+        SEVERITY: ${{ inputs.severity }}
+        READER: ${{ inputs.reader }} # always set, so a runner-level READER variable cannot leak into --reader
+        OUT: ${{ runner.temp }}/sim-doctor
+        SIM_DOCTOR: ${{ runner.temp }}/sim-doctor-target/release/sim-doctor
+      run: |
+        # pcsc-lite serves uid 0 without a polkit authority to ask, which a hosted runner lacks
+        # (same reason card-fixture.yml runs its client as root). GitHub-hosted runner users have
+        # passwordless sudo; a self-hosted runner without it must not use swsim.
+        if [ "$SWSIM" = true ]; then
+          sudo --preserve-env "$GITHUB_ACTION_PATH/scripts/sim-doctor-action.sh"
+        else
+          "$GITHUB_ACTION_PATH/scripts/sim-doctor-action.sh"
+        fi
+
+    - name: Comment on the pull request
+      continue-on-error: true # a missing pull-requests permission must not turn a passing gate red
+      if: always() && inputs.comment == 'true' && github.event_name == 'pull_request' && steps.run.outputs.summary != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.run.outputs.summary }}
+      run: |
+        # Update this action's own comment (found by its marker) instead of adding one per push.
+        # Only this token's own comment is ever edited. The lookup is guarded: under bash -e a failed
+        # lookup would otherwise abort before the warning below.
+        id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+          --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- sim-doctor -->"))) | .id' \
+          | tail -n 1) || id=""
+        if [ -n "$id" ]; then
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$SUMMARY" >/dev/null
+        else
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file "$SUMMARY"
+        fi || echo "::warning::could not comment on the pull request (fork PRs get a read-only token)"
+
+    - name: Upload SARIF to code scanning
+      if: always() && inputs.upload-sarif == 'true' && steps.run.outputs.sarif != ''
+      uses: github/codeql-action/upload-sarif@v3
+      continue-on-error: true # private repositories need GitHub Advanced Security for code scanning
+      with:
+        sarif_file: ${{ steps.run.outputs.sarif }}
+        category: sim-doctor

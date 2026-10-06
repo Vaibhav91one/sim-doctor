@@ -1,0 +1,50 @@
+# Runs the composite action (action.yml) on a hosted runner with the pinned software card and NO baseline, so it
+# reports without gating. This is the only verification of the swSIM build, the install, the scan and the SARIF
+# path; tests/action_script.rs covers the script logic locally.
+name: action-selftest
+
+on:
+  pull_request: # never pull_request_target: this runs the PR's own action code
+    paths:
+      - action.yml
+      - scripts/sim-doctor-action.sh
+      - src/**
+      - .github/workflows/action-selftest.yml
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - id: action
+        uses: ./
+        with:
+          swsim: "true"
+          require-baseline: "false" # no committed baseline here: report without gating
+
+      - name: Assert the summary was written
+        env:
+          SUMMARY: ${{ steps.action.outputs.summary }}
+        run: |
+          set -euo pipefail
+          test -n "$SUMMARY"
+          test -f "$SUMMARY"
+          grep -q '<!-- sim-doctor -->' "$SUMMARY"
+          cat "$SUMMARY"
