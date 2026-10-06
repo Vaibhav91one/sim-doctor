@@ -90,7 +90,10 @@ pub fn validate(options: &Options, ref_: &str) -> Result<(), String> {
             .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
         && !path.starts_with('-')
         && !path.starts_with('/')
-        && !path.contains("..");
+        && !path.contains("..")
+        && !path.contains("__")
+        && path != "."
+        && !path.ends_with('/');
     if !path_ok {
         return Err(format!(
             "--baseline: '{path}' is not a relative path of letters, digits and . _ / - (no '..', no leading '-' or '/')"
@@ -100,7 +103,11 @@ pub fn validate(options: &Options, ref_: &str) -> Result<(), String> {
     let ref_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
         && ref_
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c));
+            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+        && !ref_.contains("..")
+        && !ref_.contains("__")
+        && !ref_.ends_with('/')
+        && !ref_.ends_with(".lock");
     if !ref_ok {
         return Err(format!("--ref: '{ref_}' is not a tag or branch name"));
     }
@@ -113,15 +120,29 @@ pub fn workflow(options: &Options, ref_: &str) -> String {
         .severity
         .map(|s| format!("          severity: \"{}\"\n", s.id()))
         .unwrap_or_default();
-    TEMPLATE
-        .replace("__REF__", ref_)
-        .replace("__SWSIM__", &options.swsim.to_string())
-        .replace("__BASELINE__", &options.baseline)
-        .replace(
-            "__REQUIRE_BASELINE__",
-            &options.require_baseline.to_string(),
-        )
-        .replace("__SEVERITY__", &severity)
+    let swsim = options.swsim.to_string();
+    let require = options.require_baseline.to_string();
+    let values = [
+        ("__REF__", ref_),
+        ("__SWSIM__", swsim.as_str()),
+        ("__BASELINE__", options.baseline.as_str()),
+        ("__REQUIRE_BASELINE__", require.as_str()),
+        ("__SEVERITY__", severity.as_str()),
+    ];
+    // One pass: a substituted value is never scanned again, so it cannot inject a later placeholder.
+    let mut out = String::new();
+    let mut rest = TEMPLATE;
+    while let Some((at, name, value)) = values
+        .iter()
+        .filter_map(|(n, v)| rest.find(n).map(|i| (i, *n, *v)))
+        .min_by_key(|(i, _, _)| *i)
+    {
+        out.push_str(&rest[..at]);
+        out.push_str(value);
+        rest = &rest[at + name.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Validates, then prints or writes the workflow under `root`.
@@ -147,16 +168,39 @@ pub fn install(
         }
     }
     let io = |e: std::io::Error| CiError::Io(format!("cannot write {}: {e}", target.display()));
-    if target.exists() {
-        if std::fs::read_to_string(&target).map_err(io)? == text {
-            return Ok(InstallOutcome::Unchanged(target));
+    match std::fs::metadata(&target) {
+        Ok(m) if m.is_dir() => {
+            return Err(CiError::Io(format!(
+                "{} is a directory; refusing to replace it",
+                target.display()
+            )))
         }
-        if !force {
-            return Err(CiError::Differs(target));
-        }
+        Ok(_) => match std::fs::read(&target) {
+            Ok(bytes) if bytes == text.as_bytes() => return Ok(InstallOutcome::Unchanged(target)),
+            // Unreadable or different: kept unless forced.
+            _ if !force => return Err(CiError::Differs(target)),
+            _ => {}
+        },
+        Err(_) => {}
     }
-    std::fs::create_dir_all(target.parent().expect("WORKFLOW has a parent")).map_err(io)?;
-    std::fs::write(&target, text).map_err(io)?;
+    let dir = target.parent().expect("WORKFLOW has a parent");
+    std::fs::create_dir_all(dir).map_err(io)?;
+    // Atomic: write a sibling temp file, then rename over the target.
+    let temp = dir.join(format!(".sim-doctor.yml.tmp-{}", std::process::id()));
+    let written = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &target)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(io(e));
+    }
     Ok(InstallOutcome::Wrote(target))
 }
 
@@ -343,5 +387,96 @@ mod tests {
         let err = go(&root, true, false).unwrap_err();
         assert!(matches!(err, CiError::Symlink(_)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+    }
+
+    #[test]
+    fn placeholder_lookalikes_and_odd_paths_are_refused() {
+        for value in ["__SEVERITY__", "a__b", ".", "ci/", "./"] {
+            assert!(
+                validate(&bad_baseline(value), "v1").is_err(),
+                "accepted baseline {value:?}"
+            );
+        }
+        for value in [
+            "x__SEVERITY__",
+            "x__BASELINE__",
+            "a..b",
+            "x/",
+            "x.lock",
+            "a/b.lock",
+        ] {
+            assert!(
+                validate(&Options::default(), value).is_err(),
+                "accepted ref {value:?}"
+            );
+        }
+        let root = tempdir("lookalike");
+        for (baseline, ref_) in [
+            ("__SEVERITY__", "v1"),
+            (".sim-doctor/b.json", "x__BASELINE__"),
+        ] {
+            let err = install(&root, &bad_baseline(baseline), ref_, false, false).unwrap_err();
+            assert!(matches!(err, CiError::Invalid(_)));
+        }
+        assert!(!root.join(".github").exists());
+    }
+
+    #[test]
+    fn a_value_is_never_re_expanded() {
+        // Bypass validation: workflow() itself must substitute in one pass.
+        let options = Options {
+            baseline: "__REF__".into(),
+            severity: Some(Severity::High),
+            ..Options::default()
+        };
+        let text = workflow(&options, "__SEVERITY__");
+        assert!(text.contains("baseline: \"__REF__\""), "{text}");
+        assert!(text.contains("sim-doctor@__SEVERITY__\n"), "{text}");
+        assert!(text.contains("severity: \"high\""));
+    }
+
+    #[test]
+    fn a_binary_file_is_kept_without_force_and_overwritten_with_it() {
+        let root = tempdir("binary");
+        let target = root.join(WORKFLOW);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        assert_eq!(
+            go(&root, false, false).unwrap_err(),
+            CiError::Differs(target.clone())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), [0xff, 0xfe, 0x00, 0x80]);
+        assert_eq!(
+            go(&root, true, false).unwrap(),
+            InstallOutcome::Wrote(target.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            workflow(&Options::default(), "v1")
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_target_is_always_refused() {
+        let root = tempdir("dirtarget");
+        std::fs::create_dir_all(root.join(WORKFLOW)).unwrap();
+        for force in [false, true] {
+            let err = go(&root, force, false).unwrap_err();
+            assert!(matches!(err, CiError::Io(_)), "{err:?}");
+            assert!(err.to_string().contains("directory"), "{err}");
+        }
+        assert!(root.join(WORKFLOW).is_dir());
+    }
+
+    #[test]
+    fn no_temp_file_remains_after_a_write() {
+        let root = tempdir("atomic");
+        go(&root, false, false).unwrap();
+        go(&root, true, false).unwrap();
+        let names: Vec<_> = std::fs::read_dir(root.join(".github/workflows"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["sim-doctor.yml"]);
     }
 }

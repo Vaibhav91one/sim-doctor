@@ -264,7 +264,7 @@ symlink anywhere from `--dir` down to the file (exit 1). A differing existing fi
 identical one is not a conflict. `--print-only` prints the workflow and writes nothing. Output is plain text
 (`wrote <path>`), not an envelope.
 
-The pinned ref `v<version>` exists only once that release is cut; until then pass `--ref main` or another existing ref.
+The file is written atomically (a temp file renamed over the target); a directory at the path is always refused. After a write, two hints go to stderr: commit a baseline first with `sim-doctor scan --baseline <path>` (with the default `--require-baseline true` the first run fails without one), and the pinned ref `v<version>` exists only once that release is tagged; until then pass `--ref main` or another existing ref. `--baseline` and `--ref` also refuse `__`, and `--baseline` refuses `.` and a trailing `/`; `--ref` refuses `..`, a trailing `/` and `.lock`.
 
 ## Documentation
 

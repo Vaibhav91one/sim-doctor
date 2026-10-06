@@ -988,6 +988,11 @@ fn run_ci(args: CiArgs) -> contract::ExitCode {
         }
         Ok(ci::InstallOutcome::Wrote(path)) => {
             println!("wrote {}", path.display());
+            eprintln!(
+                "next: commit a baseline first (`sim-doctor scan --baseline {}`), because require-baseline fails the first run without one.",
+                options.baseline
+            );
+            eprintln!("next: the pinned ref {ref_} only exists once that release is tagged.");
             contract::ExitCode::Success
         }
         Ok(ci::InstallOutcome::Unchanged(path)) => {

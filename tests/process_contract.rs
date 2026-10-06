@@ -1658,4 +1658,46 @@ mod ci_install {
             0
         );
     }
+
+    #[test]
+    fn a_successful_write_tells_the_next_steps_on_stderr_only() {
+        let dir = tempdir("hints");
+        let d = dir.to_str().unwrap();
+        let run = run_piped(&["ci", "install", "--dir", d, "--baseline", "ci/b.json"]);
+        assert_eq!(run.code(), 0, "{}", run.stderr);
+        assert!(
+            run.stdout.starts_with("wrote ") && run.stdout.lines().count() == 1,
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stderr.contains("sim-doctor scan --baseline ci/b.json"),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "{}",
+            run.stderr
+        );
+        assert!(run.stderr.contains("tagged"), "{}", run.stderr);
+
+        let again = run_piped(&["ci", "install", "--dir", d, "--baseline", "ci/b.json"]);
+        assert_eq!(again.code(), 0);
+        assert!(again.stdout.starts_with("unchanged "), "{}", again.stdout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workflows_dir_is_refused_with_the_victim_untouched() {
+        let dir = tempdir("symlink");
+        let outside = tempdir("symlink-outside");
+        std::fs::create_dir_all(dir.join(".github")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(".github/workflows")).unwrap();
+        let run = run_piped(&["ci", "install", "--dir", dir.to_str().unwrap(), "--force"]);
+        assert_eq!(run.code(), 1);
+        assert_eq!(run.stdout, "");
+        assert!(run.stderr.contains("symlink"), "{}", run.stderr);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
 }
