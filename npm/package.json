@@ -1,0 +1,19 @@
+{
+  "name": "sim-doctor",
+  "version": "0.1.0",
+  "description": "CLI-first SIM/UICC security testing tool. Runs the prebuilt sim-doctor binary matching this version.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vaibhav91one/sim-doctor.git"
+  },
+  "bin": {
+    "sim-doctor": "bin/sim-doctor.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
