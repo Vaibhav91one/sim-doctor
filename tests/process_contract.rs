@@ -1567,3 +1567,17 @@ mod mcp_server {
         drop(stdin);
     }
 }
+
+/// `scan --tui` is on the surface, and it is a view, not a second output
+/// format: it refuses to be combined with `--json` as bad usage (129) with
+/// nothing on stdout. A real terminal run is NOT tested here.
+#[test]
+fn scan_tui_is_listed_and_conflicts_with_json() {
+    let help = run_piped(&["scan", "--help"]);
+    assert_eq!(help.code(), 0);
+    assert!(help.stdout.contains("--tui"), "{:?}", help.stdout);
+
+    let both = run_piped(&["scan", "--tui", "--json"]);
+    assert_eq!(both.code(), 129, "{:?}", both.stderr);
+    assert_eq!(both.stdout, "");
+}
