@@ -470,6 +470,20 @@ pub fn rules_run() -> usize {
     rules().len()
 }
 
+/// The declarations of every rule a scan knows, in registration order.
+///
+/// This is the catalog `sim-doctor rules list` and `sim-doctor rules explain`
+/// read from, without a card: a [RuleSpec](crate::rules::RuleSpec) is the part
+/// of a rule an agent can read without running anything, so the whole registry
+/// is publishable headlessly.
+pub fn specs() -> Vec<rules::RuleSpec> {
+    rules()
+        .rules()
+        .iter()
+        .map(|rule| rule.spec().clone())
+        .collect()
+}
+
 /// The findings one card produces, before any filtering.
 ///
 /// Coverage is taken from **both** halves of the scan, not just the walk. A
