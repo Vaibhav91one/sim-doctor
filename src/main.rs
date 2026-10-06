@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, contract, rules, sarif, scan, session, signals, skill, tar,
+    baseline, contract, fix, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -161,6 +161,15 @@ enum Command {
     /// existing file holding a saved `sim-doctor scan --json` envelope. There
     /// is no persisted "last scan": save one with `scan --json > scan.json`.
     Why(WhyArgs),
+
+    /// Hand one finding from a saved scan to a coding agent.
+    ///
+    /// Prints a prompt as plain text on stdout (not JSON) and exits 0. With
+    /// --agent it also starts that agent with the prompt; the agent keeps its own
+    /// approval prompts unless --skip-approvals (or SIM_DOCTOR_HANDOFF_SKIP_APPROVALS=1).
+    /// Nothing is launched when already inside a coding agent. FILE is a saved
+    /// `sim-doctor scan --json` envelope, like `why` reads.
+    Fix(FixArgs),
 }
 
 /// The long description of `sim-doctor scan`.
@@ -561,6 +570,22 @@ struct WhyArgs {
     json: bool,
 }
 
+/// Everything `sim-doctor fix` takes.
+#[derive(Args)]
+struct FixArgs {
+    /// The rule id to fix, such as gsma/msl-zero-allowed.
+    rule_id: String,
+    /// A saved `sim-doctor scan --json` envelope holding a finding for that rule.
+    #[arg(long, value_name = "FILE")]
+    from: String,
+    /// Start this coding agent with the prompt instead of only printing it.
+    #[arg(long, value_parser = ["claude", "codex", "cursor"])]
+    agent: Option<String>,
+    /// Pass the agent its flag that skips approval prompts (unverified for every CLI version).
+    #[arg(long)]
+    skip_approvals: bool,
+}
+
 #[derive(Args)]
 struct ModulesArgs {
     /// Emit the JSON envelope on stdout instead of a human-readable table.
@@ -620,6 +645,7 @@ fn main() -> process::ExitCode {
             Some(RulesAction::Explain { id, json }) => run_why_rule(&id, json),
         },
         Command::Why(args) => run_why(&args.target, args.json),
+        Command::Fix(args) => run_fix(&args),
     })
 }
 
@@ -1427,6 +1453,26 @@ fn run_why_rule(id: &str, json: bool) -> contract::ExitCode {
     }
 }
 
+/// Reads a saved `scan --json` envelope: a file, within the size limit, UTF-8, an envelope.
+/// Shared by `why` and `fix`; the error is the refusal sentence.
+fn read_saved_envelope(target: &str) -> Result<contract::Envelope, String> {
+    let path = std::path::Path::new(target);
+    let meta = std::fs::metadata(path).map_err(|err| format!("cannot read {target}: {err}"))?;
+    if !meta.is_file() {
+        return Err(format!("{target} is not a file"));
+    }
+    if meta.len() > MAX_WHY_FILE_BYTES {
+        return Err(format!(
+            "{target} is {} bytes, over the {MAX_WHY_FILE_BYTES}-byte limit for a saved envelope",
+            meta.len()
+        ));
+    }
+    let raw =
+        std::fs::read_to_string(path).map_err(|err| format!("cannot read {target}: {err}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|err| format!("{target} is not a saved sim-doctor envelope: {err}"))
+}
+
 /// Explains a rule id, or every rule in a saved scan envelope.
 fn run_why(target: &str, json: bool) -> contract::ExitCode {
     let path = std::path::Path::new(target);
@@ -1442,30 +1488,9 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
     if !path.is_file() && !looks_like_path && !path.exists() {
         return run_why_rule(target, json);
     }
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(err) => return refuse(format!("cannot read {target}: {err}")),
-    };
-    if !meta.is_file() {
-        return refuse(format!("{target} is not a file"));
-    }
-    if meta.len() > MAX_WHY_FILE_BYTES {
-        return refuse(format!(
-            "{target} is {} bytes, over the {MAX_WHY_FILE_BYTES}-byte limit for a saved envelope",
-            meta.len()
-        ));
-    }
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) => return refuse(format!("cannot read {target}: {err}")),
-    };
-    let envelope: contract::Envelope = match serde_json::from_str(&raw) {
+    let envelope = match read_saved_envelope(target) {
         Ok(envelope) => envelope,
-        Err(err) => {
-            return refuse(format!(
-                "{target} is not a saved sim-doctor envelope: {err}"
-            ))
-        }
+        Err(message) => return refuse(message),
     };
     let Some(findings) = envelope.payload().data()["findings"]["findings"].as_array() else {
         return refuse(format!(
@@ -1511,6 +1536,110 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
         text.push_str("no findings in this envelope\n");
     }
     emit_rules(json, serde_json::json!({ "rules": rules }), text)
+}
+
+/// The first executable called `bin` on PATH.
+fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(bin))
+        .find(|candidate| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(candidate)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file()
+            }
+        })
+}
+
+/// Runs `sim-doctor fix`: print the prompt, and with `--agent` launch that agent.
+fn run_fix(args: &FixArgs) -> contract::ExitCode {
+    let specs = scan::specs();
+    let Some(spec) = specs.iter().find(|s| s.id().as_str() == args.rule_id) else {
+        return unknown_rule(&specs, &args.rule_id, false);
+    };
+    let refuse = |message: String| {
+        report_refusal(
+            RULES_KIND,
+            &message,
+            serde_json::json!({ "error": message }),
+            false,
+        )
+    };
+    let envelope = match read_saved_envelope(&args.from) {
+        Ok(envelope) => envelope,
+        Err(message) => return refuse(message),
+    };
+    let Some(all) = envelope.payload().data()["findings"]["findings"].as_array() else {
+        return refuse(format!(
+            "{} carries no data.findings.findings; was it saved from `scan --json`?",
+            args.from
+        ));
+    };
+    let findings: Vec<(String, String)> = all
+        .iter()
+        .filter(|f| f["rule"].as_str() == Some(spec.id().as_str()))
+        .map(|f| {
+            (
+                f["severity"].as_str().unwrap_or("?").to_owned(),
+                f["message"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    if findings.is_empty() {
+        return refuse(format!(
+            "rule `{}` has no finding in {}",
+            args.rule_id, args.from
+        ));
+    }
+    let prompt = fix::build_prompt(
+        spec.id().as_str(),
+        spec.summary(),
+        spec.remediation().unwrap_or("(none declared)"),
+        &findings,
+        env!("CARGO_PKG_VERSION"),
+    );
+    if let Err(message) = emit_stdout(&prompt, "the prompt") {
+        eprintln!("sim-doctor: {message}");
+        return contract::ExitCode::Findings;
+    }
+    let Some(name) = &args.agent else {
+        return contract::ExitCode::Success;
+    };
+    if fix::in_agent(|k| std::env::var(k).ok()) {
+        eprintln!(
+            "sim-doctor: already inside a coding agent: not launching another; use the prompt above"
+        );
+        return contract::ExitCode::Success;
+    }
+    let agent = fix::AGENTS
+        .iter()
+        .find(|a| a.name == name)
+        .expect("clap restricts --agent to the table");
+    let Some(bin) = find_on_path(agent.bin) else {
+        eprintln!("sim-doctor: {} is not on PATH", agent.bin);
+        return contract::ExitCode::Findings;
+    };
+    let skip = args.skip_approvals
+        || std::env::var("SIM_DOCTOR_HANDOFF_SKIP_APPROVALS").is_ok_and(|v| v == "1");
+    let argv = fix::launch_argv(agent, &prompt, skip);
+    eprintln!("$ {} <prompt>", argv[..argv.len() - 1].join(" "));
+    match std::process::Command::new(bin).args(&argv[1..]).status() {
+        Ok(status) if status.success() => contract::ExitCode::Success,
+        Ok(status) => {
+            eprintln!("sim-doctor: {} exited with {status}", agent.bin);
+            contract::ExitCode::Findings
+        }
+        Err(err) => {
+            eprintln!("sim-doctor: could not launch {}: {err}", agent.bin);
+            contract::ExitCode::Findings
+        }
+    }
 }
 
 /// Reports a scan that could not run, and returns exit code 1.

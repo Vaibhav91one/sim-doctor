@@ -101,6 +101,7 @@ pub mod baseline;
 pub mod contract;
 pub mod der;
 pub mod fcp;
+pub mod fix;
 pub mod fs;
 pub mod rules;
 pub mod sarif;
@@ -172,6 +173,11 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: skill::NAME,
         owns: "The agent skill text and writing it (SKILL.md, a Cursor rule, an AGENTS.md block) under a project root.",
+        depends_on: &[],
+    },
+    ModuleInfo {
+        name: fix::NAME,
+        owns: "One finding from a saved scan as a prompt for a coding agent, with card text cleaned and fenced as untrusted, and the argv that starts the agent.",
         depends_on: &[],
     },
     ModuleInfo {

@@ -1339,3 +1339,89 @@ fn scan_help_lists_the_sarif_flag() {
     assert_eq!(run.code(), 0);
     assert!(run.stdout.contains("--sarif"), "{}", run.stdout);
 }
+
+/// Issue #44: `fix` prints (or launches) a prompt for one rule from a saved envelope.
+mod fix_handoff {
+    use super::*;
+
+    const RULE: &str = "gsma/msl-zero-allowed";
+
+    fn saved(name: &str, rule: &str) -> std::path::PathBuf {
+        let body = serde_json::json!({"type":"scan","payload":{"code":0,"message":"ok","data":{
+            "findings":{"findings":[{"rule":rule,"severity":"high","message":"TAR 000000 accepted"}]}}}});
+        let path =
+            std::env::temp_dir().join(format!("sim-doctor-{name}-{}.json", std::process::id()));
+        std::fs::write(&path, body.to_string()).expect("write the temp file");
+        path
+    }
+
+    #[test]
+    fn fix_prints_the_prompt_from_a_saved_envelope() {
+        let path = saved("fix-ok", RULE);
+        let run = run_piped(&["fix", RULE, "--from", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        assert!(
+            run.stdout.contains("You are fixing one finding"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("HIGH TAR 000000 accepted"),
+            "{}",
+            run.stdout
+        );
+        assert!(run.stdout.contains("How to fix:"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn fix_unknown_rule_exits_1() {
+        let path = saved("fix-unknown", RULE);
+        let run = run_piped(&[
+            "fix",
+            "gsma/msl-zero-allowd",
+            "--from",
+            path.to_str().unwrap(),
+        ]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 1, "{:?}", run.stderr);
+        assert!(run.stderr.contains("did you mean"), "{}", run.stderr);
+        assert_eq!(run.stdout, "");
+    }
+
+    #[test]
+    fn fix_with_no_finding_for_the_rule_exits_1() {
+        let path = saved("fix-none", "other/not-here");
+        let run = run_piped(&["fix", RULE, "--from", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 1, "{:?}", run.stderr);
+        assert!(run.stderr.contains("has no finding"), "{}", run.stderr);
+        assert_eq!(run.stdout, "");
+    }
+
+    #[test]
+    fn fix_inside_an_agent_launches_nothing_and_exits_0() {
+        let path = saved("fix-agent", RULE);
+        let output = {
+            let _guard = spawn_lock();
+            Command::new(binary())
+                .args([
+                    "fix",
+                    RULE,
+                    "--from",
+                    path.to_str().unwrap(),
+                    "--agent",
+                    "claude",
+                ])
+                .env("CLAUDECODE", "1")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run the binary")
+        };
+        let _ = std::fs::remove_file(&path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(stderr.contains("already inside a coding agent"), "{stderr}");
+        assert!(!stderr.contains("$ claude"), "{stderr}");
+    }
+}
