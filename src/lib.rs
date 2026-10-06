@@ -103,6 +103,7 @@ pub mod rules;
 pub mod scan;
 pub mod session;
 pub mod signals;
+pub mod skill;
 pub mod tar;
 pub mod tlv;
 pub mod transport;
@@ -162,6 +163,11 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: signals::NAME,
         owns: "The SIGINT handler: one atomic flag, checked at a checkpoint, that becomes exit code 130.",
+        depends_on: &[],
+    },
+    ModuleInfo {
+        name: skill::NAME,
+        owns: "The agent skill text and writing it (SKILL.md, a Cursor rule, an AGENTS.md block) under a project root.",
         depends_on: &[],
     },
     ModuleInfo {
