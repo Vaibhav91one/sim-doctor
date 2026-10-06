@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, contract, fix, rules, sarif, scan, session, signals, skill, tar,
+    baseline, ci, contract, fix, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -135,6 +135,9 @@ enum Command {
     /// `.cursor/rules/sim-doctor.mdc` and a marked block in `AGENTS.md`
     /// (replaced in place on re-run; the rest of the file is untouched).
     Install(InstallArgs),
+
+    /// Write the GitHub Actions workflow that runs this repo's action on pull requests.
+    Ci(CiArgs),
 
     /// Write a shell completion script to stdout.
     ///
@@ -623,6 +626,47 @@ struct InstallArgs {
     dir: std::path::PathBuf,
 }
 
+/// Everything `sim-doctor ci` takes.
+#[derive(Args)]
+struct CiArgs {
+    #[command(subcommand)]
+    action: CiAction,
+}
+
+#[derive(Subcommand)]
+enum CiAction {
+    /// Write .github/workflows/sim-doctor.yml, pinned to this version's tag.
+    ///
+    /// Refuses to write through a symlink, keeps a differing existing file
+    /// unless --force, and validates every value before writing anything.
+    Install {
+        /// Build the software card on the runner (CI has no card otherwise).
+        #[arg(long, value_parser = ["true", "false"], default_value = "true")]
+        swsim: String,
+        /// Committed baseline path (letters, digits and . _ / - only).
+        #[arg(long, value_name = "PATH", default_value = ".sim-doctor/baseline.json")]
+        baseline: String,
+        /// Fail the job when the baseline file is missing.
+        #[arg(long, value_parser = ["true", "false"], default_value = "true")]
+        require_baseline: String,
+        /// Pass --severity to the scan.
+        #[arg(long)]
+        severity: Option<rules::Severity>,
+        /// The action ref to pin (default: v<this version>; it exists once that release is cut).
+        #[arg(long = "ref", value_name = "REF")]
+        ref_: Option<String>,
+        /// Project root to write under (default: the current directory).
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        dir: std::path::PathBuf,
+        /// Overwrite a differing existing workflow.
+        #[arg(long)]
+        force: bool,
+        /// Print the workflow instead of writing it.
+        #[arg(long)]
+        print_only: bool,
+    },
+}
+
 /// Everything `sim-doctor completions` takes.
 #[derive(Args)]
 struct CompletionsArgs {
@@ -653,6 +697,7 @@ fn main() -> process::ExitCode {
         Command::Scan(args) => run_scan(args),
         Command::Install(args) => run_install(args),
         Command::Completions(args) => run_completions(args),
+        Command::Ci(args) => run_ci(args),
         Command::Rules(args) => match args.action {
             None => run_rules_list(false),
             Some(RulesAction::List { json }) => run_rules_list(json),
@@ -910,6 +955,59 @@ fn run_install(args: InstallArgs) -> contract::ExitCode {
         }
     }
     contract::ExitCode::Success
+}
+
+/// Runs `sim-doctor ci install`: plain text, no envelope.
+fn run_ci(args: CiArgs) -> contract::ExitCode {
+    let CiAction::Install {
+        swsim,
+        baseline,
+        require_baseline,
+        severity,
+        ref_,
+        dir,
+        force,
+        print_only,
+    } = args.action;
+    let options = ci::Options {
+        swsim: swsim == "true",
+        baseline,
+        require_baseline: require_baseline == "true",
+        severity,
+    };
+    let ref_ = ref_.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+    match ci::install(&dir, &options, &ref_, force, print_only) {
+        Ok(ci::InstallOutcome::Printed(text)) => {
+            match emit_stdout(text.trim_end_matches('\n'), "the workflow") {
+                Ok(()) => contract::ExitCode::Success,
+                Err(message) => {
+                    eprintln!("sim-doctor: {message}");
+                    contract::ExitCode::Findings
+                }
+            }
+        }
+        Ok(ci::InstallOutcome::Wrote(path)) => {
+            println!("wrote {}", path.display());
+            eprintln!(
+                "next: commit a baseline first (`sim-doctor scan --baseline {}`), because require-baseline fails the first run without one.",
+                options.baseline
+            );
+            eprintln!("next: the pinned ref {ref_} only exists once that release is tagged.");
+            contract::ExitCode::Success
+        }
+        Ok(ci::InstallOutcome::Unchanged(path)) => {
+            println!("unchanged {}", path.display());
+            contract::ExitCode::Success
+        }
+        Err(err @ ci::CiError::Invalid(_)) => {
+            eprintln!("sim-doctor: {err}");
+            contract::ExitCode::InvalidUsage
+        }
+        Err(err) => {
+            eprintln!("sim-doctor: {err}");
+            contract::ExitCode::Findings
+        }
+    }
 }
 
 /// Runs `sim-doctor completions` and returns the exit code for it.

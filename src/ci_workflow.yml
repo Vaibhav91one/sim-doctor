@@ -1,0 +1,26 @@
+# Written by `sim-doctor ci install`. On each pull request, scan the card and fail only on findings that are new
+# compared with the committed baseline.
+name: sim-doctor
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # one summary comment, updated in place
+  security-events: write # SARIF upload to code scanning
+
+jobs:
+  sim-doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Vaibhav91one/sim-doctor@__REF__
+        with:
+          swsim: "__SWSIM__"
+          baseline: "__BASELINE__"
+          require-baseline: "__REQUIRE_BASELINE__"
+__SEVERITY__          comment: "true"
+          upload-sarif: "true"

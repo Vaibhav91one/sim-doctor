@@ -243,6 +243,29 @@ What is verified: the script logic (gate mapping, argv, summary, sanitising of c
 real baseline, and acceptance of the SARIF by code scanning, are not verified. The `@<tag>` ref above exists only once a
 release is cut.
 
+### `sim-doctor ci install`
+
+Writes `.github/workflows/sim-doctor.yml`: on every `pull_request` it checks out with full history and runs the action
+above, pinned to the version that wrote it.
+
+```sh
+sim-doctor ci install [--dir DIR] [--force] [--print-only] [--swsim true|false] [--baseline PATH]
+                      [--require-baseline true|false] [--severity LEVEL] [--ref REF]
+```
+
+Defaults: `--swsim true` (a CI runner has no card otherwise), `--baseline .sim-doctor/baseline.json`,
+`--require-baseline true`, no `--severity`, `--ref v<this version>`, `--dir .`. There is no `paths:` filter, because a card
+has no files in the repository.
+
+Safety: every value is validated before anything is written, because it lands inside YAML. `--baseline` allows only
+`A-Za-z0-9._/-`, no leading `-` or `/`, no `..`; `--ref` must match `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; an empty value is
+refused, not defaulted; a bad value exits 129 with a message on stderr and writes nothing. It refuses to write through a
+symlink anywhere from `--dir` down to the file (exit 1). A differing existing file is kept unless `--force` (exit 1); an
+identical one is not a conflict. `--print-only` prints the workflow and writes nothing. Output is plain text
+(`wrote <path>`), not an envelope.
+
+The file is written atomically (a temp file renamed over the target); a directory at the path is always refused. After a write, two hints go to stderr: commit a baseline first with `sim-doctor scan --baseline <path>` (with the default `--require-baseline true` the first run fails without one), and the pinned ref `v<version>` exists only once that release is tagged; until then pass `--ref main` or another existing ref. `--baseline` and `--ref` also refuse `__`, and `--baseline` refuses `.` and a trailing `/`; `--ref` refuses `..`, a trailing `/` and `.lock`.
+
 ## Documentation
 
 | File | Purpose |

@@ -1581,3 +1581,123 @@ fn scan_tui_is_listed_and_conflicts_with_json() {
     assert_eq!(both.code(), 129, "{:?}", both.stderr);
     assert_eq!(both.stdout, "");
 }
+
+mod ci_install {
+    use super::*;
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sim-doctor-ci-proc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn print_only_prints_the_workflow_and_exits_0() {
+        let run = run_piped(&["ci", "install", "--print-only"]);
+        assert_eq!(run.code(), 0, "{}", run.stderr);
+        assert!(run
+            .stdout
+            .starts_with("# Written by `sim-doctor ci install`."));
+        assert!(run.stdout.contains(concat!(
+            "Vaibhav91one/sim-doctor@v",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn a_hostile_baseline_is_a_usage_error_with_nothing_on_stdout() {
+        let dir = tempdir("hostile");
+        let run = run_piped(&[
+            "ci",
+            "install",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--baseline",
+            "$(id)",
+        ]);
+        assert_eq!(run.code(), 129, "{}", run.stderr);
+        assert_eq!(run.stdout, "");
+        assert!(run.stderr.contains("--baseline"), "{}", run.stderr);
+        assert!(!dir.join(".github").exists());
+        for bad in [
+            &["--baseline", ""][..],
+            &["--ref", ""],
+            &["--swsim", "maybe"],
+        ] {
+            let mut args = vec!["ci", "install", "--dir", dir.to_str().unwrap()];
+            args.extend_from_slice(bad);
+            let run = run_piped(&args);
+            assert_eq!(run.code(), 129, "{bad:?}: {}", run.stderr);
+            assert_eq!(run.stdout, "");
+        }
+        assert!(!dir.join(".github").exists());
+    }
+
+    #[test]
+    fn dir_writes_the_workflow_and_a_differing_one_is_kept() {
+        let dir = tempdir("write");
+        let d = dir.to_str().unwrap();
+        let run = run_piped(&["ci", "install", "--dir", d, "--severity", "high"]);
+        assert_eq!(run.code(), 0, "{}", run.stderr);
+        let file = dir.join(".github/workflows/sim-doctor.yml");
+        assert!(run.stdout.starts_with("wrote "), "{}", run.stdout);
+        assert!(std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("severity: \"high\""));
+
+        std::fs::write(&file, "mine\n").unwrap();
+        let run = run_piped(&["ci", "install", "--dir", d]);
+        assert_eq!(run.code(), 1);
+        assert!(run.stderr.contains("--force"), "{}", run.stderr);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine\n");
+        assert_eq!(
+            run_piped(&["ci", "install", "--dir", d, "--force"]).code(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_successful_write_tells_the_next_steps_on_stderr_only() {
+        let dir = tempdir("hints");
+        let d = dir.to_str().unwrap();
+        let run = run_piped(&["ci", "install", "--dir", d, "--baseline", "ci/b.json"]);
+        assert_eq!(run.code(), 0, "{}", run.stderr);
+        assert!(
+            run.stdout.starts_with("wrote ") && run.stdout.lines().count() == 1,
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stderr.contains("sim-doctor scan --baseline ci/b.json"),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "{}",
+            run.stderr
+        );
+        assert!(run.stderr.contains("tagged"), "{}", run.stderr);
+
+        let again = run_piped(&["ci", "install", "--dir", d, "--baseline", "ci/b.json"]);
+        assert_eq!(again.code(), 0);
+        assert!(again.stdout.starts_with("unchanged "), "{}", again.stdout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workflows_dir_is_refused_with_the_victim_untouched() {
+        let dir = tempdir("symlink");
+        let outside = tempdir("symlink-outside");
+        std::fs::create_dir_all(dir.join(".github")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(".github/workflows")).unwrap();
+        let run = run_piped(&["ci", "install", "--dir", dir.to_str().unwrap(), "--force"]);
+        assert_eq!(run.code(), 1);
+        assert_eq!(run.stdout, "");
+        assert!(run.stderr.contains("symlink"), "{}", run.stderr);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+}

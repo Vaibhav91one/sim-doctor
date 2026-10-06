@@ -21,6 +21,7 @@
 //! layer 0  contract   JSON envelope and process exit codes
 //! layer 0  mcp        the stdio MCP server; runs the binary itself, imports nothing
 //! layer 0  signals    the SIGINT flag, and when it may be acted on
+//! layer 1  ci         the pull-request workflow that runs the action (rules only)
 //! layer 1  fcp        the caller-supplied tag table of a file capabilities
 //!                template, and the file metadata read through it
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
@@ -100,6 +101,7 @@
 
 pub mod apdu;
 pub mod baseline;
+pub mod ci;
 pub mod contract;
 pub mod der;
 pub mod fcp;
@@ -178,6 +180,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: skill::NAME,
         owns: "The agent skill text and writing it (SKILL.md, a Cursor rule, an AGENTS.md block) under a project root.",
         depends_on: &[],
+    },
+    ModuleInfo {
+        name: ci::NAME,
+        owns: "The GitHub Actions workflow that runs this repo's action, validated before it is written, and writing it under a project root without following a symlink.",
+        depends_on: &[rules::NAME],
     },
     ModuleInfo {
         name: fix::NAME,
