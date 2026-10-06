@@ -41,6 +41,20 @@ sim-doctor install
 - [Design principles](#design-principles)
 - [License](#license)
 
+## MCP server
+
+`sim-doctor mcp` serves three tools over stdio (JSON-RPC 2.0, MCP protocol 2024-11-05) so a coding agent can call sim-doctor without shelling out:
+
+- `scan`: a card scan; needs a card and a reader. Its arguments are generated from `scan --help`.
+- `rules_list`: the rule catalogue. No card.
+- `rules_explain`: one rule by `id`. No card.
+
+`baseline`, `diff` and `sarif` are deliberately not exposed: they read or write files, and an agent could overwrite one. `json` is always on. Each call runs `sim-doctor` itself as a subprocess and returns its JSON envelope unchanged as the tool text. Exit 0 and 1 are normal results (isError false): exit 1 from `scan` is findings, regressed, or a refusal that carries `data.error`, and the envelope is returned as is. 129, 130 or any other exit is a tool error (isError true) carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything.
+
+Calls are handled serially, one at a time. Each child is killed after 300 seconds (override with `SIM_DOCTOR_MCP_TIMEOUT_SECONDS`; 0 or a non-number means the default) and the call returns an error saying it timed out. Captured stdout and stderr are each capped at 16 MiB; a truncated result is an error and says so. A scan holds the PC/SC reader only while its child runs, so the reader is released when the scan finishes or is killed. Ctrl-C ends the server.
+
+Tested through the real process: the initialize, tools/list and tools/call handshake, `rules_list`, refusal of file-flag arguments, and Ctrl-C. `scan` itself is not exercised through the server (it needs a card). Acceptance by specific agent clients is unverified.
+
 ## Get started
 
 ### 1. Install

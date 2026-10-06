@@ -1425,3 +1425,145 @@ mod fix_handoff {
         assert!(!stderr.contains("$ claude"), "{stderr}");
     }
 }
+
+mod mcp_server {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn mcp_speaks_json_rpc_and_nothing_else_on_stdout() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rules_list","arguments":{}}}"#,
+            "\n",
+        );
+        let output = {
+            let _guard = spawn_lock();
+            let mut child = Command::new(binary())
+                .arg("mcp")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("run the binary");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output().expect("wait")
+        };
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l}: {e}")))
+            .collect();
+        assert_eq!(lines.len(), 3, "{stdout}");
+        for l in &lines {
+            assert_eq!(l["jsonrpc"], "2.0");
+        }
+        assert_eq!(lines[0]["result"]["serverInfo"]["name"], "sim-doctor");
+
+        let tools = lines[1]["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["scan", "rules_list", "rules_explain"]);
+        let props = tools[0]["inputSchema"]["properties"].as_object().unwrap();
+        for hidden in ["baseline", "diff", "sarif", "json"] {
+            assert!(!props.contains_key(hidden), "{hidden} exposed");
+        }
+        for shown in ["reader", "max-depth", "score", "severity", "dialect"] {
+            assert!(props.contains_key(shown), "{shown} missing");
+        }
+
+        assert_eq!(lines[2]["result"]["isError"], false, "{}", lines[2]);
+        let text = lines[2]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("gsma/msl-zero-allowed"), "{text}");
+        let envelope: serde_json::Value = serde_json::from_str(text).expect("the rules envelope");
+        assert!(envelope["payload"]["data"]["rules"].is_array(), "{text}");
+    }
+
+    /// Sends `input` to a real `sim-doctor mcp`, closes stdin, returns the response lines.
+    fn mcp_session(input: &str) -> Vec<serde_json::Value> {
+        let _guard = spawn_lock();
+        let mut child = Command::new(binary())
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the binary");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().expect("wait");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_real_server_refuses_file_flags_without_starting_a_scan() {
+        let call = |args: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"scan\",\"arguments\":{args}}}}}\n"
+            )
+        };
+        let input = format!(
+            "{}{}{}",
+            call(r#"{"baseline":"x.json"}"#),
+            call(r#"{"reader":"--baseline=x"}"#),
+            "\u{ff}not json\n"
+        );
+        let lines = mcp_session(&input);
+        assert_eq!(lines.len(), 3);
+        for l in &lines[..2] {
+            assert_eq!(l["result"]["isError"], true, "{l}");
+            // A started scan would have said something about a reader or a card.
+            let text = l["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("baseline") || text.contains("start with"),
+                "{text}"
+            );
+        }
+        assert_eq!(lines[2]["error"]["code"], -32700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_ends_the_mcp_server() {
+        let _guard = spawn_lock();
+        let mut child = Command::new(binary())
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run the binary");
+        // Round-trip one request so the server has certainly run past its startup.
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .unwrap();
+        let mut first = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+            &mut first,
+        )
+        .unwrap();
+        assert!(first.contains("result"), "{first}");
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+        drop(stdin);
+    }
+}
