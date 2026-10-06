@@ -149,6 +149,18 @@ enum Command {
     /// The script IS the document here, so it is written to stdout and nothing
     /// else is. It is not JSON, so --json does not apply to this subcommand.
     Completions(CompletionsArgs),
+
+    /// List the rules a scan runs, or explain one, without a card.
+    ///
+    /// With no subcommand this is `rules list`.
+    Rules(RulesArgs),
+
+    /// Explain a rule, or every rule in a saved `scan --json` envelope.
+    ///
+    /// The argument is a rule id (like `rules explain`) or the path of an
+    /// existing file holding a saved `sim-doctor scan --json` envelope. There
+    /// is no persisted "last scan": save one with `scan --json > scan.json`.
+    Why(WhyArgs),
 }
 
 /// The long description of `sim-doctor scan`.
@@ -501,6 +513,41 @@ struct ScanArgs {
 /// in CONTEXT.md section 3.
 const FINDINGS_FAIL_A_SCAN: bool = false;
 
+/// Everything `sim-doctor rules` takes.
+#[derive(Args)]
+struct RulesArgs {
+    #[command(subcommand)]
+    action: Option<RulesAction>,
+}
+
+#[derive(Subcommand)]
+enum RulesAction {
+    /// One row per rule: id, severity, summary.
+    List {
+        /// Emit one JSON envelope of kind "rules" on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What a rule means and how to fix it.
+    Explain {
+        /// The rule id, such as gsma/msl-zero-allowed.
+        id: String,
+        /// Emit one JSON envelope of kind "rules" on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Everything `sim-doctor why` takes.
+#[derive(Args)]
+struct WhyArgs {
+    /// A rule id, or the path of a saved `sim-doctor scan --json` envelope.
+    target: String,
+    /// Emit one JSON envelope of kind "rules" on stdout.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args)]
 struct ModulesArgs {
     /// Emit the JSON envelope on stdout instead of a human-readable table.
@@ -554,6 +601,12 @@ fn main() -> process::ExitCode {
         Command::Scan(args) => run_scan(args),
         Command::Install(args) => run_install(args),
         Command::Completions(args) => run_completions(args),
+        Command::Rules(args) => match args.action {
+            None => run_rules_list(false),
+            Some(RulesAction::List { json }) => run_rules_list(json),
+            Some(RulesAction::Explain { id, json }) => run_why_rule(&id, json),
+        },
+        Command::Why(args) => run_why(&args.target, args.json),
     })
 }
 
@@ -1192,6 +1245,192 @@ fn limits_from(args: &ScanArgs) -> Limits {
         limits.max_directories = value;
     }
     limits
+}
+
+const RULES_KIND: &str = "rules";
+
+/// One rule's page, as JSON.
+fn rule_json(spec: &sim_doctor::rules::RuleSpec) -> serde_json::Value {
+    serde_json::json!({
+        "id": spec.id().as_str(),
+        "severity": spec.severity().id(),
+        "summary": spec.summary(),
+        "remediation": spec.remediation(),
+    })
+}
+
+/// One rule's page, as text.
+fn rule_page(spec: &sim_doctor::rules::RuleSpec) -> String {
+    format!(
+        "{}  [{}]\n\nWhat it means\n  {}\n\nHow to fix\n  {}\n",
+        spec.id().as_str(),
+        spec.severity().id(),
+        spec.summary(),
+        spec.remediation().unwrap_or("(none declared)"),
+    )
+}
+
+/// Prints one success document: the envelope under --json, else `text`.
+fn emit_rules(json: bool, data: serde_json::Value, text: String) -> contract::ExitCode {
+    let rendered = if json {
+        match contract::Envelope::new(
+            RULES_KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        )
+        .to_json()
+        {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("sim-doctor: {err}");
+                return contract::ExitCode::Findings;
+            }
+        }
+    } else {
+        text.trim_end().to_owned()
+    };
+    match emit_stdout(&rendered, "the rules document") {
+        Ok(()) => contract::ExitCode::Success,
+        Err(message) => {
+            eprintln!("sim-doctor: {message}");
+            contract::ExitCode::Findings
+        }
+    }
+}
+
+fn run_rules_list(json: bool) -> contract::ExitCode {
+    let specs = scan::specs();
+    let mut text = format!("{:<28}  {:<8}  SUMMARY\n", "RULE", "SEVERITY");
+    for spec in &specs {
+        text.push_str(&format!(
+            "{:<28}  {:<8}  {}\n",
+            spec.id().as_str(),
+            spec.severity().id(),
+            spec.summary()
+        ));
+    }
+    let data = serde_json::json!({ "rules": specs.iter().map(rule_json).collect::<Vec<_>>() });
+    emit_rules(json, data, text)
+}
+
+/// Edit distance between two short ids, for did-you-mean.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+/// The nearest known id to `id`, if it is close enough to be a typo.
+fn nearest_rule(specs: &[sim_doctor::rules::RuleSpec], id: &str) -> Option<String> {
+    specs
+        .iter()
+        .map(|spec| (edit_distance(spec.id().as_str(), id), spec.id().as_str()))
+        .min()
+        .filter(|(distance, _)| *distance <= 3)
+        .map(|(_, name)| name.to_owned())
+}
+
+fn unknown_rule(specs: &[sim_doctor::rules::RuleSpec], id: &str, json: bool) -> contract::ExitCode {
+    let near = nearest_rule(specs, id);
+    let mut message = format!("unknown rule `{id}`");
+    if let Some(near) = &near {
+        message.push_str(&format!("; did you mean `{near}`?"));
+    }
+    report_refusal(
+        RULES_KIND,
+        &message,
+        serde_json::json!({ "error": message, "did_you_mean": near }),
+        json,
+    )
+}
+
+fn run_why_rule(id: &str, json: bool) -> contract::ExitCode {
+    let specs = scan::specs();
+    match specs.iter().find(|spec| spec.id().as_str() == id) {
+        Some(spec) => emit_rules(
+            json,
+            serde_json::json!({ "rule": rule_json(spec) }),
+            rule_page(spec),
+        ),
+        None => unknown_rule(&specs, id, json),
+    }
+}
+
+/// Explains a rule id, or every rule in a saved scan envelope.
+fn run_why(target: &str, json: bool) -> contract::ExitCode {
+    if !std::path::Path::new(target).is_file() {
+        return run_why_rule(target, json);
+    }
+    let refuse = |message: String| {
+        report_refusal(
+            RULES_KIND,
+            &message,
+            serde_json::json!({ "error": message }),
+            json,
+        )
+    };
+    let raw = match std::fs::read_to_string(target) {
+        Ok(raw) => raw,
+        Err(err) => return refuse(format!("cannot read {target}: {err}")),
+    };
+    let envelope: contract::Envelope = match serde_json::from_str(&raw) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            return refuse(format!(
+                "{target} is not a saved sim-doctor envelope: {err}"
+            ))
+        }
+    };
+    let Some(findings) = envelope.payload().data()["findings"]["findings"].as_array() else {
+        return refuse(format!(
+            "{target} carries no data.findings.findings; was it saved from `scan --json`?"
+        ));
+    };
+
+    // (rule id, severity, count), in first-seen order.
+    let mut seen: Vec<(String, String, usize)> = Vec::new();
+    for finding in findings {
+        let rule = finding["rule"].as_str().unwrap_or("(unnamed)");
+        match seen.iter_mut().find(|(id, _, _)| id == rule) {
+            Some(entry) => entry.2 += 1,
+            None => seen.push((
+                rule.to_owned(),
+                finding["severity"].as_str().unwrap_or("?").to_owned(),
+                1,
+            )),
+        }
+    }
+
+    let specs = scan::specs();
+    let mut text = String::new();
+    let mut rules = Vec::new();
+    for (id, severity, count) in &seen {
+        text.push_str(&format!("{id}  [{severity}]  {count} finding(s)\n"));
+        let spec = specs.iter().find(|spec| spec.id().as_str() == id);
+        match spec {
+            Some(spec) => text.push_str(&rule_page(spec)),
+            None => text.push_str("  no catalog entry for this rule in this build\n"),
+        }
+        text.push('\n');
+        rules.push(serde_json::json!({
+            "id": id, "severity": severity, "count": count,
+            "rule": spec.map(rule_json),
+        }));
+    }
+    if seen.is_empty() {
+        text.push_str("no findings in this envelope\n");
+    }
+    emit_rules(json, serde_json::json!({ "rules": rules }), text)
 }
 
 /// Reports a scan that could not run, and returns exit code 1.

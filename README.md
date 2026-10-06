@@ -112,6 +112,7 @@ built-in PCSC framework.
 | `install [--agent claude\|cursor\|codex\|opencode] [--print-only] [--dir DIR]` | write agent guidance into a project |
 | `modules [--json]` | describe the crate's module roots and layering |
 | `completions <shell>` | shell completion script for the whole flag surface |
+| `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 

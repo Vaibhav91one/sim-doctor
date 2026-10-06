@@ -1814,6 +1814,20 @@ impl<S> Registry<S> {
         producer: Producer<S>,
         evidence: HadEvidence<S>,
     ) -> Result<&Rule<S>, RegistryError> {
+        // A rule with no remediation cannot be explained, and a rule with no
+        // summary explains nothing: both are bugs in the rule, not features the
+        // caller can work around, so they are refused at registration rather than
+        // rendered as blanks later by `rules explain` / `why`.
+        if spec.remediation().is_none() {
+            return Err(RegistryError::MissingRemediation {
+                id: spec.id().clone(),
+            });
+        }
+        if spec.summary().trim().is_empty() {
+            return Err(RegistryError::EmptySummary {
+                id: spec.id().clone(),
+            });
+        }
         if let Some(existing) = self.get(spec.id()) {
             return Err(RegistryError::DuplicateRule {
                 id: spec.id().clone(),
@@ -1987,6 +2001,22 @@ pub enum RegistryError {
         /// The ID the finding claimed.
         claimed: RuleId,
     },
+
+    /// A rule spec declared without a remediation, which an agent cannot act on.
+    #[error(
+        "rule ID {id} has no remediation; an explainable rule must say how to fix its finding"
+    )]
+    MissingRemediation {
+        /// The ID of the rule that has nothing to offer.
+        id: RuleId,
+    },
+
+    /// A rule spec with an empty summary, which explains nothing.
+    #[error("rule ID {id} has an empty summary; an explainable rule must say what it means")]
+    EmptySummary {
+        /// The ID of the rule whose summary is blank.
+        id: RuleId,
+    },
 }
 
 #[cfg(test)]
@@ -2020,6 +2050,7 @@ mod finding_tests {
             Severity::High,
             "a file the card would not give up",
         )
+        .with_remediation("unlock the file or confirm it is intentionally absent")
     }
 
     #[test]
@@ -2482,7 +2513,7 @@ mod finding_tests {
         // The refusal changed nothing: one rule, and it is still the first one.
         assert_eq!(registry.len(), 1);
         assert!(registry.contains(&RuleId::new("filesystem/unreadable-ef").unwrap()));
-        assert!(registry.rules()[0].spec().remediation().is_none());
+        assert!(registry.rules()[0].spec().remediation().is_some());
 
         // A different plugin namespace is a different ID and does register.
         registry
@@ -2501,6 +2532,90 @@ mod finding_tests {
             ]
         );
         assert!(registry.get(&RuleId::new("fs/nothing").unwrap()).is_none());
+    }
+
+    /// A spec without a remediation cannot explain itself and is refused.
+    ///
+    /// `sim-doctor rules explain` and `sim-doctor why` must always have a "How
+    /// to fix" line to show, so a rule that registered without one is a bug in
+    /// the rule, not a feature: it is refused at registration rather than
+    /// rendered as a blank section later.
+    #[test]
+    fn the_registry_refuses_a_rule_spec_with_no_remediation() {
+        let mut registry: Registry<NoSubject> = Registry::new();
+        let spec = RuleSpec::new(
+            RuleId::new("gsma/msl-zero-allowed").unwrap(),
+            Severity::Critical,
+            "the card accepted TAR 000000, so it runs at MSL 0",
+        );
+
+        let error = registry
+            .register(spec, |_: &NoSubject| Vec::new(), |_: &NoSubject| true)
+            .expect_err("a spec with no remediation must be refused");
+
+        assert!(
+            matches!(
+                error,
+                RegistryError::MissingRemediation { ref id }
+                    if id.as_str() == "gsma/msl-zero-allowed"
+            ),
+            "got {error}"
+        );
+        assert!(
+            registry.is_empty(),
+            "the refused rule must not have been registered"
+        );
+    }
+
+    /// A spec with an empty summary explains nothing and is refused.
+    #[test]
+    fn the_registry_refuses_a_rule_spec_with_an_empty_summary() {
+        let mut registry: Registry<NoSubject> = Registry::new();
+        let spec = RuleSpec::new(
+            RuleId::new("gsma/msl-zero-allowed").unwrap(),
+            Severity::Critical,
+            "   ",
+        )
+        .with_remediation("raise MSL and reload the card");
+
+        let error = registry
+            .register(spec, |_: &NoSubject| Vec::new(), |_: &NoSubject| true)
+            .expect_err("a spec with an empty summary must be refused");
+
+        assert!(
+            matches!(
+                error,
+                RegistryError::EmptySummary { ref id }
+                    if id.as_str() == "gsma/msl-zero-allowed"
+            ),
+            "got {error}"
+        );
+        assert!(
+            registry.is_empty(),
+            "the refused rule must not have been registered"
+        );
+    }
+
+    /// A spec with both a summary and a remediation registers cleanly.
+    #[test]
+    fn a_complete_rule_spec_registers() {
+        let mut registry: Registry<NoSubject> = Registry::new();
+        let spec = RuleSpec::new(
+            RuleId::new("gsma/msl-zero-allowed").unwrap(),
+            Severity::Critical,
+            "the card accepted TAR 000000, so it runs at MSL 0",
+        )
+        .with_remediation("raise MSL and reload the card");
+
+        registry
+            .register(spec, |_: &NoSubject| Vec::new(), |_: &NoSubject| true)
+            .expect("a complete spec registers");
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.rules()[0].spec().remediation(),
+            Some("raise MSL and reload the card"),
+        );
     }
 
     #[test]

@@ -1194,3 +1194,68 @@ fn the_human_modes_of_the_same_matrix_print_no_report_when_the_scan_cannot_run()
         );
     }
 }
+
+/// Issue #46: the rule catalog needs no card, so these run the binary bare.
+mod rule_catalog {
+    use super::*;
+
+    const RULE: &str = "gsma/msl-zero-allowed";
+
+    fn saved_envelope(name: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("sim-doctor-{name}-{}.json", std::process::id()));
+        std::fs::write(&path, body).expect("write the temp file");
+        path
+    }
+
+    #[test]
+    fn rules_list_json_is_one_envelope_naming_the_rule() {
+        let run = run_piped(&["rules", "list", "--json"]);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Success);
+        assert_eq!(envelope.kind(), "rules");
+        let listed = envelope.payload().data()["rules"].to_string();
+        assert!(listed.contains(RULE), "{listed}");
+    }
+
+    #[test]
+    fn rules_explain_prints_summary_and_remediation() {
+        let run = run_piped(&["rules", "explain", RULE]);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        assert!(run.stdout.contains(RULE), "{}", run.stdout);
+        assert!(run.stdout.contains("What it means"), "{}", run.stdout);
+        assert!(run.stdout.contains("How to fix"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn rules_explain_unknown_id_refuses_and_suggests_the_near_miss() {
+        let run = run_piped(&["rules", "explain", "gsma/msl-zero-allowd", "--json"]);
+        assert_eq!(run.code(), 1, "{:?}", run.stderr);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        let data = envelope.payload().data();
+        assert!(data["error"].is_string(), "{data}");
+        assert!(data.to_string().contains(RULE), "no suggestion: {data}");
+    }
+
+    #[test]
+    fn why_a_saved_envelope_explains_the_rules_in_its_findings() {
+        let path = saved_envelope(
+            "why-ok",
+            r#"{"type":"scan","payload":{"code":0,"message":"ok","data":{"findings":{"findings":[{"rule":"gsma/msl-zero-allowed","severity":"high","message":"TAR 000000 accepted"}]}}}}"#,
+        );
+        let run = run_piped(&["why", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 0, "{:?}", run.stderr);
+        assert!(run.stdout.contains(RULE), "{}", run.stdout);
+        assert!(run.stdout.contains("How to fix"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn why_garbage_file_refuses() {
+        let path = saved_envelope("why-bad", "this is not an envelope");
+        let run = run_piped(&["why", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(run.code(), 1, "{:?}", run.stderr);
+        assert_eq!(run.stdout, "");
+    }
+}
