@@ -367,15 +367,17 @@ jobs:
           # ONLY place it can be: on a cardless machine both flags fail at
           # reader discovery before producing a score block at all.
           #
-          # The COUNT moved from 3 to 4 with that test. It is a count rather
+          # The COUNT moved from 3 to 4 with that test, and from 4 to 5 with
+          # issue #12's baseline test. It is a count rather
           # than only names because `--ignored` against a deleted test still
           # exits 0; the names pin the set and the count is what fails when a
           # fifth test is added and not wired up here.
-          grep -q '4 passed' "$log"
+          grep -q '5 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
           grep -q 'scans_a_real_card_end_to_end' "$log"
           grep -q 'the_score_and_severity_flags_reach_the_envelope_against_a_real_card' "$log"
+          grep -q 'a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job
@@ -409,6 +411,12 @@ jobs:
           grep -q 'severity/score: rules_run is 1 but the audit probed nothing' "$log"
           grep -q 'severity/score: --severity critical --score scored what the report shows' "$log"
           grep -q 'severity/score: the human report printed the formula and no no-rules warning' "$log"
+
+          # Issue #12's baseline test: it saved a baseline and read it back, and
+          # the diff against that truncated baseline was refused. These are the
+          # lines it prints on the way, so a green job means both ran.
+          grep -q 'baseline/diff: saved a baseline to' "$log"
+          grep -q 'baseline/diff: diffed a second run against the truncated baseline' "$log"
 
           # Issue #4's test got as far as the SELECT MF and READ BINARY round
           # trips.
