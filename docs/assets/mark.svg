@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="-2 -2 68 68">
+  <style>.m{stroke:#111}@media (prefers-color-scheme:dark){.m{stroke:#eee}}</style>
+  <g class="m" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 6H38L50 18V58H18Z"/>
+    <rect x="24" y="16" width="20" height="14" rx="2.5"/>
+    <path d="M34 16V30M24 23H44"/>
+    <path d="M8 44H25L29.5 35L35 54L39 44H60"/>
+  </g>
+</svg>

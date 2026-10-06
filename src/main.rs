@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, contract, rules, scan, session, signals, tar,
+    baseline, contract, rules, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         ReaderName, ReaderProvider,
@@ -127,6 +127,14 @@ enum Command {
     /// cannot parse, 130 if you interrupt it.
     #[command(long_about = SCAN_LONG_ABOUT)]
     Scan(ScanArgs),
+
+    /// Write agent guidance (Claude skill, Cursor rule, AGENTS.md block) into a project.
+    ///
+    /// Teaches a coding agent to run `sim-doctor scan --json` and read the
+    /// envelope. Writes `.claude/skills/sim-doctor/SKILL.md`,
+    /// `.cursor/rules/sim-doctor.mdc` and a marked block in `AGENTS.md`
+    /// (replaced in place on re-run; the rest of the file is untouched).
+    Install(InstallArgs),
 
     /// Write a shell completion script to stdout.
     ///
@@ -500,6 +508,22 @@ struct ModulesArgs {
     json: bool,
 }
 
+/// Everything `sim-doctor install` takes.
+#[derive(Args)]
+struct InstallArgs {
+    /// Install for one agent only; omit for all of them.
+    #[arg(long, value_parser = skill::Agent::NAMES)]
+    agent: Option<String>,
+
+    /// Print what would be written instead of writing it.
+    #[arg(long)]
+    print_only: bool,
+
+    /// Project root to write under (default: the current directory).
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    dir: std::path::PathBuf,
+}
+
 /// Everything `sim-doctor completions` takes.
 #[derive(Args)]
 struct CompletionsArgs {
@@ -528,6 +552,7 @@ fn main() -> process::ExitCode {
     exit(match cli.command {
         Command::Modules(args) => run_modules(args),
         Command::Scan(args) => run_scan(args),
+        Command::Install(args) => run_install(args),
         Command::Completions(args) => run_completions(args),
     })
 }
@@ -752,6 +777,32 @@ fn emit_stdout(text: &str, what: &str) -> Result<(), String> {
         // allowed to hide a flush that did not.
         .and_then(|()| handle.flush())
         .map_err(|e| format!("cannot write {what} to stdout: {e}"))
+}
+
+/// Runs `sim-doctor install`: write the agent guidance, or with `--print-only` show it.
+fn run_install(args: InstallArgs) -> contract::ExitCode {
+    let agent = args.agent.as_deref().and_then(skill::Agent::parse);
+    let mut printed = String::new();
+    for target in skill::targets(agent) {
+        if args.print_only {
+            printed.push_str(&format!("==> {}\n{}\n", target.path(), target.content()));
+        } else {
+            match skill::install(&args.dir, target) {
+                Ok(path) => println!("wrote {}", path.display()),
+                Err(err) => {
+                    eprintln!("sim-doctor: cannot write {}: {err}", target.path());
+                    return contract::ExitCode::Findings;
+                }
+            }
+        }
+    }
+    if args.print_only {
+        if let Err(message) = emit_stdout(printed.trim_end_matches('\n'), "the skill") {
+            eprintln!("sim-doctor: {message}");
+            return contract::ExitCode::Findings;
+        }
+    }
+    contract::ExitCode::Success
 }
 
 /// Runs `sim-doctor completions` and returns the exit code for it.

@@ -3,8 +3,14 @@ name = "sim-doctor"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "CLI-first SIM security testing tool"
+description = "CLI-first SIM/UICC/eUICC security testing tool: scans a card over PC/SC and reports findings as a table or one stable JSON envelope"
 license = "MIT"
+repository = "https://github.com/Vaibhav91one/sim-doctor"
+homepage = "https://github.com/Vaibhav91one/sim-doctor"
+readme = "README.md"
+keywords = ["sim", "uicc", "euicc", "smartcard", "security"]
+categories = ["command-line-utilities", "hardware-support"]
+exclude = [".issues/", ".github/", "npm/", "docs/assets/"]
 
 [dependencies]
 # --- Smartcard transport ---
