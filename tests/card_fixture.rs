@@ -1103,7 +1103,10 @@ fn scans_a_real_card_end_to_end() {
         "{data:#}"
     );
     assert!(
-        data["absent"].as_array().expect("absent is an array").len() > 0,
+        !data["absent"]
+            .as_array()
+            .expect("absent is an array")
+            .is_empty(),
         "probing the SIM identifier space must have found most of it missing"
     );
     assert!(data["refused"]
