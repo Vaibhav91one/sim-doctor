@@ -98,9 +98,8 @@ wrote ./AGENTS.md
 | cargo | `cargo install sim-doctor` |
 | Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/Vaibhav91one/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` |
 
-The npm package, the crate and the binaries are all published by the tagged-release workflow;
-until the first release is out, use `cargo install --git https://github.com/Vaibhav91one/sim-doctor`
-or, from a checkout, `cargo build --release`.
+The npm package, the crate and the binaries are all published by the tagged-release workflow.
+From a checkout, `cargo build --release` builds the same binary.
 
 Linux needs `libpcsclite` (build: `libpcsclite-dev`, run: `pcscd`). macOS uses the
 built-in PCSC framework.
