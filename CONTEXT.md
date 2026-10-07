@@ -60,8 +60,8 @@ heredocs inside template literals.
 | ~~`iso7816-tlv` over `der` for BER-TLV~~ **SUPERSEDED by issue #11** | The premise was right - `der` is strict DER and rejects real SIM BER lengths - and the conclusion was wrong. See the three rows below |
 | Development loop uses swSIM + swicc-pcsc | No hardware prerequisite for the test suite |
 | JSON envelope modelled on `lpac` | Best existing agent-friendly contract found |
-| **TS.48 in scope as a RUNNER, not transcribed profiles** | Owner decision. The profile definitions sit behind the same GSMA member login as SGP.22, so we build the executor that consumes operator-supplied profile files and stop there. Progress without pretending to spec access |
-| **No GSMA member access** | Owner decision. Every SGP.22 / TS.48 section number is provenance-backed from `euicc-rsp` source comments, never primary. Label accordingly, permanently |
+| **TS.48 in scope as a profile comparison (re-scoped 2026-10-07)** | TS.48 is public (Apache-2.0, `https://github.com/GSMATerminals/Generic-eUICC-Test-Profile-for-Device-Testing-Public`). It defines a test profile, not test cases, so #25 parses the public profile package and compares a card's file system against it, read-only. Supersedes the earlier "runner for operator-supplied profiles" decision, which assumed the profiles were behind a member login |
+| **SGP.22 and TS.48 are public (corrected 2026-10-07)** | SGP.22 v2.5 PDF: `https://www.gsma.com/solutions-and-impact/technologies/esim/wp-content/uploads/2023/05/SGP.22-v2.5.pdf`. Section numbers taken from `euicc-rsp` stay `[U]` until checked against it; eUICC issues upgrade them to `[V]` as they go |
 | **swSIM only, no physical reader for now** | Owner decision. Real-reader testing stays available later as a second fixture, not a redesign |
 | **Autonomous PR merging** | Owner decision. A subagent may implement, test, self-review and open a PR; it may **not** merge. An orchestrator verifies then merges |
 | **Serial, dependency-ordered delivery** | Owner decision. M1 is a strict chain, so parallel agents would collide on the contract and drift from it. Fan-out is deliberately rejected |
@@ -188,18 +188,15 @@ By value-per-effort:
 
 ## 5. Open questions
 
-**Does TS.48 belong in scope?** ANSWERED - yes, as a runner. See section 3.
+**Does TS.48 belong in scope?** ANSWERED - yes, as a comparison against the public profile package (re-scoped 2026-10-07). See section 3.
 
-**Is GSMA member access available?** ANSWERED - no. See section 3.
+**Is GSMA member access needed?** ANSWERED - no: SGP.22 and TS.48 are public. See section 3.
 
-**Hardware in the loop or not?** ANSWERED - swSIM only for now. See section 3.
+**Hardware in the loop or not?** ANSWERED - swSIM in CI, plus a live operator SIM used read-only on the owner's machine (from 2026-10-07: SELECT, GET RESPONSE, READ of metadata files, STATUS, GET DATA only; no PIN, auth, write, ENVELOPE or fuzzing). See section 3.
 
 These were the three questions this section used to carry. They are now decisions, and
-the answers are recorded above. The one question that remains genuinely open is a scope
-question for the end of M3: whether the TS.48 runner should also attempt to self-derive a
-small set of smoke profiles from SIMTester behaviour, or stay strictly operator-supplied.
-The current answer is strictly operator-supplied, because self-derived profiles would be
-tagged `[U]` and would create a false impression of conformance coverage.
+the answers are recorded above. The former open question (whether the TS.48 runner should
+self-derive smoke profiles) is moot: the real TS.48 profile is public, so #25 uses it directly.
 
 ---
 
@@ -226,7 +223,7 @@ Work is tracked as GitHub issues and delivered one at a time, in dependency orde
 | Phase 1 | transport, APDU, TLV, walker, contract, CLI | M1 acceptance passes |
 | Phase 2 | rule model, severity/score, baseline/diff, TUI | contract stable |
 | Phase 3 | the six feature modules, fuzzer last | each module emits findings through the contract |
-| Phase 4 | TS.48 runner | runner executes an operator-supplied profile |
+| Phase 4 | TS.48 profile comparison | a card's file system is compared against the public TS.48 profile |
 
 Per issue, one subagent: branch, implement, verify locally, self-review the diff, open a PR,
 watch CI. Then the orchestrator verifies independently and merges. A subagent never merges.
