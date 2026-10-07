@@ -198,7 +198,8 @@ pub fn access_of(tree: &Tree, node: &Node) -> Option<Access> {
                 parse_expanded(record)
             })
             .collect();
-        return Some(Access::across(&rules?)).filter(|_| !arr.records.is_empty());
+        let rules = rules?;
+        return (!rules.is_empty()).then(|| Access::across(&rules));
     }
     if let Some(expanded) = &caps.security_expanded {
         return parse_expanded(expanded);
