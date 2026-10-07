@@ -130,6 +130,11 @@ pub struct Policy {
     /// Both [`CLA_GET_RESPONSE_GSM`] and [`crate::apdu::CLA_GET_RESPONSE_ISO`]
     /// are supported because a card may dispatch INS `0xC0` at either and
     /// swSIM does not route the ISO one at all. \[V], swSIM src/apduh.c.
+    ///
+    /// A real USIM rejects the GSM class with `6E 00`/`6D 00` after a CLA 00
+    /// command and drops the pending data, so for a read-only command [`send`]
+    /// sends it once more and collects at the command's own class. Every
+    /// round trip, including the re-send, is recorded.
     pub get_response_class: u8,
 
     /// CLA for a FETCH follow-up. Defaults to [`CLA_FETCH_ETSI`].
@@ -436,6 +441,10 @@ pub fn send<S: CardSession + ?Sized>(
     follow_up(session, command, steps, response, data, stop, policy)
 }
 
+/// Instructions that change nothing on the card, so sending one a second time
+/// is safe: SELECT, READ BINARY, READ RECORD, STATUS, GET DATA.
+const READ_ONLY_INSTRUCTIONS: [u8; 6] = [0xA4, 0xB0, 0xB2, 0xF2, 0xCA, 0xCB];
+
 /// Issues the follow-up exchanges a status word says the card is owed.
 fn follow_up<S: CardSession + ?Sized>(
     session: &mut S,
@@ -446,6 +455,9 @@ fn follow_up<S: CardSession + ?Sized>(
     mut stop: StopReason,
     policy: &Policy,
 ) -> Result<Exchange, Error> {
+    let mut policy = *policy;
+    let policy = &mut policy;
+    let instruction = command.header().instruction();
     let mut follow_ups = 0usize;
     while let Some(status) = response.status() {
         let Some(choice) = follow_up_for(status, policy) else {
@@ -464,6 +476,30 @@ fn follow_up<S: CardSession + ?Sized>(
             break;
         };
         response = exchange(session, &mut steps, follow_up.encode()?)?;
+        // A real USIM answers a SELECT at CLA 00 with 61 xx but rejects the
+        // GSM-class GET RESPONSE with 6E 00 (class not supported), and that
+        // rejection discards the pending data: a GET RESPONSE at CLA 00 sent
+        // afterwards answers 6F 00. So the data has to be produced again.
+        // Once per logical command: re-send the command (only if it is a
+        // read-only instruction) and collect with GET RESPONSE at the
+        // command's own class. The class switch makes a second pass
+        // impossible, because the two classes are then equal.
+        let own_class = command.header().class();
+        if choice == PendingFollowUp::GetResponse
+            && own_class != policy.get_response_class
+            && READ_ONLY_INSTRUCTIONS.contains(&instruction)
+            && matches!(
+                response.status().map(|s| (s.sw1(), s.sw2())),
+                Some((0x6E | 0x6D, 0x00))
+            )
+        {
+            if let Ok(wire) = command.encode() {
+                response = exchange(session, &mut steps, wire)?;
+                data.extend_from_slice(response.body());
+                policy.get_response_class = own_class;
+                continue;
+            }
+        }
         follow_ups += 1;
         data.extend_from_slice(response.body());
     }
@@ -699,6 +735,62 @@ mod tests {
             assert_eq!(exchange.stop_reason(), StopReason::Answered);
             assert_eq!(exchange.data(), body.as_slice(), "61 {sw2:02X}");
         }
+    }
+
+    #[test]
+    fn a_rejected_get_response_class_re_sends_the_read_and_collects_at_the_commands_class() {
+        for sw1 in [0x6E, 0x6D] {
+            // The rejection discards the pending data, as the real card does,
+            // so the command has to be sent again before the second GET RESPONSE.
+            let mut card = Scripted::new([
+                vec![0x61, 0x04],
+                vec![sw1, 0x00],
+                vec![0x61, 0x04],
+                with_body(&[1, 2, 3, 4], 0x90, 0x00),
+            ]);
+            let exchange = send(&mut card, &probe(), &Policy::default()).unwrap();
+            assert_eq!(exchange.exchange_count(), 4);
+            let sent = exchange.steps();
+            assert_eq!(sent[1].command()[0], CLA_GET_RESPONSE_GSM);
+            assert_eq!(sent[2].command(), sent[0].command());
+            assert_eq!(
+                sent[3].command(),
+                [CLA_GET_RESPONSE_ISO, INS_GET_RESPONSE, 0, 0, 4]
+            );
+            assert!(exchange.is_success());
+            assert_eq!(exchange.data(), [1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn a_failed_second_class_is_reported_and_nothing_is_tried_a_third_time() {
+        let mut card = Scripted::new([
+            vec![0x61, 0x04],
+            vec![0x6E, 0x00],
+            vec![0x61, 0x04],
+            vec![0x6E, 0x00],
+        ]);
+        let exchange = send(&mut card, &probe(), &Policy::default()).unwrap();
+        assert_eq!(exchange.exchange_count(), 4, "one retry, never a second");
+        assert_eq!(exchange.status(), Some(StatusWord::new(0x6E, 0x00)));
+        assert!(!exchange.is_success());
+    }
+
+    #[test]
+    fn a_command_that_changes_the_card_is_never_sent_again_to_work_around_a_class() {
+        // ENVELOPE (C2) is not in the read-only set.
+        let envelope = Command::case2(Header::new(0x80, 0xC2, 0x00, 0x00), Le::Short(0x20));
+        let mut card = Scripted::new([vec![0x61, 0x04], vec![0x6E, 0x00]]);
+        let exchange = send(&mut card, &envelope, &Policy::default()).unwrap();
+        assert_eq!(exchange.exchange_count(), 2);
+        assert_eq!(exchange.status(), Some(StatusWord::new(0x6E, 0x00)));
+    }
+
+    #[test]
+    fn a_get_response_that_succeeds_at_the_policy_class_is_not_retried() {
+        let mut card = Scripted::new([vec![0x61, 0x04], with_body(&[9; 4], 0x90, 0x00)]);
+        let exchange = send(&mut card, &probe(), &Policy::default()).unwrap();
+        assert_eq!(exchange.exchange_count(), 2);
     }
 
     #[test]

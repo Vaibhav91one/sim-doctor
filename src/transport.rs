@@ -136,6 +136,13 @@ pub enum Error {
         reader: ReaderName,
     },
 
+    /// The reader is there but nothing is in it.
+    #[error("no card in reader `{reader}`")]
+    NoCard {
+        /// The empty reader.
+        reader: ReaderName,
+    },
+
     /// The card left mid-exchange.
     #[error("the card in reader `{reader}` was removed or reset during the exchange")]
     CardGone {
