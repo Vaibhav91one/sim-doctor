@@ -629,6 +629,16 @@ pub struct Capabilities {
     /// The dedicated file's name, trimmed of the padding a card writes.
     pub name: Reported<Vec<u8>>,
 
+    /// The value of the referenced security attributes DO (`8B`), exactly as
+    /// sent. Decoded by [`crate::access`].
+    pub security_reference: Option<Vec<u8>>,
+
+    /// The value of the expanded security attributes DO (`AB`), exactly as sent.
+    pub security_expanded: Option<Vec<u8>>,
+
+    /// The value of the PIN status template DO (`C6`), exactly as sent.
+    pub pin_status: Option<Vec<u8>>,
+
     /// Tags the supplied mapping gives no meaning to, in wire order.
     pub unknown_tags: Vec<Tag>,
 }
@@ -971,6 +981,7 @@ pub struct Tree {
     meaning: StatusMeaning,
     limits: Limits,
     dialect: String,
+    access_rule_files: Vec<(Path, Vec<Vec<u8>>)>,
 }
 
 impl Tree {
@@ -1070,6 +1081,25 @@ impl Tree {
     /// The node at `path`, when the walk reached it.
     pub fn at(&self, path: &Path) -> Option<&Node> {
         self.nodes.iter().find(|node| node.path == *path)
+    }
+
+    /// Records the records read from an access rule reference file
+    /// (EF.ARR) at `path`, replacing any earlier read of the same file.
+    ///
+    /// The card is read by [`crate::access::resolve`]; this only stores what
+    /// came back, so rules stay pure functions of the tree.
+    pub fn record_access_rules(&mut self, path: Path, records: Vec<Vec<u8>>) {
+        self.access_rule_files.retain(|(known, _)| *known != path);
+        self.access_rule_files.push((path, records));
+    }
+
+    /// The records read from the access rule reference file at `path`, if
+    /// [`crate::access::resolve`] read it. Record 1 is element 0.
+    pub fn access_rule_records(&self, path: &Path) -> Option<&[Vec<u8>]> {
+        self.access_rule_files
+            .iter()
+            .find(|(known, _)| known == path)
+            .map(|(_, records)| records.as_slice())
     }
 
     /// What was found.
@@ -1424,6 +1454,9 @@ fn read_capabilities(
         access_conditions: field(template.access_conditions())
             .map(|conditions| conditions.octets().to_vec()),
         name: field(dedicated_file_name(&template, dialect)).map(|name| name.to_vec()),
+        security_reference: template.security_reference().map(<[u8]>::to_vec),
+        security_expanded: template.security_expanded().map(<[u8]>::to_vec),
+        pin_status: template.pin_status().map(<[u8]>::to_vec),
         unknown_tags: template.tags_without_meaning(),
     };
 
@@ -1689,6 +1722,7 @@ impl<'a> Builder<'a> {
             meaning: self.options.meaning.clone(),
             limits: self.options.limits,
             dialect: self.dialect.name().to_owned(),
+            access_rule_files: Vec::new(),
         }
     }
 

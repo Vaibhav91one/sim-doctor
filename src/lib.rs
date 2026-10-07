@@ -29,6 +29,7 @@
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
+//! layer 1  access      file access conditions and PIN status decoded from the FCP (EF.ARR read-only)
 //! layer 1  baseline     a saved run, and the rules for comparing a later
 //!                one against it honestly
 //! layer 1  tui        a terminal view over the scan data (reads JSON only)
@@ -99,6 +100,7 @@
 
 #![deny(missing_docs)]
 
+pub mod access;
 pub mod aka;
 pub mod apdu;
 pub mod baseline;
@@ -233,6 +235,11 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fcp::NAME, fs::NAME, session::NAME],
     },
     ModuleInfo {
+        name: access::NAME,
+        owns: "File access conditions (compact, expanded and EF.ARR-referenced) and PIN status decoded from the FCP, and the read-only SELECT/READ RECORD of EF.ARR that resolves a reference.",
+        depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fs::NAME, session::NAME, walk::NAME],
+    },
+    ModuleInfo {
         name: baseline::NAME,
         owns: "A saved run, what it actually did, and the rules for refusing a comparison two runs cannot honestly support.",
         depends_on: &[rules::NAME],
@@ -273,6 +280,7 @@ pub const MODULES: &[ModuleInfo] = &[
             rules::NAME,
             tar::NAME,
             walk::NAME,
+            access::NAME,
             baseline::NAME,
             scp03::NAME,
         ],

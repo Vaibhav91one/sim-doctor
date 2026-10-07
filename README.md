@@ -89,8 +89,9 @@ file tree, the dialect it was read under, `complete` / `truncated` / `limits_hit
 sim-doctor scan --json --score --tar focused
 ```
 
-`--tar focused` probes 592 TARs for MSL 0 (`gsma/msl-zero-allowed`, the one rule that
-runs). `--score` adds an integer 0-100 beside `rules_run`. A 100 with `rules_run` 0 means
+`--tar focused` probes 592 TARs for MSL 0 (`gsma/msl-zero-allowed`). Without it the scan
+still checks PIN1 status (`auth/pin1-disabled`) and sensitive EFs under ALWays
+(`filesystem/sensitive-ef-always`) from the FCPs and EF.ARR, read-only. `--score` adds an integer 0-100 beside `rules_run`. A 100 with `rules_run` 0 means
 nothing was checked, and the report says so in words.
 
 ### 4. Hand it to an agent
@@ -197,8 +198,9 @@ block. `--print-only` shows what would be written.
 
 ## What it will not tell you
 
-- **A clean scan is not a clean card.** One rule runs (`gsma/msl-zero-allowed`), and only
-  with `--tar`. Most of the rule space does not exist yet.
+- **A clean scan is not a clean card.** Four rules are registered: MSL 0 (only with
+  `--tar`), PIN1 disabled, sensitive EFs under ALWays, and SCP03 (no CLI path). Crypto
+  (COMP128, Milenage use) and eUICC rules do not exist yet.
 - **A truncated walk saw part of the card.** The report says so in three places; check `data.complete`.
 - **The default dialect and candidate set are assumptions.** The output names the ones used;
   a file outside the default identifier families is never probed and cannot be reported missing.
