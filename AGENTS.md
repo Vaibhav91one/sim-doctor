@@ -914,42 +914,31 @@ Do not treat any of these as settled.
 | # | Item | Status |
 |---|---|---|
 | 1 | ~~`rand_core` alignment~~ | **RESOLVED** [V] single `rand_core 0.10.1`, no drop needed. See 4.4 |
-| 2 | GSMA SGP.22 spec text | **GATED, CONFIRMED UNAVAILABLE** - owner has no member access. Both public PDF paths 404 under a browser UA. Do not retry with curl |
-| 3 | ES10a's actual responsibility | `[U]` traces to blocker 2 |
-| 4 | HandleNotification / CancelSession section numbers | `[U]` traces to blocker 2 |
-| 5 | GSMA TS.48 conformance test profiles | **KNOWN-BLOCKED** - profile CONTENT is behind the same GSMA login as blocker 2. The RUNNER is in scope (#25); authoring profiles is not, until access exists |
+| 2 | GSMA SGP.22 spec text | **RESOLVED** [V] public: SGP.22 v2.5 PDF at `https://www.gsma.com/solutions-and-impact/technologies/esim/wp-content/uploads/2023/05/SGP.22-v2.5.pdf` returns HTTP 200 (checked 2026-10-07). The earlier 404s were wrong URLs, not a member gate |
+| 3 | ES10a's actual responsibility | `[U]` until checked against SGP.22 v2.5 (now readable, see blocker 2) |
+| 4 | HandleNotification / CancelSession section numbers | `[U]` until checked against SGP.22 v2.5 (now readable, see blocker 2) |
+| 5 | GSMA TS.48 test profiles | **RESOLVED** [V] public under Apache-2.0 in GSMA's own repo `https://github.com/GSMATerminals/Generic-eUICC-Test-Profile-for-Device-Testing-Public` (v7.1 spec, profile structure, SAIP 2.3 package). #25 re-scoped, #26 closed |
 | 6 | ~~`der` / `oid` pairing~~ | **RESOLVED** [V] single `der 0.8.2`, shared with p256/ecdsa/spki. See 4.5 |
 
-### On blocker 2
+### On blocker 2 (resolved 2026-10-07)
 
-This is **not** a tooling problem and **cannot be fixed with curl**. Both plausible
-`gsma.com/wp-content/uploads` PDF paths return HTTP 404 under a browser UA. The spec is behind
-a GSMA member login.
+SGP.22 is published by GSMA without a login: v2.5 at `https://www.gsma.com/solutions-and-impact/technologies/esim/wp-content/uploads/2023/05/SGP.22-v2.5.pdf`
+(HTTP 200, PDF). The 404s recorded earlier came from guessed `wp-content/uploads` paths.
 
-Consequence: every SGP.22 section number in section 5.6 comes from euicc-rsp's own source
-comments, not from the spec. That is decent provenance - the repo cites section numbers
-consistently and matches at pinned SHA - but it is not primary. If member access becomes
-available, verify 5.6 and 5.7 before shipping the eUICC half.
+Consequence: the section numbers in 5.6 and 5.7 still come from euicc-rsp's source comments
+and stay `[U]` until someone checks each one against SGP.22 v2.5. Any issue touching the eUICC
+half (#17, #18, #20, #23) checks the numbers it uses against the PDF and upgrades them to `[V]`.
 
-### On blocker 5 - TS.48 scope decision
+### On blocker 5 - TS.48 (resolved 2026-10-07)
 
-**Decided by the owner: TS.48 is in scope as a RUNNER, not as transcribed profiles.**
+GSMA publishes TS.48 itself under Apache-2.0: `https://github.com/GSMATerminals/Generic-eUICC-Test-Profile-for-Device-Testing-Public` holds the v7.1 document, the profile
+structure spreadsheet and the SAIP 2.3 profile package.
 
-TS.48 *is* the conformance test profile definitions, so it sits behind the same GSMA member
-login as blocker 2. Transcribing profiles we cannot read was never available. What is
-available, and what we are building, is the **executor**: a runner that consumes profile files
-supplied by an operator who does have access, runs them against a card, and reports per-test
-verdicts through the standard JSON contract. That is issue #25.
-
-Two consequences to keep straight:
-
-- The runner's own conformance to TS.48 is **unverifiable** without the spec. Document it as
-  such. Do not let "TS.48 support" in the README imply a conformance claim we cannot back.
-- Self-authoring a few smoke profiles from SIMTester behaviour is **rejected**, not deferred.
-  They would be tagged `[U]` and would manufacture a false impression of conformance coverage.
-
-Profile authoring stays tracked as issue #26, open and blocked, with its unblock condition
-written down. It is not dropped.
+What TS.48 actually is: a *test profile*, the eSIM contents (file system, applications, test
+keys) that a test eUICC carries for device testing. It is not a list of APDU test cases with
+expected outcomes. So issue #25 is re-scoped from a generic test-case runner to: parse the
+public TS.48 profile package and compare a card's file system against it (read-only).
+Issue #26 is closed: there is no access blocker.
 
 ---
 
