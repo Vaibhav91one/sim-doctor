@@ -1656,3 +1656,56 @@ fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
 
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// `ts48 compare` against the swSIM card: the walk runs, the envelope is one
+/// line of type `ts48`, and every file the profile defines is accounted for.
+///
+/// swSIM is not a TS.48 card, so the test asserts the arithmetic and the
+/// contract and not any particular number of matches.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn ts48_compare_accounts_for_every_profile_file_against_a_real_card() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args(["ts48", "compare", "--json", "--reader", reader.as_str()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout.matches('\n').count(),
+        1,
+        "one envelope line: {stdout}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(stdout.trim_end()).expect("one envelope");
+    assert_eq!(envelope["type"], serde_json::json!("ts48"));
+
+    let data = &envelope["payload"]["data"];
+    let count = |key: &str| data["summary"][key].as_u64().expect(key);
+    assert!(count("expected") > 200, "{data}");
+    assert_eq!(
+        count("expected"),
+        count("matched") + count("missing") + count("different") + count("unverified"),
+        "{data}"
+    );
+    assert_eq!(
+        data["findings"]["count"].as_u64().expect("count"),
+        count("missing") + count("extra") + count("different"),
+        "{data}"
+    );
+    assert!(data["not_conformance"]
+        .as_str()
+        .is_some_and(|text| text.contains("not GCF or PTCRB conformance")));
+}

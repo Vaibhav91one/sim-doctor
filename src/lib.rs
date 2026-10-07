@@ -122,6 +122,7 @@ pub mod skill;
 pub mod tar;
 pub mod tlv;
 pub mod transport;
+pub mod ts48;
 pub mod tui;
 pub mod walk;
 
@@ -275,6 +276,11 @@ pub const MODULES: &[ModuleInfo] = &[
             baseline::NAME,
             scp03::NAME,
         ],
+    },
+    ModuleInfo {
+        name: ts48::NAME,
+        owns: "The public GSMA TS.48 test profile's expected file list, the extractor that derives it from the SAIP package, and the diff of a walked card against it; read-only, and not a conformance check.",
+        depends_on: &[fcp::NAME, fs::NAME, rules::NAME, walk::NAME],
     },
 ];
 

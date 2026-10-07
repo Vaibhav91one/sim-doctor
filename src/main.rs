@@ -33,6 +33,7 @@ use sim_doctor::{
         pcsc::{Pcsc, PcscSession},
         Error as TransportError, ReaderName, ReaderProvider,
     },
+    ts48,
     walk::{self, Limits},
     MODULES,
 };
@@ -127,6 +128,9 @@ enum Command {
     /// cannot parse, 130 if you interrupt it.
     #[command(long_about = SCAN_LONG_ABOUT)]
     Scan(ScanArgs),
+
+    /// Compare a card against the public GSMA TS.48 test profile.
+    Ts48(Ts48Args),
 
     /// Write agent guidance (Claude skill, Cursor rule, AGENTS.md block) into a project.
     ///
@@ -291,6 +295,56 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "  129  the command line could not be parsed\n",
     "  130  interrupted\n",
 );
+/// Everything `sim-doctor ts48` takes.
+#[derive(Args)]
+struct Ts48Args {
+    #[command(subcommand)]
+    action: Ts48Action,
+}
+
+#[derive(Subcommand)]
+enum Ts48Action {
+    /// Walk the card and diff its file system against the GSMA TS.48 test profile.
+    ///
+    /// Read-only: the same SELECT / GET RESPONSE walk as `scan`, and nothing
+    /// else (no TAR probes, no ENVELOPE). The expected file list is derived from
+    /// the public TS.48 v7.0 SAIP profile (Apache-2.0, pinned commit) and is
+    /// compiled into this binary.
+    ///
+    /// Reports files the profile defines that the card lacks (ts48/file-missing),
+    /// files the card has that the profile does not (ts48/file-extra) and files
+    /// present in both that differ in type, layout, size or record length
+    /// (ts48/file-different). An operator SIM is not a TS.48 card, so many
+    /// differences are the expected answer: they are findings, exit code 0.
+    ///
+    /// MATCHING THE TS.48 FILE STRUCTURE IS NOT GCF OR PTCRB CONFORMANCE. This
+    /// compares a file system with a public test profile and certifies nothing.
+    ///
+    /// Exit codes: 0 when the walk finished, 1 when it could not run (no reader,
+    /// no card), 129 for a bad command line, 130 if interrupted.
+    Compare(Ts48CompareArgs),
+}
+
+#[derive(Args)]
+struct Ts48CompareArgs {
+    /// Emit one JSON envelope (type "ts48") on stdout, and nothing else.
+    #[arg(long)]
+    json: bool,
+
+    /// The reader to use, matched against the driver's own name.
+    #[arg(long, value_name = "NAME")]
+    reader: Option<String>,
+
+    /// Which FCP tag table this card answers SELECT with (see `scan --help`).
+    #[arg(
+        long,
+        value_name = "TABLE",
+        default_value_t = scan::Dialect::Ts102221,
+        value_parser = parse_dialect
+    )]
+    dialect: scan::Dialect,
+}
+
 /// Everything `sim-doctor scan` takes.
 #[derive(Args)]
 struct ScanArgs {
@@ -743,6 +797,9 @@ fn main() -> process::ExitCode {
     exit(match cli.command {
         Command::Modules(args) => run_modules(args),
         Command::Scan(args) => run_scan(args),
+        Command::Ts48(args) => match args.action {
+            Ts48Action::Compare(args) => run_ts48_compare(args),
+        },
         Command::Install(args) => run_install(args),
         Command::Completions(args) => run_completions(args),
         Command::Ci(args) => run_ci(args),
@@ -1514,6 +1571,117 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
     contract::ExitCode::Success
 }
 
+/// Every rule `rules list`, `rules explain`, `why` and `fix` know: the scan's,
+/// then the TS.48 comparison's. A scan still runs and scores only its own.
+fn all_specs() -> Vec<rules::RuleSpec> {
+    let mut specs = scan::specs();
+    specs.extend(ts48::specs());
+    specs
+}
+
+/// Runs `sim-doctor ts48 compare`: the scan's walk, then the diff.
+///
+/// The walk is the one `run_scan` does (same candidates, same status meaning,
+/// same default bounds) and nothing after it touches the card: no TAR audit.
+fn run_ts48_compare(args: Ts48CompareArgs) -> contract::ExitCode {
+    let fixture = match ts48::Fixture::bundled() {
+        Ok(fixture) => fixture,
+        Err(err) => {
+            return report_refusal(
+                ts48::KIND,
+                &format!("the bundled TS.48 file list is unreadable: {err}"),
+                serde_json::json!({ "error": { "kind": "fixture-unreadable" } }),
+                args.json,
+            )
+        }
+    };
+    let refuse = |failure: scan::Failure| {
+        report_refusal(ts48::KIND, &failure.message, failure.data(), args.json)
+    };
+
+    if checkpoint() {
+        return report_interrupted(ts48::KIND, args.json);
+    }
+    let readers = match Pcsc::readers() {
+        Ok(readers) => readers,
+        Err(err) => return refuse(scan::Failure::new("context-unavailable", err.to_string())),
+    };
+    let reader = match pick_reader(&readers, args.reader.as_deref()) {
+        Ok(reader) => reader,
+        Err(failure) => return refuse(failure),
+    };
+    let mut session = match PcscSession::open(reader) {
+        Ok(session) => session,
+        Err(err) => {
+            let kind = match err {
+                TransportError::NoCard { .. } => "no-card",
+                _ => "reader-unavailable",
+            };
+            return refuse(scan::Failure::new(kind, err.to_string()));
+        }
+    };
+
+    let options = walk::Options {
+        addressing: walk::Addressing::PathFromMasterFile,
+        candidates: walk::Candidates::SimFamilies,
+        meaning: walk::StatusMeaning::default(),
+        ..walk::Options::default()
+    };
+    let tree = match walk::walk(&mut session, &args.dialect.tag_set(), &options) {
+        Ok(tree) => tree,
+        Err(err) => return refuse(scan::Failure::new("walk-failed", err.to_string())),
+    };
+    if checkpoint() {
+        return report_interrupted(ts48::KIND, args.json);
+    }
+
+    let comparison = ts48::compare(&fixture.files, &ts48::observe(&tree));
+    let complete = tree.is_complete();
+    let findings = ts48::findings(
+        &comparison,
+        (!complete).then_some("the walk stopped at a bound, so this list may be short"),
+    );
+    if !complete {
+        eprintln!("sim-doctor: warning: the walk stopped early, so this is not the whole card");
+    }
+
+    let (rendered, what) = if args.json {
+        let data = ts48::to_json(
+            &fixture,
+            &comparison,
+            &findings,
+            reader.as_str(),
+            args.dialect.id(),
+            complete,
+        );
+        let envelope = contract::Envelope::new(
+            ts48::KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        );
+        match envelope.to_json() {
+            Ok(line) => (line, "the ts48 envelope"),
+            Err(err) => {
+                eprintln!("sim-doctor: {err}");
+                return contract::ExitCode::Findings;
+            }
+        }
+    } else {
+        (
+            ts48::to_human(&comparison, &findings, complete),
+            "the ts48 report",
+        )
+    };
+    match emit_stdout(rendered.trim_end_matches('\n'), what) {
+        Ok(()) => contract::ExitCode::Success,
+        Err(message) => {
+            eprintln!("sim-doctor: {message}");
+            contract::ExitCode::Findings
+        }
+    }
+}
+
 /// Picks the reader to scan, or says why there is not one.
 ///
 /// Exit code 1 rather than 129 for both refusals. A reader name that matches
@@ -1663,7 +1831,7 @@ fn run_mcp() -> contract::ExitCode {
 }
 
 fn run_rules_list(json: bool) -> contract::ExitCode {
-    let specs = scan::specs();
+    let specs = all_specs();
     let mut text = format!("{:<28}  {:<8}  SUMMARY\n", "RULE", "SEVERITY");
     for spec in &specs {
         text.push_str(&format!(
@@ -1718,7 +1886,7 @@ fn unknown_rule(specs: &[sim_doctor::rules::RuleSpec], id: &str, json: bool) -> 
 }
 
 fn run_why_rule(id: &str, json: bool) -> contract::ExitCode {
-    let specs = scan::specs();
+    let specs = all_specs();
     match specs.iter().find(|spec| spec.id().as_str() == id) {
         Some(spec) => emit_rules(
             json,
@@ -1788,7 +1956,7 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
         }
     }
 
-    let specs = scan::specs();
+    let specs = all_specs();
     let mut text = String::new();
     let mut rules = Vec::new();
     for (id, severity, count) in &seen {
@@ -1816,7 +1984,7 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
 
 /// Runs `sim-doctor fix`: print the prompt, and with `--agent` launch that agent.
 fn run_fix(args: &FixArgs) -> contract::ExitCode {
-    let specs = scan::specs();
+    let specs = all_specs();
     let Some(spec) = specs.iter().find(|s| s.id().as_str() == args.rule_id) else {
         return unknown_rule(&specs, &args.rule_id, false);
     };
