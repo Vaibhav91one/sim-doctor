@@ -1204,6 +1204,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     let found = match scan::findings(&scan::Subject {
         tree: &tree,
         tar: &audit,
+        scp03: None,
     }) {
         Ok(found) => found,
         Err(err) => {
