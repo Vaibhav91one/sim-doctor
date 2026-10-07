@@ -845,39 +845,58 @@ GPShell3 DAP token family: `sign-load-token`, `sign-install-token`, `sign-delete
 
 ### 5.6 SGP.22 ES9+ / ES10x
 
-ES9+ section mapping [V]:
+ES9+ section mapping [V] SGP.22 v2.5 §5.6 (headings checked 2026-10-07):
 
 | Section | Function |
 |---|---|
 | 5.6.1 | InitiateAuthentication |
 | 5.6.2 | GetBoundProfilePackage |
 | 5.6.3 | AuthenticateClient |
+| 5.6.4 | HandleNotification |
+| 5.6.5 | CancelSession |
 
 euicc-rsp implements 3 of 5 ES9+ functions; **HandleNotification and CancelSession are NOT
-implemented** [V]. Their section numbers remain `[U]`.
+implemented** [V]. Their section numbers are 5.6.4 and 5.6.5 [V] SGP.22 v2.5 §5.6.4, §5.6.5.
 
-ES10a/b/c all share one generic STORE DATA APDU (SGP.22 5.7.2) [V]:
+ES10a/b/c all share one generic STORE DATA APDU ("Transport Command") [V] SGP.22 v2.5 §5.7.2:
 CLA `80-83`/`C0-CF`, INS `E2`, P1 `11` more blocks / `91` last block, P2 = block number,
 <=255 data bytes.
 
-- **ES10b** (eUICC ISD-R write/derive): PrepareDownload 5.7.5, LoadBoundProfilePackage 5.7.6,
-  GetEUICCChallenge 5.7.7, GetEUICCInfo 5.7.8, AuthenticateServer 5.7.13, CancelSession
-- **ES10c** (profile management): GetProfilesInfo 5.7.15, EnableProfile 5.7.16, DeleteProfile 5.7.18
-- **ES10a** role: `[U]` - GSMA spec unavailable. Best available source is virtual-rsp's README
-  ("Local Profile Assistant to Local Discovery Service"), uncorroborated.
+- **ES10b** (eUICC ISD-R write/derive) [V] SGP.22 v2.5 §5.7.5 to §5.7.14: PrepareDownload 5.7.5,
+  LoadBoundProfilePackage 5.7.6, GetEUICCChallenge 5.7.7, GetEUICCInfo 5.7.8, AuthenticateServer
+  5.7.13, CancelSession 5.7.14
+- **ES10c** (profile management) [V] SGP.22 v2.5 §5.7.15 to §5.7.21: GetProfilesInfo 5.7.15,
+  EnableProfile 5.7.16, DeleteProfile 5.7.18
+- **ES10a** role: [V] SGP.22 v2.5 §5.7.3 (GetEuiccConfiguredAddresses: Root SM-DS and default
+  SM-DP+ address) and §5.7.4 (SetDefaultDpAddress). Address configuration, not profile work.
+  virtual-rsp's README gloss ("Local Profile Assistant to Local Discovery Service") is not the
+  spec's wording.
 
 ### 5.7 SCP03t crypto
 
-- MAC: `CMAC(S-MAC, chain || tag || Lcc || data)`, 128-bit key. **Wire MAC is the 8 MSB of
-  the 16-byte CMAC output** [V]
-- Cipher: AES-128-CBC. IV = ICV from S-ENC + 16-byte encryption counter [V]
-- KDF: ECDH P-256 (SECP256R1) + X9.63 with SHA-256, `SHA-256(Z || counter_be32(i) || info)` [V]
-- Key split (Annex G), L=16: 1..L = initial MAC chaining value, L+1..2L = S-ENC, 2L+1..3L = S-MAC [V]
-- SharedInfo: `keyType(1) || keyLen(1) || HostID-LV || EID-LV`. **HostID is NOT the EID** [V]
+Implemented in `src/scp03t.rs` (issue #23); SGP.22 v2.5 calls this SCP03t, later versions BSP.
+
+- MAC: `CMAC(S-MAC, chain || tag || Lcc || data)`, 128-bit key, `Lcc = L + padding + 8`.
+  **Wire MAC is the 8 MSB of the 16-byte CMAC output; the chain is the full 16 bytes** [V]
+  SGP.02 v4.2.1 §4.1.3.3 (figures 45 to 47), which SGP.22 v2.5 §2.5.3 incorporates by reference;
+  the 8 MSB rule is also pinned by the third-party known-answer test in `src/scp03t.rs`
+- Cipher: AES-128-CBC with S-ENC, padding `80 00..00` always present [V] SGP.22 v2.5 §2.5.3,
+  §5.5 intro. ICV = AES-ECB(S-ENC, 16-byte big-endian encryption counter), counter starts at 1
+  and advances for every `86`/`87`/`88` TLV, MAC-only ones included [V] SGP.22 v2.5 §2.5.3,
+  §2.5.4 for the counter rules; the exact ICV block recipe is [V] by known-answer test only
+  (the clause is in GP Amendment D, not fetched)
+- KDF: ECDH P-256 (SECP256R1) + X9.63 with SHA-256, `SHA-256(Z || counter_be32(i) || info)`,
+  counter from 1 [V] SGP.22 v2.5 Annex G (BSI TR-03111 for X9.63; checked against the CAVS
+  ANS X9.63-2001 vectors)
+- Key split (Annex G), L=16: 1..L = initial MAC chaining value, L+1..2L = S-ENC, 2L+1..3L = S-MAC
+  [V] SGP.22 v2.5 Annex G
+- SharedInfo: `keyType(1) || keyLen(1) || HostID-LV || EID-LV` (keyType `88`, keyLen `10`).
+  **HostID is NOT the EID**: it is the separate `hostId` field (1 to 16 bytes) of
+  `ControlRefTemplate` in `InitialiseSecureChannel` [V] SGP.22 v2.5 Annex G, §5.5.1
 
 ### 5.8 BPP tag semantics
 
-Group order per SGP.22 2.5.4 [V]:
+Group order per SGP.22 [V] SGP.22 v2.5 §2.5.4:
 
 1. `initialiseSecureChannelRequest` - in clear
 2. `firstSequenceOf87` = ConfigureISDP - tag `'87'`, encrypted + MAC'd
@@ -886,13 +905,13 @@ Group order per SGP.22 2.5.4 [V]:
 5. `sequenceOf86` = Protected Profile Package - tag `'86'` segments
 
 **All three tags advance ONE shared MAC chaining value**, not three independent counters [V].
-Segmentation: 1020-byte max segment, 1008 usable, 1007 bytes PPP payload after padding [V].
+Segmentation: 1020-byte max segment, 1008 usable, 1007 bytes PPP payload after padding [V] SGP.22 v2.5 §2.5.3.
 Padding always 1-16 bytes, never all-zero [V].
 
 ### 5.9 Signing and test PKI
 
 - **RFC 6979 deterministic ECDSA** [V]. Signature format is **plain `r||s`, 64 bytes, NOT DER**
-  (SGP.22 2.6.7.2 -> GPCS v2.2 Amendment E 3.1.3, SHA-256).
+  (SGP.22 2.6.7.2 -> GPCS v2.2 Amendment E 3.1.3, SHA-256; the SGP.22 v2.5 §2.6.7.2 -> Amendment E hop is [V], the Amendment E clause number is still `[U]`).
 - SGP.26 test certs live in `waigel/euicc-rsp/testdata/sgp26/` [V]. Both DP certs **expire
   30 March 2030** [V].
 - `euicc.der` is a **re-issuance**: asn1c's `CertificateSerialNumber_t` is a native `long` and
@@ -921,8 +940,8 @@ Do not treat any of these as settled.
 |---|---|---|
 | 1 | ~~`rand_core` alignment~~ | **RESOLVED** [V] single `rand_core 0.10.1`, no drop needed. See 4.4 |
 | 2 | GSMA SGP.22 spec text | **RESOLVED** [V] public: SGP.22 v2.5 PDF at `https://www.gsma.com/solutions-and-impact/technologies/esim/wp-content/uploads/2023/05/SGP.22-v2.5.pdf` returns HTTP 200 (checked 2026-10-07). The earlier 404s were wrong URLs, not a member gate |
-| 3 | ES10a's actual responsibility | `[U]` until checked against SGP.22 v2.5 (now readable, see blocker 2) |
-| 4 | HandleNotification / CancelSession section numbers | `[U]` until checked against SGP.22 v2.5 (now readable, see blocker 2) |
+| 3 | ES10a's actual responsibility | **RESOLVED** [V] SGP.22 v2.5 §5.7.3, §5.7.4: configured addresses (Root SM-DS, default SM-DP+). See 5.6 |
+| 4 | HandleNotification / CancelSession section numbers | **RESOLVED** [V] SGP.22 v2.5 §5.6.4 and §5.6.5 (ES9+), §5.7.14 (ES10b CancelSession) |
 | 5 | GSMA TS.48 test profiles | **RESOLVED** [V] public under Apache-2.0 in GSMA's own repo `https://github.com/GSMATerminals/Generic-eUICC-Test-Profile-for-Device-Testing-Public` (v7.1 spec, profile structure, SAIP 2.3 package). #25 re-scoped, #26 closed |
 | 6 | ~~`der` / `oid` pairing~~ | **RESOLVED** [V] single `der 0.8.2`, shared with p256/ecdsa/spki. See 4.5 |
 
@@ -931,9 +950,14 @@ Do not treat any of these as settled.
 SGP.22 is published by GSMA without a login: v2.5 at `https://www.gsma.com/solutions-and-impact/technologies/esim/wp-content/uploads/2023/05/SGP.22-v2.5.pdf`
 (HTTP 200, PDF). The 404s recorded earlier came from guessed `wp-content/uploads` paths.
 
-Consequence: the section numbers in 5.6 and 5.7 still come from euicc-rsp's source comments
-and stay `[U]` until someone checks each one against SGP.22 v2.5. Any issue touching the eUICC
-half (#17, #18, #20, #23) checks the numbers it uses against the PDF and upgrades them to `[V]`.
+Consequence: the section numbers in 5.6 and 5.7 came from euicc-rsp's source comments; issue
+#23 checked every one against SGP.22 v2.5 (all matched, none needed correcting) and upgraded them
+to `[V] SGP.22 v2.5 §x.y.z`. Others in this file that cite SGP.22 stay as they are until checked. Any issue touching the eUICC
+half (#17, #18, #20) checks the numbers it uses against the PDF and upgrades them to `[V]`.
+
+Download note: the server returns 403 to `curl`'s default User-Agent (a Varnish ban page); send a
+browser User-Agent (`curl -A "Mozilla/5.0"`). SGP.02 v4.2.1, which SGP.22 defers the MAC and
+encryption details to, is at `.../esim/wp-content/uploads/2025/01/SGP.02-v4.2.1.pdf`.
 
 ### On blocker 5 - TS.48 (resolved 2026-10-07)
 

@@ -66,7 +66,7 @@ pub enum Error {
 }
 
 /// AES-CMAC (NIST SP 800-38B), full 16-byte output.
-fn cmac(key: &[u8; BLOCK], parts: &[&[u8]]) -> [u8; BLOCK] {
+pub(crate) fn cmac(key: &[u8; BLOCK], parts: &[&[u8]]) -> [u8; BLOCK] {
     // The key is exactly 16 bytes, so new_from_slice cannot fail.
     let mut mac = <Cmac<Aes128> as KeyInit>::new_from_slice(key).expect("16-byte AES-128 key");
     for part in parts {
