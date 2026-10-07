@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, ci, contract, fix, gp, rules, sarif, scan, session, signals, skill, tar,
+    access, baseline, ci, contract, fix, gp, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         Error as TransportError, ReaderName, ReaderProvider,
@@ -1265,7 +1265,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         ..walk::Options::default()
     };
 
-    let tree = match walk::walk(&mut session, &args.dialect.tag_set(), &options) {
+    let mut tree = match walk::walk(&mut session, &args.dialect.tag_set(), &options) {
         Ok(tree) => tree,
         Err(err) => {
             return report_failure(
@@ -1274,6 +1274,15 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             )
         }
     };
+
+    // EF.ARR, read-only (SELECT and READ RECORD), so that the access rules the
+    // FCPs only reference can be decoded by the rules.
+    if let Err(err) = access::resolve(&mut session, &mut tree, &session::Policy::default()) {
+        return report_failure(
+            &scan::Failure::new("access-rules-failed", err.to_string()),
+            args.json,
+        );
+    }
 
     // The second of three checkpoints. Everything the tree knows is still only
     // in memory here, so stopping now costs the whole run rather than emitting

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
+use sim_doctor::access;
 use sim_doctor::rules::Location;
 use sim_doctor::scan::{self, Dialect, Subject};
 use sim_doctor::session::Policy;
@@ -22,6 +23,10 @@ use sim_doctor::walk::{self, Candidates, Limits};
 /// TAR probe. `msl0` makes TAR 000000 answer `6D 00`; every other TAR gets `94 04`.
 struct Card {
     files: HashMap<Vec<u8>, Vec<u8>>,
+    /// Records of a linear fixed EF, by path.
+    records: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// What the last SELECT chose, for READ RECORD.
+    current: Vec<u8>,
     queued: VecDeque<Vec<u8>>,
     msl0: bool,
     reader: ReaderName,
@@ -40,6 +45,12 @@ enum Fcp {
     Ts102221,
 }
 
+fn path_bytes(path: &str) -> Vec<u8> {
+    path.split('/')
+        .flat_map(|s| u16::from_str_radix(s, 16).unwrap().to_be_bytes())
+        .collect()
+}
+
 const DIR: [u8; 2] = [0x38, 0x21];
 const EF: [u8; 2] = [0x09, 0x21];
 
@@ -47,6 +58,8 @@ impl Card {
     fn new(msl0: bool) -> Self {
         Self {
             files: HashMap::new(),
+            records: HashMap::new(),
+            current: Vec::new(),
             queued: VecDeque::new(),
             msl0,
             reader: ReaderName::new("corpus card").unwrap(),
@@ -54,11 +67,21 @@ impl Card {
     }
 
     /// Adds `path` (`3F00/7F20/6F07`) with an FCP in `dialect`; `size` None for a directory.
-    fn file(mut self, path: &str, dialect: Fcp, size: Option<u16>) -> Self {
-        let ids: Vec<u8> = path
-            .split('/')
-            .flat_map(|s| u16::from_str_radix(s, 16).unwrap().to_be_bytes())
-            .collect();
+    fn file(self, path: &str, dialect: Fcp, size: Option<u16>) -> Self {
+        let descriptor = if size.is_some() { EF } else { DIR };
+        self.described(path, dialect, size, &descriptor, &[])
+    }
+
+    /// `file` with an explicit descriptor and extra FCP atoms (security attributes, PIN status).
+    fn described(
+        mut self,
+        path: &str,
+        dialect: Fcp,
+        size: Option<u16>,
+        descriptor: &[u8],
+        extra: &[u8],
+    ) -> Self {
+        let ids = path_bytes(path);
         let leaf = &ids[ids.len() - 2..];
         let (size_tag, desc_tag, id_tag) = match dialect {
             Fcp::Swicc => (0x80, 0x82, 0x83),
@@ -68,9 +91,33 @@ impl Card {
         if let Some(size) = size {
             body.extend(atom(size_tag, &size.to_be_bytes()));
         }
-        body.extend(atom(desc_tag, if size.is_some() { &EF } else { &DIR }));
+        body.extend(atom(desc_tag, descriptor));
         body.extend(atom(id_tag, leaf));
+        body.extend_from_slice(extra);
         self.files.insert(ids.clone(), atom(0x62, &body));
+        self
+    }
+
+    /// Adds a linear fixed EF.ARR (`path`) holding `records`, each padded with `FF` to 32 octets.
+    fn arr(mut self, path: &str, records: &[&[u8]]) -> Self {
+        let count = u8::try_from(records.len()).unwrap();
+        let descriptor = [0x0A, 0x21, 0x00, 0x20, count];
+        self = self.described(
+            path,
+            Fcp::Ts102221,
+            Some(32 * u16::from(count)),
+            &descriptor,
+            &[],
+        );
+        let padded = records
+            .iter()
+            .map(|r| {
+                let mut r = r.to_vec();
+                r.resize(32, 0xFF);
+                r
+            })
+            .collect();
+        self.records.insert(path_bytes(path), padded);
         self
     }
 
@@ -103,8 +150,19 @@ impl CardSession for Card {
                 }
                 None => vec![0x6F, 0x00],
             }),
+            Some(0xB2) => {
+                let record = self
+                    .records
+                    .get(&self.current)
+                    .and_then(|r| r.get(usize::from(command[2]).checked_sub(1)?));
+                Ok(match record {
+                    Some(record) => [record.as_slice(), &[0x90, 0x00]].concat(),
+                    None => vec![0x6A, 0x83],
+                })
+            }
             Some(0xA4) => Ok(match self.files.get(&self.target(command)) {
                 Some(fcp) => {
+                    self.current = self.target(command);
                     self.queued.push_back(fcp.clone());
                     vec![0x61, u8::try_from(fcp.len()).unwrap()]
                 }
@@ -144,7 +202,14 @@ struct Case {
     complete: bool,
     /// How many files the walk must record.
     nodes: usize,
+    /// The identifiers probed in every directory.
+    probe: &'static [&'static str],
 }
+
+const BASIC_PROBE: &[&str] = &["2F01", "2FE2", "6F07", "7F20"];
+const USIM_PROBE: &[&str] = &[
+    "2F06", "6F06", "7FFF", "5F3B", "5F3C", "4F20", "6F07", "6F08", "6F73", "6F7E",
+];
 
 /// The same shape in every case: MF, an EF, a DF with an EF below it.
 fn tree(msl0: bool, dialect: Fcp) -> Card {
@@ -156,6 +221,49 @@ fn tree(msl0: bool, dialect: Fcp) -> Card {
         ("3F00/7F20/6F07", Some(4)),
     ] {
         card = card.file(path, dialect, size);
+    }
+    card
+}
+
+/// ARR record: READ and UPDATE both ALWays (TS 102 221 annex F: AM_DO `80`, SC_DO `90`).
+const ARR_ALWAYS: &[u8] = &[0x80, 0x01, 0x03, 0x90, 0x00];
+/// ARR record: READ PIN Appl 1, UPDATE ADM1 (key references 01 and 0A, usage qualifier 08).
+const ARR_PIN_ADM: &[u8] = &[
+    0x80, 0x01, 0x01, 0xA4, 0x06, 0x83, 0x01, 0x01, 0x95, 0x01, 0x08, 0x80, 0x01, 0x02, 0xA4, 0x06,
+    0x83, 0x01, 0x0A, 0x95, 0x01, 0x08,
+];
+/// ARR record: READ ALWays, UPDATE ADM1.
+const ARR_READ_OPEN: &[u8] = &[
+    0x80, 0x01, 0x01, 0x90, 0x00, 0x80, 0x01, 0x02, 0xA4, 0x06, 0x83, 0x01, 0x0A, 0x95, 0x01, 0x08,
+];
+
+/// `8B` referencing record `record` of the EF.ARR `file`.
+fn arr_ref(file: [u8; 2], record: u8) -> Vec<u8> {
+    atom(0x8B, &[file[0], file[1], record])
+}
+
+/// A PIN status template: PIN Appl 1 and the universal PIN, each enabled or not.
+fn pin_status(pin1: bool, universal: bool) -> Vec<u8> {
+    let bitmap = u8::from(pin1) << 7 | u8::from(universal) << 6;
+    let mut body = atom(0x90, &[bitmap]);
+    body.extend(atom(0x83, &[0x01]));
+    body.extend(atom(0x95, &[0x08]));
+    body.extend(atom(0x83, &[0x11]));
+    atom(0xC6, &body)
+}
+
+/// A USIM-shaped card: an EF.ARR at the MF, an application directory `7FFF` with its own
+/// EF.ARR, and the sensitive EFs of TS 31.102 below it, each with the given FCP atoms.
+fn usim(pin: Vec<u8>, efs: &[(&str, Vec<u8>)], arr_mf: &[&[u8]], arr_adf: &[&[u8]]) -> Card {
+    let mut card = Card::new(false)
+        .file("3F00", Fcp::Ts102221, None)
+        .arr("3F00/2F06", arr_mf)
+        .described("3F00/7FFF", Fcp::Ts102221, None, &DIR, &pin)
+        .arr("3F00/7FFF/6F06", arr_adf)
+        .file("3F00/7FFF/5F3B", Fcp::Ts102221, None)
+        .file("3F00/7FFF/5F3C", Fcp::Ts102221, None);
+    for (path, extra) in efs {
+        card = card.described(path, Fcp::Ts102221, Some(9), &EF, extra);
     }
     card
 }
@@ -173,12 +281,24 @@ fn corpus() -> Vec<Case> {
         expected,
         complete,
         nodes,
+        probe: BASIC_PROBE,
     };
     let tight = Limits {
         max_nodes: 2,
         ..Limits::default()
     };
     let (swicc, iso) = (Dialect::Swicc, Dialect::Ts102221);
+    let file = |path: &str| Location::selected_file(path).to_string();
+    let usim_case = |name, card, expected, nodes| Case {
+        name,
+        card,
+        dialect: iso,
+        limits: Limits::default(),
+        expected,
+        complete: true,
+        nodes,
+        probe: USIM_PROBE,
+    };
     vec![
         case(
             "clean",
@@ -224,6 +344,70 @@ fn corpus() -> Vec<Case> {
             vec![msl0_finding()],
             true,
             9,
+        ),
+        // The access rules (issue #40): every EF's security attributes are in its FCP or
+        // in an EF.ARR the scan reads with READ RECORD, never in file contents.
+        usim_case(
+            "usim-open",
+            usim(
+                pin_status(false, false),
+                &[
+                    ("3F00/7FFF/6F07", arr_ref([0x6F, 0x06], 2)),
+                    ("3F00/7FFF/6F08", atom(0x8C, &[0x7F, 0, 0, 0, 0, 0, 0, 0])),
+                    ("3F00/7FFF/6F73", arr_ref([0x2F, 0x06], 2)),
+                    ("3F00/7FFF/6F7E", arr_ref([0x6F, 0x06], 1)),
+                    (
+                        "3F00/7FFF/5F3B/4F20",
+                        atom(
+                            0xAB,
+                            &[
+                                0x80, 0x01, 0x01, 0xA4, 0x06, 0x83, 0x01, 0x01, 0x95, 0x01, 0x08,
+                                0x80, 0x01, 0x02, 0x90, 0x00,
+                            ],
+                        ),
+                    ),
+                    // 4F20 is only sensitive under 5F3B; below 5F3C it is another EF.
+                    (
+                        "3F00/7FFF/5F3C/4F20",
+                        atom(0x8C, &[0x7F, 0, 0, 0, 0, 0, 0, 0]),
+                    ),
+                ],
+                &[ARR_ALWAYS, ARR_PIN_ADM],
+                &[ARR_ALWAYS, ARR_READ_OPEN],
+            ),
+            vec![
+                (scan::PIN1_DISABLED_RULE, file("3F00/7FFF")),
+                (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F07")),
+                (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F08")),
+                (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F7E")),
+                (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/5F3B/4F20")),
+            ],
+            41,
+        ),
+        usim_case(
+            "usim-protected",
+            usim(
+                pin_status(true, false),
+                &[
+                    ("3F00/7FFF/6F07", arr_ref([0x6F, 0x06], 2)),
+                    ("3F00/7FFF/6F08", atom(0x8C, &[0x03, 0x10, 0x10])),
+                    // Points at a record the EF.ARR does not have: unknown, not a finding.
+                    ("3F00/7FFF/6F73", arr_ref([0x6F, 0x06], 9)),
+                    // Points at an EF.ARR the card does not hold.
+                    ("3F00/7FFF/6F7E", arr_ref([0x6F, 0x99], 1)),
+                    ("3F00/7FFF/5F3B/4F20", atom(0xAB, ARR_PIN_ADM)),
+                ],
+                &[ARR_ALWAYS, ARR_PIN_ADM],
+                &[ARR_PIN_ADM, ARR_PIN_ADM],
+            ),
+            vec![],
+            41,
+        ),
+        usim_case(
+            "usim-pin1-off-universal-in-use",
+            usim(pin_status(false, true), &[], &[ARR_ALWAYS], &[ARR_ALWAYS]),
+            vec![],
+            41,
         ),
     ]
 }
@@ -317,14 +501,16 @@ fn run(mut case: Case) -> (Vec<Found>, Vec<Found>, Vec<String>) {
     let mut problems = Vec::new();
     let options = walk::Options {
         candidates: Candidates::List(
-            ["2F01", "2FE2", "6F07", "7F20"]
+            case.probe
+                .iter()
                 .map(|s| s.parse().unwrap())
-                .to_vec(),
+                .collect::<Vec<_>>(),
         ),
         limits: case.limits,
         ..walk::Options::default()
     };
-    let tree = walk::walk(&mut case.card, &case.dialect.tag_set(), &options).expect("walk");
+    let mut tree = walk::walk(&mut case.card, &case.dialect.tag_set(), &options).expect("walk");
+    access::resolve(&mut case.card, &mut tree, &Policy::default()).expect("access rules");
     let audit = tar::audit(
         &mut case.card,
         &Selection::focused(),

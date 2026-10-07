@@ -64,6 +64,7 @@ use std::str::FromStr;
 
 use serde_json::{json, Value};
 
+use crate::access;
 use crate::baseline;
 use crate::fcp::{self, TagSet};
 use crate::fs;
@@ -420,6 +421,152 @@ const TAR_PARTIAL_REASON: &str =
      others this scan never probed; this report is a list of what was found, not of everything
      there is";
 
+/// The ID of the PIN rule.
+pub const PIN1_DISABLED_RULE: &str = "auth/pin1-disabled";
+
+/// The ID of the sensitive-EF access rule.
+pub const SENSITIVE_EF_RULE: &str = "filesystem/sensitive-ef-always";
+
+/// The EFs whose READ and UPDATE conditions 3GPP TS 31.102 V17.8.0 never sets to
+/// ALWays, as (the directory the identifier is only meaningful under, EF, name).
+///
+/// Clause 4.2.2 EF.IMSI: READ PIN, UPDATE ADM. Clauses 4.2.3 EF.Keys, 4.2.4
+/// EF.KeysPS, 4.2.17 EF.LOCI and 4.2.23 EF.PSLOCI: READ PIN, UPDATE PIN, and
+/// they hold the ciphering/integrity keys or the TMSI and location. Clauses
+/// 4.4.3.1 EF.Kc and 4.4.3.2 EF.KcGPRS (under DF.GSM-ACCESS `5F3B`): READ PIN,
+/// UPDATE PIN. A `None` parent means "any directory below the master file";
+/// `4F20` is also an unrelated linear fixed EF in DF.GRAPHICS, which is why
+/// those two are pinned to `5F3B`.
+/// (required parent directory, file identifier, name).
+type SensitiveEf = (Option<[u8; 2]>, [u8; 2], &'static str);
+
+const SENSITIVE_EFS: [SensitiveEf; 7] = [
+    (None, [0x6F, 0x07], "EF.IMSI"),
+    (None, [0x6F, 0x08], "EF.Keys"),
+    (None, [0x6F, 0x09], "EF.KeysPS"),
+    (None, [0x6F, 0x7E], "EF.LOCI"),
+    (None, [0x6F, 0x73], "EF.PSLOCI"),
+    (Some([0x5F, 0x3B]), [0x4F, 0x20], "EF.Kc"),
+    (Some([0x5F, 0x3B]), [0x4F, 0x52], "EF.KcGPRS"),
+];
+
+/// The name of the sensitive EF a node is, if it is one.
+fn sensitive_name(node: &walk::Node) -> Option<&'static str> {
+    let segments = node.path().segments();
+    let [.., parent, leaf] = segments else {
+        return None;
+    };
+    // Not by `Kind::Reported(ElementaryFile)`: a live USIM's EF descriptors read as
+    // `Kind::Unreported`, and the identifier plus the parent already name the file.
+    if segments.len() < 3 || node.state().kind().is_none_or(walk::Kind::is_container) {
+        return None;
+    }
+    SENSITIVE_EFS
+        .iter()
+        .find(|(under, id, _)| {
+            leaf.to_bytes() == *id && under.is_none_or(|u| parent.to_bytes() == u)
+        })
+        .map(|(_, _, name)| *name)
+}
+
+/// Sensitive EFs readable or updatable without any verification.
+///
+/// **High when UPDATE is open, medium when only READ is.** Open UPDATE lets
+/// anyone holding the card rewrite the identity or the keys; open READ only
+/// exposes them. Evidence is the file path (the location) and the decoded
+/// access rule; the file's contents are never read.
+fn sensitive_ef_always(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    subject
+        .tree
+        .selected()
+        .filter_map(|node| {
+            let name = sensitive_name(node)?;
+            let access = access::access_of(subject.tree, node)?;
+            let read_open = access.read == access::Condition::Always;
+            let update_open = access.update == access::Condition::Always;
+            if !read_open && !update_open {
+                return None;
+            }
+            let (severity, what) = match (read_open, update_open) {
+                (true, true) => (rules::Severity::High, "readable and updatable"),
+                (false, true) => (rules::Severity::High, "updatable"),
+                _ => (rules::Severity::Medium, "readable"),
+            };
+            Some(rules::Finding::new(
+                rules::RuleId::new(SENSITIVE_EF_RULE).expect("a validated constant"),
+                severity,
+                format!(
+                    "{name} is {what} without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays"
+                ),
+                rules::Location::selected_file(node.path().to_string()),
+                rules::Evidence::text(format!(
+                    "read={} update={}",
+                    access.read.label(),
+                    access.update.label()
+                )),
+            ))
+        })
+        .collect()
+}
+
+fn sensitive_ef_evidence(subject: &Subject<'_>) -> bool {
+    subject.tree.selected().any(|node| {
+        sensitive_name(node).is_some() && access::access_of(subject.tree, node).is_some()
+    })
+}
+
+/// PIN Appl 1 listed as disabled in the PIN status templates.
+///
+/// **One finding per scan, not one per directory.** Key reference `01` is a
+/// global PIN (TS 102 221 table 9.3, level 1) and every directory under the
+/// master file repeats the same template (a live USIM sends it in 11 of 11), so
+/// a finding per directory would score one fact eleven times. The finding is
+/// located at the first directory in walk order that lists it disabled, and its
+/// evidence says how many of the templates listing key reference `01` agree.
+///
+/// **Medium, and the reasoning is the exposure, not the setting.** A disabled
+/// PIN is a legitimate configuration on many operator SIMs, so this is not a
+/// defect in the card; it is that everything whose READ or UPDATE needs PIN1
+/// (the IMSI, the keys and the location files above, per TS 31.102) can be
+/// used by whoever holds the card. That is a real weakness with limited impact
+/// (it needs physical possession), which is the ladder's medium. A disabled
+/// PIN1 is not counted when an enabled universal PIN is in use in its place
+/// (TS 102 221 table 9.0d).
+fn pin1_disabled(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    let states: Vec<(&walk::Node, bool)> = subject
+        .tree
+        .selected()
+        .filter_map(|node| Some((node, access::pin1_disabled(&pin_status(node)?)?)))
+        .collect();
+    let disabled = states.iter().filter(|(_, off)| *off).count();
+    let Some((first, _)) = states.iter().find(|(_, off)| *off) else {
+        return Vec::new();
+    };
+    vec![rules::Finding::new(
+        rules::RuleId::new(PIN1_DISABLED_RULE).expect("a validated constant"),
+        rules::Severity::Medium,
+        "PIN Appl 1 (key reference 01) is disabled, so files that need PIN1 are open to anyone holding the card",
+        rules::Location::selected_file(first.path().to_string()),
+        rules::Evidence::text(format!(
+            "key reference 01 disabled in {disabled} of {} PIN status templates",
+            states.len()
+        )),
+    )]
+}
+
+fn pin_status(node: &walk::Node) -> Option<Vec<access::PinEntry>> {
+    let raw = node.state().capabilities()?.pin_status.as_deref()?;
+    access::parse_pin_status(raw)
+}
+
+fn pin1_evidence(subject: &Subject<'_>) -> bool {
+    subject.tree.selected().any(|node| {
+        pin_status(node)
+            .and_then(|e| access::pin1_disabled(&e))
+            .is_some()
+    })
+}
+
 /// The rules this scan runs over one card.
 ///
 /// **One rule today, and that is what makes the score mean something.**
@@ -460,6 +607,34 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             |subject| subject.scp03.is_some_and(scp03::had_evidence),
         )
         .expect("the SCP03 rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(PIN1_DISABLED_RULE).expect("a validated constant"),
+                rules::Severity::Medium,
+                "PIN Appl 1 is disabled, so files protected by PIN1 are open to anyone holding the card",
+            )
+            .with_remediation(
+                "enable PIN1 (key reference 01) on the application, or confirm the universal PIN is enabled and in use, then re-scan",
+            ),
+            pin1_disabled,
+            pin1_evidence,
+        )
+        .expect("the PIN rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(SENSITIVE_EF_RULE).expect("a validated constant"),
+                rules::Severity::High,
+                "a file holding the IMSI, ciphering keys or location (TS 31.102 gives them PIN or ADM conditions) is readable or updatable under ALWays",
+            )
+            .with_remediation(
+                "set the file's READ and UPDATE access rule (its EF.ARR record) back to the TS 31.102 conditions, PIN for READ and PIN or ADM for UPDATE, then re-scan",
+            ),
+            sensitive_ef_always,
+            sensitive_ef_evidence,
+        )
+        .expect("the sensitive EF rule ID is unique in this registry");
     registry
 }
 
@@ -2651,7 +2826,7 @@ mod tests {
         assert_eq!(id.rule(), "msl-zero-allowed");
 
         let registry = rules();
-        assert_eq!(registry.len(), 2, "two rules are registered over a card");
+        assert_eq!(registry.len(), 4, "four rules are registered over a card");
         let rule = registry.get(&id).expect("the rule is registered");
         assert_eq!(rule.severity(), rules::Severity::Critical);
         assert!(
@@ -2693,12 +2868,12 @@ mod tests {
     }
 
     #[test]
-    fn a_scan_evaluates_one_rule_so_the_no_rules_warning_cannot_fire() {
+    fn a_scan_evaluates_its_rules_so_the_no_rules_warning_cannot_fire() {
         // **The warning going null here is CORRECT rather than defeated.**
         // rules_run is 1 because a rule really ran, so the 100 it sits beside
         // is a score over an audit rather than an absence of one. That is the
         // whole difference NO_RULES_WARNING was written to make visible.
-        assert_eq!(rules_run(), 2);
+        assert_eq!(rules_run(), 4);
 
         let mut card = sample_card();
         let tree = walk_sample(&mut card, Limits::default());
@@ -2722,7 +2897,7 @@ mod tests {
             .tar_audit(audit);
         let block = verdict.fields();
         let score = &block["score"];
-        assert_eq!(score["rules_run"], serde_json::json!(2));
+        assert_eq!(score["rules_run"], serde_json::json!(4));
         assert_eq!(score["value"], serde_json::json!(rules::SCORE_MAX));
         assert_eq!(
             score["warning"],

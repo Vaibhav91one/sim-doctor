@@ -139,6 +139,9 @@ pub struct TagSet {
     short_file_id: Option<Tag>,
     df_name: Option<Tag>,
     proprietary: Option<Tag>,
+    security_reference: Option<Tag>,
+    security_expanded: Option<Tag>,
+    pin_status: Option<Tag>,
 }
 
 impl TagSet {
@@ -160,6 +163,9 @@ impl TagSet {
             short_file_id: None,
             df_name: None,
             proprietary: None,
+            security_reference: None,
+            security_expanded: None,
+            pin_status: None,
         }
     }
 
@@ -168,11 +174,14 @@ impl TagSet {
     /// `80` file size, `82` file descriptor, `83` file identifier, `84` DF
     /// name, `88` short file identifier, `8A` life cycle status, `8C` compact
     /// access conditions, `A5` proprietary information. `81` (total file
-    /// size), `8B`/`AB` (expanded and referenced security attributes) and
-    /// `C6` (PIN status template) are real tags in that clause that this
-    /// type has no slot for; they surface as tags the dialect does not
-    /// explain. \[V] against a live USIM's MF FCP (`82` descriptor, `83`
-    /// FID) and against swSIM's builder.
+    /// size) is a real tag in that clause that this type has no slot for.
+    /// `8B` (security attributes referenced to expanded format, clause
+    /// 11.1.1.4.7.3), `AB` (expanded format, 11.1.1.4.7.2) and `C6` (PIN
+    /// status template DO, 11.1.1.4.10) are mapped as the raw-value slots
+    /// [`Template::security_reference`], [`Template::security_expanded`] and
+    /// [`Template::pin_status`], all per ETSI TS 102 221 V17.0.0 (2021-10).
+    /// \[V] against a live USIM's MF FCP (`82` descriptor, `83` FID) and
+    /// against swSIM's builder.
     pub fn ts_102_221() -> Self {
         Self::named("ETSI TS 102 221")
             .with_file_size(Tag::new(0x80))
@@ -183,6 +192,9 @@ impl TagSet {
             .with_life_cycle_status(Tag::new(0x8A))
             .with_access_conditions(Tag::new(0x8C))
             .with_proprietary(Tag::new(0xA5))
+            .with_security_reference(Tag::new(0x8B))
+            .with_security_expanded(Tag::new(0xAB))
+            .with_pin_status(Tag::new(0xC6))
     }
 
     /// The mapping swSIM writes, from the FCP builder in its `src/3gpp.c`.
@@ -206,6 +218,9 @@ impl TagSet {
             .with_life_cycle_status(Tag::new(0x8A))
             .with_access_conditions(Tag::new(0x8C))
             .with_proprietary(Tag::new(0xA5))
+            .with_security_reference(Tag::new(0x8B))
+            .with_security_expanded(Tag::new(0xAB))
+            .with_pin_status(Tag::new(0xC6))
     }
 
     /// The name this mapping was given, for a scan to report.
@@ -306,6 +321,42 @@ impl TagSet {
     #[must_use]
     pub const fn with_proprietary(mut self, tag: Tag) -> Self {
         self.proprietary = Some(tag);
+        self
+    }
+
+    /// The tag of the referenced security attributes (`8B`), if mapped.
+    pub const fn security_reference(&self) -> Option<Tag> {
+        self.security_reference
+    }
+
+    /// The tag of the expanded security attributes (`AB`), if mapped.
+    pub const fn security_expanded(&self) -> Option<Tag> {
+        self.security_expanded
+    }
+
+    /// The tag of the PIN status template DO (`C6`), if mapped.
+    pub const fn pin_status(&self) -> Option<Tag> {
+        self.pin_status
+    }
+
+    /// Sets the tag of the referenced security attributes.
+    #[must_use]
+    pub const fn with_security_reference(mut self, tag: Tag) -> Self {
+        self.security_reference = Some(tag);
+        self
+    }
+
+    /// Sets the tag of the expanded security attributes.
+    #[must_use]
+    pub const fn with_security_expanded(mut self, tag: Tag) -> Self {
+        self.security_expanded = Some(tag);
+        self
+    }
+
+    /// Sets the tag of the PIN status template DO.
+    #[must_use]
+    pub const fn with_pin_status(mut self, tag: Tag) -> Self {
+        self.pin_status = Some(tag);
         self
     }
 }
@@ -504,6 +555,37 @@ impl<'a> Template<'a> {
         }
     }
 
+    /// The value of the referenced security attributes DO (`8B`), raw.
+    ///
+    /// ETSI TS 102 221 V17.0.0 clause 11.1.1.4.7.3: length 3 is EF(ARR) file
+    /// ID (2 octets) and record number; length `02 + X * 02` is the file ID
+    /// followed by X pairs of SE ID and record number. Decoded by
+    /// [`crate::access`].
+    pub fn security_reference(&self) -> Option<&'a [u8]> {
+        self.dialect
+            .security_reference()
+            .and_then(|tag| self.find(tag))
+            .map(|atom| atom.value())
+    }
+
+    /// The value of the expanded security attributes DO (`AB`), raw
+    /// (clause 11.1.1.4.7.2).
+    pub fn security_expanded(&self) -> Option<&'a [u8]> {
+        self.dialect
+            .security_expanded()
+            .and_then(|tag| self.find(tag))
+            .map(|atom| atom.value())
+    }
+
+    /// The value of the PIN status template DO (`C6`), raw
+    /// (clause 11.1.1.4.10).
+    pub fn pin_status(&self) -> Option<&'a [u8]> {
+        self.dialect
+            .pin_status()
+            .and_then(|tag| self.find(tag))
+            .map(|atom| atom.value())
+    }
+
     /// The access conditions the card reported, if it reported them.
     ///
     /// # Errors
@@ -535,6 +617,9 @@ impl TagSet {
             self.short_file_id,
             self.df_name,
             self.proprietary,
+            self.security_reference,
+            self.security_expanded,
+            self.pin_status,
         ]
         .contains(&Some(tag))
     }

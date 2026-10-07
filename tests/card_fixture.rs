@@ -759,21 +759,27 @@ fn walks_the_file_system_of_a_real_card() {
          can be forbidden. A non-zero count here would mean the walk invented a \
          finding."
     );
-    // A tag the mapping cannot read is named rather than dropped. swSIM sends
-    // a C6 PIN status template for every folder `[V]`, swSIM `src/3gpp.c`
-    // `o3gpp_select_res` at the pinned commit, and `TagSet::swicc()` has no tag
-    // for it, so a dedicated file's capabilities must carry it in the
-    // forward-compatibility list rather than losing it.
+    // swSIM sends a C6 PIN status template for every folder `[V]`, swSIM
+    // `src/3gpp.c` `o3gpp_select_res` at the pinned commit. The swICC table maps
+    // it (ETSI TS 102 221 clause 11.1.1.4.10, issue #40), so a dedicated file's
+    // capabilities carry its value rather than listing it as unexplained.
     let folder = tree.at(&directory).expect("3F00/7F20 is in the tree");
-    let folder_unknown = &folder
+    let folder_capabilities = folder
         .state()
         .capabilities()
-        .expect("a selected folder has capabilities")
-        .unknown_tags;
+        .expect("a selected folder has capabilities");
     assert!(
-        folder_unknown.iter().any(|tag| tag.octet() == 0xC6),
-        "the PIN status template the card sent is named, not dropped: {:?}",
-        folder_unknown
+        folder_capabilities.pin_status.is_some(),
+        "the PIN status template the card sent is read: {:?}",
+        folder_capabilities
+    );
+    assert!(
+        folder_capabilities
+            .unknown_tags
+            .iter()
+            .all(|tag| tag.octet() != 0xC6),
+        "C6 is mapped, so it is no longer an unexplained tag: {:?}",
+        folder_capabilities.unknown_tags
     );
 
     // Every identifier probed under the master file produced exactly one
@@ -1390,28 +1396,35 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         serde_json::json!(sim_doctor::scan::rules_run())
     );
 
-    // The four facts, asserted together rather than one at a time, because it
-    // is the COMBINATION that says what the 100 means.
-    //
-    //   rules_run 1          a rule really evaluated this card
-    //   scored_findings 0    it looked and found nothing
-    //   value 100 penalty 0  so nothing was subtracted
-    //   warning null         and this 100 is a verdict, not an absence of one
-    //
-    // The last one is the whole point. Before issue #24 this line asserted the
-    // warning WAS present, which said the opposite: nothing had been checked.
-    // Both are 100 with rules_run beside them; only one of them is a card that
-    // passed.
+    // The score is the formula over the findings beside it, and the warning
+    // below says the MSL 0 check did not run. (Before issue #40 this card
+    // produced no findings at all, so the score was always 100.)
+    // Issue #40 added access rules, and swSIM is a card whose PIN and access
+    // attributes this repository did not choose, so the number of findings is
+    // not asserted here. What is asserted is that the score is the formula
+    // applied to the findings beside it, whatever they are.
+    let reported = with_score["payload"]["data"]["findings"]["findings"]
+        .as_array()
+        .expect("findings is an array");
     assert_eq!(
         block["scored_findings"],
-        serde_json::json!(0),
-        "the one rule this crate has found nothing on this card, which is the          right answer for a card with no TAR check"
+        serde_json::json!(reported.len()),
+        "no severity filter, so every finding is scored"
     );
+    let penalty: u64 = reported
+        .iter()
+        .map(|f| {
+            u64::from(
+                sim_doctor::rules::SCORE_PENALTY
+                    [f["severity_rank"].as_u64().expect("a rank") as usize],
+            )
+        })
+        .sum();
+    assert_eq!(block["penalty"], serde_json::json!(penalty));
     assert_eq!(
         block["value"],
-        serde_json::json!(sim_doctor::rules::SCORE_MAX)
+        serde_json::json!(u64::from(sim_doctor::rules::SCORE_MAX).saturating_sub(penalty))
     );
-    assert_eq!(block["penalty"], serde_json::json!(0));
     // rules_run is 1, so a rule DID run - but `--tar` defaults to off, so
     // the audit probed nothing and the rule had nothing to look at. That is
     // the no-evidence case, not the earned-100 case, and the warning has to
@@ -1424,8 +1437,8 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     );
     assert_eq!(
         block["rules_run"],
-        serde_json::json!(2),
-        "gsma/msl-zero-allowed and auth/scp03-missing-mac are registered; a scan that evaluated zero rules          is the regression this assertion exists to catch"
+        serde_json::json!(sim_doctor::scan::rules_run()),
+        "every registered rule runs; a scan that evaluated zero rules is the regression this assertion exists to catch"
     );
 
     // The table travels too, so the number can be rebuilt without the source.
