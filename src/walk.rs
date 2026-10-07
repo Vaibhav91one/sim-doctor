@@ -1354,7 +1354,14 @@ pub fn walk<S: CardSession + ?Sized>(
             builder.note_limit(child, Limit::Depth);
         }
 
-        if !within_depth || !kind.is_some_and(Kind::is_container) {
+        // Under an application a DF that repeats an ancestor is the card answering
+        // for itself (a lax resolver), not a deeper directory: do not follow it.
+        let repeats_in_adf = child_path.adf().is_some()
+            && builder.nodes[child.0]
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::RepeatedAncestor { .. }));
+        if !within_depth || repeats_in_adf || !kind.is_some_and(Kind::is_container) {
             stack.push(frame);
             continue;
         }
@@ -2200,6 +2207,42 @@ mod tests {
         assert!(crate::ts48::observe(&tree).contains_key("3F00/7FD0/6F07"));
         // Reading EF.DIR is read-only.
         assert!(card.with_instruction(0xD6).is_empty());
+    }
+
+    #[test]
+    fn a_directory_that_answers_for_its_own_identifier_under_an_application_is_not_followed() {
+        let aid = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0xFF];
+        let mut record = tlv(0x61, &tlv(0x4F, &aid));
+        record.resize(0x20, 0xFF);
+        record.extend_from_slice(&[0x90, 0x00]);
+        let mut card = FakeCard::default()
+            .with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None))
+            .with(
+                "3F00/2F00",
+                tlv(
+                    0x62,
+                    &[
+                        tlv(0x82, &[0x42, 0x21, 0x00, 0x20, 0x01]),
+                        tlv(0x83, &[0x2F, 0x00]),
+                    ]
+                    .concat(),
+                ),
+            )
+            .with("3F00/7FF0", fcp(id("7FF0"), DIRECTORY_DESCRIPTOR, None))
+            .script(&[0x00, 0xB2, 0x01, 0x04, 0x20], &record);
+        // 5F3B answers inside 5F3B, to ten levels.
+        let mut key = String::from("3F00/7FF0");
+        for _ in 0..10 {
+            key.push_str("/5F3B");
+            card = card.with(&key, fcp(id("5F3B"), DIRECTORY_DESCRIPTOR, None));
+        }
+        card.adfs.push((aid.to_vec(), path_segments("3F00/7FF0")));
+
+        let tree = walk(&mut card, &dialect(), &options_for(&["5F3B"])).unwrap();
+
+        let deepest = tree.nodes().iter().map(|n| n.path().depth()).max().unwrap();
+        assert_eq!(deepest, 4, "ADF, 5F3B, and the one repeat that is recorded");
+        assert!(tree.report().repeated_ancestors > 0);
     }
 
     /// Options that probe exactly the leaves of the paths a test names, so a

@@ -598,6 +598,8 @@ fn walks_the_file_system_of_a_real_card() {
         .nodes()
         .iter()
         .filter(|node| node.state().is_selected())
+        // Application files are addressed by AID, not by this two-level layout.
+        .filter(|node| node.path().adf().is_none())
         .filter(|node| {
             !node
                 .notes()
