@@ -901,12 +901,16 @@ Group order per SGP.22 [V] SGP.22 v2.5 §2.5.4:
 1. `initialiseSecureChannelRequest` - in clear
 2. `firstSequenceOf87` = ConfigureISDP - tag `'87'`, encrypted + MAC'd
 3. `sequenceOf88` = StoreMetadata - tag `'88'`, **MAC-only, never encrypted**
-4. `secondSequenceOf87` = Profile Protection Keys - NOT implemented upstream
+4. `secondSequenceOf87` = Profile Protection Keys (ReplaceSessionKeys, optional) - tag `'87'`
 5. `sequenceOf86` = Protected Profile Package - tag `'86'` segments
 
 **All three tags advance ONE shared MAC chaining value**, not three independent counters [V].
-Segmentation: 1020-byte max segment, 1008 usable, 1007 bytes PPP payload after padding [V] SGP.22 v2.5 §2.5.3.
-Padding always 1-16 bytes, never all-zero [V].
+Segmentation [V] SGP.22 v2.5 §2.5.3: 1020-byte max segment (tag, length, MAC included), 1008 usable
+(1 tag + 3 length + 8 MAC), and with the `80` padding an encrypted segment holds 1007 bytes of data
+(that is the data BEFORE padding, not "after"). A MAC-only `88` has no padding and holds all 1008.
+Padding is `80` then zeros, always 1-16 bytes, so never all-zero [V] §2.5.3. After ReplaceSessionKeys the
+`86` segments use the new keys, an explicit initial chaining value and a counter reset to 1 [V] §2.5.3.
+Segment list for LoadBoundProfilePackage [V] §2.5.5. Implemented in `src/bpp.rs` (issue #17).
 
 ### 5.9 Signing and test PKI
 

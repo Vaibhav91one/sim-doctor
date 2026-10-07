@@ -104,6 +104,7 @@ pub mod access;
 pub mod aka;
 pub mod apdu;
 pub mod baseline;
+pub mod bpp;
 pub mod ci;
 pub mod contract;
 pub mod der;
@@ -268,6 +269,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: gp::NAME,
         owns: "Read-only GlobalPlatform: select the issuer security domain, GET DATA, CPLC and key information decoders, the APDU trace and the AES key check value; sends no authenticating or writing command.",
         depends_on: &[apdu::NAME, transport::NAME, session::NAME],
+    },
+    ModuleInfo {
+        name: bpp::NAME,
+        owns: "The SGP.22 Bound Profile Package builder: BPP block order, one shared SCP03t chain over the 87/88/86 TLVs, 1007/1008-byte segmentation and the BF36/A0-A3 segment list; sends nothing.",
+        depends_on: &[scp03t::NAME],
     },
     ModuleInfo {
         name: scan::NAME,
