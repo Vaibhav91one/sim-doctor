@@ -1227,8 +1227,8 @@ fn scans_a_real_card_end_to_end() {
     assert_eq!(envelope["payload"]["code"], serde_json::json!(0));
     assert_eq!(
         envelope["payload"]["data"]["dialect"]["name"],
-        serde_json::json!(dialect.name()),
-        "the binary reported the dialect it ran under"
+        serde_json::json!(sim_doctor::fcp::TagSet::ts_102_221().name()),
+        "the binary ran under the default dialect, ETSI TS 102 221"
     );
     assert_eq!(
         envelope["payload"]["data"]["truncated"],
