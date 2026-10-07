@@ -460,18 +460,34 @@ pub fn inner_tlv(tag: u8, data: &[u8]) -> Option<Vec<u8>> {
 /// written out rather than left to a debug assertion so that the arithmetic is
 /// visible in the code that depends on it.
 pub fn command_packet(tar: u32) -> Vec<u8> {
+    command_packet_with(tar, KEY_SET, SPI1_PLAIN, SPI2_PROBE)
+}
+
+/// The same Command Packet as [`command_packet`], with the keyset and SPI
+/// octets as parameters instead of the TAR probe's fixed values.
+///
+/// **This is what `fuzz.rs`'s OTA sweep is built on.** [`command_packet`]
+/// fixes keyset `0` and SPI1/SPI2 at the TAR probe's own values because that
+/// probe asks one question - "will you route this TAR" - and nothing about
+/// ciphering or Proof-of-Response is in play. A fuzz sweep asks a different
+/// question - which keyset and which SPI1/SPI2 combination a card will
+/// accept - so it needs those octets as inputs rather than constants. KIC and
+/// KID both carry `keyset << 4` in their high nibble, same encoding
+/// [`CommandPacket.setKeyset`] uses \[V] (see [`KEY_SET`]'s doc comment).
+pub fn command_packet_with(tar: u32, keyset: u8, spi1: u8, spi2: u8) -> Vec<u8> {
     let ud = PROBE_USER_DATA;
     let cpl = u16::try_from(1 + usize::from(COMMAND_HEADER_LEN) + ud.len())
         .expect("the probe user data is seven octets, so CPL is 21");
+    let key_nibble = keyset << 4;
 
     let mut out = Vec::with_capacity(usize::from(cpl) + COMMAND_PACKET_HEADER.len());
     out.extend_from_slice(&COMMAND_PACKET_HEADER);
     out.extend_from_slice(&cpl.to_be_bytes());
     out.push(COMMAND_HEADER_LEN);
-    out.push(SPI1_PLAIN);
-    out.push(SPI2_PROBE);
-    out.push(KEY_SET);
-    out.push(KEY_SET);
+    out.push(spi1);
+    out.push(spi2);
+    out.push(key_nibble);
+    out.push(key_nibble);
     out.extend_from_slice(&tar.to_be_bytes()[1..]);
     out.extend_from_slice(&COMMAND_COUNTER);
     out.push(0x00);
@@ -507,7 +523,21 @@ pub fn sms_deliver_tpdu(user_data: &[u8]) -> Option<Vec<u8>> {
 /// \[V] `OTASMS.send` to `EnvelopeSMSPPDownload` to
 /// `InnerTLV.getInnerTLV(0xD1, device_identities || address || tpdu)`.
 pub fn envelope_data(tar: u32, class: Class) -> Option<Vec<u8>> {
-    let tpdu = sms_deliver_tpdu(&command_packet(tar))?;
+    envelope_data_with(tar, class, KEY_SET, SPI1_PLAIN, SPI2_PROBE)
+}
+
+/// The same envelope data field as [`envelope_data`], with the Command
+/// Packet built from [`command_packet_with`] instead of [`command_packet`].
+///
+/// See [`command_packet_with`] for why a fuzz sweep needs this.
+pub fn envelope_data_with(
+    tar: u32,
+    class: Class,
+    keyset: u8,
+    spi1: u8,
+    spi2: u8,
+) -> Option<Vec<u8>> {
+    let tpdu = sms_deliver_tpdu(&command_packet_with(tar, keyset, spi1, spi2))?;
     let (identities, address) = match class {
         Class::Etsi => (&DEVICE_IDENTITIES_3G[..], &ADDRESS_3G[..]),
         Class::Gsm => (&DEVICE_IDENTITIES_GSM[..], &ADDRESS_GSM[..]),
@@ -536,7 +566,19 @@ pub const PROBE_ENVELOPE_LEN: usize = 58;
 /// halves with no card, which is the only way the invariant is provable on a
 /// machine with no reader.
 pub fn envelope_exchange(tar: u32, class: Class) -> Option<(Vec<u8>, Vec<u8>)> {
-    let data = envelope_data(tar, class)?;
+    envelope_exchange_with(tar, class, KEY_SET, SPI1_PLAIN, SPI2_PROBE)
+}
+
+/// The same two-exchange pair as [`envelope_exchange`], over
+/// [`envelope_data_with`] instead of [`envelope_data`].
+pub fn envelope_exchange_with(
+    tar: u32,
+    class: Class,
+    keyset: u8,
+    spi1: u8,
+    spi2: u8,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let data = envelope_data_with(tar, class, keyset, spi1, spi2)?;
     let len = u8::try_from(data.len()).ok()?;
     let opening = vec![class.octet(), INS_ENVELOPE, 0x00, 0x00, len];
     Some((opening, data))
@@ -1550,10 +1592,15 @@ enum Stop {
 
 /// One ENVELOPE exchange's worth of answer, reduced to what the differential
 /// needs.
+///
+/// `pub(crate)` rather than private: [`crate::fuzz`] builds its own envelope
+/// data from [`envelope_exchange_with`] and reads the result through
+/// [`probe_envelope`], and needs both fields to do what [`audit`] does with
+/// a [`Signature`].
 #[derive(Debug)]
-struct Reply {
-    signature: Signature,
-    exchanges: usize,
+pub(crate) struct Reply {
+    pub(crate) signature: Signature,
+    pub(crate) exchanges: usize,
 }
 
 /// Sends one TAR to a card and reads what it says.
@@ -1587,9 +1634,28 @@ fn probe<S: CardSession + ?Sized>(
             "the SMS-PP-DOWNLOAD envelope does not fit a short APDU data field",
         ));
     };
+    probe_envelope(session, &opening, &data, policy)
+}
 
+/// The two-exchange ENVELOPE protocol [`probe`] speaks, over an
+/// already-built `(opening, data)` pair instead of one this module built
+/// from a TAR.
+///
+/// **This is the part [`crate::fuzz`] reuses.** [`probe`] is the TAR audit's
+/// own wrapper: it builds the opening and data from [`envelope_exchange`] and
+/// calls this. A fuzz sweep builds its envelope from
+/// [`envelope_exchange_with`] instead, varying the keyset and SPI octets
+/// [`probe`] leaves fixed, and the wire mechanics - the procedure byte, the
+/// length check, draining a pending proactive command - are identical either
+/// way, so they live here once rather than twice.
+pub(crate) fn probe_envelope<S: CardSession + ?Sized>(
+    session: &mut S,
+    opening: &[u8],
+    data: &[u8],
+    policy: &Policy,
+) -> Result<Result<Reply, String>, Error> {
     // 1. The opening.
-    let first = session.transmit(&opening)?;
+    let first = session.transmit(opening)?;
     let first = Response::parse(&first)?;
 
     let Some(requested) = advertised_data_octets(&first) else {
@@ -1611,7 +1677,7 @@ fn probe<S: CardSession + ?Sized>(
     }
 
     // 2. The data, in one block of exactly the size the card named.
-    let second = session.transmit(&data)?;
+    let second = session.transmit(data)?;
     let second = Response::parse(&second)?;
 
     if second.status().is_none() {

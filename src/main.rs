@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    access, baseline, ci, contract, fix, gp, rules, sarif, scan, session, signals, skill, tar,
+    access, apdu_scan, baseline, ci, contract, fix, fuzz, gp, rules, sarif, scan, session, signals,
+    skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         Error as TransportError, ReaderName, ReaderProvider,
@@ -205,6 +206,93 @@ enum Command {
     /// Sends SELECT, GET RESPONSE and GET DATA only. Never an authenticating
     /// or writing command.
     Gp(GpArgs),
+
+    /// APDU discovery and the OTA/SMS fuzz sweep.
+    ///
+    /// REFUSES to run unless BOTH --i-understand-this-can-brick-the-card is
+    /// given AND the reader's name matches the software card (swicc-pcsc
+    /// names its reader with "swICC"; see docs/swsim-fixture.md), or
+    /// --allow-real-hardware is also given. A fuzz run sends ENVELOPE and
+    /// undocumented CLA/INS combinations, either of which can brick a real
+    /// SIM; this crate will not run one against hardware by accident.
+    ///
+    /// Exit codes: 0 when the run finished, 1 when it could not (including
+    /// the opt-in refusal, error kind fuzz-needs-opt-in), 129 for a bad
+    /// command line, 130 if interrupted.
+    Fuzz(FuzzArgs),
+}
+
+/// Everything `sim-doctor fuzz` takes.
+#[derive(Args)]
+struct FuzzArgs {
+    #[command(subcommand)]
+    action: FuzzAction,
+}
+
+#[derive(Subcommand)]
+enum FuzzAction {
+    /// CLA discovery (level 1) or CLA+INS discovery (level 2) over a session.
+    ///
+    /// Every candidate is sent as a CASE 1 header (CLA INS 00 00, no data):
+    /// discovery never carries a payload. Classified by status word: 6E00 is
+    /// "class not supported", 6D00 is "instruction not supported", anything
+    /// else reached a handler and is reported interesting.
+    Apdu(FuzzApduArgs),
+
+    /// The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR
+    /// scanner's ENVELOPE builder.
+    Ota(FuzzOtaArgs),
+}
+
+/// Flags every `fuzz` subcommand shares: the safety interlock and the reader.
+#[derive(Args, Clone)]
+struct FuzzSafety {
+    /// Required. Without it, `fuzz` refuses to run at all (exit 1, error
+    /// kind fuzz-needs-opt-in).
+    #[arg(long = "i-understand-this-can-brick-the-card")]
+    i_understand: bool,
+
+    /// Required in addition to the opt-in above when the reader's name does
+    /// not match the software card (swicc-pcsc names its reader with
+    /// "swICC"). Without it, `fuzz` refuses to run against anything that is
+    /// not recognisably the software card.
+    #[arg(long = "allow-real-hardware")]
+    allow_real_hardware: bool,
+
+    /// The reader to use, matched against the driver's own name.
+    #[arg(long, value_name = "NAME")]
+    reader: Option<String>,
+
+    /// Emit one JSON envelope on stdout, and nothing else.
+    #[arg(long)]
+    json: bool,
+
+    /// Probe a small, documented subset instead of the full space.
+    #[arg(long)]
+    quick: bool,
+}
+
+/// Everything `sim-doctor fuzz apdu` takes.
+#[derive(Args)]
+struct FuzzApduArgs {
+    #[command(flatten)]
+    safety: FuzzSafety,
+
+    /// 1 for CLA discovery, 2 for CLA+INS discovery.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    level: u8,
+
+    /// The CLA level 2 probes INS values at, as two hex digits (e.g. A0).
+    /// Required for --level 2.
+    #[arg(long, value_name = "HEX")]
+    class: Option<String>,
+}
+
+/// Everything `sim-doctor fuzz ota` takes.
+#[derive(Args)]
+struct FuzzOtaArgs {
+    #[command(flatten)]
+    safety: FuzzSafety,
 }
 
 /// Everything `sim-doctor gp` takes.
@@ -835,6 +923,10 @@ fn main() -> process::ExitCode {
             } => run_gp_info(reader.as_deref(), json, trace),
         },
         Command::Mcp => run_mcp(),
+        Command::Fuzz(args) => match args.action {
+            FuzzAction::Apdu(args) => run_fuzz_apdu(args),
+            FuzzAction::Ota(args) => run_fuzz_ota(args),
+        },
     })
 }
 
@@ -1641,6 +1733,8 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
 fn all_specs() -> Vec<rules::RuleSpec> {
     let mut specs = scan::specs();
     specs.extend(ts48::specs());
+    specs.extend(apdu_scan::specs());
+    specs.extend(fuzz::specs());
     specs
 }
 
@@ -1740,6 +1834,298 @@ fn run_ts48_compare(args: Ts48CompareArgs) -> contract::ExitCode {
         )
     };
     match emit_stdout(rendered.trim_end_matches('\n'), what) {
+        Ok(()) => contract::ExitCode::Success,
+        Err(message) => {
+            eprintln!("sim-doctor: {message}");
+            contract::ExitCode::Findings
+        }
+    }
+}
+
+/// The fragment swicc-pcsc names its reader with.
+///
+/// \[V] docs/swsim-fixture.md: "Expect a reader whose name contains swICC",
+/// and every other place in this crate that matches the software card's
+/// reader (`tests/card_fixture.rs`) does it the same way: a case-insensitive
+/// substring match, because the exact spelling is not part of swicc-pcsc's
+/// contract and this crate does not own it.
+const SWICC_READER_FRAGMENT: &str = "swicc";
+
+/// Error kind every `fuzz` opt-in refusal carries.
+const FUZZ_OPT_IN_KIND: &str = "fuzz-needs-opt-in";
+
+/// The mandatory safety interlock on every `fuzz` subcommand (issue #16).
+///
+/// Refuses, with [`FUZZ_OPT_IN_KIND`], unless BOTH
+/// `--i-understand-this-can-brick-the-card` is given AND the reader's name
+/// matches the software card, or `--allow-real-hardware` is also given.
+/// Checked before a reader is even listed when the first flag is missing, so
+/// the common mistake - forgetting it entirely - never touches PC/SC at all.
+fn fuzz_opt_in(safety: &FuzzSafety, reader: Option<&ReaderName>) -> Result<(), String> {
+    if !safety.i_understand {
+        return Err(
+            "fuzz refuses to run without --i-understand-this-can-brick-the-card: a fuzz run \
+             sends undocumented CLA/INS values and OTA envelopes that can brick a SIM"
+                .to_owned(),
+        );
+    }
+    let is_software = reader.is_some_and(|reader| {
+        reader
+            .as_str()
+            .to_ascii_lowercase()
+            .contains(SWICC_READER_FRAGMENT)
+    });
+    if !is_software && !safety.allow_real_hardware {
+        return Err(format!(
+            "fuzz refuses to run against {:?}: it does not look like the software card \
+             (swicc-pcsc names its reader with \"swICC\", see docs/swsim-fixture.md); pass \
+             --allow-real-hardware to run against it anyway",
+            reader.map(ReaderName::as_str).unwrap_or("(no reader)")
+        ));
+    }
+    Ok(())
+}
+
+/// Opens the reader `safety` and `kind` agree to open, or returns the exit
+/// code of a refusal.
+///
+/// Shared by `fuzz apdu` and `fuzz ota`: the opt-in check, then the same
+/// reader-listing and reader-opening path `run_scan` and `run_ts48_compare`
+/// use, so a fuzz refusal is the same shape as every other refusal in this
+/// crate - `data.error`, exit 1, no `data.findings`.
+fn open_fuzz_session(
+    kind: &str,
+    safety: &FuzzSafety,
+) -> Result<(ReaderName, PcscSession), contract::ExitCode> {
+    if !safety.i_understand {
+        return Err(report_refusal(
+            kind,
+            &fuzz_opt_in(safety, None).unwrap_err(),
+            serde_json::json!({ "error": { "kind": FUZZ_OPT_IN_KIND } }),
+            safety.json,
+        ));
+    }
+    if checkpoint() {
+        return Err(report_interrupted(kind, safety.json));
+    }
+    let readers = match Pcsc::readers() {
+        Ok(readers) => readers,
+        Err(err) => {
+            return Err(report_failure(
+                &scan::Failure::new("context-unavailable", err.to_string()),
+                safety.json,
+            ))
+        }
+    };
+    let reader = match pick_reader(&readers, safety.reader.as_deref()) {
+        Ok(reader) => reader.clone(),
+        Err(failure) => return Err(report_failure(&failure, safety.json)),
+    };
+    if let Err(message) = fuzz_opt_in(safety, Some(&reader)) {
+        return Err(report_refusal(
+            kind,
+            &message,
+            serde_json::json!({ "error": { "kind": FUZZ_OPT_IN_KIND, "message": message } }),
+            safety.json,
+        ));
+    }
+    let session = match PcscSession::open(&reader) {
+        Ok(session) => session,
+        Err(err) => {
+            let failure_kind = match err {
+                TransportError::NoCard { .. } => "no-card",
+                _ => "reader-unavailable",
+            };
+            return Err(report_failure(
+                &scan::Failure::new(failure_kind, err.to_string()),
+                safety.json,
+            ));
+        }
+    };
+    Ok((reader, session))
+}
+
+/// Runs `sim-doctor fuzz apdu`: CLA discovery (level 1) or CLA+INS discovery
+/// (level 2), behind the safety interlock.
+fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
+    // The opt-in flag is the very first gate: a run missing it is refused
+    // before any other flag, including --class, is even looked at. The
+    // reader-matches-the-software-card half of the interlock needs a reader
+    // to check against, so it waits for `open_fuzz_session`.
+    if !args.safety.i_understand {
+        return report_refusal(
+            apdu_scan::KIND,
+            &fuzz_opt_in(&args.safety, None).unwrap_err(),
+            serde_json::json!({ "error": { "kind": FUZZ_OPT_IN_KIND } }),
+            args.safety.json,
+        );
+    }
+
+    let mode = if args.safety.quick {
+        apdu_scan::Mode::Quick
+    } else {
+        apdu_scan::Mode::Full
+    };
+
+    // A bad or missing --class is a command-line mistake, not a card fact, so
+    // it is caught before a reader is even listed - the same reason
+    // `pick_reader` is exit 1 rather than 129 but a flag's own shape is
+    // caught before either runs.
+    let class = if args.level == 2 {
+        let Some(class_text) = &args.class else {
+            return report_refusal(
+                apdu_scan::KIND,
+                "--level 2 needs --class HEX, the CLA to probe INS values at",
+                serde_json::json!({ "error": { "kind": "missing-class" } }),
+                args.safety.json,
+            );
+        };
+        match u8::from_str_radix(class_text.trim_start_matches("0x"), 16) {
+            Ok(class) => Some(class),
+            Err(_) => {
+                return report_refusal(
+                    apdu_scan::KIND,
+                    &format!("{class_text:?} is not a CLA byte; expected two hex digits, e.g. A0"),
+                    serde_json::json!({ "error": { "kind": "bad-class" } }),
+                    args.safety.json,
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    let (reader, mut session) = match open_fuzz_session(apdu_scan::KIND, &args.safety) {
+        Ok(opened) => opened,
+        Err(code) => return code,
+    };
+
+    if let Some(class) = class {
+        let audit = match apdu_scan::ins_discovery(
+            &mut session,
+            class,
+            mode,
+            &session::Policy::default(),
+            &mut || signals::interrupted(),
+        ) {
+            Ok(audit) => audit,
+            Err(err) => {
+                return report_failure(
+                    &scan::Failure::new("apdu-discovery-failed", err.to_string()),
+                    args.safety.json,
+                )
+            }
+        };
+        let findings = apdu_scan::ins_findings(&audit);
+        emit_fuzz_report(
+            apdu_scan::KIND,
+            reader.as_str(),
+            audit.to_json(),
+            &findings,
+            args.safety.json,
+        )
+    } else {
+        let audit = match apdu_scan::cla_discovery(
+            &mut session,
+            mode,
+            &session::Policy::default(),
+            &mut || signals::interrupted(),
+        ) {
+            Ok(audit) => audit,
+            Err(err) => {
+                return report_failure(
+                    &scan::Failure::new("apdu-discovery-failed", err.to_string()),
+                    args.safety.json,
+                )
+            }
+        };
+        let findings = apdu_scan::cla_findings(&audit);
+        emit_fuzz_report(
+            apdu_scan::KIND,
+            reader.as_str(),
+            audit.to_json(),
+            &findings,
+            args.safety.json,
+        )
+    }
+}
+
+/// Runs `sim-doctor fuzz ota`: the TAR x keyset x mechanism sweep, behind the
+/// safety interlock.
+fn run_fuzz_ota(args: FuzzOtaArgs) -> contract::ExitCode {
+    let (reader, mut session) = match open_fuzz_session(fuzz::KIND, &args.safety) {
+        Ok(opened) => opened,
+        Err(code) => return code,
+    };
+
+    let sweep = fuzz::Sweep {
+        quick: args.safety.quick,
+        class: tar::Class::Etsi,
+    };
+    let audit = match fuzz::audit(
+        &mut session,
+        sweep,
+        &session::Policy::default(),
+        &mut || signals::interrupted(),
+    ) {
+        Ok(audit) => audit,
+        Err(err) => {
+            return report_failure(
+                &scan::Failure::new("fuzz-sweep-failed", err.to_string()),
+                args.safety.json,
+            )
+        }
+    };
+    let findings = fuzz::findings(&audit);
+    emit_fuzz_report(
+        fuzz::KIND,
+        reader.as_str(),
+        audit.to_json(),
+        &findings,
+        args.safety.json,
+    )
+}
+
+/// One `fuzz` report, in both modes: the reader name, the raw audit block
+/// (named `data` under its own key per subcommand) and the findings, through
+/// the same [`rules::Finding::to_json`] contract every other rule uses.
+fn emit_fuzz_report(
+    kind: &str,
+    reader: &str,
+    audit: serde_json::Value,
+    findings: &[rules::Finding],
+    json: bool,
+) -> contract::ExitCode {
+    let data = serde_json::json!({
+        "reader": reader,
+        "audit": audit,
+        "findings": {
+            "count": findings.len(),
+            "findings": findings.iter().map(rules::Finding::to_json).collect::<Vec<_>>(),
+        },
+    });
+    let rendered = if json {
+        let envelope = contract::Envelope::new(
+            kind,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        );
+        match envelope.to_json() {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("sim-doctor: {err}");
+                return contract::ExitCode::Findings;
+            }
+        }
+    } else {
+        let mut text = format!("{kind} on {reader}: {} finding(s)\n", findings.len());
+        for finding in findings {
+            text.push_str(&format!("{finding}\n"));
+        }
+        text
+    };
+    match emit_stdout(rendered.trim_end_matches('\n'), "the fuzz report") {
         Ok(()) => contract::ExitCode::Success,
         Err(message) => {
             eprintln!("sim-doctor: {message}");

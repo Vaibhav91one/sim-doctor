@@ -371,14 +371,16 @@ jobs:
           # issue #12's baseline test. It is a count rather
           # than only names because `--ignored` against a deleted test still
           # exits 0; the names pin the set and the count is what fails when a
-          # fifth test is added and not wired up here (6 with issue #25's ts48 compare).
-          grep -q '6 passed' "$log"
+          # fifth test is added and not wired up here (6 with issue #25's ts48
+          # compare, 7 with issue #16's fuzz apdu --quick).
+          grep -q '7 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
           grep -q 'scans_a_real_card_end_to_end' "$log"
           grep -q 'the_score_and_severity_flags_reach_the_envelope_against_a_real_card' "$log"
           grep -q 'a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused' "$log"
           grep -q 'ts48_compare_accounts_for_every_profile_file_against_a_real_card' "$log"
+          grep -q 'fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job
