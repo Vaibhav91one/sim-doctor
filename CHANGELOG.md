@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `scan` works on real cards: a GET RESPONSE rejected at the GSM class (`6E 00`/`6D 00`) re-sends a read-only command once and collects at the command's own class; swSIM is unaffected (#64).
+- The FCP tag table for real cards was wrong. The new default `--dialect ts-102-221` (ETSI TS 102 221: 80 size, 82 descriptor, 83 FID, 84 DF name) replaces it; `iec-7816-4-table-42` is a deprecated alias. A baseline taken under another dialect is refused by `--diff` (#69).
+- An empty reader is reported as `no card in reader` (error kind `no-card`) instead of an unusable reader (#64).
+- Tests no longer open an attached reader (#72).
+
+### Added
+
+- SCP03 core (key derivation, cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders), Milenage wrapper and the `auth/scp03-missing-mac` rule; vector-tested, never sent to a card. `rules_run` is now 2, so older baselines are refused by `--diff` (#22).
+- RFC 6979 deterministic ECDSA P-256/SHA-256 signing, 64-byte r||s (#21).
+- A generated-card corpus with a per-rule precision/recall gate (#47).
+
+### Changed
+
+- SGP.22 and TS.48 are public; the recorded GSMA member-access blockers were wrong and are resolved; TS.48 work is re-scoped to comparing a card with the public test profile (#26, #25).
+
 ## [0.2.0] - 2026-10-07
 
 ### Fixed
