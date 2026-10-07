@@ -1425,8 +1425,8 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     );
     assert_eq!(
         block["rules_run"],
-        serde_json::json!(1),
-        "gsma/msl-zero-allowed is registered; a scan that evaluated zero rules          is the regression this assertion exists to catch"
+        serde_json::json!(2),
+        "gsma/msl-zero-allowed and auth/scp03-missing-mac are registered; a scan that evaluated zero rules          is the regression this assertion exists to catch"
     );
 
     // The table travels too, so the number can be rebuilt without the source.
