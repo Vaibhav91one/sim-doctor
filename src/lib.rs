@@ -112,6 +112,7 @@ pub mod rules;
 pub mod sarif;
 pub mod scan;
 pub mod session;
+pub mod sign;
 pub mod signals;
 pub mod skill;
 pub mod tar;
