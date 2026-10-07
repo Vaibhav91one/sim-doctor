@@ -970,6 +970,12 @@ expected outcomes. So issue #25 is re-scoped from a generic test-case runner to:
 public TS.48 profile package and compare a card's file system against it (read-only).
 Issue #26 is closed: there is no access blocker.
 
+Implemented (issue #25): `sim-doctor ts48 compare` diffs a walked card against the file list in
+`tests/corpus/ts48/ts48-v7.0-files.json`, derived by `src/ts48.rs` from the SAIP 2.3 package at a
+pinned commit. The package itself is never committed (it carries public test keys); only the derived
+list is. Rules `ts48/file-missing`, `ts48/file-different` (low) and `ts48/file-extra` (info). Matching
+TS.48's file structure is not GCF or PTCRB conformance, and an operator SIM is not a TS.48 card.
+
 ---
 
 ## 7. Where to look

@@ -136,6 +136,7 @@ built-in PCSC framework.
 | Command | What it does |
 | --- | --- |
 | `scan` | select the master file, walk the card, report |
+| `ts48 compare [--json] [--reader NAME] [--dialect TABLE]` | walk the card (read-only, no TAR probes) and diff its file system against the public GSMA TS.48 test profile; see below |
 | `install [--agent claude\|cursor\|codex\|opencode] [--print-only] [--dir DIR]` | write agent guidance into a project |
 | `modules [--json]` | describe the crate's module roots and layering |
 | `completions <shell>` | shell completion script for the whole flag surface |
@@ -154,6 +155,28 @@ built-in PCSC framework.
 | `--severity <LEVEL>` | drop findings below `info\|low\|medium\|high\|critical` |
 | `--score` | add `data.score`, integer 0-100 |
 | `--baseline <FILE>`, `--diff` | regression gating against a saved run (in review, see the baseline PR) |
+
+### `ts48 compare`
+
+Walks the card exactly as `scan` does (SELECT and GET RESPONSE only; no ENVELOPE, no TAR
+probes) and diffs the files it found against the file list of the GSMA Generic eUICC Test
+Profile (TS.48 v7.0, SAIP 2.3). GSMA publishes that profile under Apache-2.0 at
+[GSMATerminals/Generic-eUICC-Test-Profile-for-Device-Testing-Public](https://github.com/GSMATerminals/Generic-eUICC-Test-Profile-for-Device-Testing-Public);
+the list compiled into the binary is `tests/corpus/ts48/ts48-v7.0-files.json`, derived from the
+pinned commit named in it. The profile package itself, which carries public test keys, is never
+committed; `cargo test regenerates_the_fixture -- --ignored` re-derives the list from a download.
+
+Findings go through the usual contract, rules `ts48/file-missing` and `ts48/file-different`
+(low) and `ts48/file-extra` (info), and `data.summary` carries the counts
+(`expected`, `matched`, `missing`, `extra`, `different`, `unverified`). A file under a directory
+the card refused to select is `unverified`, not missing. Compared: file type, EF layout, size and
+record length, each only when both sides state it. An operator SIM is not a TS.48 card, so
+differences are the expected result and the exit code is 0 whenever the walk finished.
+
+**Matching the TS.48 file structure is not GCF or PTCRB conformance.** This compares a file
+system with a public test profile and certifies nothing. The walk's limits apply (the default
+candidate set can miss a file, and an application directory is compared at the profile's
+identifier, so a USIM ADF that a card exposes under another identifier reads as missing plus extra).
 
 ## Exit codes
 
