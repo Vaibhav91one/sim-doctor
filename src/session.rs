@@ -130,6 +130,10 @@ pub struct Policy {
     /// Both [`CLA_GET_RESPONSE_GSM`] and [`crate::apdu::CLA_GET_RESPONSE_ISO`]
     /// are supported because a card may dispatch INS `0xC0` at either and
     /// swSIM does not route the ISO one at all. \[V], swSIM src/apduh.c.
+    ///
+    /// A real USIM rejects the GSM class with `6E 00`/`6D 00` after a CLA 00
+    /// command, so [`send`] retries that GET RESPONSE once at the triggering
+    /// command's own class. The retry is recorded as its own round trip.
     pub get_response_class: u8,
 
     /// CLA for a FETCH follow-up. Defaults to [`CLA_FETCH_ETSI`].
@@ -463,7 +467,23 @@ fn follow_up<S: CardSession + ?Sized>(
             stop = StopReason::PendingLengthNotExpressible;
             break;
         };
-        response = exchange(session, &mut steps, follow_up.encode()?)?;
+        let mut wire = follow_up.encode()?;
+        response = exchange(session, &mut steps, wire.clone())?;
+        // A real USIM answers a SELECT at CLA 00 with 61 xx but rejects the
+        // GSM-class GET RESPONSE with 6E 00 (class not supported). Retry the
+        // same GET RESPONSE once at the triggering command's own class. At
+        // most once per GET RESPONSE: the retry's answer is final.
+        let own_class = command.header().class();
+        if choice == PendingFollowUp::GetResponse
+            && own_class != wire[0]
+            && matches!(
+                response.status().map(|s| (s.sw1(), s.sw2())),
+                Some((0x6E | 0x6D, 0x00))
+            )
+        {
+            wire[0] = own_class;
+            response = exchange(session, &mut steps, wire)?;
+        }
         follow_ups += 1;
         data.extend_from_slice(response.body());
     }
@@ -699,6 +719,45 @@ mod tests {
             assert_eq!(exchange.stop_reason(), StopReason::Answered);
             assert_eq!(exchange.data(), body.as_slice(), "61 {sw2:02X}");
         }
+    }
+
+    #[test]
+    fn a_get_response_rejected_as_unsupported_class_is_retried_once_at_the_commands_class() {
+        for sw1 in [0x6E, 0x6D] {
+            let mut card = Scripted::new([
+                vec![0x61, 0x04],
+                vec![sw1, 0x00],
+                with_body(&[1, 2, 3, 4], 0x90, 0x00),
+            ]);
+            let exchange = send(&mut card, &probe(), &Policy::default()).unwrap();
+            assert_eq!(exchange.exchange_count(), 3);
+            assert_eq!(
+                exchange.steps()[1].command(),
+                [CLA_GET_RESPONSE_GSM, INS_GET_RESPONSE, 0, 0, 4]
+            );
+            assert_eq!(
+                exchange.steps()[2].command(),
+                [CLA_GET_RESPONSE_ISO, INS_GET_RESPONSE, 0, 0, 4]
+            );
+            assert!(exchange.is_success());
+            assert_eq!(exchange.data(), [1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn a_failed_get_response_retry_is_reported_and_not_retried_again() {
+        let mut card = Scripted::new([vec![0x61, 0x04], vec![0x6E, 0x00]]);
+        let exchange = send(&mut card, &probe(), &Policy::default()).unwrap();
+        assert_eq!(exchange.exchange_count(), 3, "one retry, never a second");
+        assert_eq!(exchange.status(), Some(StatusWord::new(0x6E, 0x00)));
+        assert!(!exchange.is_success());
+    }
+
+    #[test]
+    fn a_get_response_that_succeeds_at_the_policy_class_is_not_retried() {
+        let mut card = Scripted::new([vec![0x61, 0x04], with_body(&[9; 4], 0x90, 0x00)]);
+        let exchange = send(&mut card, &probe(), &Policy::default()).unwrap();
+        assert_eq!(exchange.exchange_count(), 2);
     }
 
     #[test]

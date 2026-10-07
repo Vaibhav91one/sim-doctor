@@ -31,7 +31,7 @@ use sim_doctor::{
     baseline, ci, contract, fix, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
-        ReaderName, ReaderProvider,
+        Error as TransportError, ReaderName, ReaderProvider,
     },
     walk::{self, Limits},
     MODULES,
@@ -1127,10 +1127,11 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     let mut session = match PcscSession::open(reader) {
         Ok(session) => session,
         Err(err) => {
-            return report_failure(
-                &scan::Failure::new("reader-unavailable", err.to_string()),
-                args.json,
-            )
+            let kind = match err {
+                TransportError::NoCard { .. } => "no-card",
+                _ => "reader-unavailable",
+            };
+            return report_failure(&scan::Failure::new(kind, err.to_string()), args.json);
         }
     };
 

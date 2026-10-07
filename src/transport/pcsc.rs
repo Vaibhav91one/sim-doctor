@@ -100,7 +100,8 @@ impl PcscSession {
     /// # Errors
     ///
     /// Returns [`Error::ContextUnavailable`] when no PC/SC context can be
-    /// established, [`Error::ReaderUnavailable`] when the reader exists but
+    /// established, [`Error::NoCard`] when the reader is empty,
+    /// [`Error::ReaderUnavailable`] when the reader exists but
     /// the card in it cannot be opened, and [`Error::Driver`] for any other
     /// refusal from the PC/SC layer.
     pub fn open(reader: &ReaderName) -> Result<Self, Error> {
@@ -233,12 +234,13 @@ impl CardSession for PcscSession {
 /// fails when the thing that was there went away.
 fn classify_connect(error: ::pcsc::Error, reader: &ReaderName) -> Error {
     match error {
+        ::pcsc::Error::NoSmartcard | ::pcsc::Error::RemovedCard => Error::NoCard {
+            reader: reader.clone(),
+        },
         ::pcsc::Error::UnknownReader
         | ::pcsc::Error::NoReadersAvailable
-        | ::pcsc::Error::NoSmartcard
         | ::pcsc::Error::UnknownCard
         | ::pcsc::Error::ReaderUnavailable
-        | ::pcsc::Error::RemovedCard
         | ::pcsc::Error::ResetCard
         | ::pcsc::Error::SharingViolation
         | ::pcsc::Error::NotReady
@@ -296,7 +298,6 @@ mod tests {
         for code in [
             ::pcsc::Error::UnknownReader,
             ::pcsc::Error::NoReadersAvailable,
-            ::pcsc::Error::NoSmartcard,
             ::pcsc::Error::UnknownCard,
             ::pcsc::Error::ReaderUnavailable,
             ::pcsc::Error::SharingViolation,
@@ -308,6 +309,15 @@ mod tests {
                 ),
                 "{code:?} should say the reader is unusable"
             );
+        }
+    }
+
+    #[test]
+    fn an_empty_reader_is_reported_as_no_card_not_as_an_unusable_reader() {
+        for code in [::pcsc::Error::NoSmartcard, ::pcsc::Error::RemovedCard] {
+            let mapped = classify_connect(code, &reader());
+            assert!(matches!(mapped, Error::NoCard { .. }), "{code:?}");
+            assert!(mapped.to_string().starts_with("no card in reader `"));
         }
     }
 
