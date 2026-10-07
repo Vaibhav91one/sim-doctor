@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    baseline, ci, contract, fix, rules, sarif, scan, session, signals, skill, tar,
+    baseline, ci, contract, fix, gp, rules, sarif, scan, session, signals, skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
         Error as TransportError, ReaderName, ReaderProvider,
@@ -178,6 +178,39 @@ enum Command {
     /// Nothing is launched when already inside a coding agent. FILE is a saved
     /// `sim-doctor scan --json` envelope, like `why` reads.
     Fix(FixArgs),
+
+    /// Read-only GlobalPlatform queries.
+    ///
+    /// Sends SELECT, GET RESPONSE and GET DATA only. Never an authenticating
+    /// or writing command.
+    Gp(GpArgs),
+}
+
+/// Everything `sim-doctor gp` takes.
+#[derive(Args)]
+struct GpArgs {
+    #[command(subcommand)]
+    action: GpAction,
+}
+
+#[derive(Subcommand)]
+enum GpAction {
+    /// Select the issuer security domain and read CPLC, card data, key
+    /// information, IIN and CIN with GET DATA.
+    ///
+    /// Exit 0 when an ISD answered, 1 when none did (the envelope still carries
+    /// the status words), 129 for a bad command line.
+    Info {
+        /// The reader to use, matched against the driver's own name.
+        #[arg(long, value_name = "NAME")]
+        reader: Option<String>,
+        /// Emit one JSON envelope of kind "gp" on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Add every APDU exchange (command and response hex) as data.trace.
+        #[arg(long)]
+        trace: bool,
+    },
 }
 
 /// The long description of `sim-doctor scan`.
@@ -720,6 +753,13 @@ fn main() -> process::ExitCode {
         },
         Command::Why(args) => run_why(&args.target, args.json),
         Command::Fix(args) => run_fix(&args),
+        Command::Gp(args) => match args.action {
+            GpAction::Info {
+                reader,
+                json,
+                trace,
+            } => run_gp_info(reader.as_deref(), json, trace),
+        },
         Command::Mcp => run_mcp(),
     })
 }
@@ -1406,6 +1446,72 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             contract::ExitCode::Findings
         }
     }
+}
+
+/// `sim-doctor gp info`: one read-only GlobalPlatform pass over one card.
+fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitCode {
+    const KIND: &str = "gp";
+    let refuse =
+        |failure: scan::Failure| report_refusal(KIND, &failure.message, failure.data(), json);
+    let readers = match Pcsc::readers() {
+        Ok(readers) => readers,
+        Err(err) => return refuse(scan::Failure::new("context-unavailable", err.to_string())),
+    };
+    let reader = match pick_reader(&readers, reader) {
+        Ok(reader) => reader,
+        Err(failure) => return refuse(failure),
+    };
+    let mut session = match PcscSession::open(reader) {
+        Ok(session) => session,
+        Err(err) => {
+            let kind = match err {
+                TransportError::NoCard { .. } => "no-card",
+                _ => "reader-unavailable",
+            };
+            return refuse(scan::Failure::new(kind, err.to_string()));
+        }
+    };
+    let report = match gp::info(&mut session, trace) {
+        Ok(report) => report,
+        Err(err) => return refuse(scan::Failure::new("gp-exchange-failed", err.to_string())),
+    };
+    let mut data = report.data;
+    data["reader"] = serde_json::json!(reader.as_str());
+    if !report.isd_found {
+        data["error"] = serde_json::json!({
+            "kind": "isd-not-found",
+            "message": "no issuer security domain answered SELECT at either AID",
+        });
+        return report_refusal(
+            KIND,
+            "no issuer security domain answered SELECT at either AID",
+            data,
+            json,
+        );
+    }
+    let rendered = if json {
+        match contract::Envelope::new(
+            KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        )
+        .to_json()
+        {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("sim-doctor: {err}");
+                return contract::ExitCode::Findings;
+            }
+        }
+    } else {
+        serde_json::to_string_pretty(&data).unwrap_or_default()
+    };
+    if let Err(err) = emit_stdout(&rendered, "the gp info report") {
+        eprintln!("sim-doctor: {err}");
+        return contract::ExitCode::Findings;
+    }
+    contract::ExitCode::Success
 }
 
 /// Picks the reader to scan, or says why there is not one.

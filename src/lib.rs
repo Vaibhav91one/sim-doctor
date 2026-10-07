@@ -108,6 +108,7 @@ pub mod der;
 pub mod fcp;
 pub mod fix;
 pub mod fs;
+pub mod gp;
 pub mod mcp;
 pub mod rules;
 pub mod sarif;
@@ -254,6 +255,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: scp03t::NAME,
         owns: "SCP03t (SGP.22 BPP protection): ECDH P-256, the X9.63 KDF, the ICV/S-ENC/S-MAC split, and the tag 86/87/88 MAC and AES-CBC protection of TLV segments; sends nothing.",
         depends_on: &[tlv::NAME, scp03::NAME],
+    },
+    ModuleInfo {
+        name: gp::NAME,
+        owns: "Read-only GlobalPlatform: select the issuer security domain, GET DATA, CPLC and key information decoders, the APDU trace and the AES key check value; sends no authenticating or writing command.",
+        depends_on: &[apdu::NAME, transport::NAME, session::NAME],
     },
     ModuleInfo {
         name: scan::NAME,
