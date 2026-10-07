@@ -11,29 +11,33 @@
 //! now provides. It also does not own the file system vocabulary; a file
 //! identifier as an addressable thing is [`crate::fs`].
 //!
-//! # The tag table is not the protocol, and there is more than one of them
+//! # The tag table is a decision, and the standard one is ETSI TS 102 221
 //!
-//! This is the finding AGENTS.md section 2 records, and it is the reason this
-//! module exists in the shape it does. Inside a file capabilities template,
-//! ISO/IEC 7816-4 table 42 and the FCP builder in swSIM's `src/3gpp.c`
-//! **disagree** about what three of the tags mean:
+//! Inside a file capabilities template the tag numbering is fixed by ETSI
+//! TS 102 221 clause 11.1.1.3 (the UICC profile of ISO/IEC 7816-4):
 //!
-//! | Field | ISO/IEC 7816-4 table 42 | swSIM `src/3gpp.c` |
-//! |---|---|---|
-//! | file size | `82` | `80` |
-//! | file descriptor | `83` | `82` |
-//! | file identifier | `84` | `83` |
+//! | Field | Tag |
+//! |---|---|
+//! | file size | `80` |
+//! | file descriptor | `82` |
+//! | file identifier | `83` |
+//! | DF name | `84` |
+//! | short file identifier | `88` |
+//! | life cycle status | `8A` |
+//! | compact access conditions | `8C` |
+//! | proprietary information | `A5` |
 //!
-//! Reading an swSIM FCP against the ISO table gives a file size of `0x0921`
-//! for EF.IMSI. Reading it against swSIM's table gives `80 = 0x000A = 10`,
-//! which is the file's real length. That was not a rounding error; it was a
-//! card reported as absurd. \[V] for the swSIM column, read in `src/3gpp.c` at
-//! swsim commit `281da8c6`; the ISO column is recorded in AGENTS.md section 2
-//! and `docs/swsim-fixture.md` and is not re-derived here.
+//! A live operator USIM answers SELECT MF with
+//! `62 .. | 82 02 78 21 | 83 02 3F 00 | A5 .. | 8A 01 05 | 8B 03 .. | C6 ..`,
+//! which is exactly this layout, and swSIM's FCP builder (`src/3gpp.c` at
+//! swsim commit `281da8c6`) writes the same tags. The mapping this crate once
+//! called "ISO/IEC 7816-4 table 42" (`82` size, `83` descriptor, `84` FID) was
+//! wrong: it read a real card's descriptor as its size and its FID as its
+//! descriptor. It is gone; issue #69.
 //!
-//! So the design decision this module exists to enforce is: **there is no
-//! default mapping.** [`Template::parse`] takes a [`TagSet`], and the only
-//! way to get one is to name it - [`TagSet::iec_7816_4_table_42`],
+//! The design decision this module still enforces: **there is no default
+//! mapping inside the library.** [`Template::parse`] takes a [`TagSet`], and
+//! the only way to get one is to name it - [`TagSet::ts_102_221`],
 //! [`TagSet::swicc`], or [`TagSet::named`] plus builders for a card nobody
 //! has characterised yet. [`TagSet`] deliberately has no `Default` and no
 //! constructor that invents tags, so a decoder cannot be reached without a
@@ -44,9 +48,7 @@
 //! Each field is an `Option<Tag>`, not a `Tag`, and that is load-bearing
 //! rather than decoration. swSIM's master-file FCP carries no file size at
 //! all, because a master file has no size; a mapping that must invent a tag
-//! for it would report something the card never sent. A caller that wants
-//! `df_name` under the ISO table, where this repository has not verified
-//! which tag carries it, supplies one.
+//! for it would report something the card never sent.
 //!
 //! # What is verified and what is not
 //!
@@ -161,19 +163,22 @@ impl TagSet {
         }
     }
 
-    /// The mapping in ISO/IEC 7816-4 table 42.
+    /// The mapping in ETSI TS 102 221 clause 11.1.1.3, which real UICCs use.
     ///
-    /// `82` file size, `83` file descriptor, `84` file identifier, `88` short
-    /// file identifier, `8A` life cycle status, `8C` compact access
-    /// conditions, `A5` proprietary information. \[U] beyond the three
-    /// entries AGENTS.md section 2 states, which this repository records
-    /// rather than re-derives; `df_name` is left unset precisely because
-    /// this repository has not verified which tag carries it here.
-    pub fn iec_7816_4_table_42() -> Self {
-        Self::named("IEC 7816-4 table 42")
-            .with_file_size(Tag::new(0x82))
-            .with_file_descriptor(Tag::new(0x83))
-            .with_file_id(Tag::new(0x84))
+    /// `80` file size, `82` file descriptor, `83` file identifier, `84` DF
+    /// name, `88` short file identifier, `8A` life cycle status, `8C` compact
+    /// access conditions, `A5` proprietary information. `81` (total file
+    /// size), `8B`/`AB` (expanded and referenced security attributes) and
+    /// `C6` (PIN status template) are real tags in that clause that this
+    /// type has no slot for; they surface as tags the dialect does not
+    /// explain. \[V] against a live USIM's MF FCP (`82` descriptor, `83`
+    /// FID) and against swSIM's builder.
+    pub fn ts_102_221() -> Self {
+        Self::named("ETSI TS 102 221")
+            .with_file_size(Tag::new(0x80))
+            .with_file_descriptor(Tag::new(0x82))
+            .with_file_id(Tag::new(0x83))
+            .with_df_name(Tag::new(0x84))
             .with_short_file_id(Tag::new(0x88))
             .with_life_cycle_status(Tag::new(0x8A))
             .with_access_conditions(Tag::new(0x8C))
@@ -188,12 +193,9 @@ impl TagSet {
     /// status template. \[V], read at swsim commit
     /// `281da8c63398ece9a5126cad969674f4f413ab63`.
     ///
-    /// Named after the software that was observed writing it rather than
-    /// after a specification, because a real UICC follows 3GPP TS 31.102 or
-    /// ETSI TS 102 221 clause 11.1.1.3 - which swICC's own comments cite and
-    /// this repository has not read. A card that follows that document and a
-    /// card that follows swICC will agree here; if one does not, the caller
-    /// builds a [`TagSet::named`] for it.
+    /// Named after the software that was observed writing it. The tags are
+    /// the same as [`TagSet::ts_102_221`], which is what swICC's comments
+    /// cite; the separate name records which source the table was read from.
     pub fn swicc() -> Self {
         Self::named("swICC FCP builder (swsim 281da8c)")
             .with_file_size(Tag::new(0x80))
@@ -1019,30 +1021,76 @@ mod tests {
         0x83, 0x02, 0x3F, 0x00, // file identifier
     ];
 
+    /// The mapping this crate used to ship as "table 42" (issue #69). Kept
+    /// here only to show what reading with a wrong table looks like.
+    fn wrong_table() -> TagSet {
+        TagSet::named("wrong table")
+            .with_file_size(Tag::new(0x82))
+            .with_file_descriptor(Tag::new(0x83))
+            .with_file_id(Tag::new(0x84))
+    }
+
     #[test]
-    fn the_two_known_tables_disagree_and_the_caller_chooses() {
+    fn ts_102_221_is_the_standard_layout_and_swicc_writes_the_same_tags() {
+        let std = TagSet::ts_102_221();
         let swicc = TagSet::swicc();
-        let iso = TagSet::iec_7816_4_table_42();
-
-        // The finding, as code: the same three fields, three different tags.
-        assert_eq!(swicc.file_size().map(Tag::octet), Some(0x80));
-        assert_eq!(iso.file_size().map(Tag::octet), Some(0x82));
-        assert_eq!(swicc.file_descriptor().map(Tag::octet), Some(0x82));
-        assert_eq!(iso.file_descriptor().map(Tag::octet), Some(0x83));
-        assert_eq!(swicc.file_id().map(Tag::octet), Some(0x83));
-        assert_eq!(iso.file_id().map(Tag::octet), Some(0x84));
-
-        // The two mappings are not interchangeable, and saying so is free.
-        assert_ne!(swicc, iso);
-        assert_ne!(swicc.name(), iso.name());
+        assert_eq!(std.name(), "ETSI TS 102 221");
+        assert_eq!(std.file_size().map(Tag::octet), Some(0x80));
+        assert_eq!(std.file_descriptor().map(Tag::octet), Some(0x82));
+        assert_eq!(std.file_id().map(Tag::octet), Some(0x83));
+        assert_eq!(std.df_name().map(Tag::octet), Some(0x84));
+        assert_eq!(std.short_file_id().map(Tag::octet), Some(0x88));
+        assert_eq!(std.life_cycle_status().map(Tag::octet), Some(0x8A));
+        assert_eq!(std.access_conditions().map(Tag::octet), Some(0x8C));
+        assert_eq!(std.proprietary().map(Tag::octet), Some(0xA5));
+        assert_ne!(std.name(), swicc.name());
         assert_eq!(swicc.to_string(), swicc.name());
+        for (a, b) in [
+            (std.file_size(), swicc.file_size()),
+            (std.file_descriptor(), swicc.file_descriptor()),
+            (std.file_id(), swicc.file_id()),
+            (std.df_name(), swicc.df_name()),
+            (std.short_file_id(), swicc.short_file_id()),
+            (std.life_cycle_status(), swicc.life_cycle_status()),
+            (std.access_conditions(), swicc.access_conditions()),
+            (std.proprietary(), swicc.proprietary()),
+        ] {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn a_real_card_mf_fcp_reads_as_descriptor_7821_fid_3f00_and_no_size() {
+        // Structure of a live USIM's MF FCP: 82 descriptor, 83 FID, A5, 8A,
+        // 8B, C6 with synthesised contents. No secret is in it.
+        let body = [
+            0x62, 0x1D, 0x82, 0x02, 0x78, 0x21, 0x83, 0x02, 0x3F, 0x00, 0xA5, 0x03, 0x80, 0x01,
+            0x71, 0x8A, 0x01, 0x05, 0x8B, 0x03, 0x2F, 0x06, 0x01, 0xC6, 0x06, 0x90, 0x01, 0x40,
+            0x83, 0x01, 0x01,
+        ];
+        let binding = TagSet::ts_102_221();
+        let t = Template::parse(&body, &binding).unwrap();
+        assert_eq!(
+            t.file_descriptor().unwrap().unwrap().octets(),
+            &[0x78, 0x21]
+        );
+        assert_eq!(t.file_id().unwrap(), Some([0x3F, 0x00]));
+        assert_eq!(t.file_size().unwrap(), None);
+    }
+
+    #[test]
+    fn an_ef_fcp_with_80_0002_000a_has_size_ten() {
+        let body = [0x62, 0x07, 0x80, 0x02, 0x00, 0x0A, 0x83, 0x01, 0x01];
+        let binding = TagSet::ts_102_221();
+        let t = Template::parse(&body, &binding).unwrap();
+        assert_eq!(t.file_size().unwrap().unwrap().octets(), 10);
     }
 
     #[test]
     fn reading_a_card_with_the_wrong_table_reports_nonsense_not_nothing() {
         let body = &EF_IMSI_FCP[..];
         let swicc = TagSet::swicc();
-        let iso = TagSet::iec_7816_4_table_42();
+        let iso = wrong_table();
 
         let right = Template::parse(body, &swicc).unwrap();
         assert_eq!(right.file_size().unwrap().unwrap().octets(), 10);
@@ -1443,7 +1491,7 @@ mod tests {
         // an untrusted input source and a decode path is reachable with
         // whatever bytes it felt like sending.
         let swicc = TagSet::swicc();
-        let iso = TagSet::iec_7816_4_table_42();
+        let iso = wrong_table();
         for a in 0u16..=255 {
             for b in 0u16..=255 {
                 for c in 0u16..=255 {

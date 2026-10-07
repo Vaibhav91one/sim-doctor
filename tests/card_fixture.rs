@@ -88,12 +88,11 @@ const READ_BINARY_PREFIX: [u8; 4] = [0x00, 0xB0, 0x00, 0x00];
 ///     0x82, /* '62': File descriptor,  'A5': Min app clock frequency. */
 ///     0x83, /* '62': File ID,          ... */
 ///
-/// ISO/IEC 7816-4 table 42 uses 0x82 for the file size and 0x83 for the file
-/// descriptor, so the two disagree. Reading an swSIM FCP as if it were the ISO
-/// table yields a nonsense file size, which is exactly what happened the first
-/// time this test ran. [V] for swSIM, read at the pinned commit. A real card
-/// may follow the ISO table instead, which is why the mapping is a value this
-/// test supplies and not a default anywhere in the library: see
+/// ETSI TS 102 221 clause 11.1.1.3 uses the same tags (80 size, 82 descriptor,
+/// 83 FID), as does a real USIM. Reading them with a different numbering
+/// yields a nonsense file size, which is what happened the first time this
+/// test ran. [V] for swSIM, read at the pinned commit. The mapping is a value
+/// this test supplies and not a default anywhere in the library: see
 /// `sim_doctor::fcp::TagSet`.
 ///
 /// Issue #11 replaced the four-byte window scan this test used to do with a
@@ -1026,7 +1025,7 @@ fn scans_a_real_card_end_to_end() {
     assert_eq!(
         data["dialect"]["tags"]["file_size"],
         serde_json::json!(dialect.file_size().map(|tag| tag.to_string()).unwrap()),
-        "swICC reads the file size out of 80, not out of the ISO table's 82"
+        "the file size is read out of 80 (ETSI TS 102 221)"
     );
     assert_eq!(data["reader"], serde_json::json!(reader.as_str()));
     assert_eq!(
@@ -1228,8 +1227,8 @@ fn scans_a_real_card_end_to_end() {
     assert_eq!(envelope["payload"]["code"], serde_json::json!(0));
     assert_eq!(
         envelope["payload"]["data"]["dialect"]["name"],
-        serde_json::json!(dialect.name()),
-        "the binary reported the dialect it ran under"
+        serde_json::json!(sim_doctor::fcp::TagSet::ts_102_221().name()),
+        "the binary ran under the default dialect, ETSI TS 102 221"
     );
     assert_eq!(
         envelope["payload"]["data"]["truncated"],

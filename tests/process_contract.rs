@@ -1128,7 +1128,7 @@ fn json_stdout_is_one_envelope_across_the_whole_flag_matrix() {
             "score over the worst",
         ),
         (
-            &["--json", "--dialect", "iec-7816-4-table-42", "--score"],
+            &["--json", "--dialect", "ts-102-221", "--score"],
             "a declared dialect and a score",
         ),
         (

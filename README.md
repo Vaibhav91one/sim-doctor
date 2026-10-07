@@ -148,7 +148,7 @@ built-in PCSC framework.
 | --- | --- |
 | `--json` | one JSON envelope on stdout and nothing else; diagnostics go to stderr |
 | `--reader <NAME>` | which PC/SC reader (default: the first) |
-| `--dialect <TABLE>` | FCP tag table: `swicc` (default) or `iec-7816-4-table-42` |
+| `--dialect <TABLE>` | FCP tag table: `ts-102-221` (default, ETSI TS 102 221; real cards and swSIM) or `swicc` (same tags, own name). `iec-7816-4-table-42` is a deprecated alias for `ts-102-221` |
 | `--max-depth`, `--max-children`, `--max-nodes`, `--max-directories` | walk bounds; hitting one is reported as truncation |
 | `--tar <SELECTION>` | TARs to probe for MSL 0: `off` (default), `focused`, `full`, `range:A-B`, `regex:P`; capped at 4096 probes |
 | `--severity <LEVEL>` | drop findings below `info\|low\|medium\|high\|critical` |

@@ -279,22 +279,26 @@ struct ScanArgs {
 
     /// Which FCP tag table this card answers SELECT with.
     ///
-    /// Defaults to swicc. This is an assumption and the output says which one
-    /// was used; the chosen table's name appears in the human report and under
-    /// "dialect" in the JSON, so the assumption is never invisible.
+    /// Defaults to ts-102-221. This is an assumption and the output says which
+    /// one was used; the chosen table's name appears in the human report and
+    /// under "dialect" in the JSON, so the assumption is never invisible.
     ///
-    /// swicc is what swSIM writes: file size in 80, descriptor in 82, file id in
-    /// 83. A card that follows ISO/IEC 7816-4 table 42 puts the file size in 82
-    /// instead, and reading such a card with the swicc table reports a 10-octet
-    /// file as 2337 octets. A real UICC is more likely to follow the ISO table
-    /// than the software simulator, so prefer iec-7816-4-table-42 unless you
-    /// have checked.
+    /// ts-102-221 is the ETSI TS 102 221 clause 11.1.1.3 layout that real UICCs
+    /// and swSIM both write: file size in 80, descriptor in 82, file id in 83,
+    /// DF name in 84. swicc has the same tags and exists only so a baseline
+    /// taken under that name stays comparable. iec-7816-4-table-42 is a
+    /// deprecated alias for ts-102-221.
     ///
     /// A card nobody has characterised needs a hand-built TagSet, which this
     /// flag cannot express yet. That is a real gap rather than a missing third
     /// value: an "unknown" dialect would render an empty table as though it
     /// meant something.
-    #[arg(long, value_name = "TABLE", default_value_t = scan::Dialect::Swicc)]
+    #[arg(
+        long,
+        value_name = "TABLE",
+        default_value_t = scan::Dialect::Ts102221,
+        value_parser = parse_dialect
+    )]
     dialect: scan::Dialect,
 
     /// The reader to use, matched against the driver's own name.
@@ -675,6 +679,17 @@ struct CompletionsArgs {
     /// One of bash, elvish, fish, powershell or zsh.
     #[arg(value_name = "SHELL")]
     shell: clap_complete::Shell,
+}
+
+/// Parses `--dialect`, saying once on stderr when the deprecated spelling is used.
+fn parse_dialect(text: &str) -> Result<scan::Dialect, scan::UnknownDialect> {
+    if text.eq_ignore_ascii_case(scan::DEPRECATED_TABLE_42) {
+        eprintln!(
+            "sim-doctor: --dialect {} is deprecated: that mapping was wrong for real cards; using ts-102-221",
+            scan::DEPRECATED_TABLE_42
+        );
+    }
+    text.parse()
 }
 
 fn main() -> process::ExitCode {
@@ -1920,7 +1935,7 @@ mod tests {
         let args = ScanArgs {
             json: false,
             tui: false,
-            dialect: scan::Dialect::Swicc,
+            dialect: scan::Dialect::Ts102221,
             reader: None,
             max_depth: None,
             max_children: None,

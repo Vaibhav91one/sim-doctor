@@ -37,7 +37,7 @@ fn atom(tag: u8, body: &[u8]) -> Vec<u8> {
 #[derive(Clone, Copy)]
 enum Fcp {
     Swicc,
-    Table42,
+    Ts102221,
 }
 
 const DIR: [u8; 2] = [0x38, 0x21];
@@ -62,7 +62,7 @@ impl Card {
         let leaf = &ids[ids.len() - 2..];
         let (size_tag, desc_tag, id_tag) = match dialect {
             Fcp::Swicc => (0x80, 0x82, 0x83),
-            Fcp::Table42 => (0x82, 0x83, 0x84),
+            Fcp::Ts102221 => (0x80, 0x82, 0x83),
         };
         let mut body = Vec::new();
         if let Some(size) = size {
@@ -178,7 +178,7 @@ fn corpus() -> Vec<Case> {
         max_nodes: 2,
         ..Limits::default()
     };
-    let (swicc, iso) = (Dialect::Swicc, Dialect::Iec7816_4Table42);
+    let (swicc, iso) = (Dialect::Swicc, Dialect::Ts102221);
     vec![
         case(
             "clean",
@@ -208,8 +208,8 @@ fn corpus() -> Vec<Case> {
             2,
         ),
         case(
-            "odd-dialect-table42",
-            tree(false, Fcp::Table42),
+            "dialect-ts-102-221",
+            tree(false, Fcp::Ts102221),
             iso,
             Limits::default(),
             vec![],
@@ -217,8 +217,8 @@ fn corpus() -> Vec<Case> {
             9,
         ),
         case(
-            "odd-dialect-table42-msl0",
-            tree(true, Fcp::Table42),
+            "dialect-ts-102-221-msl0",
+            tree(true, Fcp::Ts102221),
             iso,
             Limits::default(),
             vec![msl0_finding()],

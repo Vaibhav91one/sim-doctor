@@ -699,10 +699,9 @@ pub enum Incomparable {
 
     /// The two walks read the same FCP bytes through different tag tables.
     ///
-    /// **A different question, not a different answer.** swICC puts a file
-    /// size in tag `80` where ISO/IEC 7816-4 table 42 puts it in `82`, and a
-    /// walk under the wrong table reports a 10-octet EF.ICCID as 2337 octets.
-    /// Every finding either run makes about that file is about a different
+    /// **A different question, not a different answer.** A walk under a
+    /// table that puts the file size in the wrong tag reports a 10-octet
+    /// EF.ICCID as some other number. Every finding either run makes about that file is about a different
     /// number, so a diff across the two compares answers to two questions.
     #[error("the baseline was taken under the {baseline} FCP tag table and this run under {this_run}; the two read the same bytes differently, so the findings are not about the same things. Re-scan with the same --dialect")]
     Dialect {
@@ -1817,7 +1816,7 @@ mod tests {
             (
                 facts_with(
                     "fake card",
-                    "iec-7816-4-table-42",
+                    "ts-102-221",
                     "sim-families (1280 probed, exhaustive=false)",
                     None,
                     "focused@00",
