@@ -99,6 +99,7 @@
 
 #![deny(missing_docs)]
 
+pub mod aka;
 pub mod apdu;
 pub mod baseline;
 pub mod ci;
@@ -111,6 +112,7 @@ pub mod mcp;
 pub mod rules;
 pub mod sarif;
 pub mod scan;
+pub mod scp03;
 pub mod session;
 pub mod sign;
 pub mod signals;
@@ -155,6 +157,11 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: apdu::NAME,
         owns: "The typed ISO 7816-4 command header and the two-byte status word.",
+        depends_on: &[],
+    },
+    ModuleInfo {
+        name: aka::NAME,
+        owns: "Milenage f1, f1*, f2, f3, f4, f5 and f5* in one call over the milenage crate; known-answer tested, never run against a card.",
         depends_on: &[],
     },
     ModuleInfo {
@@ -238,6 +245,11 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[fix::NAME, signals::NAME],
     },
     ModuleInfo {
+        name: scp03::NAME,
+        owns: "SCP03 key derivation, cryptograms, C-MAC, the INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders and the auth/scp03-missing-mac rule over a recorded exchange; sends nothing.",
+        depends_on: &[apdu::NAME, rules::NAME],
+    },
+    ModuleInfo {
         name: scan::NAME,
         owns: "A card rendered as JSON or prose, carrying the dialect it ran under, every bound it hit, the TAR audit, the rules, the score and the diff.",
         depends_on: &[
@@ -249,6 +261,7 @@ pub const MODULES: &[ModuleInfo] = &[
             tar::NAME,
             walk::NAME,
             baseline::NAME,
+            scp03::NAME,
         ],
     },
 ];

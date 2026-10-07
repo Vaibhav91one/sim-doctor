@@ -181,6 +181,12 @@ block. `--print-only` shows what would be written.
   a file outside the default identifier families is never probed and cannot be reported missing.
 - **`--tar` is bounded.** The full TAR space is 16 777 216 values; the tool sends at most 4096.
 - Verified only against the swSIM software card, not yet against a real card.
+- **SCP03 never runs against a card.** `src/scp03.rs` is a library (key derivation,
+  cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders) verified by
+  known-answer vectors. The `auth/scp03-missing-mac` rule is registered, but a scan has no
+  recorded SCP03 exchange to hand it, so it reports no evidence. There is no CLI path; a
+  future one must refuse to run without an explicit opt-in flag. Milenage (`src/aka.rs`) is
+  likewise vector-tested only. SCP02 and SCP11 are not implemented.
 
 ## Status
 

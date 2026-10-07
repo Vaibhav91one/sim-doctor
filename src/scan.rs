@@ -68,6 +68,7 @@ use crate::baseline;
 use crate::fcp::{self, TagSet};
 use crate::fs;
 use crate::rules;
+use crate::scp03;
 use crate::tar;
 use crate::tlv::Tag;
 use crate::walk::{self, Candidates, Limit, Limits, Node, NodeState, Note, Tree};
@@ -318,6 +319,9 @@ pub struct Subject<'a> {
     pub tree: &'a Tree,
     /// What the TAR audit concluded.
     pub tar: &'a tar::Audit,
+    /// Recorded SCP03 exchanges, if any. `None` on every scan today: nothing
+    /// sends SCP03 to a card (issue #22 is forbidden on the live SIM).
+    pub scp03: Option<&'a scp03::Audit>,
 }
 
 /// The ID of the TAR rule, exactly as AGENTS.md section 3 spells it.
@@ -448,6 +452,13 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
         )
         .expect("the TAR rule ID is unique in this registry");
     registry
+        .register(
+            scp03::missing_mac_spec(),
+            |subject| subject.scp03.map_or_else(Vec::new, scp03::missing_mac),
+            |subject| subject.scp03.is_some_and(scp03::had_evidence),
+        )
+        .expect("the SCP03 rule ID is unique in this registry");
+    registry
 }
 
 /// Whether the MSL 0 rule had a TAR audit to decide from.
@@ -563,6 +574,7 @@ pub fn run_facts(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> basel
         rules().runs(&Subject {
             tree,
             tar: verdict.tar(),
+            scp03: None,
         }),
     )
 }
@@ -2637,7 +2649,7 @@ mod tests {
         assert_eq!(id.rule(), "msl-zero-allowed");
 
         let registry = rules();
-        assert_eq!(registry.len(), 1, "one rule is registered over a card");
+        assert_eq!(registry.len(), 2, "two rules are registered over a card");
         let rule = registry.get(&id).expect("the rule is registered");
         assert_eq!(rule.severity(), rules::Severity::Critical);
         assert!(
@@ -2647,12 +2659,44 @@ mod tests {
     }
 
     #[test]
+    fn the_scp03_rule_fires_from_a_recorded_exchange_and_has_no_evidence_without_one() {
+        let mut card = sample_card();
+        let tree = walk_sample(&mut card, Limits::default());
+        let audit = quiet_audit();
+        let recorded = scp03::Audit {
+            probes: vec![scp03::Probe {
+                kind: scp03::ProbeKind::CommandWithoutMac,
+                status: crate::apdu::StatusWord::new(0x90, 0x00),
+            }],
+        };
+        let subject = Subject {
+            tree: &tree,
+            tar: &audit,
+            scp03: Some(&recorded),
+        };
+        let found = findings(&subject).expect("no misattribution");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found.as_slice()[0].rule().as_str(), scp03::MISSING_MAC_RULE);
+
+        let id = rules::RuleId::new(scp03::MISSING_MAC_RULE).unwrap();
+        let registry = rules();
+        let rule = registry.get(&id).expect("registered");
+        assert!(rule.had_evidence(&subject));
+        let none = Subject {
+            scp03: None,
+            ..subject
+        };
+        assert!(!rule.had_evidence(&none));
+        assert!(rule.run(&none).is_empty());
+    }
+
+    #[test]
     fn a_scan_evaluates_one_rule_so_the_no_rules_warning_cannot_fire() {
         // **The warning going null here is CORRECT rather than defeated.**
         // rules_run is 1 because a rule really ran, so the 100 it sits beside
         // is a score over an audit rather than an absence of one. That is the
         // whole difference NO_RULES_WARNING was written to make visible.
-        assert_eq!(rules_run(), 1);
+        assert_eq!(rules_run(), 2);
 
         let mut card = sample_card();
         let tree = walk_sample(&mut card, Limits::default());
@@ -2660,6 +2704,7 @@ mod tests {
         let found = findings(&Subject {
             tree: &tree,
             tar: &audit,
+            scp03: None,
         })
         .expect("no misattribution");
         assert!(
@@ -2675,7 +2720,7 @@ mod tests {
             .tar_audit(audit);
         let block = verdict.fields();
         let score = &block["score"];
-        assert_eq!(score["rules_run"], serde_json::json!(1));
+        assert_eq!(score["rules_run"], serde_json::json!(2));
         assert_eq!(score["value"], serde_json::json!(rules::SCORE_MAX));
         assert_eq!(
             score["warning"],
@@ -2693,6 +2738,7 @@ mod tests {
         let found = findings(&Subject {
             tree: &tree,
             tar: &audit,
+            scp03: None,
         })
         .expect("no misattribution");
 
@@ -2747,6 +2793,7 @@ mod tests {
         let found = findings(&Subject {
             tree: &tree,
             tar: &audit,
+            scp03: None,
         })
         .expect("no misattribution");
 
@@ -2780,6 +2827,7 @@ mod tests {
         let found = findings(&Subject {
             tree: &tree,
             tar: &audit,
+            scp03: None,
         })
         .expect("no misattribution");
 

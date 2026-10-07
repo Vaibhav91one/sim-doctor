@@ -335,6 +335,7 @@ fn run(mut case: Case) -> (Vec<Found>, Vec<Found>, Vec<String>) {
     let found = scan::findings(&Subject {
         tree: &tree,
         tar: &audit,
+        scp03: None,
     })
     .expect("rules");
 
