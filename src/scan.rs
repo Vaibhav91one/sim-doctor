@@ -295,15 +295,16 @@ pub const NO_RULES_WARNING: &str =
 ///
 /// **This is the case `--tar off` produces, and it is not the same as the one
 /// above.** A rule is registered, so `rules_run` is 1, and the rule looked -
-/// but the TAR audit probed nothing, so it had nothing to look at. A score of
-/// 100 from that is not a verdict either: it says the MSL 0 check did not run.
+/// but the TAR audit probed nothing, so it had nothing to look at. The score
+/// from that is not a verdict on MSL 0 either (it is 100 only when no other
+/// rule found anything): it says the MSL 0 check did not run.
 ///
 /// The default is `off` because an ENVELOPE probe leaves swicc-pcsc unable to
 /// start a transaction for any later process. Turning the audit on is an
 /// explicit operator decision, and while it is off this sentence is the honest
 /// description of what the number means.
 pub const NO_TAR_EVIDENCE_WARNING: &str =
-    "the TAR audit probed nothing, so the MSL 0 check did not run: this score is 100 because no TAR was probed, NOT because the card refuses TAR 0. Run with --tar focused to check";
+    "the TAR audit probed nothing, so the MSL 0 check did not run: this score says nothing about whether the card refuses TAR 0, because no TAR was probed. Run with --tar focused to check";
 
 // ---------------------------------------------------------------------------
 // What a scan concluded
