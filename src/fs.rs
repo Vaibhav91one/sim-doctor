@@ -150,6 +150,13 @@ impl fmt::Display for FileKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Path {
     segments: Vec<FileId>,
+    /// The AID of the application this path runs through, when it does.
+    ///
+    /// A UICC exposes USIM/ISIM as applications selected by AID (ETSI TS 102 221
+    /// clause 13.1), not as a DF with a file identifier under the master file.
+    /// The application sits between the master file and `segments[1..]`, which
+    /// are then relative to it. Rendered `3F00/ADF:<AID hex>/6F07`.
+    adf: Option<Vec<u8>>,
 }
 
 impl Path {
@@ -157,7 +164,21 @@ impl Path {
     pub fn master_file() -> Self {
         Self {
             segments: vec![FileId::MASTER_FILE],
+            adf: None,
         }
+    }
+
+    /// The path to an application directory file, selected by `aid`.
+    pub fn application(aid: Vec<u8>) -> Self {
+        Self {
+            adf: Some(aid),
+            ..Self::master_file()
+        }
+    }
+
+    /// The AID of the application this path is under or at, if any.
+    pub fn adf(&self) -> Option<&[u8]> {
+        self.adf.as_deref()
     }
 
     /// Builds a path from a sequence of identifiers, first one first.
@@ -182,7 +203,10 @@ impl Path {
         if let Some(duplicate) = rest.iter().find(|id| id.is_master_file()) {
             return Err(Error::NestedMasterFile { found: *duplicate });
         }
-        Ok(Self { segments })
+        Ok(Self {
+            segments,
+            adf: None,
+        })
     }
 
     /// The path to a file directly inside this one.
@@ -197,7 +221,10 @@ impl Path {
         }
         let mut segments = self.segments.clone();
         segments.push(id);
-        Ok(Self { segments })
+        Ok(Self {
+            segments,
+            adf: self.adf.clone(),
+        })
     }
 
     /// The path to the file containing this one, if there is one.
@@ -205,10 +232,12 @@ impl Path {
     /// `None` at the master file, which has no parent on the card.
     pub fn parent(&self) -> Option<Self> {
         if self.segments.len() <= 1 {
-            return None;
+            // An application's parent is the master file.
+            return self.adf.is_some().then(Self::master_file);
         }
         Some(Self {
             segments: self.segments[..self.segments.len() - 1].to_vec(),
+            adf: self.adf.clone(),
         })
     }
 
@@ -228,12 +257,12 @@ impl Path {
     ///
     /// A bare `3F00` has depth 1; `3F00/2FE2/6F3A` has depth 3.
     pub fn depth(&self) -> usize {
-        self.segments.len()
+        self.segments.len() + usize::from(self.adf.is_some())
     }
 
     /// Whether this is the master file and nothing below it.
     pub fn is_master_file(&self) -> bool {
-        self.segments.len() == 1
+        self.segments.len() == 1 && self.adf.is_none()
     }
 }
 
@@ -248,6 +277,14 @@ impl fmt::Display for Path {
                 f.write_str("/")?;
             }
             write!(f, "{id}")?;
+            if index == 0 {
+                if let Some(aid) = &self.adf {
+                    f.write_str("/ADF:")?;
+                    for octet in aid {
+                        write!(f, "{octet:02X}")?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -263,11 +300,29 @@ impl FromStr for Path {
     /// Returns [`Error::MalformedFileId`] for a segment that is not four hex
     /// digits, including an empty one.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let segments = text
-            .split(SEPARATOR)
+        let mut parts: Vec<&str> = text.split(SEPARATOR).collect();
+        let mut adf = None;
+        if let Some(hex) = parts.get(1).and_then(|p| p.strip_prefix("ADF:")) {
+            let bad = || Error::MalformedFileId {
+                segment: text.to_owned(),
+            };
+            if hex.is_empty() || hex.len() % 2 != 0 || !hex.is_ascii() {
+                return Err(bad());
+            }
+            let aid = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| bad())?;
+            adf = Some(aid);
+            parts.remove(1);
+        }
+        let segments = parts
+            .into_iter()
             .map(FileId::from_str)
             .collect::<Result<Vec<_>, _>>()?;
-        Path::from_segments(segments)
+        let mut path = Path::from_segments(segments)?;
+        path.adf = adf;
+        Ok(path)
     }
 }
 
@@ -325,6 +380,21 @@ pub fn select_capabilities_header() -> apdu::Header {
 /// [`select_capabilities_header`] is used for it instead.
 pub fn select_path_header() -> apdu::Header {
     apdu::Header::new(0x00, 0xA4, 0x08, 0x04)
+}
+
+/// The header of a SELECT of an application by AID: `00 A4 04 04`.
+///
+/// P1 `04` selects by DF name (the AID) and P2 `04` asks for the FCP template.
+pub fn select_aid_header() -> apdu::Header {
+    apdu::Header::new(0x00, 0xA4, 0x04, 0x04)
+}
+
+/// The header of a SELECT by path from the current DF: `00 A4 09 04`.
+///
+/// P1 `09` (ETSI TS 102 221 clause 11.1.1.2); used under an application, whose
+/// directory has no path from the master file.
+pub fn select_from_current_df_header() -> apdu::Header {
+    apdu::Header::new(0x00, 0xA4, 0x09, 0x04)
 }
 
 /// The file identifier a SELECT response reports back, if it reports one.

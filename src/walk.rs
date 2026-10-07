@@ -74,7 +74,17 @@
 //! exactly one node, so [`Limits::max_nodes`] is a bound on the total number of
 //! exchanges a walk can issue, not only on the size of what it returns. There is
 //! no configuration of [`Candidates`] that makes a walk longer than that, and a
-//! test asserts it.
+//! test asserts it. (Applications from EF.DIR add one SELECT for EF.DIR up
+//! front, up to sixteen READ RECORDs, and a second SELECT per probe under an
+//! application, so there the bound is twice `max_nodes`.)
+//!
+//! **Applications.** A UICC exposes USIM and ISIM as applications selected by
+//! AID, listed in EF.DIR (`2F00`, ETSI TS 102 221 clause 13.1), not as a DF under
+//! the master file. The walk reads EF.DIR (READ RECORD only), SELECTs each AID
+//! (P1 `04`) and probes its children by path from that application (P1 `09`). The
+//! application is a child of the master file in the tree, walked before the
+//! master file's other children, and its path reads `3F00/ADF:<AID hex>/6F07`
+//! ([`fs::Path::adf`]).
 //!
 //! **And the default candidate set can miss a file.** [`Candidates::SimFamilies`]
 //! probes the five GSM 11.11 identifier families and nothing else. Every
@@ -88,11 +98,11 @@ pub const NAME: &str = "walk";
 
 use std::{fmt, vec::IntoIter};
 
-use crate::apdu::{Command, StatusWord};
+use crate::apdu::{Command, Header, Le, StatusWord};
 use crate::fcp::{self, FileSize, LifeCycleStatus, TagSet};
 use crate::fs::{self, FileId, FileKind, Path};
 use crate::session::{self, Exchange, StopReason};
-use crate::tlv::Tag;
+use crate::tlv::{Stream, Tag, Tlv};
 use crate::transport::CardSession;
 
 /// How many identifiers a directory is probed for unless told otherwise.
@@ -1256,7 +1266,7 @@ pub fn walk<S: CardSession + ?Sized>(
     }
 
     let root = Path::master_file();
-    let selection = select(session, options, dialect, &root)?;
+    let selection = select(session, options, dialect, &root, &mut None)?;
     match selection.state {
         NodeState::Selected { .. } => {}
         // Absent and forbidden are separate errors for the same reason they are
@@ -1274,12 +1284,13 @@ pub fn walk<S: CardSession + ?Sized>(
 
     let mut builder = Builder::new(options, dialect);
     let root_id = builder.push(root.clone(), selection.state, selection.notes);
-    let mut stack = vec![Frame::new(
-        root_id,
-        root,
-        vec![FileId::MASTER_FILE],
-        options,
-    )];
+    let mut root_frame = Frame::new(root_id, root, vec![FileId::MASTER_FILE], options);
+    // Applications are listed in EF.DIR and are walked before the master file's
+    // other children: the node budget is spent in order, and a real card's
+    // USIM/ISIM files are not reachable any other way (see `applications`).
+    root_frame.pending = applications(session, options, dialect)?.into_iter();
+    let mut stack = vec![root_frame];
+    let mut current_adf: Option<Vec<u8>> = None;
 
     // The traversal itself. A frame is one directory waiting to be enumerated;
     // it is popped, contributes at most one child, and goes back on the stack,
@@ -1287,10 +1298,16 @@ pub fn walk<S: CardSession + ?Sized>(
     // on. That is what makes the node vector pre-order, and it means this loop
     // is the only place a tree grows. Nothing here calls itself.
     while let Some(mut frame) = stack.pop() {
-        let Some(id) = frame.remaining.next() else {
+        let aid = frame.pending.next();
+        let next = if aid.is_none() {
+            frame.remaining.next()
+        } else {
+            None
+        };
+        if next.is_none() && aid.is_none() {
             builder.finish(frame);
             continue;
-        };
+        }
 
         if builder.nodes.len() >= options.limits.max_nodes {
             frame.stopped_by = Some(Limit::Nodes);
@@ -1298,13 +1315,20 @@ pub fn walk<S: CardSession + ?Sized>(
             continue;
         }
 
-        let Ok(child_path) = frame.path.child(id) else {
-            frame.notes.push(Note::NotAChild { id });
-            stack.push(frame);
-            continue;
+        let child_path = match (next, aid) {
+            (Some(id), _) => match frame.path.child(id) {
+                Ok(path) => path,
+                Err(_) => {
+                    frame.notes.push(Note::NotAChild { id });
+                    stack.push(frame);
+                    continue;
+                }
+            },
+            (None, Some(aid)) => Path::application(aid),
+            (None, None) => continue,
         };
 
-        let selection = select(session, options, dialect, &child_path)?;
+        let selection = select(session, options, dialect, &child_path, &mut current_adf)?;
         frame.observe(&selection);
         let within_depth = child_path.depth() <= options.limits.max_depth;
 
@@ -1312,7 +1336,9 @@ pub fn walk<S: CardSession + ?Sized>(
         // Only a file the card actually selected has an identity to repeat.
         // An absent identifier is not a file, and calling one a repeat of its
         // parent would be a finding about a file that does not exist.
-        if selection.state.is_selected() && frame.ancestors.contains(&id) {
+        if let Some(id) =
+            next.filter(|id| selection.state.is_selected() && frame.ancestors.contains(id))
+        {
             // Recorded, not obeyed. See Note::RepeatedAncestor: a file
             // identifier repeats across directories legally, and refusing to
             // descend here would hide files rather than protect the walk.
@@ -1339,7 +1365,7 @@ pub fn walk<S: CardSession + ?Sized>(
         }
 
         let mut ancestors = frame.ancestors.clone();
-        ancestors.push(id);
+        ancestors.extend(next);
         stack.push(frame);
         builder.expanded();
         stack.push(Frame::new(child, child_path, ancestors, options));
@@ -1364,10 +1390,109 @@ fn select<S: CardSession + ?Sized>(
     options: &Options,
     dialect: &TagSet,
     path: &Path,
+    current_adf: &mut Option<Vec<u8>>,
 ) -> Result<Selection, Error> {
-    let command = select_command(options.addressing, path);
-    let exchange = session::send(session, &command, &options.session)?;
-    Ok(classify(&exchange, &options.meaning, dialect, path))
+    let mut commands = select_commands(options.addressing, path);
+    // `current_adf` is the application known to be the current DF. Under it the
+    // SELECT by AID is already done, which halves the exchanges of a walk.
+    if commands.len() == 2 && path.adf() == current_adf.as_deref() {
+        commands.remove(0);
+    }
+    let last = commands.len() - 1;
+    if path.adf().is_none() {
+        *current_adf = None;
+    }
+    for (index, command) in commands.iter().enumerate() {
+        let exchange = session::send(session, command, &options.session)?;
+        // A failed step (the application is not there) answers for the file.
+        let failed = !exchange.status().is_some_and(|s| s.is_normal_processing());
+        let by_aid = path.adf().is_some() && command.header().parameter_1() == 0x04;
+        if by_aid {
+            *current_adf = (!failed).then(|| path.adf().unwrap_or_default().to_vec());
+        }
+        if index == last || failed {
+            let selection = classify(&exchange, &options.meaning, dialect, path);
+            // A selected DF, or one whose kind is unknown, becomes the current
+            // DF; only a known EF leaves the application current.
+            if selection.state.is_selected()
+                && !by_aid
+                && !matches!(
+                    selection.state.kind(),
+                    Some(Kind::Reported(FileKind::ElementaryFile))
+                )
+            {
+                *current_adf = None;
+            }
+            return Ok(selection);
+        }
+    }
+    unreachable!("select_commands returns at least one command")
+}
+
+/// The most EF.DIR records read. EF.DIR lists a handful of applications.
+const MAX_DIR_RECORDS: usize = 16;
+
+/// The AIDs EF.DIR (`2F00`) lists, in record order, without duplicates.
+///
+/// Sends SELECT and READ RECORD only. EF.DIR must be a selectable linear fixed
+/// file (ETSI TS 102 221 clause 13.1); otherwise there is nothing to read. A refused read stops with the records read so far.
+fn applications<S: CardSession + ?Sized>(
+    session: &mut S,
+    options: &Options,
+    dialect: &TagSet,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut aids: Vec<Vec<u8>> = Vec::new();
+    let Ok(path) = Path::master_file().child(FileId::from_bytes([0x2F, 0x00])) else {
+        return Ok(aids);
+    };
+    let dir = select(session, options, dialect, &path, &mut None)?;
+    let Some(shape) = dir
+        .state
+        .capabilities()
+        .and_then(|c| c.descriptor.reported())
+        .and_then(|d| match d.octets.as_slice() {
+            [_, _, hi, lo, count, ..] => Some((u16::from_be_bytes([*hi, *lo]), *count)),
+            _ => None,
+        })
+    else {
+        return Ok(aids);
+    };
+    let (length, count) = shape;
+    let Some(le) = Le::for_byte_count(u32::from(length)).filter(|_| length > 0) else {
+        return Ok(aids);
+    };
+    for number in 1..=usize::from(count).min(MAX_DIR_RECORDS) {
+        // `number` is at most 16 here.
+        let header = Header::new(0x00, 0xB2, u8::try_from(number).unwrap_or(0xFF), 0x04);
+        let read = session::send(session, &Command::case2(header, le), &options.session)?;
+        if !read.status().is_some_and(|s| s.is_normal_processing()) {
+            break;
+        }
+        if let Some(aid) = application_id(read.data()) {
+            if !aids.contains(&aid) {
+                aids.push(aid);
+            }
+        }
+    }
+    Ok(aids)
+}
+
+/// The AID (tag `4F`) of one EF.DIR record, an application template (tag `61`).
+fn application_id(record: &[u8]) -> Option<Vec<u8>> {
+    let (template, _) = Tlv::decode(record).ok()?;
+    if template.tag().octet() != 0x61 {
+        return None;
+    }
+    let mut atoms = Stream::new(template.value());
+    while let Ok(Some(atom)) = atoms.next_atom() {
+        if atom.tag().octet() == 0x4F {
+            // ETSI TS 101 220: an AID is 5 to 16 octets.
+            return (5..=16)
+                .contains(&atom.value().len())
+                .then(|| atom.value().to_vec());
+        }
+    }
+    None
 }
 
 /// Turns one finished exchange into a node state.
@@ -1460,7 +1585,15 @@ fn read_capabilities(
         unknown_tags: template.tags_without_meaning(),
     };
 
-    if let Some(reported) = capabilities.reported_file_id.reported().copied() {
+    // An application directory is selected by AID, so its own identifier is not
+    // the path's leaf.
+    let by_aid = path.adf().is_some() && path.segments().len() == 1;
+    if let Some(reported) = capabilities
+        .reported_file_id
+        .reported()
+        .copied()
+        .filter(|_| !by_aid)
+    {
         if FileId::from_bytes(reported) != path.leaf() {
             notes.push(Note::IdentityMismatch {
                 requested: path.leaf(),
@@ -1539,6 +1672,23 @@ fn field<T>(read: Result<Option<T>, fcp::Error>) -> Reported<T> {
 ///
 /// The master file has no path to be named by under the path coding, so it is
 /// always addressed by identifier, whichever variant the caller chose.
+/// The commands that select `path`: one, or for a path through an application
+/// the SELECT by AID followed by a SELECT by path from that application.
+pub(crate) fn select_commands(addressing: Addressing, path: &Path) -> Vec<Command> {
+    let Some(aid) = path.adf() else {
+        return vec![select_command(addressing, path)];
+    };
+    let mut commands = vec![Command::case3(fs::select_aid_header(), aid.to_vec())];
+    let below: Vec<u8> = path.segments()[1..]
+        .iter()
+        .flat_map(|id| id.to_bytes())
+        .collect();
+    if !below.is_empty() {
+        commands.push(Command::case3(fs::select_from_current_df_header(), below));
+    }
+    commands
+}
+
 fn select_command(addressing: Addressing, path: &Path) -> Command {
     let below_master_file = path.segments().get(1..).filter(|rest| !rest.is_empty());
     match (addressing, below_master_file) {
@@ -1561,6 +1711,8 @@ struct Frame {
     remaining: IntoIter<FileId>,
     notes: Vec<Note>,
     refusals: Uniform,
+    /// Application AIDs read from EF.DIR, still to be selected.
+    pending: IntoIter<Vec<u8>>,
     selected: usize,
     probed: usize,
     stopped_by: Option<Limit>,
@@ -1582,6 +1734,7 @@ impl Frame {
             remaining: candidates.into_iter(),
             notes: Vec::new(),
             refusals: Uniform::None,
+            pending: Vec::new().into_iter(),
             selected: 0,
             probed: 0,
             stopped_by: truncated.then_some(Limit::Children),
@@ -1833,6 +1986,9 @@ mod tests {
         scripted: HashMap<Vec<u8>, VecDeque<Vec<u8>>>,
         reader: ReaderName,
         sent: Vec<Vec<u8>>,
+        /// Applications: AID and the key their root is held under.
+        adfs: Vec<(Vec<u8>, Vec<u8>)>,
+        current_adf: Option<Vec<u8>>,
     }
 
     impl Default for FakeCard {
@@ -1843,6 +1999,8 @@ mod tests {
                 scripted: HashMap::new(),
                 reader: ReaderName::new("fake card").expect("a valid reader name"),
                 sent: Vec::new(),
+                adfs: Vec::new(),
+                current_adf: None,
             }
         }
     }
@@ -1956,7 +2114,32 @@ mod tests {
                 response.extend_from_slice(&[0x90, 0x00]);
                 return Ok(response);
             }
-            if let Some(path) = self.select_target(command) {
+            // SELECT by AID names an application; P1 09 then resolves below it.
+            let adf_target = match (command.get(1), command.get(2)) {
+                (Some(0xA4), Some(0x04)) => {
+                    let aid = command.get(5..).unwrap_or_default();
+                    let root = self
+                        .adfs
+                        .iter()
+                        .find(|(a, _)| a == aid)
+                        .map(|(_, k)| k.clone());
+                    if root.is_some() {
+                        self.current_adf = root.clone();
+                    }
+                    Some(root)
+                }
+                (Some(0xA4), Some(0x09)) => Some(self.current_adf.as_ref().map(|root| {
+                    let mut key = root.clone();
+                    key.extend_from_slice(command.get(5..).unwrap_or_default());
+                    key
+                })),
+                _ => None,
+            };
+            let target = match adf_target {
+                Some(found) => found,
+                None => self.select_target(command),
+            };
+            if let Some(path) = target {
                 return Ok(match self.files.get(&path) {
                     Some(held) => match held.refusal {
                         Some(status) => status.to_vec(),
@@ -1974,6 +2157,49 @@ mod tests {
         fn disconnect(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn applications_listed_in_ef_dir_are_selected_by_aid_and_walked() {
+        let aid = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0xFF];
+        let mut record = tlv(0x61, &[tlv(0x4F, &aid), tlv(0x50, b"USIM")].concat());
+        record.resize(0x20, 0xFF);
+        let mut response = record;
+        response.extend_from_slice(&[0x90, 0x00]);
+        let mut card = FakeCard::default()
+            .with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None))
+            .with(
+                "3F00/2F00",
+                // linear fixed, one record of 0x20 octets
+                tlv(
+                    0x62,
+                    &[
+                        tlv(0x82, &[0x42, 0x21, 0x00, 0x20, 0x01]),
+                        tlv(0x83, &[0x2F, 0x00]),
+                    ]
+                    .concat(),
+                ),
+            )
+            // The fake keys an application's root under a stand-in identifier.
+            .with("3F00/7FF0", fcp(id("7FF0"), DIRECTORY_DESCRIPTOR, None))
+            .with(
+                "3F00/7FF0/6F07",
+                fcp(id("6F07"), TRANSPARENT_DESCRIPTOR, Some(9)),
+            )
+            .script(&[0x00, 0xB2, 0x01, 0x04, 0x20], &response);
+        card.adfs.push((aid.to_vec(), path_segments("3F00/7FF0")));
+
+        let tree = walk(&mut card, &dialect(), &options_for(&["2F00", "6F07"])).unwrap();
+
+        let app = "3F00/ADF:A0000000871002FFFF";
+        assert!(tree.at(&path_of(app)).unwrap().state().is_selected());
+        let file = path_of(&format!("{app}/6F07"));
+        assert!(tree.at(&file).unwrap().state().is_selected());
+        // The path survives a round trip, and the profile calls it 7FD0.
+        assert_eq!(file.to_string().parse::<Path>().unwrap(), file);
+        assert!(crate::ts48::observe(&tree).contains_key("3F00/7FD0/6F07"));
+        // Reading EF.DIR is read-only.
+        assert!(card.with_instruction(0xD6).is_empty());
     }
 
     /// Options that probe exactly the leaves of the paths a test names, so a
@@ -3041,8 +3267,8 @@ mod tests {
         let tree = walk(&mut card, &dialect(), &bounded).unwrap();
         assert_eq!(
             card.with_instruction(0xA4).len(),
-            4,
-            "the master file and three"
+            5,
+            "the EF.DIR probe, the master file and three"
         );
         assert_eq!(tree.len(), 4);
         assert_eq!(tree.report().truncated_by, Some(Limit::Children));
@@ -3347,8 +3573,9 @@ mod tests {
         let tree = walk(&mut card, &dialect(), &options).unwrap();
 
         let selects = card.with_instruction(0xA4).len();
+        // One more than the node bound: the EF.DIR probe that finds applications.
         assert!(
-            selects <= limits.max_nodes,
+            selects <= limits.max_nodes + 1,
             "{selects} SELECTs against a node bound of {}",
             limits.max_nodes
         );

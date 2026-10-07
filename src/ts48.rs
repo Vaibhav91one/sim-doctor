@@ -439,6 +439,26 @@ pub enum Observed {
     Blocked,
 }
 
+/// The profile's spelling of a walked path.
+///
+/// A real UICC exposes USIM and ISIM as applications selected by AID, so the walk
+/// prints `3F00/ADF:A0000000871002/6F07`; the profile files them under `7FD0`
+/// (USIM, AID prefix `A0000000871002`) and `7FC0` (ISIM, `A0000000871004`).
+/// Any other application keeps its `ADF:` spelling.
+fn profile_path(path: &crate::fs::Path) -> String {
+    let text = path.to_string();
+    let Some(aid) = path.adf() else { return text };
+    let fid = if aid.starts_with(&[0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]) {
+        "7FD0"
+    } else if aid.starts_with(&[0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04]) {
+        "7FC0"
+    } else {
+        return text;
+    };
+    let hex: String = aid.iter().map(|b| format!("{b:02X}")).collect();
+    text.replacen(&format!("ADF:{hex}"), fid, 1)
+}
+
 /// Reduces a walked tree to [`Observed`] per path. The master file is left out.
 pub fn observe(tree: &Tree) -> BTreeMap<String, Observed> {
     let mut seen = BTreeMap::new();
@@ -472,7 +492,7 @@ pub fn observe(tree: &Tree) -> BTreeMap<String, Observed> {
             NodeState::Forbidden { .. } | NodeState::Refused { .. } => Observed::Blocked,
             NodeState::Absent => continue,
         };
-        seen.insert(node.path().to_string(), observed);
+        seen.insert(profile_path(node.path()), observed);
     }
     seen
 }

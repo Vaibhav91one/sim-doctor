@@ -458,7 +458,7 @@ fn sensitive_name(node: &walk::Node) -> Option<&'static str> {
     };
     // Not by `Kind::Reported(ElementaryFile)`: a live USIM's EF descriptors read as
     // `Kind::Unreported`, and the identifier plus the parent already name the file.
-    if segments.len() < 3 || node.state().kind().is_none_or(walk::Kind::is_container) {
+    if node.path().depth() < 3 || node.state().kind().is_none_or(walk::Kind::is_container) {
         return None;
     }
     SENSITIVE_EFS
