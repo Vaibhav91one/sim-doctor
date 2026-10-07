@@ -335,10 +335,10 @@ pub fn select_path_header() -> apdu::Header {
 /// template at the top of the response.
 ///
 /// **Which tag that is, is the caller's decision.** `dialect` says which
-/// table the card being read follows: [`fcp::TagSet::iec_7816_4_table_42`]
-/// puts the file identifier in `84`, and [`fcp::TagSet::swicc`] puts it in
-/// `83`. Hard-coding either one is the bug AGENTS.md section 2 records, and
-/// the parameter is how this function refuses to do it.
+/// table the card being read follows: [`fcp::TagSet::ts_102_221`] puts the
+/// file identifier in `83`, and a hand-built [`fcp::TagSet::named`] can put it
+/// anywhere. Hard-coding one is the bug AGENTS.md section 2 records, and the
+/// parameter is how this function refuses to do it.
 ///
 /// This reads one identifier and nothing else. Interpreting file size, file
 /// type or access conditions is [`fcp`]'s, and deciding what a scan found is
@@ -546,9 +546,9 @@ mod tests {
     fn a_response_that_echoes_its_identifier_is_read_out_of_the_template() {
         // A FileDescriptor template holding a two-octet FileID atom, which is
         // the shape a card answers SELECT with when it echoes at all. Tag 84
-        // is the ISO table's choice, so the caller says so.
+        // is not the standard FID tag, so the caller says so.
         let body = [0x6F, 0x07, 0x84, 0x02, 0x2F, 0xE2, 0x82, 0x01, 0x02];
-        let iso = fcp::TagSet::iec_7816_4_table_42();
+        let iso = fcp::TagSet::named("fid in 84").with_file_id(crate::tlv::Tag::new(0x84));
         assert_eq!(
             selected_file_id(&body, &iso).unwrap(),
             Some(FileId::from_bytes([0x2F, 0xE2])),
@@ -566,7 +566,7 @@ mod tests {
             Some(FileId::from_bytes([0x2F, 0xE2])),
         );
 
-        let iso = fcp::TagSet::iec_7816_4_table_42();
+        let iso = fcp::TagSet::named("fid in 84").with_file_id(crate::tlv::Tag::new(0x84));
         assert_eq!(selected_file_id(&body, &iso).unwrap(), None);
     }
 
@@ -600,7 +600,7 @@ mod tests {
     fn a_malformed_response_body_surfaces_the_tlv_failure() {
         // The template claims six octets and supplies three. The caller needs
         // to know the bytes were unusable, not that no file was found.
-        let dialect = fcp::TagSet::iec_7816_4_table_42();
+        let dialect = fcp::TagSet::ts_102_221();
         let body = [0x6F, 0x06, 0x84, 0x02];
         assert!(matches!(
             selected_file_id(&body, &dialect),

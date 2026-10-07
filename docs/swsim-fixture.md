@@ -256,9 +256,10 @@ simulator's mood.
 This one cost a CI run too, and every later issue that reads a file
 capabilities template will meet it.
 
-ISO/IEC 7816-4 table 42 gives **0x82 = file size** and **0x83 = file
-descriptor**. swICC's own FCP builder says something different, in
-**src/3gpp.c**:
+The first version of this crate assumed a table with **0x82 = file size** and
+**0x83 = file descriptor** (mislabelled "ISO/IEC 7816-4 table 42"). That table
+is wrong, for swSIM and for real cards alike. swICC's own FCP builder, in
+**src/3gpp.c**, uses the ETSI TS 102 221 clause 11.1.1.3 numbering:
 
 ~~~c
 0x80, /* '62': File size,        'A5': UICC characteristics. */
@@ -278,14 +279,14 @@ against, pinned as submodule `421c8cdd544d1fab508351d8cd81c5f61aae6363`. The
 file-descriptor byte layout this crate reads comes from that swICC commit's
 `src/fs.c` (`swicc_fs_file_descr_byte`), whose own comment cites
 ISO/IEC 7816-4:2020 clause 7.4.5 table 12. swSIM's own comments attribute the
-FCP tag table to ETSI TS 102 221 V16.4.0 clause 11.1.1.3, which this repository
-has not read, so the mapping is named after the software that was observed
-writing it rather than after that specification.
+FCP tag table to ETSI TS 102 221 V16.4.0 clause 11.1.1.3, and a live operator
+USIM's MF FCP uses the same tags (issue #69), so `TagSet::ts_102_221()` is the
+default and `TagSet::swicc()` carries identical tags under the swSIM name.
 
 **How the crate handles it.** `fcp::TagSet` is the mapping, supplied by the
 caller. It has no `Default` and no constructor that invents tags, so
 `fcp::Template::parse` cannot be reached until somebody has said which table
-is being read; `TagSet::swicc()` and `TagSet::iec_7816_4_table_42()` are the two
+is being read; `TagSet::ts_102_221()` and `TagSet::swicc()` are the two
 known ones, and `TagSet::named(..)` plus the `with_*` builders are there for a
 card nobody has characterised. Every `TagSet` carries the name it was given, so
 a scan can report the assumption it ran under instead of burying it.
@@ -332,8 +333,8 @@ res->sw1 = SWICC_APDU_SW1_CHER_CMD;
 res->sw2 = 0x81; /* "Command incompatible with file structure" */
 ~~~
 
-So **69 81** is the right answer and ISO/IEC 7816-4 clause 9.1.2 and table 42
-give its meaning. The test now asserts the 6X class rather than the literal, so
+So **69 81** is the right answer and ISO/IEC 7816-4 clause 9.1.2 gives its
+meaning. The test now asserts the 6X class rather than the literal, so
 it states the rule and not one simulator's choice of code, and it reads its
 content from EF.IMSI (2FE2), which is transparent in the same profile.
 

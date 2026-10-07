@@ -142,23 +142,29 @@ behaviour, and are flagged as such so nobody generalises them.
   answers a plain `90 00`. An issue that issues commands without draining
   proactive commands will see `91 xx` where it expected `90 00` and must not
   read that as failure.
-- **swICC's FCP tag numbering is NOT ISO/IEC 7816-4 table 42.** Inside an FCP
-  template swICC puts the file size in `0x80`, the file descriptor in `0x82`
-  and the file ID in `0x83`, where the ISO table says `82` is the file size
-  (`swICC/src/3gpp.c`, the FCP builder's own tag table). Reading an swSIM FCP
-  as if it were the ISO table yields a nonsense size. A real card may follow
-  the ISO table, so neither mapping may be hard-coded anywhere.
+- **FCP tag numbering is ETSI TS 102 221 clause 11.1.1.3, and swSIM and real
+  cards agree on it.** Inside an FCP template `80` is the file size, `82` the
+  file descriptor, `83` the file ID, `84` the DF name, `88` the SFI, `8A` the
+  life cycle status, `8B`/`8C`/`AB` security attributes, `A5` proprietary
+  information and `C6` the PIN status template. A live operator USIM answers
+  SELECT MF with `82 02 78 21 | 83 02 3F 00 | ...`, and swICC's builder
+  (`swICC/src/3gpp.c`) writes the same tags. An earlier version of this section
+  (and `TagSet::iec_7816_4_table_42`) claimed ISO put the size in `82` and the
+  FID in `84`; that was wrong (issue #69) and the mapping is removed. The
+  `--dialect` value `iec-7816-4-table-42` is still accepted as a deprecated
+  alias for `ts-102-221` (it prints a note on stderr), because the CLI value
+  and the JSON `dialect.id` are part of the contract. A mapping must still not
+  be hard-coded anywhere: a card may deviate.
 
   **RESOLVED by issue #11.** `fcp::TagSet` is the mapping, it is a value the
   caller supplies, and it has no `Default` and no constructor that invents tags.
   `fcp::Template::parse` takes one, so a decoder cannot be reached until somebody
-  has recorded which dialect is being read. `TagSet::iec_7816_4_table_42()` and
-  `TagSet::swicc()` are the two known ones; `TagSet::named(..)` plus the
+  has recorded which dialect is being read. `TagSet::ts_102_221()` and
+  `TagSet::swicc()` are the two known ones (same tags, different names);
+  `TagSet::named(..)` plus the
   `with_*` builders are for a card nobody has characterised. Every `TagSet`
   carries the name it was given so a scan can report the assumption it ran
-  under. The swICC mapping is named after the software that was observed
-  writing it, not after a specification, because the spec swICC cites
-  (ETSI TS 102 221 clause 11.1.1.3) has not been read here.
+  under. The CLI default is `ts-102-221`.
 
 ### Never commit card secrets
 

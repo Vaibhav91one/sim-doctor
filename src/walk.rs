@@ -3119,8 +3119,8 @@ mod tests {
 
     #[test]
     fn a_name_under_a_mapping_that_has_no_tag_for_one_is_not_reported() {
-        // The ISO table leaves df_name unset precisely because this repository
-        // has not verified which tag carries it there.
+        // A hand-built mapping may leave df_name unset; the card's `84` is then
+        // an unexplained tag, not a name.
         let mut body = tlv(0x82, &DIRECTORY_DESCRIPTOR);
         body.extend(tlv(0x84, b"TELECOM\0\0"));
         body.extend(tlv(0x83, &id("7F20").to_bytes()));
@@ -3140,7 +3140,9 @@ mod tests {
             );
         let tree = walk(
             &mut card,
-            &TagSet::iec_7816_4_table_42(),
+            &TagSet::named("no df_name")
+                .with_file_descriptor(Tag::new(0x82))
+                .with_file_id(Tag::new(0x83)),
             &options_for(&["7F20"]),
         )
         .unwrap();

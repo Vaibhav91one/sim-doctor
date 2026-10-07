@@ -94,28 +94,26 @@ pub const KIND: &str = "scan";
 /// and the parser both rely on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Dialect {
-    /// swICC's FCP builder, as observed in swSIM at the pinned commit.
-    ///
-    /// The default, and **not** the ISO table: swICC puts the file size in
-    /// `80` where ISO/IEC 7816-4 table 42 puts it in `82`, and reading an
-    /// swSIM FCP with the ISO table reported a 10-octet EF.ICCID as 2337 octets.
+    /// ETSI TS 102 221 clause 11.1.1.3: `80` size, `82` descriptor, `83` FID.
+    /// The default; real UICCs and swSIM both write this layout.
     #[default]
-    Swicc,
+    Ts102221,
 
-    /// ISO/IEC 7816-4 table 42, which is what a real UICC is more likely to
-    /// follow.
-    Iec7816_4Table42,
+    /// swICC's FCP builder, as observed in swSIM at the pinned commit. The
+    /// same tags as [`Dialect::Ts102221`], kept as a distinct name so a
+    /// baseline taken under it stays a distinct run.
+    Swicc,
 }
 
 impl Dialect {
-    /// Every dialect `--dialect` accepts.
-    pub const ALL: [Self; 2] = [Self::Swicc, Self::Iec7816_4Table42];
+    /// Every dialect `--dialect` accepts, not counting the deprecated alias.
+    pub const ALL: [Self; 2] = [Self::Ts102221, Self::Swicc];
 
     /// The spelling `--dialect` takes and the JSON reports.
     pub const fn id(self) -> &'static str {
         match self {
+            Self::Ts102221 => "ts-102-221",
             Self::Swicc => "swicc",
-            Self::Iec7816_4Table42 => "iec-7816-4-table-42",
         }
     }
 
@@ -127,11 +125,15 @@ impl Dialect {
     /// did not use.
     pub fn tag_set(self) -> TagSet {
         match self {
+            Self::Ts102221 => TagSet::ts_102_221(),
             Self::Swicc => TagSet::swicc(),
-            Self::Iec7816_4Table42 => TagSet::iec_7816_4_table_42(),
         }
     }
 }
+
+/// The spelling the wrong "ISO/IEC 7816-4 table 42" mapping was reachable by
+/// before issue #69. Still accepted, and now means [`Dialect::Ts102221`].
+pub const DEPRECATED_TABLE_42: &str = "iec-7816-4-table-42";
 
 impl fmt::Display for Dialect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,8 +151,8 @@ impl FromStr for Dialect {
     /// against a stored identifier.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         match text.to_ascii_lowercase().as_str() {
+            "ts-102-221" | DEPRECATED_TABLE_42 => Ok(Self::Ts102221),
             "swicc" => Ok(Self::Swicc),
-            "iec-7816-4-table-42" => Ok(Self::Iec7816_4Table42),
             _ => Err(UnknownDialect(text.to_owned())),
         }
     }
@@ -158,7 +160,7 @@ impl FromStr for Dialect {
 
 /// A `--dialect` value that names no mapping this repository has read.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0:?} is not a known FCP dialect; expected swicc or iec-7816-4-table-42")]
+#[error("{0:?} is not a known FCP dialect; expected ts-102-221 or swicc")]
 pub struct UnknownDialect(pub String);
 
 /// The sentence `--help` and every report use to say that the default
@@ -1926,14 +1928,12 @@ mod tests {
     }
 
     #[test]
-    fn the_two_dialects_really_are_different_tables() {
+    fn the_two_dialects_are_told_apart_by_name() {
         // If this ever stopped holding, reporting the name would be reporting
         // nothing at all.
         let swicc = Dialect::Swicc.tag_set();
-        let iso = Dialect::Iec7816_4Table42.tag_set();
-        assert_ne!(swicc.file_size(), iso.file_size());
-        assert_ne!(swicc.file_descriptor(), iso.file_descriptor());
-        assert_ne!(swicc.file_id(), iso.file_id());
+        let std = Dialect::Ts102221.tag_set();
+        assert_ne!(swicc.name(), std.name());
     }
 
     #[test]
@@ -2062,9 +2062,11 @@ mod tests {
         }
         assert!("SWICC".parse::<Dialect>().is_ok(), "case-insensitive");
         assert_eq!(
-            "iec-7816-4-table-42".parse::<Dialect>().unwrap(),
-            Dialect::Iec7816_4Table42
+            DEPRECATED_TABLE_42.parse::<Dialect>().unwrap(),
+            Dialect::Ts102221,
+            "the old spelling is an alias for the corrected table"
         );
+        assert_eq!(Dialect::default(), Dialect::Ts102221);
         assert!("iec7816".parse::<Dialect>().is_err());
         assert!("".parse::<Dialect>().is_err());
     }
