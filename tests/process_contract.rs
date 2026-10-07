@@ -2074,13 +2074,13 @@ mod fuzz_safety {
 
     #[test]
     fn opt_in_alone_still_refuses_a_reader_that_does_not_look_like_the_software_card() {
-        // `hermetic` supplies a bogus --reader (NO_SUCH_READER), which does
-        // not name any attached reader, so this run refuses before it ever
-        // opens one (an "unknown-reader" refusal, the same `pick_reader`
-        // gives `scan` for the same reason) and never reaches the point of
-        // comparing a reader's name against "swicc" at all. Either way the
-        // opt-in flag alone does not open a session: the property this test
-        // actually guards is that nothing here ever touches a real reader.
+        // The interlock's reader check is decided from the raw --reader
+        // string alone (see fuzz_opt_in in src/main.rs), never from a PC/SC
+        // listing, so this is deterministic whatever hardware happens to be
+        // attached to the machine running the suite: `hermetic` supplies the
+        // bogus --reader NO_SUCH_READER, which does not contain "swicc", so
+        // the opt-in flag alone is refused for the --allow-real-hardware
+        // reason before a reader is ever listed or opened.
         let run = run_piped(&[
             "fuzz",
             "apdu",
@@ -2089,7 +2089,11 @@ mod fuzz_safety {
         ]);
         assert_eq!(run.code(), 1);
         assert_eq!(run.stdout, "");
-        assert!(run.stderr.contains(NO_SUCH_READER), "{}", run.stderr);
+        assert!(
+            run.stderr.contains("--allow-real-hardware"),
+            "{}",
+            run.stderr
+        );
     }
 
     #[test]

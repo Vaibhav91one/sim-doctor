@@ -46,9 +46,8 @@ pub const KIND: &str = "apdu_scan";
 
 use serde_json::{json, Value};
 
-use crate::apdu::{Command, Header, StatusWord};
-use crate::session::{self, Policy};
-use crate::transport::CardSession;
+use crate::apdu::{Command, Header, Response, StatusWord};
+use crate::transport::{CardSession, Error as TransportError};
 
 /// The most candidates one discovery run may probe.
 ///
@@ -239,11 +238,28 @@ fn probe<S: CardSession + ?Sized>(
     session: &mut S,
     class: u8,
     instruction: u8,
-    policy: &Policy,
-) -> Result<Outcome, session::Error> {
+) -> Result<Outcome, TransportError> {
+    // A single raw transmit, deliberately NOT crate::session::send. That
+    // function may issue a GET RESPONSE or FETCH follow-up, or re-send the
+    // command at a different class, for a status word discovery exists to
+    // classify in the first place (6E00/6D00) - so going through it would
+    // turn one CASE 1 probe into an unpredictable number of exchanges,
+    // which is exactly the ENVELOPE-shaped hazard AGENTS.md and tar.rs's
+    // module documentation warn about: an extra, unneeded exchange is how a
+    // scanner leaves swicc-pcsc unable to track the transaction at all
+    // (`transmitting ... failed ... An attempt was made to end a
+    // non-existent transaction`, seen in the card-fixture job before this
+    // was fixed). Discovery sends exactly one APDU per candidate and reads
+    // exactly one response; nothing here drains a 61xx or a 9x.
     let command = Command::case1(Header::new(class, instruction, 0x00, 0x00));
-    let exchange = session::send(session, &command, policy)?;
-    Ok(Outcome::of(exchange.status()))
+    let bytes = command
+        .encode()
+        .expect("a CASE 1 command has no data field and cannot fail to encode");
+    let raw = session.transmit(&bytes)?;
+    let status = Response::parse(&raw)
+        .ok()
+        .and_then(|response| response.status());
+    Ok(Outcome::of(status))
 }
 
 /// Runs CLA discovery (SIMTester's level 1) over one session.
@@ -255,9 +271,8 @@ fn probe<S: CardSession + ?Sized>(
 pub fn cla_discovery<S: CardSession + ?Sized>(
     session: &mut S,
     mode: Mode,
-    policy: &Policy,
     interrupt: &mut dyn FnMut() -> bool,
-) -> Result<ClaAudit, session::Error> {
+) -> Result<ClaAudit, TransportError> {
     let candidates: Vec<u8> = match mode {
         Mode::Quick => QUICK_CLAS.to_vec(),
         Mode::Full => (0x00..=0xFF).collect(),
@@ -270,7 +285,7 @@ pub fn cla_discovery<S: CardSession + ?Sized>(
         if interrupt() {
             break;
         }
-        let outcome = probe(session, class, 0x00, policy)?;
+        let outcome = probe(session, class, 0x00)?;
         probes.push(Probe {
             candidate: class,
             outcome,
@@ -296,9 +311,8 @@ pub fn ins_discovery<S: CardSession + ?Sized>(
     session: &mut S,
     class: u8,
     mode: Mode,
-    policy: &Policy,
     interrupt: &mut dyn FnMut() -> bool,
-) -> Result<InsAudit, session::Error> {
+) -> Result<InsAudit, TransportError> {
     let candidates: Vec<u8> = match mode {
         Mode::Quick => QUICK_INS.to_vec(),
         Mode::Full => (0x00..=0xFF).collect(),
@@ -311,7 +325,7 @@ pub fn ins_discovery<S: CardSession + ?Sized>(
         if interrupt() {
             break;
         }
-        let outcome = probe(session, class, instruction, policy)?;
+        let outcome = probe(session, class, instruction)?;
         probes.push(Probe {
             candidate: instruction,
             outcome,
@@ -484,7 +498,7 @@ mod tests {
     #[test]
     fn every_probe_is_a_bare_four_octet_case_1_header() {
         let mut card = Scripted::new(&[&[0x90, 0x00]]);
-        let outcome = probe(&mut card, 0x00, 0xA4, &Policy::default()).unwrap();
+        let outcome = probe(&mut card, 0x00, 0xA4).unwrap();
         assert_eq!(card.sent.borrow()[0], vec![0x00, 0xA4, 0x00, 0x00]);
         assert!(outcome.is_interesting());
     }
@@ -492,7 +506,7 @@ mod tests {
     #[test]
     fn class_not_supported_is_classified() {
         let mut card = Scripted::new(&[&[0x6E, 0x00]]);
-        let outcome = probe(&mut card, 0xFE, 0x00, &Policy::default()).unwrap();
+        let outcome = probe(&mut card, 0xFE, 0x00).unwrap();
         assert_eq!(outcome, Outcome::ClassNotSupported);
         assert_eq!(outcome.id(), "class-not-supported");
     }
@@ -500,14 +514,14 @@ mod tests {
     #[test]
     fn ins_not_supported_is_classified() {
         let mut card = Scripted::new(&[&[0x6D, 0x00]]);
-        let outcome = probe(&mut card, 0x00, 0xFE, &Policy::default()).unwrap();
+        let outcome = probe(&mut card, 0x00, 0xFE).unwrap();
         assert_eq!(outcome, Outcome::InsNotSupported);
     }
 
     #[test]
     fn anything_else_is_interesting() {
         let mut card = Scripted::new(&[&[0x69, 0x82]]);
-        let outcome = probe(&mut card, 0x00, 0xA4, &Policy::default()).unwrap();
+        let outcome = probe(&mut card, 0x00, 0xA4).unwrap();
         assert!(outcome.is_interesting());
     }
 
@@ -516,8 +530,7 @@ mod tests {
         let replies: Vec<Vec<u8>> = QUICK_CLAS.iter().map(|_| vec![0x6E, 0x00]).collect();
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
-        let audit =
-            cla_discovery(&mut card, Mode::Quick, &Policy::default(), &mut || false).unwrap();
+        let audit = cla_discovery(&mut card, Mode::Quick, &mut || false).unwrap();
         assert_eq!(audit.probes.len(), QUICK_CLAS.len());
         assert!(audit.exhausted);
         assert_eq!(audit.interesting().count(), 0);
@@ -528,8 +541,7 @@ mod tests {
         let replies: Vec<Vec<u8>> = (0..=255u16).map(|_| vec![0x6E, 0x00]).collect();
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
-        let audit =
-            cla_discovery(&mut card, Mode::Full, &Policy::default(), &mut || false).unwrap();
+        let audit = cla_discovery(&mut card, Mode::Full, &mut || false).unwrap();
         assert_eq!(audit.probes.len(), 256);
         assert!(audit.exhausted);
     }
@@ -540,7 +552,7 @@ mod tests {
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
         let mut probed = 0;
-        let audit = cla_discovery(&mut card, Mode::Full, &Policy::default(), &mut || {
+        let audit = cla_discovery(&mut card, Mode::Full, &mut || {
             probed += 1;
             probed > 3
         })
@@ -553,14 +565,7 @@ mod tests {
         let replies: Vec<Vec<u8>> = QUICK_INS.iter().map(|_| vec![0x6D, 0x00]).collect();
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
-        let audit = ins_discovery(
-            &mut card,
-            0xA0,
-            Mode::Quick,
-            &Policy::default(),
-            &mut || false,
-        )
-        .unwrap();
+        let audit = ins_discovery(&mut card, 0xA0, Mode::Quick, &mut || false).unwrap();
         assert_eq!(audit.class, 0xA0);
         for sent in card.sent.borrow().iter() {
             assert_eq!(sent[0], 0xA0);

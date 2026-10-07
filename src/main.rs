@@ -1859,9 +1859,17 @@ const FUZZ_OPT_IN_KIND: &str = "fuzz-needs-opt-in";
 /// Refuses, with [`FUZZ_OPT_IN_KIND`], unless BOTH
 /// `--i-understand-this-can-brick-the-card` is given AND the reader's name
 /// matches the software card, or `--allow-real-hardware` is also given.
-/// Checked before a reader is even listed when the first flag is missing, so
-/// the common mistake - forgetting it entirely - never touches PC/SC at all.
-fn fuzz_opt_in(safety: &FuzzSafety, reader: Option<&ReaderName>) -> Result<(), String> {
+///
+/// **Deterministic, and never touches PC/SC.** `reader` is the raw
+/// `--reader` string the command line carried, not a name read back from an
+/// opened session - so this decision never depends on what hardware happens
+/// to be attached to the machine running it, only on what was typed. An
+/// omitted `--reader` is treated as "not recognisably the software card",
+/// the same as a name that does not match: this is the side to be wrong on,
+/// since the alternative is listing readers to find out what the default
+/// would have been, which is exactly the PC/SC round trip this check exists
+/// to run only once the interlock has already passed.
+fn fuzz_opt_in(safety: &FuzzSafety, reader: Option<&str>) -> Result<(), String> {
     if !safety.i_understand {
         return Err(
             "fuzz refuses to run without --i-understand-this-can-brick-the-card: a fuzz run \
@@ -1869,18 +1877,14 @@ fn fuzz_opt_in(safety: &FuzzSafety, reader: Option<&ReaderName>) -> Result<(), S
                 .to_owned(),
         );
     }
-    let is_software = reader.is_some_and(|reader| {
-        reader
-            .as_str()
-            .to_ascii_lowercase()
-            .contains(SWICC_READER_FRAGMENT)
-    });
+    let is_software =
+        reader.is_some_and(|name| name.to_ascii_lowercase().contains(SWICC_READER_FRAGMENT));
     if !is_software && !safety.allow_real_hardware {
         return Err(format!(
             "fuzz refuses to run against {:?}: it does not look like the software card \
              (swicc-pcsc names its reader with \"swICC\", see docs/swsim-fixture.md); pass \
              --allow-real-hardware to run against it anyway",
-            reader.map(ReaderName::as_str).unwrap_or("(no reader)")
+            reader.unwrap_or("(no --reader given)")
         ));
     }
     Ok(())
@@ -1893,15 +1897,21 @@ fn fuzz_opt_in(safety: &FuzzSafety, reader: Option<&ReaderName>) -> Result<(), S
 /// reader-listing and reader-opening path `run_scan` and `run_ts48_compare`
 /// use, so a fuzz refusal is the same shape as every other refusal in this
 /// crate - `data.error`, exit 1, no `data.findings`.
+///
+/// **The interlock runs once, first, against the raw `--reader` string.**
+/// [`fuzz_opt_in`] never needs PC/SC to answer, so it is checked - and can
+/// refuse - before [`Pcsc::readers`] is even called, which is what makes the
+/// refusal deterministic: it depends only on the command line, never on
+/// which readers happen to be attached to the machine running it.
 fn open_fuzz_session(
     kind: &str,
     safety: &FuzzSafety,
 ) -> Result<(ReaderName, PcscSession), contract::ExitCode> {
-    if !safety.i_understand {
+    if let Err(message) = fuzz_opt_in(safety, safety.reader.as_deref()) {
         return Err(report_refusal(
             kind,
-            &fuzz_opt_in(safety, None).unwrap_err(),
-            serde_json::json!({ "error": { "kind": FUZZ_OPT_IN_KIND } }),
+            &message,
+            serde_json::json!({ "error": { "kind": FUZZ_OPT_IN_KIND, "message": message } }),
             safety.json,
         ));
     }
@@ -1921,14 +1931,6 @@ fn open_fuzz_session(
         Ok(reader) => reader.clone(),
         Err(failure) => return Err(report_failure(&failure, safety.json)),
     };
-    if let Err(message) = fuzz_opt_in(safety, Some(&reader)) {
-        return Err(report_refusal(
-            kind,
-            &message,
-            serde_json::json!({ "error": { "kind": FUZZ_OPT_IN_KIND, "message": message } }),
-            safety.json,
-        ));
-    }
     let session = match PcscSession::open(&reader) {
         Ok(session) => session,
         Err(err) => {
@@ -2001,13 +2003,9 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
     };
 
     if let Some(class) = class {
-        let audit = match apdu_scan::ins_discovery(
-            &mut session,
-            class,
-            mode,
-            &session::Policy::default(),
-            &mut || signals::interrupted(),
-        ) {
+        let audit = match apdu_scan::ins_discovery(&mut session, class, mode, &mut || {
+            signals::interrupted()
+        }) {
             Ok(audit) => audit,
             Err(err) => {
                 return report_failure(
@@ -2025,20 +2023,16 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
             args.safety.json,
         )
     } else {
-        let audit = match apdu_scan::cla_discovery(
-            &mut session,
-            mode,
-            &session::Policy::default(),
-            &mut || signals::interrupted(),
-        ) {
-            Ok(audit) => audit,
-            Err(err) => {
-                return report_failure(
-                    &scan::Failure::new("apdu-discovery-failed", err.to_string()),
-                    args.safety.json,
-                )
-            }
-        };
+        let audit =
+            match apdu_scan::cla_discovery(&mut session, mode, &mut || signals::interrupted()) {
+                Ok(audit) => audit,
+                Err(err) => {
+                    return report_failure(
+                        &scan::Failure::new("apdu-discovery-failed", err.to_string()),
+                        args.safety.json,
+                    )
+                }
+            };
         let findings = apdu_scan::cla_findings(&audit);
         emit_fuzz_report(
             apdu_scan::KIND,
