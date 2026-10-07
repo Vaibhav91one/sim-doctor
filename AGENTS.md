@@ -860,7 +860,8 @@ implemented** [V]. Their section numbers are 5.6.4 and 5.6.5 [V] SGP.22 v2.5 §5
 
 ES10a/b/c all share one generic STORE DATA APDU ("Transport Command") [V] SGP.22 v2.5 §5.7.2:
 CLA `80-83`/`C0-CF`, INS `E2`, P1 `11` more blocks / `91` last block, P2 = block number,
-<=255 data bytes.
+<=255 data bytes per block (Table 47 gives Lc as "Var."; the 255 limit is [V] SGP.22 v2.5 §5.7.6 and §2.5.5,
+which also reset P2 to 0 at the start of each BPP segment). Implemented in `src/es10.rs` (issue #18).
 
 - **ES10b** (eUICC ISD-R write/derive) [V] SGP.22 v2.5 §5.7.5 to §5.7.14: PrepareDownload 5.7.5,
   LoadBoundProfilePackage 5.7.6, GetEUICCChallenge 5.7.7, GetEUICCInfo 5.7.8, AuthenticateServer

@@ -26,6 +26,7 @@
 //!                template, and the file metadata read through it
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
+//! layer 1  es10        ES10x: STORE DATA segmentation, ES10b/ES10c encoders and decoders
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
@@ -108,6 +109,7 @@ pub mod bpp;
 pub mod ci;
 pub mod contract;
 pub mod der;
+pub mod es10;
 pub mod fcp;
 pub mod fix;
 pub mod fs;
@@ -274,6 +276,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: bpp::NAME,
         owns: "The SGP.22 Bound Profile Package builder: BPP block order, one shared SCP03t chain over the 87/88/86 TLVs, 1007/1008-byte segmentation and the BF36/A0-A3 segment list; sends nothing.",
         depends_on: &[scp03t::NAME],
+    },
+    ModuleInfo {
+        name: es10::NAME,
+        owns: "ES10x (SGP.22 v2.5): generic STORE DATA segmentation and response reassembly, and the ES10b/ES10c request encoders and typed response decoders; sends nothing unless a caller hands it a session.",
+        depends_on: &[apdu::NAME, transport::NAME, session::NAME],
     },
     ModuleInfo {
         name: scan::NAME,
