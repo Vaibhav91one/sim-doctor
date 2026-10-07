@@ -180,7 +180,7 @@ block. `--print-only` shows what would be written.
 - **The default dialect and candidate set are assumptions.** The output names the ones used;
   a file outside the default identifier families is never probed and cannot be reported missing.
 - **`--tar` is bounded.** The full TAR space is 16 777 216 values; the tool sends at most 4096.
-- Verified only against the swSIM software card, not yet against a real card.
+- Verified against the swSIM software card in CI and read-only against one live operator USIM.
 - **SCP03 never runs against a card.** `src/scp03.rs` is a library (key derivation,
   cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders) verified by
   known-answer vectors. The `auth/scp03-missing-mac` rule is registered, but a scan has no
@@ -190,19 +190,18 @@ block. `--print-only` shows what would be written.
 
 ## Status
 
-**M1, structure-only.** `sim-doctor scan` opens a real PC/SC session, selects the master
-file, walks the file system, and reports it as a table or, under `--json`, as one
-envelope with a meaningful exit code. It is card-verified against the swSIM fixture in CI.
+**Structure plus a first rule set.** `sim-doctor scan` opens a real PC/SC session, selects the
+master file, walks the file system, and reports it as a table or, under `--json`, as one envelope
+with a meaningful exit code. It is card-verified against the swSIM fixture in CI and, read-only
+(`--tar off`), against a live operator USIM: the walk completes under the default
+`ts-102-221` FCP dialect.
 
-What it is **not** yet: a security rule engine. The rule model exists (findings,
-locations, bounded evidence, a registry that refuses a duplicate ID) and a single rule,
-`gsma/msl-zero-allowed`, runs behind `--tar`. Everything else is deferred:
-real SIM/UICC/eUICC rules that make `--score` meaningful ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)),
-an MCP server ([#41](https://github.com/Vaibhav91one/sim-doctor/issues/41)),
-a CI action ([#43](https://github.com/Vaibhav91one/sim-doctor/issues/43)),
-`ci install` ([#45](https://github.com/Vaibhav91one/sim-doctor/issues/45)),
-`why` / `rules explain` ([#46](https://github.com/Vaibhav91one/sim-doctor/issues/46)) and
-a corpus/precision gate ([#47](https://github.com/Vaibhav91one/sim-doctor/issues/47)).
+What it is **not** yet: a full security rule engine. Registered rules: `gsma/msl-zero-allowed`
+(behind `--tar`) and `auth/scp03-missing-mac` (registered; no scan path records SCP03 yet, so
+it has no evidence on a real card). Access-condition and PIN-status rules are in progress
+([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)); every rule is gated by the corpus
+precision/recall test (`tests/corpus.rs`). Library modules without a card path yet: SCP03
+(`src/scp03.rs`), Milenage (`src/aka.rs`), RFC 6979 signing (`src/sign.rs`).
 See [CONTEXT.md](CONTEXT.md) for the plan.
 
 `sim-doctor scan --sarif FILE` also writes the findings as SARIF 2.1.0, using logical locations
@@ -222,7 +221,7 @@ permissions:
   security-events: write
 steps:
   - uses: actions/checkout@v5
-  - uses: Vaibhav91one/sim-doctor@<tag> # a release tag; none exists until a release is cut
+  - uses: Vaibhav91one/sim-doctor@<tag> # a release tag, e.g. v0.2.0
     with:
       swsim: "true"   # build the pinned software card; omit when the runner has a real reader
 ```
@@ -246,8 +245,7 @@ The card is the subject, so there is no per-capture file: the baseline is a comm
 What is verified: the script logic (gate mapping, argv, summary, sanitising of card/tool text) locally against a fake
 `sim-doctor` in `tests/action_script.rs`. The software-card build, install, scan and SARIF upload are exercised only by the
 `action-selftest` workflow on a hosted runner, with no baseline (so it reports, it does not gate). A gating run against a
-real baseline, and acceptance of the SARIF by code scanning, are not verified. The `@<tag>` ref above exists only once a
-release is cut.
+real baseline, and acceptance of the SARIF by code scanning, are not verified. Use a released tag (v0.2.0 or later) for `@<tag>`.
 
 ### `sim-doctor ci install`
 
