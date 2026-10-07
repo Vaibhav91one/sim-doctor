@@ -41,6 +41,20 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sim-doctor")
 }
 
+/// A reader name that cannot exist, so a `scan` takes the no-reader/unknown-reader
+/// path (exit 1, `card_touched: false`) whatever hardware is attached (issue #72).
+const NO_SUCH_READER: &str = "sim-doctor-test-no-such-reader";
+
+/// `args`, plus a bogus `--reader` when it is a `scan` that names none, so the
+/// suite never opens a real reader. The `card-fixture` tests do not go through here.
+fn hermetic(args: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    if args.first().is_some_and(|a| a == "scan") && !args.iter().any(|a| a == "--reader") {
+        args.extend(["--reader".to_string(), NO_SUCH_READER.to_string()]);
+    }
+    args
+}
+
 /// What one run of the binary produced.
 struct Run {
     /// The real exit status, as the operating system reported it.
@@ -99,7 +113,7 @@ fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 /// and a lock taken in here as well would be taken twice by one thread.
 fn run(args: &[&str], stdout: Stdio) -> Run {
     let output = Command::new(binary())
-        .args(args)
+        .args(hermetic(args))
         // Never inherit the harness's stdin. A child that can read a human's
         // terminal is a child whose behaviour depends on who ran the tests.
         .stdin(Stdio::null())
@@ -193,7 +207,7 @@ fn interrupt(args: &[&str]) -> Run {
 fn interrupt_with(args: &[&str], signal: libc::c_int) -> Run {
     let _guard = spawn_lock();
     let mut child = Command::new(binary())
-        .args(args)
+        .args(hermetic(args))
         .env("SIM_DOCTOR_TEST_SIGNAL_HOLD_MS", HOLD_MS.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1089,7 +1103,7 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
 /// only runs when both are present, is exactly the regression a single-flag
 /// test cannot see.
 ///
-/// Every combination is expected to exit 1 on a machine with no reader, and
+/// Every combination is expected to exit 1 with a reader that does not exist, and
 /// that is not asserted against: the code differs legitimately between a
 /// machine with a card, a deferred flag and a failed walk. What IS asserted
 /// is the same three things for all of them, which is what makes this a
