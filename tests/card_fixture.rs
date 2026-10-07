@@ -1785,6 +1785,22 @@ fn fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card() {
     );
     assert_eq!(audit["exhausted"], serde_json::json!(true), "{data}");
 
+    // A candidate that wedges the PC/SC transaction (seen against this very
+    // fixture before this test's own fix) is survived rather than aborting
+    // the run: the sweep still reached every candidate and reports how many
+    // times, if any, it had to re-establish the session to get there.
+    let reconnects = audit["reconnects"].as_u64().expect("reconnects");
+    assert!(
+        reconnects <= sim_doctor::apdu_scan::MAX_RECONNECTS as u64,
+        "{data}"
+    );
+    if reconnects > 0 {
+        eprintln!(
+            "fuzz apdu --quick: survived {reconnects} transport failure(s): {}",
+            audit["transport_errors"]
+        );
+    }
+
     // Every probe is a bare four-octet CASE 1 header: no Lc, no data, no Le,
     // and P1 = P2 = 00 - "discovery never carries a payload" (issue #16),
     // proved here against a real card rather than only against the scripted

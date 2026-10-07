@@ -2002,18 +2002,21 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
         Err(code) => return code,
     };
 
+    // A single candidate can leave the PC/SC transaction unusable without
+    // the card itself having gone anywhere - observed against the real
+    // swSIM fixture - so discovery survives that rather than aborting the
+    // whole run: `reconnect` re-opens the session in place, bounded by
+    // `apdu_scan::MAX_RECONNECTS`. See `apdu_scan::sweep`.
+    let mut reconnect = |session: &mut PcscSession| -> Result<(), TransportError> {
+        *session = PcscSession::open(&reader)?;
+        Ok(())
+    };
+
     if let Some(class) = class {
-        let audit = match apdu_scan::ins_discovery(&mut session, class, mode, &mut || {
-            signals::interrupted()
-        }) {
-            Ok(audit) => audit,
-            Err(err) => {
-                return report_failure(
-                    &scan::Failure::new("apdu-discovery-failed", err.to_string()),
-                    args.safety.json,
-                )
-            }
-        };
+        let audit =
+            apdu_scan::ins_discovery(&mut session, class, mode, &mut reconnect, &mut || {
+                signals::interrupted()
+            });
         let findings = apdu_scan::ins_findings(&audit);
         emit_fuzz_report(
             apdu_scan::KIND,
@@ -2023,16 +2026,9 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
             args.safety.json,
         )
     } else {
-        let audit =
-            match apdu_scan::cla_discovery(&mut session, mode, &mut || signals::interrupted()) {
-                Ok(audit) => audit,
-                Err(err) => {
-                    return report_failure(
-                        &scan::Failure::new("apdu-discovery-failed", err.to_string()),
-                        args.safety.json,
-                    )
-                }
-            };
+        let audit = apdu_scan::cla_discovery(&mut session, mode, &mut reconnect, &mut || {
+            signals::interrupted()
+        });
         let findings = apdu_scan::cla_findings(&audit);
         emit_fuzz_report(
             apdu_scan::KIND,

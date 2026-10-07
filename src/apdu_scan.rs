@@ -57,6 +57,15 @@ use crate::transport::{CardSession, Error as TransportError};
 /// classes is where the cap actually bites.
 pub const MAX_PROBES: usize = 4096;
 
+/// How many times one run re-establishes the session after a transport
+/// failure before it stops and reports what it has.
+///
+/// A fuzzer has to survive a candidate that resets the card or wedges the
+/// PC/SC transaction; it must not loop on one either. Each failure is
+/// recorded against its own candidate, the session is re-opened, and the run
+/// moves on to the NEXT candidate - the failed one is never retried.
+pub const MAX_RECONNECTS: usize = 3;
+
 /// CLA values level 1's quick mode probes.
 ///
 /// **A documented small subset, not a guess.** These are the classes
@@ -84,6 +93,10 @@ pub enum Outcome {
     ClassNotSupported,
     /// `6D 00`: the instruction is not supported (for this class).
     InsNotSupported,
+    /// The transport failed on this candidate (a card reset, or the PC/SC
+    /// layer losing its transaction). A result for the candidate, not a
+    /// reason to abort: see [`MAX_RECONNECTS`].
+    TransportError,
     /// Anything else, including no status word at all (a procedure byte).
     /// The pair reached something other than the two refusals above.
     Interesting {
@@ -106,6 +119,7 @@ impl Outcome {
         match self {
             Self::ClassNotSupported => "class-not-supported",
             Self::InsNotSupported => "ins-not-supported",
+            Self::TransportError => "transport-error",
             Self::Interesting { .. } => "interesting",
         }
     }
@@ -118,7 +132,7 @@ impl Outcome {
     const fn status(&self) -> Option<StatusWord> {
         match self {
             Self::Interesting { status } => *status,
-            Self::ClassNotSupported | Self::InsNotSupported => None,
+            Self::ClassNotSupported | Self::InsNotSupported | Self::TransportError => None,
         }
     }
 }
@@ -168,12 +182,21 @@ pub struct ClaAudit {
     pub mode: Mode,
     /// Every CLA probed, in probe order.
     pub probes: Vec<Probe<u8>>,
-    /// False when [`MAX_PROBES`] fired before the mode's candidate list ran
-    /// out. Level 1's lists never reach the cap, so this is always true
-    /// today; it is published for the same reason [`crate::tar::Audit`]
-    /// publishes it - so a future, larger candidate list cannot silently
-    /// start under-reporting.
+    /// False when the run stopped before the candidate list ran out:
+    /// interrupted, or a transport failure survived [`MAX_RECONNECTS`] times.
+    /// Level 1's lists never reach [`MAX_PROBES`], so that cap is never why
+    /// this is false; it is published for the same reason
+    /// [`crate::tar::Audit`] publishes its own `exhausted` - so a larger
+    /// candidate list added later cannot silently start under-reporting.
     pub exhausted: bool,
+    /// Why the run stopped early, when it did.
+    pub stopped: Option<String>,
+    /// How many times the session was re-established after a transport
+    /// failure.
+    pub reconnects: usize,
+    /// The transport error behind each `transport-error` probe, in the
+    /// shape `"<candidate hex>: <error>"`, in probe order.
+    pub transport_errors: Vec<String>,
 }
 
 impl ClaAudit {
@@ -192,6 +215,10 @@ impl ClaAudit {
             "probed": self.probes.len(),
             "max_probes": MAX_PROBES,
             "exhausted": self.exhausted,
+            "stopped": self.stopped,
+            "reconnects": self.reconnects,
+            "max_reconnects": MAX_RECONNECTS,
+            "transport_errors": self.transport_errors,
             "probes": self.probes.iter().map(|p| p.render("cla")).collect::<Vec<_>>(),
         })
     }
@@ -206,9 +233,16 @@ pub struct InsAudit {
     pub mode: Mode,
     /// Every INS probed, in probe order.
     pub probes: Vec<Probe<u8>>,
-    /// False when [`MAX_PROBES`] fired before the mode's candidate list ran
-    /// out.
+    /// False when the run stopped before the candidate list ran out.
     pub exhausted: bool,
+    /// Why the run stopped early, when it did.
+    pub stopped: Option<String>,
+    /// How many times the session was re-established after a transport
+    /// failure.
+    pub reconnects: usize,
+    /// The transport error behind each `transport-error` probe, in the
+    /// shape `"<candidate hex>: <error>"`, in probe order.
+    pub transport_errors: Vec<String>,
 }
 
 impl InsAudit {
@@ -228,6 +262,10 @@ impl InsAudit {
             "probed": self.probes.len(),
             "max_probes": MAX_PROBES,
             "exhausted": self.exhausted,
+            "stopped": self.stopped,
+            "reconnects": self.reconnects,
+            "max_reconnects": MAX_RECONNECTS,
+            "transport_errors": self.transport_errors,
             "probes": self.probes.iter().map(|p| p.render("ins")).collect::<Vec<_>>(),
         })
     }
@@ -262,41 +300,100 @@ fn probe<S: CardSession + ?Sized>(
     Ok(Outcome::of(status))
 }
 
+/// What one sweep over a candidate list produced.
+struct Swept {
+    probes: Vec<Probe<u8>>,
+    stopped: Option<String>,
+    reconnects: usize,
+    transport_errors: Vec<String>,
+}
+
+/// Probes `candidates` in order, surviving transport failures.
+///
+/// **A fuzzer has to survive exactly this.** A single candidate can reset
+/// the card or leave the underlying PC/SC transaction unusable (observed
+/// against the real swSIM card: `An attempt was made to end a non-existent
+/// transaction`), and a scanner that propagates that as a hard error throws
+/// away every finding the run had already made. So a failed probe is
+/// recorded as [`Outcome::TransportError`] **for that candidate** rather
+/// than aborting, `reconnect` re-establishes the session in place, and the
+/// sweep moves on to the NEXT candidate - the failed one is never retried.
+/// After [`MAX_RECONNECTS`] re-establishments, or a reconnect that itself
+/// fails, the sweep stops and says why; every candidate probed before that
+/// is still in the result.
+fn sweep<S: CardSession + ?Sized>(
+    session: &mut S,
+    candidates: Vec<u8>,
+    header_for: impl Fn(u8) -> (u8, u8),
+    reconnect: &mut dyn FnMut(&mut S) -> Result<(), TransportError>,
+    interrupt: &mut dyn FnMut() -> bool,
+) -> Swept {
+    let mut out = Swept {
+        probes: Vec::with_capacity(candidates.len()),
+        stopped: None,
+        reconnects: 0,
+        transport_errors: Vec::new(),
+    };
+    for candidate in candidates.into_iter().take(MAX_PROBES) {
+        if interrupt() {
+            out.stopped = Some("the run was interrupted".to_owned());
+            break;
+        }
+        let (class, instruction) = header_for(candidate);
+        match probe(session, class, instruction) {
+            Ok(outcome) => out.probes.push(Probe { candidate, outcome }),
+            Err(error) => {
+                out.probes.push(Probe {
+                    candidate,
+                    outcome: Outcome::TransportError,
+                });
+                out.transport_errors
+                    .push(format!("{candidate:02X}: {error}"));
+                if out.reconnects == MAX_RECONNECTS {
+                    out.stopped = Some(format!(
+                        "the transport failed again after {MAX_RECONNECTS} reconnects; \
+                         stopped with the results so far"
+                    ));
+                    break;
+                }
+                out.reconnects += 1;
+                if let Err(error) = reconnect(session) {
+                    out.stopped = Some(format!("the session could not be re-established: {error}"));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Runs CLA discovery (SIMTester's level 1) over one session.
 ///
 /// Bounded by `mode`: [`Mode::Quick`] probes [`QUICK_CLAS`], [`Mode::Full`]
 /// probes every CLA `00`..=`FF`. Both fit comfortably under [`MAX_PROBES`].
 /// `interrupt` is polled before every probe, same contract as
-/// [`crate::tar::audit`].
+/// [`crate::tar::audit`]. `reconnect` re-opens the session in place after a
+/// transport failure; see [`sweep`] for why one candidate surviving that is
+/// the whole point.
 pub fn cla_discovery<S: CardSession + ?Sized>(
     session: &mut S,
     mode: Mode,
+    reconnect: &mut dyn FnMut(&mut S) -> Result<(), TransportError>,
     interrupt: &mut dyn FnMut() -> bool,
-) -> Result<ClaAudit, TransportError> {
+) -> ClaAudit {
     let candidates: Vec<u8> = match mode {
         Mode::Quick => QUICK_CLAS.to_vec(),
         Mode::Full => (0x00..=0xFF).collect(),
     };
-    let capped: Vec<u8> = candidates.into_iter().take(MAX_PROBES).collect();
-    let exhausted = capped.len() <= MAX_PROBES;
-
-    let mut probes = Vec::with_capacity(capped.len());
-    for class in capped {
-        if interrupt() {
-            break;
-        }
-        let outcome = probe(session, class, 0x00)?;
-        probes.push(Probe {
-            candidate: class,
-            outcome,
-        });
-    }
-
-    Ok(ClaAudit {
+    let swept = sweep(session, candidates, |cla| (cla, 0x00), reconnect, interrupt);
+    ClaAudit {
         mode,
-        probes,
-        exhausted,
-    })
+        exhausted: swept.stopped.is_none(),
+        probes: swept.probes,
+        stopped: swept.stopped,
+        reconnects: swept.reconnects,
+        transport_errors: swept.transport_errors,
+    }
 }
 
 /// Runs CLA+INS discovery (SIMTester's level 2) over one session, for one
@@ -307,37 +404,34 @@ pub fn cla_discovery<S: CardSession + ?Sized>(
 /// who already knows their card's class should not have to re-run level 1 to
 /// run level 2. [`Mode::Quick`] probes [`QUICK_INS`]; [`Mode::Full`] probes
 /// every INS `00`..=`FF`, which still fits under [`MAX_PROBES`] on its own.
+/// `reconnect` is [`sweep`]'s, same as [`cla_discovery`].
 pub fn ins_discovery<S: CardSession + ?Sized>(
     session: &mut S,
     class: u8,
     mode: Mode,
+    reconnect: &mut dyn FnMut(&mut S) -> Result<(), TransportError>,
     interrupt: &mut dyn FnMut() -> bool,
-) -> Result<InsAudit, TransportError> {
+) -> InsAudit {
     let candidates: Vec<u8> = match mode {
         Mode::Quick => QUICK_INS.to_vec(),
         Mode::Full => (0x00..=0xFF).collect(),
     };
-    let capped: Vec<u8> = candidates.into_iter().take(MAX_PROBES).collect();
-    let exhausted = capped.len() <= MAX_PROBES;
-
-    let mut probes = Vec::with_capacity(capped.len());
-    for instruction in capped {
-        if interrupt() {
-            break;
-        }
-        let outcome = probe(session, class, instruction)?;
-        probes.push(Probe {
-            candidate: instruction,
-            outcome,
-        });
-    }
-
-    Ok(InsAudit {
+    let swept = sweep(
+        session,
+        candidates,
+        |ins| (class, ins),
+        reconnect,
+        interrupt,
+    );
+    InsAudit {
         class,
         mode,
-        probes,
-        exhausted,
-    })
+        exhausted: swept.stopped.is_none(),
+        probes: swept.probes,
+        stopped: swept.stopped,
+        reconnects: swept.reconnects,
+        transport_errors: swept.transport_errors,
+    }
 }
 
 /// A CLA this crate already sends on purpose, and so does not count as an
@@ -525,12 +619,18 @@ mod tests {
         assert!(outcome.is_interesting());
     }
 
+    /// Does nothing and never fails: the reconnect every test that expects
+    /// no transport failure passes.
+    fn never_reconnects(_: &mut Scripted) -> Result<(), TransportError> {
+        Ok(())
+    }
+
     #[test]
     fn quick_cla_discovery_probes_exactly_the_documented_subset() {
         let replies: Vec<Vec<u8>> = QUICK_CLAS.iter().map(|_| vec![0x6E, 0x00]).collect();
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
-        let audit = cla_discovery(&mut card, Mode::Quick, &mut || false).unwrap();
+        let audit = cla_discovery(&mut card, Mode::Quick, &mut never_reconnects, &mut || false);
         assert_eq!(audit.probes.len(), QUICK_CLAS.len());
         assert!(audit.exhausted);
         assert_eq!(audit.interesting().count(), 0);
@@ -541,7 +641,7 @@ mod tests {
         let replies: Vec<Vec<u8>> = (0..=255u16).map(|_| vec![0x6E, 0x00]).collect();
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
-        let audit = cla_discovery(&mut card, Mode::Full, &mut || false).unwrap();
+        let audit = cla_discovery(&mut card, Mode::Full, &mut never_reconnects, &mut || false);
         assert_eq!(audit.probes.len(), 256);
         assert!(audit.exhausted);
     }
@@ -552,12 +652,13 @@ mod tests {
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
         let mut probed = 0;
-        let audit = cla_discovery(&mut card, Mode::Full, &mut || {
+        let audit = cla_discovery(&mut card, Mode::Full, &mut never_reconnects, &mut || {
             probed += 1;
             probed > 3
-        })
-        .unwrap();
+        });
         assert_eq!(audit.probes.len(), 3);
+        assert!(!audit.exhausted);
+        assert_eq!(audit.stopped.as_deref(), Some("the run was interrupted"));
     }
 
     #[test]
@@ -565,12 +666,137 @@ mod tests {
         let replies: Vec<Vec<u8>> = QUICK_INS.iter().map(|_| vec![0x6D, 0x00]).collect();
         let script: Vec<&[u8]> = replies.iter().map(|v| v.as_slice()).collect();
         let mut card = Scripted::new(&script);
-        let audit = ins_discovery(&mut card, 0xA0, Mode::Quick, &mut || false).unwrap();
+        let audit = ins_discovery(
+            &mut card,
+            0xA0,
+            Mode::Quick,
+            &mut never_reconnects,
+            &mut || false,
+        );
         assert_eq!(audit.class, 0xA0);
         for sent in card.sent.borrow().iter() {
             assert_eq!(sent[0], 0xA0);
         }
         assert_eq!(audit.probes.len(), QUICK_INS.len());
+    }
+
+    /// A card that answers with a transport error on one specific INS and
+    /// is fine on every other one - the shape of the real swSIM failure this
+    /// is a regression test for: a single candidate leaving the PC/SC
+    /// transaction unusable, not the card itself.
+    struct FailsOnOneIns {
+        reader: ReaderName,
+        /// `Some(ins)` fails that one INS and answers every other
+        /// normally; `None` fails every single probe, modelling a card that
+        /// never comes back once the transaction is wedged.
+        poison: Option<u8>,
+        reconnected: RefCell<usize>,
+    }
+
+    impl CardSession for FailsOnOneIns {
+        fn reader(&self) -> &ReaderName {
+            &self.reader
+        }
+
+        fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, TransportError> {
+            let fails = match self.poison {
+                Some(poison) => command[1] == poison,
+                None => true,
+            };
+            if fails {
+                return Err(TransportError::Transmit {
+                    reader: self.reader.clone(),
+                    detail: "An attempt was made to end a non-existent transaction".to_owned(),
+                });
+            }
+            Ok(vec![0x90, 0x00])
+        }
+
+        fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_on_one_candidate_is_recorded_and_the_sweep_continues() {
+        let mut card = FailsOnOneIns {
+            reader: ReaderName::new("loopback").expect("a reader name"),
+            poison: Some(QUICK_INS[3]),
+            reconnected: RefCell::new(0),
+        };
+        let audit = ins_discovery(
+            &mut card,
+            0x00,
+            Mode::Quick,
+            &mut |c: &mut FailsOnOneIns| {
+                *c.reconnected.borrow_mut() += 1;
+                Ok(())
+            },
+            &mut || false,
+        );
+
+        // Every candidate was still probed - the poisoned one and everything
+        // after it - which is the whole point: one failing INS does not
+        // truncate the run.
+        assert_eq!(audit.probes.len(), QUICK_INS.len());
+        assert!(audit.exhausted, "{:?}", audit.stopped);
+        assert_eq!(*card.reconnected.borrow(), 1);
+        assert_eq!(audit.reconnects, 1);
+
+        let poisoned = audit
+            .probes
+            .iter()
+            .find(|p| p.candidate == QUICK_INS[3])
+            .expect("the poisoned candidate is still in the results");
+        assert_eq!(poisoned.outcome, Outcome::TransportError);
+        assert_eq!(poisoned.outcome.id(), "transport-error");
+        assert_eq!(audit.transport_errors.len(), 1);
+        assert!(audit.transport_errors[0].contains("non-existent transaction"));
+
+        // Every other candidate reached its ordinary classification.
+        for probe in &audit.probes {
+            if probe.candidate != QUICK_INS[3] {
+                assert!(probe.outcome.is_interesting(), "{probe:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_transport_failures_stop_the_sweep_after_max_reconnects_and_say_so() {
+        let mut card = FailsOnOneIns {
+            reader: ReaderName::new("loopback").expect("a reader name"),
+            // Every INS fails: a card that never comes back.
+            poison: None, // every candidate fails
+            reconnected: RefCell::new(0),
+        };
+        let mut reconnects = 0;
+        let audit = ins_discovery(
+            &mut card,
+            0x00,
+            Mode::Quick,
+            &mut |_: &mut FailsOnOneIns| {
+                reconnects += 1;
+                Ok(())
+            },
+            &mut || false,
+        );
+
+        assert!(!audit.exhausted);
+        assert_eq!(audit.reconnects, MAX_RECONNECTS);
+        assert_eq!(reconnects, MAX_RECONNECTS);
+        // MAX_RECONNECTS reconnects means MAX_RECONNECTS + 1 candidates were
+        // attempted: the sweep tries once more after the last reconnect
+        // before giving up.
+        assert_eq!(audit.probes.len(), MAX_RECONNECTS + 1);
+        assert!(audit
+            .stopped
+            .as_deref()
+            .expect("a stopped reason")
+            .contains("reconnects"));
+        // Never retried: every probe names a distinct candidate from QUICK_INS,
+        // in order, never the same one twice.
+        let seen: Vec<u8> = audit.probes.iter().map(|p| p.candidate).collect();
+        assert_eq!(seen, QUICK_INS[..MAX_RECONNECTS + 1]);
     }
 
     #[test]
