@@ -474,6 +474,28 @@ fn only<'a>(data: &'a [u8], tag: u32) -> Result<Vec<Node<'a>>, DecodeError> {
     parse(node.value)
 }
 
+/// The value of the one TLV `data` consists of, which must carry `tag`. For
+/// the ES9+ layer ([`crate::es9`]), which gets whole TLVs inside base64.
+pub(crate) fn single_value(data: &[u8], tag: u32) -> Result<&[u8], DecodeError> {
+    let outer = parse(data)?;
+    let Some(node) = outer.first() else {
+        return Err(DecodeError::Truncated {
+            needed: 1,
+            available: 0,
+        });
+    };
+    if outer.len() > 1 {
+        return Err(DecodeError::TrailingData(data.len() - node.raw.len()));
+    }
+    if node.tag != tag {
+        return Err(DecodeError::WrongTag {
+            expected: tag,
+            found: node.tag,
+        });
+    }
+    Ok(node.value)
+}
+
 /// A TLV a decoder did not recognise, kept whole so nothing is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unknown {

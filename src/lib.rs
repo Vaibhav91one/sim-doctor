@@ -27,6 +27,7 @@
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
 //! layer 1  es10        ES10x: STORE DATA segmentation, ES10b/ES10c encoders and decoders
+//! layer 1  es9         ES9+: the JSON-over-HTTPS messages to an SM-DP+, behind a transport trait
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
@@ -110,6 +111,7 @@ pub mod ci;
 pub mod contract;
 pub mod der;
 pub mod es10;
+pub mod es9;
 pub mod fcp;
 pub mod fix;
 pub mod fs;
