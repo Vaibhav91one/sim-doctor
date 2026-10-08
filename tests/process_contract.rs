@@ -693,6 +693,44 @@ fn an_unparsable_scan_command_line_exits_129() {
     );
 }
 
+/// `--terminal-profile` changes the card's CAT state, so it is only accepted together with a
+/// TAR audit that will use it: without `--tar` (default off) or with `--tar off` it is refused
+/// with 129, before any reader is opened and with nothing on stdout.
+#[test]
+fn terminal_profile_without_a_tar_audit_exits_129() {
+    for args in [
+        &["scan", "--terminal-profile", "--json"][..],
+        &["scan", "--tar", "off", "--terminal-profile", "--json"][..],
+    ] {
+        let run = run_piped(args);
+        assert_eq!(run.code(), 129, "{args:?}: {:?}", run.stderr);
+        assert_eq!(run.stdout, "", "{args:?}");
+        assert!(
+            run.stderr.contains("--terminal-profile"),
+            "{args:?}: {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// The flag's help says exactly what is sent and what it changes.
+#[test]
+fn scan_help_documents_the_terminal_profile() {
+    let run = run_piped(&["scan", "--help"]);
+    assert_eq!(run.code(), 0);
+    for needle in [
+        "80 10 00 00 01 13",
+        "CAT session state",
+        "TERMINAL RESPONSE",
+    ] {
+        assert!(
+            run.stdout.contains(needle),
+            "help lacks {needle:?}: {}",
+            run.stdout
+        );
+    }
+}
+
 /// --baseline and --diff are implemented, and the process says so.
 ///
 /// **They were the last two.** AGENTS.md section 3 required `--score`,

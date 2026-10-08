@@ -157,6 +157,7 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `--dialect <TABLE>` | FCP tag table: `ts-102-221` (default, ETSI TS 102 221; real cards and swSIM) or `swicc` (same tags, own name). `iec-7816-4-table-42` is a deprecated alias for `ts-102-221` |
 | `--max-depth`, `--max-children`, `--max-nodes`, `--max-directories` | walk bounds; hitting one is reported as truncation. `--max-nodes` (default 16384) counts files the card selected, not absent probes; walk time is bounded by `--max-directories` (64) x `--max-children` (1280). `ts48 compare` takes the same four flags |
 | `--tar <SELECTION>` | TARs to probe for MSL 0: `off` (default), `focused`, `full`, `range:A-B`, `regex:P`; capped at 4096 probes |
+| `--terminal-profile` | with `--tar` other than `off` only (else exit 129): send TERMINAL PROFILE `80 10 00 00 01 13` (SMS-PP data download declared, nothing else) before the TAR audit. **Changes the card's CAT session state** (no file is written); a pending proactive command is fetched and declined, never executed. Off by default |
 | `--severity <LEVEL>` | drop findings below `info\|low\|medium\|high\|critical` |
 | `--score` | add `data.score`, integer 0-100 |
 | `--baseline <FILE>`, `--diff` | regression gating against a saved run (in review, see the baseline PR) |
@@ -210,6 +211,7 @@ block. `--print-only` shows what would be written.
 - **A truncated walk saw part of the card.** The report says so in three places; check `data.complete`.
 - **The default dialect and candidate set are assumptions.** The output names the ones used;
   a file outside the default identifier families is never probed and cannot be reported missing.
+- **A card that answers every ENVELOPE `6F 00` (or `6D 00`, `6E 00`, `69 85`, `6A 81`) was not audited.** `data.tar.blind_spot` says so, no baseline is claimed and no sweep is sent. Many UICCs ignore CAT traffic until a TERMINAL PROFILE arrives; `--terminal-profile` sends one and is the only thing here that changes CAT state.
 - **`--tar` is bounded.** The full TAR space is 16 777 216 values; the tool sends at most 4096.
 - Verified against the swSIM software card in CI and against one live operator USIM (read-only, plus a consented `--tar focused` run).
 - **SCP03 never runs against a card.** `src/scp03.rs` is a library (key derivation,

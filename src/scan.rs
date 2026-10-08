@@ -2686,6 +2686,7 @@ mod tests {
             exhausted: true,
             stopped: None,
             exchanges: 2,
+            terminal_profile: None,
         };
         let ran = Verdict::new(rules::Findings::complete(Vec::new()), 2)
             .scored(true)
@@ -2792,6 +2793,7 @@ mod tests {
             exhausted: true,
             stopped: None,
             exchanges: 4,
+            terminal_profile: None,
         }
     }
 
@@ -2812,6 +2814,7 @@ mod tests {
             exhausted: true,
             stopped: None,
             exchanges: 2,
+            terminal_profile: None,
         }
     }
 
