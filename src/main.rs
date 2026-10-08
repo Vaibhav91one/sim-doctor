@@ -1448,7 +1448,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // exchange of this scan (JSON lines, see transport::replay). The log is
     // raw card output; it is never written unless the operator asks.
     let mut session: Box<dyn CardSession> = match std::env::var_os("SIM_DOCTOR_RECORD") {
-        Some(path) => match std::fs::File::create(&path) {
+        Some(path) => match record_log_file(&path) {
             Ok(file) => Box::new(replay::Record::new(session, file)),
             Err(err) => {
                 return report_failure(
@@ -2010,6 +2010,16 @@ fn open_fuzz_session(
         }
     };
     Ok((reader, session))
+}
+
+/// Creates (truncating) the `SIM_DOCTOR_RECORD` log. Its content is sensitive
+/// raw card data (ICCID, IMSI, file contents), so on unix it is owner-only 0600.
+fn record_log_file(path: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Runs `sim-doctor fuzz apdu`: CLA discovery (level 1) or CLA+INS discovery
