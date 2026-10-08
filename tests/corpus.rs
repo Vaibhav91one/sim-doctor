@@ -31,6 +31,8 @@ struct Card {
     msl0: bool,
     /// Answers every ENVELOPE `6F 00`, as a card does until it has had a TERMINAL PROFILE.
     generic_envelope: bool,
+    /// Alternates `94 04` / `6D 00` on every ENVELOPE, so the calibration ties (issue #101).
+    tied_envelope: Option<usize>,
     reader: ReaderName,
 }
 
@@ -65,8 +67,16 @@ impl Card {
             queued: VecDeque::new(),
             msl0,
             generic_envelope: false,
+            tied_envelope: None,
             reader: ReaderName::new("corpus card").unwrap(),
         }
+    }
+
+    /// This card alternates its ENVELOPE answer each probe, so the 20 calibration
+    /// probes tie 10/10 and no baseline is established (issue #101).
+    fn tied_envelope(mut self) -> Self {
+        self.tied_envelope = Some(0);
+        self
     }
 
     /// This card answers every ENVELOPE `6F 00` (issue #98).
@@ -179,6 +189,15 @@ impl CardSession for Card {
             }),
             // ENVELOPE as one complete APDU, the way a real reader takes it.
             Some(0xC2) if self.generic_envelope => Ok(vec![0x6F, 0x00]),
+            Some(0xC2) if self.tied_envelope.is_some() => {
+                let n = self.tied_envelope.unwrap_or(0);
+                self.tied_envelope = Some(n + 1);
+                Ok(if n % 2 == 0 {
+                    vec![0x94, 0x04]
+                } else {
+                    vec![0x6D, 0x00]
+                })
+            }
             Some(0xC2) => {
                 let zero = tar::envelope_data(tar::TAR_MIN, Class::Etsi).unwrap();
                 Ok(if self.msl0 && command.get(5..) == Some(zero.as_slice()) {
@@ -323,6 +342,16 @@ fn corpus() -> Vec<Case> {
         case(
             "no-terminal-profile-6f00",
             tree(false, Fcp::Swicc).generic_envelope(),
+            swicc,
+            Limits::default(),
+            vec![],
+            true,
+            9,
+        ),
+        // Calibration ties 10/10: no baseline, so no MSL 0 verdict (issue #101).
+        case(
+            "tied-calibration",
+            tree(false, Fcp::Swicc).tied_envelope(),
             swicc,
             Limits::default(),
             vec![],
