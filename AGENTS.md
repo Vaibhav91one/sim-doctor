@@ -439,7 +439,7 @@ answers the sharpest form of it: does this card act on TAR `000000`?
 Three things about this feature are contract, and each of them exists because
 the naive version of it is wrong.
 
-#### A TAR reaches a card inside an ENVELOPE, and the ENVELOPE is two exchanges
+#### A TAR reaches a card inside an ENVELOPE, sent as one APDU (two exchanges only on swicc-pcsc)
 
 There is no TAR in a bare command header. The chain is: a 3GPP TS 03.48
 Command Packet holding the TAR, inside a TS 23.040 SMS-DELIVER TPDU, inside an
@@ -447,16 +447,23 @@ ISO/IEC 7816-4 SMS-PP-DOWNLOAD envelope (BER-TLV tag `D1`), inside an ENVELOPE
 command. [src/tar.rs](src/tar.rs) reproduces it octet for octet from SIMTester
 at `d197fef`; the tests pin the bytes against those constants.
 
-**The ENVELOPE cannot be sent in one APDU.** swSIM answers the opening with a
-`61 Lc` procedure byte *before reading a single octet of the data field* [V]
-(swSIM `src/apduh.c`, `apduh_etsi_cat_envelope`: with `procedure_count == 0`
-and `*cmd->p3 > 0` it sets `SWICC_APDU_SW1_PROC_ACK_ALL`, copies nothing out of
-`cmd->data`, and returns). A scanner that transmits the whole envelope inline
-and moves on **leaves the card holding half a command**: the next APDU is
-swallowed as this one's continuation and every later probe is answering about
-the wrong TAR. So the probe is the opening `CLA INS P1 P2 Lc`, then exactly
-`Lc` octets, and the scanner abandons the scan rather than continue if the card
-asks for anything else.
+**PC/SC takes one complete APDU.** `SCardTransmit` carries `CLA INS P1 P2 Lc
+<data>` and the IFD handler (the CCID driver on a real reader) runs the T=0
+procedure-byte exchange itself; a header-only transmit is rejected by a real
+reader (issue #96: `probed: 0` on an OMNIKEY). So the probe and the fuzz OTA
+sweep send the ENVELOPE as one APDU through `session::send`: `61 xx` and `9F xx`
+are collected with GET RESPONSE, and a `91 xx` is recorded as the probe's answer
+and **never fetched** (the scan is no CAT terminal).
+
+**The one exception is the swicc-pcsc reader, picked by name.** swSIM answers the
+bare header with `61 Lc` *before reading a single octet of the data field* [V]
+(swSIM `src/apduh.c`, `apduh_etsi_cat_envelope`), and swicc-pcsc's
+`IFDHTransmitToICC` returns a two-octet status received before all data is sent
+as the APDU's final answer [V] (`src/ifd_handler.c`, `msg_rx_buf_len == 2U`), so
+a whole ENVELOPE would come back `61 Lc` with the data never delivered and the
+card left holding half a command. There the probe is the opening `CLA INS P1 P2
+Lc`, then exactly `Lc` octets, and the scanner abandons the scan rather than
+continue if the card asks for anything else.
 
 #### "Accepted" is a measurement, not a status word
 

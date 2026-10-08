@@ -19,7 +19,7 @@ use sim_doctor::walk::{self, Candidates, Limits};
 // A generated card
 // ---------------------------------------------------------------------------
 
-/// Answers SELECT by path (as swSIM does), GET RESPONSE, and the two-step ENVELOPE of a
+/// Answers SELECT by path (as swSIM does), GET RESPONSE, and the whole-APDU ENVELOPE of a
 /// TAR probe. `msl0` makes TAR 000000 answer `6D 00`; every other TAR gets `94 04`.
 struct Card {
     files: HashMap<Vec<u8>, Vec<u8>>,
@@ -168,17 +168,16 @@ impl CardSession for Card {
                 }
                 None => vec![0x6A, 0x82],
             }),
-            // ENVELOPE opening: swSIM asks for the data before reading it.
-            Some(0xC2) if command.len() == 5 => Ok(vec![0x61, command[4]]),
-            // ENVELOPE data field.
-            _ => {
+            // ENVELOPE as one complete APDU, the way a real reader takes it.
+            Some(0xC2) => {
                 let zero = tar::envelope_data(tar::TAR_MIN, Class::Etsi).unwrap();
-                Ok(if self.msl0 && command == zero.as_slice() {
+                Ok(if self.msl0 && command.get(5..) == Some(zero.as_slice()) {
                     vec![0x6D, 0x00]
                 } else {
                     vec![0x94, 0x04]
                 })
             }
+            _ => Ok(vec![0x6D, 0x00]),
         }
     }
 
