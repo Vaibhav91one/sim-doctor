@@ -618,10 +618,18 @@ fn walks_the_file_system_of_a_real_card() {
         .unwrap_or(0);
     println!("the deepest file the card actually holds is {real_depth} levels below 3F00");
     assert_eq!(
-        real_depth, 2,
+        real_depth,
+        2,
         "a real USIM profile is two levels below the master file; anything \
          deeper that is not a repeated-ancestor artifact means the depth bound \
-         is hiding a real file"
+         is hiding a real file. deeper: {:?}",
+        tree.nodes()
+            .iter()
+            .filter(|n| n.state().is_selected() && n.path().adf().is_none())
+            .filter(|n| n.path().depth() > 2)
+            .take(12)
+            .map(|n| n.path().to_string())
+            .collect::<Vec<_>>()
     );
     assert!(
         real_depth < options.limits.max_depth,
