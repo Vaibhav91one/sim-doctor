@@ -45,11 +45,19 @@ fn binary() -> &'static str {
 /// path (exit 1, `card_touched: false`) whatever hardware is attached (issue #72).
 const NO_SUCH_READER: &str = "sim-doctor-test-no-such-reader";
 
-/// `args`, plus a bogus `--reader` when it is a `scan` that names none, so the
-/// suite never opens a real reader. The `card-fixture` tests do not go through here.
+/// `args`, plus a bogus `--reader` when it is a `scan` or a `fuzz` that names
+/// none, so the suite never opens a real reader. The `card-fixture` tests do
+/// not go through here.
+///
+/// `fuzz` is included for the same reason `scan` is (issue #16): a test that
+/// opts in to the safety interlock with both flags and a bogus
+/// `--allow-real-hardware` reader name must still never reach a real reader,
+/// whatever hardware happens to be attached to the machine the suite runs on.
 fn hermetic(args: &[&str]) -> Vec<String> {
     let mut args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-    if args.first().is_some_and(|a| a == "scan") && !args.iter().any(|a| a == "--reader") {
+    if args.first().is_some_and(|a| a == "scan" || a == "fuzz")
+        && !args.iter().any(|a| a == "--reader")
+    {
         args.extend(["--reader".to_string(), NO_SUCH_READER.to_string()]);
     }
     args
@@ -2016,5 +2024,114 @@ mod ci_install {
         assert_eq!(run.stdout, "");
         assert!(run.stderr.contains("symlink"), "{}", run.stderr);
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+}
+
+/// The safety interlock on `fuzz apdu`/`fuzz ota` (issue #16).
+///
+/// Every test here runs through [`hermetic`], which injects the bogus
+/// `--reader` for `fuzz` the same way it does for `scan`: even a test that
+/// supplies every opt-in flag never reaches a real reader, let alone a real
+/// card.
+mod fuzz_safety {
+    use super::*;
+
+    #[test]
+    fn apdu_refuses_without_the_opt_in_flag_before_touching_a_reader() {
+        let run = run_piped(&["fuzz", "apdu", "--quick"]);
+        assert_eq!(run.code(), 1);
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.stderr
+                .contains("--i-understand-this-can-brick-the-card"),
+            "{}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn ota_refuses_without_the_opt_in_flag_before_touching_a_reader() {
+        let run = run_piped(&["fuzz", "ota", "--quick"]);
+        assert_eq!(run.code(), 1);
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.stderr
+                .contains("--i-understand-this-can-brick-the-card"),
+            "{}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn json_refusal_without_opt_in_carries_the_fuzz_needs_opt_in_kind() {
+        let run = run_piped(&["fuzz", "apdu", "--quick", "--json"]);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        assert_eq!(
+            envelope.payload().data()["error"]["kind"],
+            serde_json::json!("fuzz-needs-opt-in")
+        );
+    }
+
+    #[test]
+    fn opt_in_alone_still_refuses_a_reader_that_does_not_look_like_the_software_card() {
+        // The interlock's reader check is decided from the raw --reader
+        // string alone (see fuzz_opt_in in src/main.rs), never from a PC/SC
+        // listing, so this is deterministic whatever hardware happens to be
+        // attached to the machine running the suite: `hermetic` supplies the
+        // bogus --reader NO_SUCH_READER, which does not contain "swicc", so
+        // the opt-in flag alone is refused for the --allow-real-hardware
+        // reason before a reader is ever listed or opened.
+        let run = run_piped(&[
+            "fuzz",
+            "apdu",
+            "--quick",
+            "--i-understand-this-can-brick-the-card",
+        ]);
+        assert_eq!(run.code(), 1);
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.stderr.contains("--allow-real-hardware"),
+            "{}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn allow_real_hardware_lets_the_opt_in_through_to_the_reader_open_step() {
+        // Both flags given, against the hermetic bogus reader: the opt-in
+        // passes and the run fails for the ordinary reason `scan` does
+        // (unknown-reader), never for the opt-in refusal. This is the proof
+        // that the interlock is a gate in front of the reader step and not a
+        // second copy of it.
+        let run = run_piped(&[
+            "fuzz",
+            "apdu",
+            "--quick",
+            "--i-understand-this-can-brick-the-card",
+            "--allow-real-hardware",
+            "--json",
+        ]);
+        assert_eq!(run.code(), 1);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        let kind = envelope.payload().data()["error"]["kind"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert_ne!(kind, "fuzz-needs-opt-in", "{}", run.stderr);
+    }
+
+    #[test]
+    fn level_2_without_class_is_refused_before_a_reader_is_opened() {
+        let run = run_piped(&[
+            "fuzz",
+            "apdu",
+            "--quick",
+            "--level",
+            "2",
+            "--i-understand-this-can-brick-the-card",
+            "--allow-real-hardware",
+        ]);
+        assert_eq!(run.code(), 1);
+        assert!(run.stderr.contains("--class"), "{}", run.stderr);
     }
 }

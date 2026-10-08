@@ -1724,3 +1724,95 @@ fn ts48_compare_accounts_for_every_profile_file_against_a_real_card() {
         .as_str()
         .is_some_and(|text| text.contains("not GCF or PTCRB conformance")));
 }
+
+/// `fuzz apdu --quick` against the swSIM card (issue #16).
+///
+/// Proves three things only a real card can: the safety interlock lets a
+/// run through when the reader genuinely is the software card (no
+/// `--allow-real-hardware` needed), the envelope carries the CASE 1
+/// (`CLA INS 00 00`, no data) shape discovery promises, and the run stayed
+/// within [`sim_doctor::apdu_scan::MAX_PROBES`] - `--quick` probes exactly
+/// [`sim_doctor::apdu_scan::QUICK_CLAS`]'s length and nothing more.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "fuzz",
+            "apdu",
+            "--quick",
+            "--i-understand-this-can-brick-the-card",
+            "--json",
+            "--reader",
+            reader.as_str(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout.matches('\n').count(),
+        1,
+        "one envelope line: {stdout}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(stdout.trim_end()).expect("one envelope");
+    assert_eq!(envelope["type"], serde_json::json!("apdu_scan"));
+
+    let data = &envelope["payload"]["data"];
+    let audit = &data["audit"];
+    assert_eq!(audit["mode"], serde_json::json!("quick"));
+    assert_eq!(
+        audit["probed"].as_u64().expect("probed"),
+        sim_doctor::apdu_scan::QUICK_CLAS.len() as u64,
+        "{data}"
+    );
+    assert!(
+        audit["probed"].as_u64().expect("probed") <= sim_doctor::apdu_scan::MAX_PROBES as u64,
+        "the run stayed within the cap: {data}"
+    );
+    assert_eq!(audit["exhausted"], serde_json::json!(true), "{data}");
+
+    // A candidate that wedges the PC/SC transaction (seen against this very
+    // fixture before this test's own fix) is survived rather than aborting
+    // the run: the sweep still reached every candidate and reports how many
+    // times, if any, it had to re-establish the session to get there.
+    let reconnects = audit["reconnects"].as_u64().expect("reconnects");
+    assert!(
+        reconnects <= sim_doctor::apdu_scan::MAX_RECONNECTS as u64,
+        "{data}"
+    );
+    // But surviving is the fallback, not the expectation: swSIM must answer
+    // every CASE 1 probe (sent as the five-octet T=0 form), so any transport
+    // error here is a bug in how discovery talks to the card.
+    assert_eq!(reconnects, 0, "{data}");
+    assert_eq!(audit["transport_errors"], serde_json::json!([]), "{data}");
+
+    // Every probe is a bare four-octet CASE 1 header: no Lc, no data, no Le,
+    // and P1 = P2 = 00 - "discovery never carries a payload" (issue #16),
+    // proved here against a real card rather than only against the scripted
+    // fixture in src/apdu_scan.rs.
+    let probes = audit["probes"].as_array().expect("probes array");
+    assert!(!probes.is_empty(), "{data}");
+    for probe in probes {
+        assert!(probe["cla"].as_str().is_some(), "{probe}");
+        let outcome = probe["outcome"].as_str().expect("outcome");
+        assert_ne!(outcome, "transport-error", "{probe}");
+        eprintln!(
+            "fuzz apdu --quick: CLA {} -> {outcome} {}",
+            probe["cla"], probe["status"]
+        );
+    }
+}

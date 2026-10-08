@@ -105,6 +105,7 @@
 pub mod access;
 pub mod aka;
 pub mod apdu;
+pub mod apdu_scan;
 pub mod baseline;
 pub mod bpp;
 pub mod ci;
@@ -115,6 +116,7 @@ pub mod es9;
 pub mod fcp;
 pub mod fix;
 pub mod fs;
+pub mod fuzz;
 pub mod gp;
 pub mod mcp;
 pub mod rules;
@@ -238,6 +240,16 @@ pub const MODULES: &[ModuleInfo] = &[
         name: walk::NAME,
         owns: "The DF-tree walk: select the master file, probe identifiers, descend, and keep absent apart from forbidden.",
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fcp::NAME, fs::NAME, session::NAME],
+    },
+    ModuleInfo {
+        name: apdu_scan::NAME,
+        owns: "CLA discovery and CLA+INS discovery over a session: bounded CASE 1 probes classified by status word, a quick mode, and the apdu/undocumented-cla-accepted and apdu/undocumented-ins-accepted rules.",
+        depends_on: &[apdu::NAME, transport::NAME, session::NAME, rules::NAME],
+    },
+    ModuleInfo {
+        name: fuzz::NAME,
+        owns: "The OTA/SMS fuzz entry point: a bounded TAR x keyset x mechanism sweep built on tar's envelope builder and differential, with a quick mode and the fuzz/ota-mechanism-accepted rule.",
+        depends_on: &[apdu::NAME, transport::NAME, session::NAME, tar::NAME, rules::NAME],
     },
     ModuleInfo {
         name: access::NAME,
