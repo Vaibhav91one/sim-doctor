@@ -1059,6 +1059,27 @@ impl fmt::Display for Signature {
     }
 }
 
+/// Status words that say the card did not process the ENVELOPE, so an answer
+/// of one of them to every calibration probe is not a verdict on any TAR.
+///
+/// Meanings from ETSI TS 102 221 V16.4.0, clause 10.2.1.5 (read, not recalled):
+/// `6F 00` "Technical problem, no precise diagnosis" (table 10.11); `6D 00`
+/// "Instruction code not supported or invalid" and `6E 00` "Class not
+/// supported" (table 10.11), i.e. ENVELOPE was not dispatched at all;
+/// `69 85` "Conditions of use not satisfied" (table 10.13), which is what a CAT
+/// that has not seen a TERMINAL PROFILE can answer; `6A 81` "Function not
+/// supported" (table 10.14). None of them is a per-TAR answer. A baseline made
+/// of one is withheld and the scan reports a blind spot instead (issue #98:
+/// 20 of 20 calibration probes and every TAR probe answered `6F 00` on a live
+/// card to which no TERMINAL PROFILE had been sent).
+pub const GENERIC_ERRORS: [[u8; 2]; 5] = [
+    [0x6F, 0x00],
+    [0x6D, 0x00],
+    [0x6E, 0x00],
+    [0x69, 0x85],
+    [0x6A, 0x81],
+];
+
 /// The response this card gives to TARs it has no opinion about.
 ///
 /// **Measured, not assumed.** See the module documentation: this project cannot
@@ -1074,6 +1095,9 @@ impl fmt::Display for Signature {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     signature: Option<Signature>,
+    /// The generic-error status the calibration probes agreed on, when that is
+    /// the only thing they said. See [`GENERIC_ERRORS`].
+    generic_error: Option<StatusWord>,
     count: usize,
     sampled: usize,
     histogram: BTreeMap<Signature, usize>,
@@ -1106,12 +1130,23 @@ impl Baseline {
             histogram.values().filter(|other| **other == *count).count() > 1
         });
 
+        // A winning answer that is a generic error is a card that did not
+        // process the envelope, not a card that judged the TAR, so it is not a
+        // baseline (issue #98).
+        let generic_error = best
+            .as_ref()
+            .filter(|_| !tied)
+            .and_then(|(signature, _)| signature.status())
+            .filter(|status| GENERIC_ERRORS.contains(&status.to_bytes()));
+        let best = best.filter(|_| generic_error.is_none());
+
         Self {
             signature: if tied {
                 None
             } else {
                 best.as_ref().map(|(s, _)| s.clone())
             },
+            generic_error,
             count: if tied {
                 0
             } else {
@@ -1120,6 +1155,12 @@ impl Baseline {
             sampled,
             histogram,
         }
+    }
+
+    /// The generic-error status the calibration probes answered, when the
+    /// baseline is withheld for that reason. See [`GENERIC_ERRORS`].
+    pub const fn generic_error(&self) -> Option<StatusWord> {
+        self.generic_error
     }
 
     /// The signature a refused TAR is expected to produce.
@@ -1169,11 +1210,18 @@ impl fmt::Display for Baseline {
                 "{} ({}/{} calibration probes)",
                 signature, self.count, self.sampled
             ),
-            None => write!(
-                f,
-                "(not established: {} calibration probes, no majority response)",
-                self.sampled
-            ),
+            None => match self.generic_error {
+                Some(status) => write!(
+                    f,
+                    "(not established: {} calibration probes, answered {status}, a generic error)",
+                    self.sampled
+                ),
+                None => write!(
+                    f,
+                    "(not established: {} calibration probes, no majority response)",
+                    self.sampled
+                ),
+            },
         }
     }
 }
@@ -1274,6 +1322,9 @@ pub struct Audit {
     /// How many exchanges the probes took, for a report an operator can cost
     /// out before re-running one.
     pub exchanges: usize,
+    /// The TERMINAL PROFILE sent before the audit, when `--terminal-profile`
+    /// asked for one. `None` means none was sent, which is the default.
+    pub terminal_profile: Option<TerminalProfile>,
 }
 
 impl Audit {
@@ -1286,6 +1337,7 @@ impl Audit {
             exhausted: true,
             stopped: Some(reason.into()),
             exchanges: 0,
+            terminal_profile: None,
         }
     }
 
@@ -1340,6 +1392,9 @@ impl Audit {
         if matches!(self.selection.mode, Mode::Off) {
             return None;
         }
+        if self.baseline.generic_error().is_some() {
+            return Some(GENERIC_ERROR_BLIND_SPOT);
+        }
         if !self.baseline.is_established() {
             return Some(
                 "every calibration probe answered the same, or with no status word at all, so this card's answer to an ACCEPTED TAR cannot be told apart from its answer to an UNKNOWN one; no TAR is reported as accepted, and that is not a clean card",
@@ -1379,6 +1434,7 @@ impl Audit {
             "baseline": match self.baseline.signature() {
                 Some(signature) => json!({
                     "established": true,
+                    "generic_error": Value::Null,
                     "status": signature.status().map(|status| status.to_string()),
                     "response_octets": signature.body_len(),
                     "count": self.baseline.count(),
@@ -1386,6 +1442,7 @@ impl Audit {
                 }),
                 None => json!({
                     "established": false,
+                    "generic_error": self.baseline.generic_error().map(|status| status.to_string()),
                     "status": Value::Null,
                     "response_octets": 0,
                     "count": 0,
@@ -1396,6 +1453,7 @@ impl Audit {
             "accepted_count": self.accepted_count(),
             "msl_zero_allowed": self.msl_zero_allowed(),
             "blind_spot": self.blind_spot(),
+            "terminal_profile": self.terminal_profile.as_ref().map(TerminalProfile::to_json),
             "probes": self.probes.iter().map(Probe::to_json).collect::<Vec<Value>>(),
         });
         if let Some(object) = block.as_object_mut() {
@@ -1433,6 +1491,12 @@ impl Audit {
             out.push_str(NEWLINE);
         }
 
+        if let Some(sent) = &self.terminal_profile {
+            out.push_str(NEWLINE);
+            out.push_str(&sent.to_human());
+            out.push_str(NEWLINE);
+        }
+
         // **No probes is a different state from zero TARs accepted, and it is
         // printed as one sentence rather than as an empty result.** A reader
         // who saw "TAR PROBES: 0" next to "TAR BASELINE: not established"
@@ -1446,6 +1510,11 @@ impl Audit {
                 out.push_str(reason);
             }
             out.push_str(NEWLINE);
+            if self.baseline.generic_error().is_some() {
+                out.push_str("!! ");
+                out.push_str(GENERIC_ERROR_BLIND_SPOT);
+                out.push_str(NEWLINE);
+            }
             return out;
         }
 
@@ -1524,6 +1593,10 @@ impl Audit {
         out
     }
 }
+
+/// The blind spot for a baseline made of a generic error. Names the likely
+/// cause and the opt-in flag, because the operator's next step is that flag.
+pub const GENERIC_ERROR_BLIND_SPOT: &str = "the card answered the calibration ENVELOPEs with a generic error (such as 6F00, 6D00, 6E00, 6985 or 6A81, ETSI TS 102 221 clause 10.2.1.5) rather than judging them, so it did not process the envelopes at all; most likely no TERMINAL PROFILE was sent and the card ignores CAT traffic until one is. No TAR was probed and none is reported as accepted or refused; that is not a clean card. Re-run with --terminal-profile to send one (it changes the card's CAT session state)";
 
 /// How many per-TAR records a report lists.
 ///
@@ -1806,6 +1879,22 @@ pub fn audit<S: CardSession + ?Sized>(
     policy: &Policy,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> Result<Audit, Error> {
+    audit_with(session, selection, policy, false, interrupt)
+}
+
+/// [`audit`], optionally preceded by a TERMINAL PROFILE ([`send_terminal_profile`]).
+///
+/// `terminal_profile` is the `--terminal-profile` flag. It is sent once, after
+/// the selection is known to be non-empty and before the first calibration
+/// probe, because a card that ignores CAT traffic until it has seen a profile
+/// answers every envelope with a generic error (issue #98).
+pub fn audit_with<S: CardSession + ?Sized>(
+    session: &mut S,
+    selection: &Selection,
+    policy: &Policy,
+    terminal_profile: bool,
+    interrupt: &mut dyn FnMut() -> bool,
+) -> Result<Audit, Error> {
     if matches!(selection.mode, Mode::Off) {
         return Ok(Audit {
             selection: selection.clone(),
@@ -1814,6 +1903,7 @@ pub fn audit<S: CardSession + ?Sized>(
             exhausted: true,
             stopped: Some("the operator asked for no TAR probing".to_owned()),
             exchanges: 0,
+            terminal_profile: None,
         });
     }
 
@@ -1829,12 +1919,33 @@ pub fn audit<S: CardSession + ?Sized>(
             exhausted: selection_exhausted,
             stopped: Some(format!("the selection {selection} matched no TAR")),
             exchanges: 0,
+            terminal_profile: None,
         });
+    }
+
+    // 0. The opt-in TERMINAL PROFILE, before anything is probed.
+    let mut sent_profile = None;
+    if terminal_profile {
+        if interrupt() {
+            halted = Some(Stop::Interrupted);
+        } else {
+            match send_terminal_profile(session, policy) {
+                Ok(sent) => {
+                    exchanges += sent.exchanges;
+                    sent_profile = Some(sent);
+                }
+                Err(Error::Transport(reason)) => halted = Some(Stop::Reader(reason.to_string())),
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     // 1. The calibration pass, which is what makes the differential possible.
     let mut calibration: Vec<Option<Signature>> = Vec::with_capacity(CALIBRATION_PROBES);
     for tar in CALIBRATION_TARS {
+        if halted.is_some() {
+            break;
+        }
         if interrupt() {
             halted = Some(Stop::Interrupted);
             break;
@@ -1859,9 +1970,14 @@ pub fn audit<S: CardSession + ?Sized>(
 
     let baseline = Baseline::of(&calibration);
 
+    // A generic-error baseline means the card did not process envelopes at
+    // all, so the sweep would only repeat that answer 600 times. It is not
+    // sent: fewer commands on the card, and the rule then has no evidence.
+    let skipped = halted.is_none() && baseline.generic_error().is_some();
+
     // 2. The probes themselves.
     let mut probes = Vec::with_capacity(tars.len());
-    if halted.is_none() {
+    if halted.is_none() && !skipped {
         for tar in tars {
             if interrupt() {
                 halted = Some(Stop::Interrupted);
@@ -1895,9 +2011,14 @@ pub fn audit<S: CardSession + ?Sized>(
         }
     }
 
-    let exhausted = selection_exhausted && halted.is_none();
+    let exhausted = selection_exhausted && halted.is_none() && !skipped;
     let stopped = if exhausted {
         None
+    } else if skipped {
+        Some(
+            "the calibration ENVELOPEs were answered with a generic error, so the TAR sweep was not sent (see blind_spot)"
+                .to_owned(),
+        )
     } else if let Some(reason) = halted {
         Some(match reason {
             Stop::Interrupted => "the scan was interrupted".to_owned(),
@@ -1920,6 +2041,251 @@ pub fn audit<S: CardSession + ?Sized>(
         baseline,
         exhausted,
         stopped,
+        exchanges,
+        terminal_profile: sent_profile,
+    })
+}
+
+/// The TERMINAL PROFILE `--terminal-profile` sends: one octet, `13`.
+///
+/// **Every set bit, cited.** The command is ETSI TS 102 221 V16.4.0 clause
+/// 11.2.1 (`CLA 80`, INS `10`, P1 `00`, P2 `00`, Lc, data); its data is the
+/// profile of ETSI TS 102 223 V15.4.0 clause 5.2 / 3GPP TS 31.111 V16.7.0
+/// clause 5.2, one bit per facility, 1 = supported. Byte 1 ("Download"):
+///
+/// - b1 = 1, Profile download (TS 102 223 clause 5.2): the terminal does
+///   profile download.
+/// - b2 = 1, SMS-PP data download (TS 31.111 clause 5.2; "Reserved by 3GPP" in
+///   TS 102 223): the terminal can deliver SMS-PP DOWNLOAD envelopes.
+/// - b5 = 1, "SMS-PP data download is supported" (same two clauses): 3GPP
+///   requires several bits for one facility (TS 31.111 clause 5.2 NOTE), and
+///   b2 and b5 are the two that name this one.
+///
+/// So `0001_0011` = `13`. **Nothing else is set**: no bit of bytes 2 onward, so
+/// no Display Text, no SET UP MENU, no SET UP EVENT LIST, no SEND SHORT
+/// MESSAGE; no proactive command the card is entitled to send is one this tool
+/// would serve. Menu selection (b4) and timer expiration (b6) stay clear for
+/// the same reason. TS 102 223 clause 6.2: a card sends no `91 XX` to a
+/// terminal that did not identify itself as proactive, and sending any profile
+/// is that identification, so a `91 XX` after this command is the card
+/// volunteering a command anyway, which [`send_terminal_profile`] declines.
+pub const TERMINAL_PROFILE_DATA: [u8; 1] = [0x13];
+
+/// TS 102 221 clause 11.2.1 header: CLA 80 INS 10 P1 00 P2 00.
+const TERMINAL_PROFILE_HEADER: [u8; 4] = [0x80, 0x10, 0x00, 0x00];
+
+/// TS 102 221 clause 11.2.4 TERMINAL RESPONSE header: CLA 80 INS 14.
+const TERMINAL_RESPONSE_HEADER: [u8; 4] = [0x80, 0x14, 0x00, 0x00];
+
+/// General result `30`, "Command beyond terminal's capabilities" (TS 102 223
+/// clause 8.12, table of general results).
+const RESULT_BEYOND_CAPABILITIES: u8 = 0x30;
+
+/// How many pending proactive commands one profile may drain.
+///
+/// Four, [`session::DEFAULT_MAX_FOLLOW_UPS`]: enough for the handful a card
+/// queues at start-up, few enough that a card re-issuing one forever ends.
+pub const MAX_PROACTIVE_DRAINED: usize = 4;
+
+/// One proactive command the card handed over after the profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProactiveCommand {
+    /// Type of command (second octet of Command details), when it parsed.
+    pub type_of_command: Option<u8>,
+    /// How many octets the FETCH returned. The content is not kept.
+    pub length: usize,
+    /// Whether a TERMINAL RESPONSE "command beyond terminal's capabilities"
+    /// was sent. False means the command was fetched and could not be answered.
+    pub declined: bool,
+}
+
+/// What the TERMINAL PROFILE exchange did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalProfile {
+    /// The card's own answer to the TERMINAL PROFILE command (before any
+    /// FETCH), `None` if it carried no status word.
+    pub status: Option<StatusWord>,
+    /// Proactive commands fetched and declined, in order.
+    pub proactive: Vec<ProactiveCommand>,
+    /// True when the card still reported a proactive command pending at the end.
+    pub still_pending: bool,
+    /// Wire round trips this took.
+    pub exchanges: usize,
+}
+
+impl TerminalProfile {
+    fn to_json(&self) -> Value {
+        json!({
+            "sent": true,
+            "command": octets(&[&TERMINAL_PROFILE_HEADER[..], &[1], &TERMINAL_PROFILE_DATA].concat()),
+            "profile": octets(&TERMINAL_PROFILE_DATA),
+            "status": self.status.map(|status| status.to_string()),
+            "proactive_commands": self.proactive.iter().map(|command| json!({
+                "type_of_command": command.type_of_command.map(|t| format!("{t:02X}")),
+                "length": command.length,
+                "terminal_response": if command.declined {
+                    "sent: command beyond terminal's capabilities (30)"
+                } else {
+                    "not sent: the command could not be parsed"
+                },
+            })).collect::<Vec<Value>>(),
+            "still_pending": self.still_pending,
+            "exchanges": self.exchanges,
+        })
+    }
+
+    fn to_human(&self) -> String {
+        let status = self.status.map_or_else(
+            || "(no status word)".to_owned(),
+            |status| status.to_string(),
+        );
+        format!(
+            "TERMINAL PROFILE: {} -> {status}; {} proactive command(s) fetched and declined{}",
+            octets(&[&TERMINAL_PROFILE_HEADER[..], &[1], &TERMINAL_PROFILE_DATA].concat()),
+            self.proactive.len(),
+            if self.still_pending {
+                "; one is STILL PENDING"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// Reads a BER length at the head of `bytes`: one octet below `80`, or `81 xx`.
+fn ber_length(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    match bytes {
+        [0x81, len, rest @ ..] => Some((usize::from(*len), rest)),
+        [len, rest @ ..] if *len < 0x80 => Some((usize::from(*len), rest)),
+        _ => None,
+    }
+}
+
+/// The Command details (number, type, qualifier) of a proactive command
+/// (`D0` BER-TLV of comprehension-TLVs, TS 102 223 clause 9), or `None` when
+/// the bytes are not that shape.
+fn command_details(command: &[u8]) -> Option<[u8; 3]> {
+    let (&0xD0, rest) = command.split_first()? else {
+        return None;
+    };
+    let (len, rest) = ber_length(rest)?;
+    let mut body = rest.get(..len)?;
+    while let [tag, rest @ ..] = body {
+        let (len, rest) = ber_length(rest)?;
+        let value = rest.get(..len)?;
+        // Tag 01, with the comprehension-required bit masked off.
+        if tag & 0x7F == 0x01 && len == 3 {
+            return Some([value[0], value[1], value[2]]);
+        }
+        body = &rest[len..];
+    }
+    None
+}
+
+/// TERMINAL RESPONSE "command beyond terminal's capabilities" for `details`:
+/// Command details echoed, Device identities ME -> UICC, Result `30`.
+fn terminal_response(details: [u8; 3]) -> Command {
+    Command::case3(
+        Header::from_bytes(TERMINAL_RESPONSE_HEADER),
+        [
+            0x81,
+            0x03,
+            details[0],
+            details[1],
+            details[2],
+            0x82,
+            0x02,
+            0x82,
+            0x81,
+            0x83,
+            0x01,
+            RESULT_BEYOND_CAPABILITIES,
+        ]
+        .to_vec(),
+    )
+}
+
+/// Whether the last wire step of `exchange` was a FETCH.
+fn fetched(exchange: &session::Exchange) -> bool {
+    exchange
+        .steps()
+        .last()
+        .is_some_and(|step| step.command().get(1) == Some(&crate::apdu::INS_FETCH))
+}
+
+/// Sends the TERMINAL PROFILE and keeps the card's CAT state sane.
+///
+/// **This changes the card's CAT session state, not any file.** Handling of a
+/// `91 XX` (a proactive command pending): **fetch it, answer TERMINAL RESPONSE
+/// `30` "command beyond terminal's capabilities", and repeat up to
+/// [`MAX_PROACTIVE_DRAINED`] times; execute nothing.** Leaving it pending was
+/// rejected: TS 102 223 clause 6.3 has the UICC repeat `91 XX` after every
+/// command until the command is fetched, so every probe answer would come back
+/// `91 XX` and hide what the probe is measuring, and an unfetched command
+/// leaves the CAT session not started. Two commands per pending command
+/// (FETCH, TERMINAL RESPONSE) is the least that closes one, and clause 6.3
+/// ("shall inform the UICC ... using TERMINAL RESPONSE with an error
+/// condition") says that is what a terminal that cannot do it sends. Only the
+/// type of command is recorded, not the content.
+pub fn send_terminal_profile<S: CardSession + ?Sized>(
+    session: &mut S,
+    policy: &Policy,
+) -> Result<TerminalProfile, Error> {
+    let to_error = |err: session::Error| match err {
+        session::Error::Transport(err) => Error::Transport(err),
+        session::Error::Parse(err) => Error::Response(err),
+        _ => Error::UnbuildableEnvelope("a TERMINAL PROFILE or RESPONSE could not be encoded"),
+    };
+    let policy = Policy {
+        proactive_command: PendingFollowUp::Fetch,
+        max_follow_ups: 1,
+        ..*policy
+    };
+    let profile = Command::case3(
+        Header::from_bytes(TERMINAL_PROFILE_HEADER),
+        TERMINAL_PROFILE_DATA.to_vec(),
+    );
+    let mut exchange = session::send(session, &profile, &policy).map_err(to_error)?;
+    let mut exchanges = exchange.exchange_count();
+    let status = exchange
+        .steps()
+        .first()
+        .and_then(|step| Response::parse(step.response()).ok())
+        .and_then(|response| response.status());
+
+    let mut proactive: Vec<ProactiveCommand> = Vec::new();
+    while fetched(&exchange) {
+        let details = command_details(exchange.data());
+        let mut command = ProactiveCommand {
+            type_of_command: details.map(|d| d[1]),
+            length: exchange.data().len(),
+            declined: false,
+        };
+        let Some(details) = details else {
+            proactive.push(command);
+            break;
+        };
+        command.declined = true;
+        proactive.push(command);
+        // The last drain must not fetch again: whatever it leaves is reported.
+        let policy = Policy {
+            proactive_command: if proactive.len() < MAX_PROACTIVE_DRAINED {
+                PendingFollowUp::Fetch
+            } else {
+                PendingFollowUp::Ignore
+            },
+            ..policy
+        };
+        exchange =
+            session::send(session, &terminal_response(details), &policy).map_err(to_error)?;
+        exchanges += exchange.exchange_count();
+    }
+    let still_pending = exchange.status().is_some_and(|status| status.sw1() == 0x91);
+
+    Ok(TerminalProfile {
+        status,
+        proactive,
+        still_pending,
         exchanges,
     })
 }
@@ -2412,10 +2778,10 @@ mod tests {
     /// "refused".
     #[test]
     fn a_silent_card_has_no_baseline() {
-        let baseline = Baseline::of(&[None, None, signature(0x6D, 0x00)]);
+        let baseline = Baseline::of(&[None, None, signature(0x6A, 0x82)]);
         assert_eq!(baseline.count(), 1);
         assert!(baseline.is_established());
-        assert!(baseline.refuses(&signature(0x6D, 0x00).expect("built")));
+        assert!(baseline.refuses(&signature(0x6A, 0x82).expect("built")));
 
         let silent = Baseline::of(&[None, None, None]);
         assert!(!silent.is_established());
@@ -2996,5 +3362,219 @@ mod tests {
             "a scan that got no answer reports nothing accepted"
         );
         assert!(audit.blind_spot().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #98: a generic-error baseline, and the TERMINAL PROFILE
+    // -----------------------------------------------------------------------
+
+    /// **A uniform generic error is not a baseline.** `6F 00` is "technical
+    /// problem, no precise diagnosis" (TS 102 221 table 10.11): a card that
+    /// answers it to everything has not judged any TAR.
+    #[test]
+    fn a_generic_error_is_not_an_established_baseline() {
+        for (sw1, sw2) in [
+            (0x6F, 0x00),
+            (0x6D, 0x00),
+            (0x6E, 0x00),
+            (0x69, 0x85),
+            (0x6A, 0x81),
+        ] {
+            let baseline = Baseline::of(&vec![signature(sw1, sw2); CALIBRATION_PROBES]);
+            assert!(!baseline.is_established(), "{sw1:02X}{sw2:02X}");
+            assert_eq!(baseline.count(), 0);
+            assert_eq!(
+                baseline.generic_error().map(|s| s.to_bytes()),
+                Some([sw1, sw2])
+            );
+            assert!(!baseline.refuses(&signature(sw1, sw2).expect("built")));
+            assert!(baseline.to_string().contains("generic error"));
+        }
+        // A majority of generic errors with a few other answers is the same.
+        let mixed = Baseline::of(&[
+            signature(0x6F, 0x00),
+            signature(0x6F, 0x00),
+            signature(0x94, 0x04),
+        ]);
+        assert!(!mixed.is_established());
+        // A card whose majority answer is a real one still has a baseline.
+        let real = Baseline::of(&[
+            signature(0x94, 0x04),
+            signature(0x94, 0x04),
+            signature(0x6F, 0x00),
+        ]);
+        assert!(real.is_established());
+        assert_eq!(real.generic_error(), None);
+    }
+
+    /// A card that answers envelopes `6F 00` until it has had a TERMINAL
+    /// PROFILE, then judges each TAR: `94 04` for the ones it has no opinion
+    /// about, `90 00` for `accepts`. After the profile it can also have a
+    /// proactive command pending (`pending`).
+    struct ProfileCard {
+        reader: ReaderName,
+        profiled: bool,
+        pending: bool,
+        accepts: u32,
+        sent: Vec<Vec<u8>>,
+    }
+
+    /// SET UP EVENT LIST, 11 octets: Command details 01 05 00, Device
+    /// identities UICC -> ME.
+    const PROACTIVE: [u8; 11] = [
+        0xD0, 0x09, 0x81, 0x03, 0x01, 0x05, 0x00, 0x82, 0x02, 0x81, 0x82,
+    ];
+
+    impl ProfileCard {
+        fn new(pending: bool) -> Self {
+            Self {
+                reader: ReaderName::new("loopback").expect("a reader name"),
+                profiled: false,
+                pending,
+                accepts: TAR_MIN,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl CardSession for ProfileCard {
+        fn reader(&self) -> &ReaderName {
+            &self.reader
+        }
+
+        fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.sent.push(command.to_vec());
+            Ok(match command.get(1) {
+                Some(0x10) => {
+                    self.profiled = true;
+                    if self.pending {
+                        vec![0x91, 0x0B]
+                    } else {
+                        vec![0x90, 0x00]
+                    }
+                }
+                Some(0x12) => [&PROACTIVE[..], &[0x90, 0x00]].concat(),
+                Some(0x14) => {
+                    self.pending = false;
+                    vec![0x90, 0x00]
+                }
+                Some(0xC2) if !self.profiled => vec![0x6F, 0x00],
+                Some(0xC2)
+                    if command == envelope_apdu(self.accepts, Class::Etsi).expect("built") =>
+                {
+                    vec![0x90, 0x00]
+                }
+                Some(0xC2) => vec![0x94, 0x04],
+                _ => vec![0x6D, 0x00],
+            })
+        }
+
+        fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// Without the flag the 6F00 card is a blind spot, the sweep is not sent
+    /// (only the 20 calibration probes are), and nothing is accepted.
+    #[test]
+    fn a_card_that_says_6f00_to_everything_is_a_blind_spot_without_the_profile() {
+        let mut card = ProfileCard::new(false);
+        let audit = audit(
+            &mut card,
+            &Selection::focused(),
+            &Policy::default(),
+            &mut never,
+        )
+        .expect("no transport error");
+
+        assert_eq!(card.sent.len(), CALIBRATION_PROBES);
+        assert!(
+            card.sent.iter().all(|c| c[1] == 0xC2),
+            "no TERMINAL PROFILE sent"
+        );
+        assert!(audit.probes.is_empty());
+        assert!(!audit.baseline.is_established());
+        assert!(!audit.msl_zero_allowed());
+        assert_eq!(audit.blind_spot(), Some(GENERIC_ERROR_BLIND_SPOT));
+        assert!(audit.terminal_profile.is_none());
+        let block = audit.to_json();
+        assert_eq!(block["baseline"]["established"], false);
+        assert_eq!(block["baseline"]["generic_error"], "6F00");
+        assert_eq!(block["terminal_profile"], Value::Null);
+        assert!(audit.to_human().contains("--terminal-profile"));
+    }
+
+    /// With the flag the same card answers per TAR: the baseline is
+    /// established, TAR zero is accepted, and the exchange is in the report.
+    #[test]
+    fn the_terminal_profile_turns_the_same_card_into_an_established_baseline() {
+        let mut card = ProfileCard::new(false);
+        let audit = audit_with(
+            &mut card,
+            &Selection::focused(),
+            &Policy::default(),
+            true,
+            &mut never,
+        )
+        .expect("no transport error");
+
+        assert_eq!(card.sent[0], vec![0x80, 0x10, 0x00, 0x00, 0x01, 0x13]);
+        assert_eq!(card.sent.len(), 1 + CALIBRATION_PROBES + FOCUSED_PROBES);
+        assert!(audit.baseline.is_established());
+        assert_eq!(
+            audit.baseline.signature().expect("baseline").to_string(),
+            "9404"
+        );
+        assert!(audit.msl_zero_allowed());
+        assert_eq!(audit.accepted_count(), 1);
+        assert_eq!(audit.blind_spot(), None);
+        let block = audit.to_json();
+        assert_eq!(block["terminal_profile"]["status"], "9000");
+        assert_eq!(block["terminal_profile"]["profile"], "13");
+        assert_eq!(block["terminal_profile"]["still_pending"], false);
+        assert_eq!(block["baseline"]["generic_error"], Value::Null);
+    }
+
+    /// A `91 xx` after the profile is fetched and declined with TERMINAL
+    /// RESPONSE `30`, nothing is executed, and the card is left unpending.
+    #[test]
+    fn a_pending_proactive_command_is_fetched_and_declined() {
+        let mut card = ProfileCard::new(true);
+        let sent = send_terminal_profile(&mut card, &Policy::default()).expect("no error");
+
+        assert_eq!(sent.status.map(|s| s.to_string()).as_deref(), Some("910B"));
+        assert_eq!(
+            sent.proactive,
+            vec![ProactiveCommand {
+                type_of_command: Some(0x05),
+                length: PROACTIVE.len(),
+                declined: true
+            }]
+        );
+        assert!(!sent.still_pending);
+        assert_eq!(card.sent.len(), 3);
+        assert_eq!(card.sent[1], vec![0x80, 0x12, 0x00, 0x00, 0x0B]);
+        assert_eq!(
+            card.sent[2],
+            vec![
+                0x80, 0x14, 0x00, 0x00, 0x0C, 0x81, 0x03, 0x01, 0x05, 0x00, 0x82, 0x02, 0x82, 0x81,
+                0x83, 0x01, 0x30
+            ]
+        );
+    }
+
+    /// A card that keeps issuing commands is drained at most
+    /// [`MAX_PROACTIVE_DRAINED`] times and the leftover is reported.
+    #[test]
+    fn a_card_that_never_stops_asking_is_bounded() {
+        let mut card = Scripted::cycling(&[
+            &[0x91, 0x0B],
+            &[
+                0xD0, 0x09, 0x81, 0x03, 0x01, 0x05, 0x00, 0x82, 0x02, 0x81, 0x82, 0x91, 0x0B,
+            ],
+        ]);
+        let sent = send_terminal_profile(&mut card, &Policy::default()).expect("no error");
+        assert_eq!(sent.proactive.len(), MAX_PROACTIVE_DRAINED);
+        assert!(sent.still_pending);
     }
 }

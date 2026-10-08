@@ -29,6 +29,8 @@ struct Card {
     current: Vec<u8>,
     queued: VecDeque<Vec<u8>>,
     msl0: bool,
+    /// Answers every ENVELOPE `6F 00`, as a card does until it has had a TERMINAL PROFILE.
+    generic_envelope: bool,
     reader: ReaderName,
 }
 
@@ -62,8 +64,15 @@ impl Card {
             current: Vec::new(),
             queued: VecDeque::new(),
             msl0,
+            generic_envelope: false,
             reader: ReaderName::new("corpus card").unwrap(),
         }
+    }
+
+    /// This card answers every ENVELOPE `6F 00` (issue #98).
+    fn generic_envelope(mut self) -> Self {
+        self.generic_envelope = true;
+        self
     }
 
     /// Adds `path` (`3F00/7F20/6F07`) with an FCP in `dialect`; `size` None for a directory.
@@ -169,6 +178,7 @@ impl CardSession for Card {
                 None => vec![0x6A, 0x82],
             }),
             // ENVELOPE as one complete APDU, the way a real reader takes it.
+            Some(0xC2) if self.generic_envelope => Ok(vec![0x6F, 0x00]),
             Some(0xC2) => {
                 let zero = tar::envelope_data(tar::TAR_MIN, Class::Etsi).unwrap();
                 Ok(if self.msl0 && command.get(5..) == Some(zero.as_slice()) {
@@ -302,6 +312,17 @@ fn corpus() -> Vec<Case> {
         case(
             "clean",
             tree(false, Fcp::Swicc),
+            swicc,
+            Limits::default(),
+            vec![],
+            true,
+            9,
+        ),
+        // Every envelope answered 6F00: the baseline is withheld (a blind spot), the sweep
+        // is not sent, and nothing is raised.
+        case(
+            "no-terminal-profile-6f00",
+            tree(false, Fcp::Swicc).generic_envelope(),
             swicc,
             Limits::default(),
             vec![],

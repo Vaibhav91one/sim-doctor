@@ -372,7 +372,9 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "  A CARD THAT ANSWERS EVERY TAR IDENTICALLY REPORTS NOTHING ACCEPTED. On\n",
     "  a card with no TAR check that is the correct answer, not a miss. A scan\n",
     "  whose baseline could not be established says so in data.tar.blind_spot\n",
-    "  and raises nothing.\n\n",
+    "  and raises nothing. So does a baseline that is only a generic error\n",
+    "  (6F00, 6D00, 6E00, 6985, 6A81): the card did not process the envelopes,\n",
+    "  the sweep is not sent, and the blind spot names --terminal-profile.\n\n",
     "SEVERITY AND SCORE\n",
     "  --severity <level> REMOVES findings below that level from the report.\n",
     "  Not marked, not counted, absent from the JSON entirely, so a count or a\n",
@@ -694,6 +696,29 @@ struct ScanArgs {
     /// a card with no TAR check is the correct answer rather than a miss.
     #[arg(long, value_name = "SELECTION", default_value_t = tar::Selection::default())]
     tar: tar::Selection,
+
+    /// Send a TERMINAL PROFILE to the card before the TAR audit.
+    ///
+    /// Only meaningful with --tar other than `off`; without it the command
+    /// line is refused (exit 129).
+    ///
+    /// WHAT IS SENT: `80 10 00 00 01 13` (TS 102 221 clause 11.2.1), a
+    /// one-octet profile with three bits set, all in byte 1 (TS 102 223 /
+    /// TS 31.111 clause 5.2): b1 profile download, b2 and b5 SMS-PP data
+    /// download. No proactive command, menu, event or display capability is
+    /// declared. A card that answers `91 xx` anyway has that command fetched
+    /// and answered with TERMINAL RESPONSE `30` (command beyond terminal's
+    /// capabilities); nothing it asks for is executed.
+    ///
+    /// WHY: a card that ignores CAT traffic until it has seen a profile
+    /// answers every ENVELOPE `6F 00`, and the TAR audit then says nothing
+    /// (data.tar.blind_spot). This is the handset's own first CAT step.
+    ///
+    /// WHAT IT CHANGES: the card's CAT session state for this power cycle.
+    /// It writes no file. It is off by default for that reason. The exchange
+    /// is reported as data.tar.terminal_profile.
+    #[arg(long)]
+    terminal_profile: bool,
 }
 
 /// Whether a scan that produced findings exits 1.
@@ -1343,6 +1368,11 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 /// - no card, an unreadable baseline, an incomparable pair.
 fn run_scan(args: ScanArgs) -> contract::ExitCode {
     guard_exchange(scan::KIND, args.json);
+    // A flag's own shape is refused before a reader is opened, as clap would.
+    if args.terminal_profile && matches!(args.tar.mode, tar::Mode::Off) {
+        eprintln!("sim-doctor: --terminal-profile is only meaningful with --tar other than off");
+        return contract::ExitCode::InvalidUsage;
+    }
     // Read the baseline before a reader is opened, and refuse before one is.
     // A --baseline naming a file that is not there, is not JSON, or was written
     // by another format version has an answer before a card exists, and an
@@ -1459,10 +1489,11 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // `61 Lc` before reading a byte of it, so the default selection is
     // 592 probes of two exchanges each - see src/tar.rs, which is where the
     // wire sequence, the bound and the differential are argued.
-    let audit = match tar::audit(
+    let audit = match tar::audit_with(
         &mut session,
         &args.tar,
         &session::Policy::default(),
+        args.terminal_profile,
         &mut || signals::interrupted(),
     ) {
         Ok(audit) => audit,
@@ -2680,6 +2711,7 @@ mod tests {
             sarif: None,
             diff: true,
             tar: tar::Selection::default(),
+            terminal_profile: false,
         };
 
         // The whole surface is on and nothing refuses before a card is asked

@@ -301,6 +301,7 @@ finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 | `--score` | implemented | single numeric quality score for CI gating, with its formula beside it |
 | `--severity <level>` | implemented | remove findings below a minimum severity |
 | `--tar <selection>` | implemented | which TARs to probe for MSL 0: `off`, `focused`, `full`, `range:FIRST-LAST`, `regex:PATTERN`; capped at 4096 probes |
+| `--terminal-profile` | implemented | with `--tar` other than `off` (else exit 129): send TERMINAL PROFILE `80 10 00 00 01 13` before the TAR audit; see [TERMINAL PROFILE and a generic-error baseline](#terminal-profile-and-a-generic-error-baseline) |
 | `--baseline <file>` | implemented | save this run, so a later scan can be compared against it |
 | `--diff` | implemented | compare this run against `--baseline`; **exits 1 when the diff regresses** |
 
@@ -521,6 +522,52 @@ card's *response*, and skips the TAR whose response matched [V]. That is a
 response filter rather than a TAR selector. Both halves exist here and are
 named apart - `--tar regex:` chooses which TARs to probe, and every response is
 recorded per probe under `data.tar.probes`.
+
+#### TERMINAL PROFILE and a generic-error baseline
+
+**A baseline made of a generic error is not a baseline (issue #98).** On a live
+operator USIM, 20 of 20 calibration probes and every TAR probe answered `6F 00`
+and the old code called that an established baseline. `6F 00` is "technical
+problem, no precise diagnosis" (ETSI TS 102 221 V16.4.0 table 10.11); `6D 00`
+"instruction code not supported" and `6E 00` "class not supported" (table 10.11),
+`69 85` "conditions of use not satisfied" (table 10.13) and `6A 81` "function not
+supported" (table 10.14) are the same kind of answer: the card did not process the
+envelope. `tar::GENERIC_ERRORS` lists the five. When the winning calibration answer
+is one of them the baseline is **withheld** (`data.tar.baseline.established` false,
+`generic_error` carries the status word), `data.tar.blind_spot` says so and names
+`--terminal-profile`, **the sweep is not sent** (20 envelopes, not 600+), `probed`
+is 0, and the MSL 0 rule has no evidence (`rules_run` semantics unchanged: the rule
+ran, `evidence` false, the score warning says nothing was looked at).
+
+**`--terminal-profile` (opt-in, needs `--tar` other than `off`, else exit 129).** A
+handset sends TERMINAL PROFILE after power-up and a UICC may refuse CAT traffic until
+then. The flag sends it once, before the calibration probes. It is TS 102 221
+clause 11.2.1 (CLA `80`, INS `10`, P1 P2 `00`, Lc, data); the data is the profile of
+ETSI TS 102 223 V15.4.0 / 3GPP TS 31.111 V16.7.0 clause 5.2. **The profile is one
+octet, `13`, byte 1 ("Download"): b1 profile download, b2 SMS-PP data download, b5
+SMS-PP data download supported** (3GPP requires several bits for one facility,
+TS 31.111 5.2 NOTE). No other bit is set: no Display Text, SET UP MENU, SET UP EVENT
+LIST, SEND SHORT MESSAGE, menu selection or timer, so nothing is declared that this
+tool would serve. Sending any profile identifies the terminal as proactive (TS 102
+223 clause 6.2).
+
+**It changes the card's CAT session state for the power cycle, not any file.** That
+is why it is off by default and why the help says so. The card's answer (`9000` or
+`91 xx`) is recorded in `data.tar.terminal_profile` (`sent`, `command`, `profile`,
+`status`, `proactive_commands`, `still_pending`, `exchanges`; `null` when not
+requested).
+
+**On `91 xx` the command is fetched and declined, not left pending.** FETCH
+(`80 12 00 00 xx`) then TERMINAL RESPONSE `80 14 00 00 0C` with Command details
+echoed, Device identities ME to UICC and Result `30` "command beyond terminal's
+capabilities" (TS 102 223 clause 8.12), up to `MAX_PROACTIVE_DRAINED` (4) times;
+nothing is executed and only the type of command is recorded. Leaving it pending was
+rejected: TS 102 223 clause 6.3 has the UICC repeat `91 xx` after every command until
+it is fetched, so every later probe answer would come back `91 xx` and hide what the
+probe measures. Two commands per pending command is the least that closes one, and
+clause 6.3 says a terminal that cannot perform a command answers TERMINAL RESPONSE
+with an error. A command that cannot be parsed is not answered (`terminal_response`
+says "not sent") and is reported.
 
 ### Severity and score
 
