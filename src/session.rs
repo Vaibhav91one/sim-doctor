@@ -30,7 +30,7 @@ pub const NAME: &str = "session";
 use std::fmt;
 
 use crate::apdu::{
-    Command, Le, Outcome, Pending, ProcedureAction, Response, StatusWord, CLA_FETCH_ETSI,
+    Command, Header, Le, Outcome, Pending, ProcedureAction, Response, StatusWord, CLA_FETCH_ETSI,
     CLA_GET_RESPONSE_GSM,
 };
 use crate::transport::CardSession;
@@ -606,6 +606,92 @@ fn exchange<S: CardSession + ?Sized>(
         response: response.clone(),
     });
     Response::parse(&response).map_err(Error::from)
+}
+
+/// INS of MANAGE CHANNEL (ISO/IEC 7816-4 clause 11.1.2).
+pub const INS_MANAGE_CHANNEL: u8 = 0x70;
+
+/// Highest logical channel number ISO/IEC 7816-4 can address (basic 1..=3,
+/// further 4..=19).
+pub const MAX_LOGICAL_CHANNEL: u8 = 19;
+
+/// MANAGE CHANNEL, open: `00 70 00 00 01`. The card picks the channel and
+/// answers with its number in one data byte (ISO/IEC 7816-4 clause 11.1.2).
+pub const fn manage_channel_open() -> Command {
+    Command::case2(
+        Header::new(0x00, INS_MANAGE_CHANNEL, 0x00, 0x00),
+        Le::Short(1),
+    )
+}
+
+/// MANAGE CHANNEL, close: `00 70 80 <channel>`, no data and no Le. `None` for
+/// channel 0 (the basic channel cannot be closed) or above
+/// [`MAX_LOGICAL_CHANNEL`].
+pub const fn manage_channel_close(channel: u8) -> Option<Command> {
+    if channel == 0 || channel > MAX_LOGICAL_CHANNEL {
+        return None;
+    }
+    Some(Command::case1(Header::new(
+        0x00,
+        INS_MANAGE_CHANNEL,
+        0x80,
+        channel,
+    )))
+}
+
+/// Reads the channel number out of the data of a successful MANAGE CHANNEL
+/// open: exactly one byte, 1..=[`MAX_LOGICAL_CHANNEL`].
+pub fn parse_opened_channel(data: &[u8]) -> Option<u8> {
+    match data {
+        [ch @ 1..=MAX_LOGICAL_CHANNEL] => Some(*ch),
+        _ => None,
+    }
+}
+
+/// Opens a supplementary logical channel. The channel is `None` if the card
+/// refused (the status word is in the returned [`Exchange`]) or answered with
+/// something that is not a channel number. Key-less: it authenticates and
+/// writes nothing, but it does change the card's channel state, so the
+/// live-card rules forbid calling it on a real SIM until a caller is added on
+/// purpose.
+///
+/// # Errors
+///
+/// Only transport and encoding failures.
+pub fn open_channel<S: CardSession + ?Sized>(
+    session: &mut S,
+) -> Result<(Option<u8>, Exchange), Error> {
+    let policy = Policy {
+        proactive_command: PendingFollowUp::Ignore,
+        ..Policy::default()
+    };
+    let ex = send(session, &manage_channel_open(), &policy)?;
+    let channel = if ex.is_success() {
+        parse_opened_channel(ex.data())
+    } else {
+        None
+    };
+    Ok((channel, ex))
+}
+
+/// Closes logical channel `channel`; `None` (and nothing sent) if the number
+/// is not closable.
+///
+/// # Errors
+///
+/// Only transport and encoding failures.
+pub fn close_channel<S: CardSession + ?Sized>(
+    session: &mut S,
+    channel: u8,
+) -> Result<Option<Exchange>, Error> {
+    let Some(command) = manage_channel_close(channel) else {
+        return Ok(None);
+    };
+    let policy = Policy {
+        proactive_command: PendingFollowUp::Ignore,
+        ..Policy::default()
+    };
+    send(session, &command, &policy).map(Some)
 }
 
 #[cfg(test)]
@@ -1357,6 +1443,42 @@ mod tests {
             send(&mut card, &probe(), &Policy::default()),
             Err(Error::Parse(_))
         ));
+    }
+
+    #[test]
+    fn manage_channel_builders_and_parse() {
+        assert_eq!(
+            manage_channel_open().encode().unwrap(),
+            [0x00, 0x70, 0x00, 0x00, 0x01]
+        );
+        assert_eq!(
+            manage_channel_close(1).unwrap().encode().unwrap(),
+            [0x00, 0x70, 0x80, 0x01]
+        );
+        assert!(manage_channel_close(0).is_none() && manage_channel_close(20).is_none());
+        assert_eq!(parse_opened_channel(&[0x02]), Some(2));
+        assert_eq!(parse_opened_channel(&[]), None);
+        assert_eq!(parse_opened_channel(&[0x00]), None);
+        assert_eq!(parse_opened_channel(&[0x01, 0x02]), None);
+    }
+
+    #[test]
+    fn open_and_close_channel_over_a_scripted_card() {
+        let mut card = Scripted::new([vec![0x01, 0x90, 0x00], vec![0x90, 0x00]]);
+        let (channel, ex) = open_channel(&mut card).unwrap();
+        assert_eq!(channel, Some(1));
+        assert!(ex.is_success());
+        assert!(close_channel(&mut card, 1).unwrap().unwrap().is_success());
+        assert!(close_channel(&mut card, 0).unwrap().is_none());
+        assert_eq!(
+            card.sent,
+            vec![
+                vec![0x00, 0x70, 0x00, 0x00, 0x01],
+                vec![0x00, 0x70, 0x80, 0x01]
+            ]
+        );
+        let mut refused = Scripted::new([vec![0x68, 0x81]]);
+        assert_eq!(open_channel(&mut refused).unwrap().0, None);
     }
 
     #[test]

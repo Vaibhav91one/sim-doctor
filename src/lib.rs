@@ -108,6 +108,7 @@ pub mod apdu;
 pub mod apdu_scan;
 pub mod baseline;
 pub mod bpp;
+pub mod cap;
 pub mod ci;
 pub mod contract;
 pub mod der;
@@ -282,8 +283,13 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[tlv::NAME, scp03::NAME],
     },
     ModuleInfo {
+        name: cap::NAME,
+        owns: "Java Card CAP files (untrusted zip, read in memory) joined into a GlobalPlatform load file in JCVM section 6.3 order, and IJC passthrough; touches no card.",
+        depends_on: &[],
+    },
+    ModuleInfo {
         name: gp::NAME,
-        owns: "Read-only GlobalPlatform: select the issuer security domain, GET DATA, CPLC and key information decoders, the APDU trace and the AES key check value; sends no authenticating or writing command.",
+        owns: "Read-only GlobalPlatform: select the issuer security domain, GET DATA (CPLC, key information, counters, extended resources, Card Recognition Data decoders), the APDU trace, AES/3DES key check values, and INSTALL [for load] / LOAD builders that are never sent; sends no authenticating or writing command.",
         depends_on: &[apdu::NAME, transport::NAME, session::NAME],
     },
     ModuleInfo {
