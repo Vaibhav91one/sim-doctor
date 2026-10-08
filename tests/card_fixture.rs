@@ -600,6 +600,12 @@ fn walks_the_file_system_of_a_real_card() {
         .filter(|node| node.state().is_selected())
         // Application files are addressed by AID, not by this two-level layout.
         .filter(|node| node.path().adf().is_none())
+        // 7FFF is the alias for the currently selected application, whose files
+        // are the application's own and not this two-level layout.
+        .filter(|node| {
+            let alias: sim_doctor::fs::FileId = "7FFF".parse().expect("a file id");
+            !node.path().segments().contains(&alias)
+        })
         // Beneath a repeated DF the card answers for itself at every depth the
         // bound allows (the node budget used to stop this early, #90), so skip
         // any file whose parent path repeats an identifier.
