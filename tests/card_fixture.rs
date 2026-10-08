@@ -600,6 +600,23 @@ fn walks_the_file_system_of_a_real_card() {
         .filter(|node| node.state().is_selected())
         // Application files are addressed by AID, not by this two-level layout.
         .filter(|node| node.path().adf().is_none())
+        // 7FFF is the alias for the currently selected application, whose files
+        // are the application's own and not this two-level layout.
+        .filter(|node| {
+            let alias: sim_doctor::fs::FileId = "7FFF".parse().expect("a file id");
+            !node.path().segments().contains(&alias)
+        })
+        // Beneath a repeated DF the card answers for itself at every depth the
+        // bound allows (the node budget used to stop this early, #90), so skip
+        // any file whose parent path repeats an identifier.
+        .filter(|node| {
+            let ids = node.path().segments();
+            let parent = &ids[..ids.len() - 1];
+            parent
+                .iter()
+                .enumerate()
+                .all(|(i, id)| !parent[..i].contains(id))
+        })
         .filter(|node| {
             !node
                 .notes()
@@ -611,10 +628,21 @@ fn walks_the_file_system_of_a_real_card() {
         .unwrap_or(0);
     println!("the deepest file the card actually holds is {real_depth} levels below 3F00");
     assert_eq!(
-        real_depth, 2,
+        real_depth,
+        2,
         "a real USIM profile is two levels below the master file; anything \
          deeper that is not a repeated-ancestor artifact means the depth bound \
-         is hiding a real file"
+         is hiding a real file. deeper: {:?}",
+        tree.nodes()
+            .iter()
+            .filter(|n| n.state().is_selected() && n.path().adf().is_none())
+            .filter(|n| n.path().depth() > 2
+                && n.path().segments()[..n.path().depth() - 1]
+                    .windows(2)
+                    .all(|w| w[0] != w[1]))
+            .take(12)
+            .map(|n| n.path().to_string())
+            .collect::<Vec<_>>()
     );
     assert!(
         real_depth < options.limits.max_depth,
@@ -623,9 +651,9 @@ fn walks_the_file_system_of_a_real_card() {
 
     // And the bounds themselves held.
     assert!(
-        report.nodes <= options.limits.max_nodes,
-        "{} nodes is past the bound of {}",
-        report.nodes,
+        report.selected <= options.limits.max_nodes,
+        "{} selected files is past the bound of {}",
+        report.selected,
         options.limits.max_nodes
     );
     assert!(

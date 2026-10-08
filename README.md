@@ -141,7 +141,7 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | Command | What it does |
 | --- | --- |
 | `scan` | select the master file, walk the card, report |
-| `ts48 compare [--json] [--reader NAME] [--dialect TABLE]` | walk the card (read-only, no TAR probes) and diff its file system against the public GSMA TS.48 test profile; see below |
+| `ts48 compare [--json] [--reader NAME] [--dialect TABLE] [walk bounds]` | walk the card (read-only, no TAR probes) and diff its file system against the public GSMA TS.48 test profile; see below |
 | `install [--agent claude\|cursor\|codex\|opencode] [--print-only] [--dir DIR]` | write agent guidance into a project |
 | `modules [--json]` | describe the crate's module roots and layering |
 | `completions <shell>` | shell completion script for the whole flag surface |
@@ -155,7 +155,7 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `--json` | one JSON envelope on stdout and nothing else; diagnostics go to stderr |
 | `--reader <NAME>` | which PC/SC reader (default: the first) |
 | `--dialect <TABLE>` | FCP tag table: `ts-102-221` (default, ETSI TS 102 221; real cards and swSIM) or `swicc` (same tags, own name). `iec-7816-4-table-42` is a deprecated alias for `ts-102-221` |
-| `--max-depth`, `--max-children`, `--max-nodes`, `--max-directories` | walk bounds; hitting one is reported as truncation |
+| `--max-depth`, `--max-children`, `--max-nodes`, `--max-directories` | walk bounds; hitting one is reported as truncation. `--max-nodes` (default 16384) counts files the card selected, not absent probes; walk time is bounded by `--max-directories` (64) x `--max-children` (1280). `ts48 compare` takes the same four flags |
 | `--tar <SELECTION>` | TARs to probe for MSL 0: `off` (default), `focused`, `full`, `range:A-B`, `regex:P`; capped at 4096 probes |
 | `--severity <LEVEL>` | drop findings below `info\|low\|medium\|high\|critical` |
 | `--score` | add `data.score`, integer 0-100 |

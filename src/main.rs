@@ -430,6 +430,45 @@ enum Ts48Action {
     Compare(Ts48CompareArgs),
 }
 
+/// The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift.
+#[derive(Args)]
+struct WalkLimitArgs {
+    /// Deepest path below the master file the walk descends into.
+    ///
+    /// The default (16) leaves room for a real card. Lowering it is how you
+    /// force a truncation on purpose, which is the supported way to see what a
+    /// truncated report looks like.
+    #[arg(long, value_name = "N")]
+    max_depth: Option<usize>,
+
+    /// Identifiers probed per directory.
+    ///
+    /// THE DEFAULT CANDIDATE SET CAN MISS A FILE. By default the walk probes
+    /// the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx, 1280 of
+    /// them. Every file on the swSIM USIM profile falls inside one of those, so
+    /// it cost no coverage there. On a card that puts a file anywhere else, that
+    /// file is INVISIBLE to the scan - never probed, so it cannot even be
+    /// reported missing - and a clean result is not proof the card holds nothing
+    /// else. The output reports which candidate set ran and whether it covered
+    /// the whole identifier space; an exhaustive --candidates range is not
+    /// offered on this flag yet, which is itself an under-reporting default
+    /// rather than a documented way out.
+    #[arg(long, value_name = "N")]
+    max_children: Option<usize>,
+
+    /// Files the card selected across the whole walk (default 16384).
+    ///
+    /// Absent probes do not count, so this is a bound on files found, not on
+    /// identifiers tried. How long a walk can run is bounded by
+    /// --max-directories times --max-children.
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<usize>,
+
+    /// Directories whose children are enumerated.
+    #[arg(long, value_name = "N")]
+    max_directories: Option<usize>,
+}
+
 #[derive(Args)]
 struct Ts48CompareArgs {
     /// Emit one JSON envelope (type "ts48") on stdout, and nothing else.
@@ -448,6 +487,9 @@ struct Ts48CompareArgs {
         value_parser = parse_dialect
     )]
     dialect: scan::Dialect,
+
+    #[command(flatten)]
+    walk_limits: WalkLimitArgs,
 }
 
 /// Everything `sim-doctor scan` takes.
@@ -501,36 +543,8 @@ struct ScanArgs {
     #[arg(long, value_name = "NAME")]
     reader: Option<String>,
 
-    /// Deepest path below the master file the walk descends into.
-    ///
-    /// The default (16) leaves room for a real card. Lowering it is how you
-    /// force a truncation on purpose, which is the supported way to see what a
-    /// truncated report looks like.
-    #[arg(long, value_name = "N")]
-    max_depth: Option<usize>,
-
-    /// Identifiers probed per directory, and the whole walk's node budget.
-    ///
-    /// THE DEFAULT CANDIDATE SET CAN MISS A FILE. By default the walk probes
-    /// the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx, 1280 of
-    /// them. Every file on the swSIM USIM profile falls inside one of those, so
-    /// it cost no coverage there. On a card that puts a file anywhere else, that
-    /// file is INVISIBLE to the scan - never probed, so it cannot even be
-    /// reported missing - and a clean result is not proof the card holds nothing
-    /// else. The output reports which candidate set ran and whether it covered
-    /// the whole identifier space; an exhaustive --candidates range is not
-    /// offered on this flag yet, which is itself an under-reporting default
-    /// rather than a documented way out.
-    #[arg(long, value_name = "N")]
-    max_children: Option<usize>,
-
-    /// Files recorded across the whole walk.
-    #[arg(long, value_name = "N")]
-    max_nodes: Option<usize>,
-
-    /// Directories whose children are enumerated.
-    #[arg(long, value_name = "N")]
-    max_directories: Option<usize>,
+    #[command(flatten)]
+    walk_limits: WalkLimitArgs,
 
     /// Add one quality score for this card, for CI gating.
     ///
@@ -1408,7 +1422,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         // Only 6A 82 is classified. Nothing else is, because this repository has
         // read no other table; see walk::StatusMeaning and CONTEXT.md section 3.
         meaning: walk::StatusMeaning::default(),
-        limits: limits_from(&args),
+        limits: limits_from(&args.walk_limits),
         ..walk::Options::default()
     };
 
@@ -1741,7 +1755,7 @@ fn all_specs() -> Vec<rules::RuleSpec> {
 /// Runs `sim-doctor ts48 compare`: the scan's walk, then the diff.
 ///
 /// The walk is the one `run_scan` does (same candidates, same status meaning,
-/// same default bounds) and nothing after it touches the card: no TAR audit.
+/// same default bounds, same walk-limit flags) and nothing after it touches the card: no TAR audit.
 fn run_ts48_compare(args: Ts48CompareArgs) -> contract::ExitCode {
     guard_exchange(ts48::KIND, args.json);
     let fixture = match ts48::Fixture::bundled() {
@@ -1785,6 +1799,7 @@ fn run_ts48_compare(args: Ts48CompareArgs) -> contract::ExitCode {
         addressing: walk::Addressing::PathFromMasterFile,
         candidates: walk::Candidates::SimFamilies,
         meaning: walk::StatusMeaning::default(),
+        limits: limits_from(&args.walk_limits),
         ..walk::Options::default()
     };
     let tree = match walk::walk(&mut session, &args.dialect.tag_set(), &options) {
@@ -2165,7 +2180,7 @@ fn pick_reader<'a>(
 /// Every one is an override rather than a positional, so a run that changes
 /// one bound still reports the other three: a report that silently used a
 /// different depth bound than the last run is not comparable to it.
-fn limits_from(args: &ScanArgs) -> Limits {
+fn limits_from(args: &WalkLimitArgs) -> Limits {
     let mut limits = Limits::default();
     if let Some(value) = args.max_depth {
         limits.max_depth = value;
@@ -2653,10 +2668,12 @@ mod tests {
             tui: false,
             dialect: scan::Dialect::Ts102221,
             reader: None,
-            max_depth: None,
-            max_children: None,
-            max_nodes: None,
-            max_directories: None,
+            walk_limits: WalkLimitArgs {
+                max_depth: None,
+                max_children: None,
+                max_nodes: None,
+                max_directories: None,
+            },
             score: true,
             severity: Some(rules::Severity::High),
             baseline: Some(std::path::PathBuf::from("saved.json")),
