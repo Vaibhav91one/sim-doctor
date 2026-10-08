@@ -12,12 +12,23 @@ All notable changes to this project are documented here. The format follows
 - The FCP tag table for real cards was wrong. The new default `--dialect ts-102-221` (ETSI TS 102 221: 80 size, 82 descriptor, 83 FID, 84 DF name) replaces it; `iec-7816-4-table-42` is a deprecated alias. A baseline taken under another dialect is refused by `--diff` (#69).
 - An empty reader is reported as `no card in reader` (error kind `no-card`) instead of an unusable reader (#64).
 - Tests no longer open an attached reader (#72).
+- `scan` walks the USIM/ISIM applications by AID from EF.DIR (path form `3F00/ADF:<AID>/…`). Before this, real cards only showed the legacy DF.GSM/DF.TELECOM paths (#83).
+- A real card no longer truncates the walk. `--max-nodes` now counts only files the card selected, as its help already said; absent probes still cost an exchange and are bounded by `--max-directories` × `--max-children`. Inside an application, the reserved identifiers 7FF0–7FFF are not walked again (#90).
+- A card command stuck in a PC/SC exchange can be interrupted: after SIGINT/SIGTERM a watchdog ends the run about 3 s later with exit 130 and releases the reader (#88).
+- The TAR probe and the fuzz OTA sweep send ENVELOPE as one APDU, so `--tar` works through real readers. Before, the header/data split was rejected by PC/SC and nothing was probed. The split is kept for the swicc-pcsc software reader only (#96).
+- The no-TAR-evidence score warning no longer claims a value of 100 (#84).
 
 ### Added
 
 - SCP03 core (key derivation, cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders), Milenage wrapper and the `auth/scp03-missing-mac` rule; vector-tested, never sent to a card. `rules_run` is now 2, so older baselines are refused by `--diff` (#22).
 - RFC 6979 deterministic ECDSA P-256/SHA-256 signing, 64-byte r||s (#21).
 - A generated-card corpus with a per-rule precision/recall gate (#47).
+- Rules `auth/pin1-disabled` (from the FCP PIN status template) and `filesystem/sensitive-ef-always` (sensitive EFs readable or updatable under ALWays, decoded from compact, expanded and EF.ARR-referenced access rules). EF.ARR is read with READ RECORD only; file contents are never read (#40, partial).
+- `sim-doctor gp info [--trace]`: read-only GlobalPlatform pass (ISD select, GET DATA for CPLC / card data / key information, decoders, AES key check value). It sends only SELECT, GET RESPONSE and GET DATA (#19, partial).
+- `sim-doctor ts48 compare`: diffs a card's file system against the public GSMA TS.48 v7.0 test profile, using a derived file list with no keys. It takes the same walk-limit flags as `scan`. Matching TS.48 is not GCF/PTCRB conformance (#25).
+- `sim-doctor fuzz apdu|ota`: CLA/INS discovery and a TAR × keyset × SPI sweep, bounded. It refuses to run without `--i-understand-this-can-brick-the-card`, and on any reader other than the swicc-pcsc software card it also needs `--allow-real-hardware` (#16).
+- Library modules, vector-tested and sending nothing on their own: SCP03t (#23), the SGP.22 Bound Profile Package builder (#17), ES10x STORE DATA and ES10b/ES10c codecs (#18), and the ES9+ message layer behind a transport trait (#20, partial; no HTTPS backend yet).
+- Prebuilt `aarch64-unknown-linux-gnu` binary (Raspberry Pi, glibc 2.39 or later); CI uploads it as an artifact on every run (#91).
 
 ### Changed
 
