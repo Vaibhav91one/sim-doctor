@@ -45,16 +45,19 @@
 //! of `cmd->data`, and returns. The data field therefore arrives on a
 //! *second* exchange, not the first.
 //!
-//! A scanner that transmits the whole envelope in one APDU and moves on leaves
-//! the card holding half a command: the next APDU it sends is swallowed as
-//! this one's continuation, and every probe after that is answering about the
-//! wrong TAR. That is worse than not probing at all.
+//! **That is swicc-pcsc's behaviour, not a real reader's.** PC/SC's
+//! `SCardTransmit` takes one complete APDU and the IFD handler runs the T=0
+//! procedure-byte exchange itself; a header-only transmit is rejected by a real
+//! CCID reader (issue #96: `probed: 0` on an OMNIKEY). So [`probe_envelope`]
+//! sends `CLA C2 00 00 Lc <D1 ...>` as ONE APDU through [`crate::session`]
+//! everywhere, and only the swicc-pcsc reader, picked by name, gets the
+//! header and the data apart, because its IFD handler returns swSIM's `61 Lc`
+//! as the APDU's final answer without sending the data (see [`probe_split`]
+//! for the source line).
 //!
-//! So the probe sends the opening `CLA INS P1 P2 Lc`, waits for the card to
-//! ask for the data, sends exactly that many octets, and **abandons the whole
-//! scan rather than continue** if the card asks for anything else. The
-//! invariant is the one that matters: the card is never left mid-command, even
-//! when the probe itself fails.
+//! Either way the probe **abandons the whole scan rather than continue** if
+//! the card answers with a procedure byte where a status word belongs: the
+//! card is never left mid-command, even when the probe itself fails.
 //!
 //! # What "the card accepted this TAR" means
 //!
@@ -110,8 +113,10 @@ use std::fmt;
 
 use serde_json::{json, Value};
 
-use crate::apdu::{Command, Le, Response, StatusWord, CLA_FETCH_ETSI};
-use crate::session::{self, Policy};
+use crate::apdu::{
+    Command, Header, Le, Response, StatusWord, CLA_FETCH_ETSI, CLA_GET_RESPONSE_ISO,
+};
+use crate::session::{self, PendingFollowUp, Policy};
 use crate::transport::{CardSession, Error as TransportError};
 
 /// The smallest TAR, `0x00_00_00`.
@@ -555,33 +560,34 @@ pub fn envelope_data_with(
 /// pins it against the octets rather than against this number.
 pub const PROBE_ENVELOPE_LEN: usize = 58;
 
-/// The two halves of one ENVELOPE exchange.
+/// The T=0 header of an ENVELOPE APDU: `CLA INS P1 P2 Lc`.
+const ENVELOPE_HEADER_LEN: usize = 5;
+
+/// One complete ENVELOPE APDU, `CLA C2 00 00 Lc <D1 ...>`.
 ///
-/// **Not one command, and that is the point.** See the module documentation:
-/// swSIM answers the opening with `61 Lc` before reading a byte of the data
-/// field, so the data arrives on the second exchange. Sending both in one
-/// APDU and moving on leaves the card holding half a command.
-///
-/// Returned as a pair rather than sent here so that a test can assert both
-/// halves with no card, which is the only way the invariant is provable on a
-/// machine with no reader.
-pub fn envelope_exchange(tar: u32, class: Class) -> Option<(Vec<u8>, Vec<u8>)> {
-    envelope_exchange_with(tar, class, KEY_SET, SPI1_PLAIN, SPI2_PROBE)
+/// **One APDU is what PC/SC takes.** `SCardTransmit` carries a whole APDU and
+/// the IFD handler (the CCID driver on a real reader) runs the T=0
+/// procedure-byte exchange itself; a header-only "APDU" is rejected by a real
+/// reader (issue #96). The one reader that needs the header and the data sent
+/// apart is swicc-pcsc, handled in [`probe_envelope`].
+pub fn envelope_apdu(tar: u32, class: Class) -> Option<Vec<u8>> {
+    envelope_apdu_with(tar, class, KEY_SET, SPI1_PLAIN, SPI2_PROBE)
 }
 
-/// The same two-exchange pair as [`envelope_exchange`], over
-/// [`envelope_data_with`] instead of [`envelope_data`].
-pub fn envelope_exchange_with(
+/// The same APDU as [`envelope_apdu`], over [`envelope_data_with`] instead of
+/// [`envelope_data`].
+pub fn envelope_apdu_with(
     tar: u32,
     class: Class,
     keyset: u8,
     spi1: u8,
     spi2: u8,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<Vec<u8>> {
     let data = envelope_data_with(tar, class, keyset, spi1, spi2)?;
     let len = u8::try_from(data.len()).ok()?;
-    let opening = vec![class.octet(), INS_ENVELOPE, 0x00, 0x00, len];
-    Some((opening, data))
+    let mut apdu = vec![class.octet(), INS_ENVELOPE, 0x00, 0x00, len];
+    apdu.extend_from_slice(&data);
+    Some(apdu)
 }
 
 /// Which TARs a scan probes.
@@ -1594,7 +1600,7 @@ enum Stop {
 /// needs.
 ///
 /// `pub(crate)` rather than private: [`crate::fuzz`] builds its own envelope
-/// data from [`envelope_exchange_with`] and reads the result through
+/// data from [`envelope_apdu_with`] and reads the result through
 /// [`probe_envelope`], and needs both fields to do what [`audit`] does with
 /// a [`Signature`].
 #[derive(Debug)]
@@ -1605,63 +1611,115 @@ pub(crate) struct Reply {
 
 /// Sends one TAR to a card and reads what it says.
 ///
-/// **Two exchanges, deliberately.** The opening is the five octets
-/// `CLA INS P1 P2 Lc`; a card that answers with a procedure byte is then sent
-/// exactly `Lc` octets, and the status word it answers that with is the one
-/// this TAR is judged on.
-///
-/// Three things are refused rather than guessed at, because guessing is how a
-/// scanner leaves a card holding half a command:
-///
-/// 1. **A procedure byte whose length is not the envelope's.** The card wants
-///    a different amount of data than this module has, so sending the envelope
-///    anyway would corrupt the exchange.
-/// 2. **No status word at all after the data.** There is nothing to compare,
-///    and continuing would mean treating silence as an answer.
-/// 3. **A status word that is an error is an answer like any other.** A card
-///    refusing the envelope is evidence; refusing to record it because it is
-///    unwelcome is how a scanner misses the thing it was built to find.
-///
-/// Nothing here retries. Every extra exchange is one the card asked for.
+/// The ENVELOPE goes out as one APDU through [`probe_envelope`]; the status
+/// word it is judged on is the card's final answer. A card refusing the
+/// envelope is evidence like any other answer, and nothing here retries.
 fn probe<S: CardSession + ?Sized>(
     session: &mut S,
     tar: u32,
     class: Class,
     policy: &Policy,
 ) -> Result<Result<Reply, String>, Error> {
-    let Some((opening, data)) = envelope_exchange(tar, class) else {
+    let Some(apdu) = envelope_apdu(tar, class) else {
         return Err(Error::UnbuildableEnvelope(
             "the SMS-PP-DOWNLOAD envelope does not fit a short APDU data field",
         ));
     };
-    probe_envelope(session, &opening, &data, policy)
+    probe_envelope(session, &apdu, policy)
 }
 
-/// The two-exchange ENVELOPE protocol [`probe`] speaks, over an
-/// already-built `(opening, data)` pair instead of one this module built
-/// from a TAR.
+/// Whether `reader` is the swicc-pcsc software-card driver.
 ///
-/// **This is the part [`crate::fuzz`] reuses.** [`probe`] is the TAR audit's
-/// own wrapper: it builds the opening and data from [`envelope_exchange`] and
-/// calls this. A fuzz sweep builds its envelope from
-/// [`envelope_exchange_with`] instead, varying the keyset and SPI octets
-/// [`probe`] leaves fixed, and the wire mechanics - the procedure byte, the
-/// length check, draining a pending proactive command - are identical either
-/// way, so they live here once rather than twice.
+/// \[V] swicc-pcsc `Makefile` names the driver `swICC PC/SC IFD Driver`, and
+/// `tests/card_fixture.rs` finds the fixture by the same substring.
+fn is_swicc(reader: &crate::transport::ReaderName) -> bool {
+    reader.as_str().to_ascii_lowercase().contains("swicc")
+}
+
+/// Sends one complete ENVELOPE APDU and reduces the answer to a [`Reply`].
+///
+/// **This is the part [`crate::fuzz`] reuses**: the wire mechanics live here
+/// once. `apdu` is `CLA INS P1 P2 Lc <data>` from [`envelope_apdu_with`].
+///
+/// On every reader but swicc-pcsc it is ONE `SCardTransmit` through
+/// [`session::send`], so `61 xx` and `9F xx` are collected with GET RESPONSE
+/// like any other command. A `91 xx` (proactive command pending) is **left
+/// alone and recorded as the probe's answer**: this scan is not a CAT
+/// terminal, and a FETCH it never answers with a TERMINAL RESPONSE is not
+/// something to do to a live card, so the policy is [`PendingFollowUp::Ignore`]
+/// for it. GET RESPONSE is collected at CLA `00`, the class a USIM accepts
+/// (the GSM class `A0` is rejected by one).
+///
+/// swicc-pcsc is the exception, by reader name: see [`probe_split`].
 pub(crate) fn probe_envelope<S: CardSession + ?Sized>(
     session: &mut S,
-    opening: &[u8],
-    data: &[u8],
+    apdu: &[u8],
     policy: &Policy,
 ) -> Result<Result<Reply, String>, Error> {
+    if is_swicc(session.reader()) {
+        return probe_split(session, apdu, policy);
+    }
+    if apdu.len() < ENVELOPE_HEADER_LEN {
+        return Err(Error::UnbuildableEnvelope(
+            "the ENVELOPE APDU has no header",
+        ));
+    }
+    let (head, data) = apdu.split_at(ENVELOPE_HEADER_LEN);
+    let header = Header::from_bytes([head[0], head[1], head[2], head[3]]);
+    let policy = Policy {
+        proactive_command: PendingFollowUp::Ignore,
+        get_response_class: CLA_GET_RESPONSE_ISO,
+        ..*policy
+    };
+    let exchange = match session::send(session, &Command::case3(header, data.to_vec()), &policy) {
+        Ok(exchange) => exchange,
+        Err(session::Error::Transport(err)) => return Err(Error::Transport(err)),
+        Err(session::Error::Parse(err)) => return Err(Error::Response(err)),
+        Err(session::Error::Encode(_)) => {
+            return Err(Error::UnbuildableEnvelope(
+                "the ENVELOPE APDU could not be encoded",
+            ))
+        }
+    };
+    if exchange.status().is_none() {
+        return Ok(Err(
+            "the card answered the envelope with a procedure byte rather than a status \
+             word; the scan stopped rather than leave the card mid-command"
+                .to_owned(),
+        ));
+    }
+    Ok(Ok(Reply {
+        signature: Signature::of(exchange.response()),
+        exchanges: exchange.exchange_count(),
+    }))
+}
+
+/// The two-exchange form swicc-pcsc needs: the header alone, then the data.
+///
+/// \[V] swicc-pcsc `src/ifd_handler.c`, `IFDHTransmitToICC` (pinned commit in
+/// `docs/swsim-fixture.md`), does run the T=0 split itself, but when the card
+/// answers a two-octet status before all data is sent it returns that status
+/// as the APDU's response and stops (`msg_rx_buf_len == 2U`: "Got a status
+/// before transmitting the whole message. This is our response to the
+/// APDU"). swSIM answers `61 Lc` to the header (module docs), so a whole
+/// ENVELOPE would come back `61 Lc` with the data never sent. The split is
+/// therefore kept for this reader only.
+///
+/// A card that answers without asking for data is taken at its word, a
+/// request for a length other than the envelope's abandons the exchange, and
+/// swSIM's `91 xx` after the data is drained with one FETCH because the next
+/// command answers differently if it is not (AGENTS.md section 2).
+fn probe_split<S: CardSession + ?Sized>(
+    session: &mut S,
+    apdu: &[u8],
+    policy: &Policy,
+) -> Result<Result<Reply, String>, Error> {
+    let (opening, data) = apdu.split_at(ENVELOPE_HEADER_LEN.min(apdu.len()));
     // 1. The opening.
     let first = session.transmit(opening)?;
     let first = Response::parse(&first)?;
 
     let Some(requested) = advertised_data_octets(&first) else {
-        // The card answered without asking for the data, which means it is not
-        // running the envelope protocol this module speaks. Its answer is
-        // returned as-is rather than inventing a second exchange.
         return Ok(Ok(Reply {
             signature: Signature::of(&first),
             exchanges: 1,
@@ -1690,13 +1748,6 @@ pub(crate) fn probe_envelope<S: CardSession + ?Sized>(
 
     let mut exchanges = 2;
 
-    // 3. swSIM rewrites a completed command's 9000 into 91 <length> whenever a
-    //    proactive command is waiting, and the NEXT command answers
-    //    differently depending on whether it was drained. So it is drained here
-    //    rather than left for the next probe to trip over - the swSIM
-    //    behaviour AGENTS.md section 2 records, read here for what it is
-    //    rather than as a failure. The FETCH goes through [crate::session] so
-    //    the follow-up policy is the tested one.
     if matches!(second.status().map(StatusWord::sw1), Some(0x91..=0x93)) {
         let Some(length) = second
             .status()
@@ -1879,8 +1930,11 @@ pub fn audit<S: CardSession + ?Sized>(
 /// sequence without a card. Not a shortcut around the probe, which is the only
 /// thing that puts bytes on a wire.
 pub fn describe_exchange(tar: u32, class: Class) -> String {
-    match envelope_exchange(tar, class) {
-        Some((opening, data)) => format!("{}  /  {}", octets(&opening), octets(&data)),
+    match envelope_apdu(tar, class) {
+        Some(apdu) => {
+            let (opening, data) = apdu.split_at(ENVELOPE_HEADER_LEN);
+            format!("{}  /  {}", octets(opening), octets(data))
+        }
         None => "(could not be built)".to_owned(),
     }
 }
@@ -1968,6 +2022,13 @@ mod tests {
                 sent: RefCell::new(Vec::new()),
                 released: false,
             }
+        }
+
+        /// Renames the reader to the swicc-pcsc driver's, the one reader that
+        /// is sent the header and the data apart.
+        fn swicc(mut self) -> Self {
+            self.reader = ReaderName::new("swICC PC/SC IFD Driver v1.2.0 00 00").expect("a name");
+            self
         }
 
         /// The next reply this card gives.
@@ -2071,29 +2132,19 @@ mod tests {
         assert_eq!(&tpdu[16..], &packet[..]);
     }
 
-    /// The whole ENVELOPE, and the two exchanges it is sent as.
+    /// The whole ENVELOPE, as the one APDU PC/SC takes.
     ///
-    /// **The split is the assertion that matters here.** [`apduh_etsi_cat_envelope`]
-    /// answers the opening with `61 Lc` and returns before reading the
-    /// data field, so the data cannot be in the opening: an exchange that put
-    /// it there would leave this card holding half a command.
+    /// Header and data are one buffer: a header-only transmit is rejected by
+    /// a real reader (issue #96). The swicc-pcsc split is made from this same
+    /// buffer at the fifth octet.
     #[test]
-    fn the_envelope_is_two_exchanges_and_never_one() {
-        let (opening, data) = envelope_exchange(0x00_00_00, Class::Etsi).expect("built");
+    fn the_envelope_is_one_complete_apdu() {
+        let apdu = envelope_apdu(0x00_00_00, Class::Etsi).expect("built");
+        let (opening, data) = apdu.split_at(ENVELOPE_HEADER_LEN);
 
-        // CLA 80, INS C2, P1 00, P2 00, Lc 3A - and nothing else.
-        assert_eq!(opening, vec![0x80, 0xC2, 0x00, 0x00, 0x3A]);
-        assert_eq!(
-            opening.len(),
-            5,
-            "the opening declares Lc and carries no data: swSIM sends 61 Lc \
-             back and reads nothing until the next exchange"
-        );
-        assert_eq!(
-            usize::from(opening[4]),
-            data.len(),
-            "the Lc the opening declares is the length of the data that follows"
-        );
+        // CLA 80, INS C2, P1 00, P2 00, Lc 3A, then exactly Lc octets.
+        assert_eq!(opening, [0x80, 0xC2, 0x00, 0x00, 0x3A]);
+        assert_eq!(usize::from(opening[4]), data.len());
         assert_eq!(data.len(), PROBE_ENVELOPE_LEN);
         assert_eq!(data[0], TAG_SMS_PP_DOWNLOAD, "D1, SMS-PP-DOWNLOAD");
         assert_eq!(data[1] as usize, data.len() - 2, "short-form TLV length");
@@ -2108,11 +2159,12 @@ mod tests {
     /// address, and the envelope is otherwise identical.
     #[test]
     fn the_gsm_class_is_the_same_envelope_addressed_differently() {
-        let (etsi, etsi_data) = envelope_exchange(0x00_00_00, Class::Etsi).expect("built");
-        let (gsm, gsm_data) = envelope_exchange(0x00_00_00, Class::Gsm).expect("built");
+        let etsi = envelope_apdu(0x00_00_00, Class::Etsi).expect("built");
+        let gsm = envelope_apdu(0x00_00_00, Class::Gsm).expect("built");
+        let (etsi_data, gsm_data) = (&etsi[5..], &gsm[5..]);
         assert_eq!(etsi[0], Class::Etsi.octet());
         assert_eq!(gsm[0], Class::Gsm.octet());
-        assert_eq!(etsi[1..], gsm[1..]);
+        assert_eq!(etsi[1..5], gsm[1..5]);
         assert_ne!(etsi_data, gsm_data);
         assert_ne!(
             etsi_data[2..16],
@@ -2374,14 +2426,86 @@ mod tests {
     // The probe loop, against a card that answers from a script
     // -----------------------------------------------------------------------
 
-    /// The happy path, and the shape of the exchange.
-    ///
-    /// The card answers the opening with `61 3A` - the ACK-ALL procedure
-    /// byte, one octet on the wire - and then a status word once it has the
-    /// envelope.
+    /// The happy path on a real reader: ONE complete APDU, no header-only
+    /// transmit. The scripted IFD below rejects a bare header the way a CCID
+    /// reader does, so a regression to the two-step form fails here.
     #[test]
-    fn a_probe_is_the_opening_then_the_envelope_then_the_answer() {
-        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+    fn a_probe_is_one_complete_apdu_on_a_reader_that_rejects_a_bare_header() {
+        let mut card = StrictIfd::new(&[0x90, 0x00]);
+        let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
+            .expect("no transport error")
+            .expect("the card cooperated");
+
+        assert_eq!(card.sent.len(), 1);
+        assert_eq!(card.sent[0], envelope_apdu(0, Class::Etsi).expect("built"));
+        assert_eq!(reply.exchanges, 1);
+        assert_eq!(
+            reply.signature.status().expect("a status").to_string(),
+            "9000"
+        );
+    }
+
+    /// A `61 xx` on a real reader is response data, collected with GET RESPONSE
+    /// like any other command, and the data field was already delivered.
+    #[test]
+    fn a_61xx_after_the_whole_apdu_is_collected_with_get_response() {
+        let mut card = Scripted::new(&[&[0x61, 0x02], &[0xAB, 0xCD, 0x90, 0x00]]);
+        let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
+            .expect("no transport error")
+            .expect("answered");
+        let sent = card.sent();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].len(), 5 + PROBE_ENVELOPE_LEN);
+        assert_eq!(&sent[1][..2], &[0x00, 0xC0], "GET RESPONSE at CLA 00");
+        assert_eq!(reply.signature.status().expect("sw").to_string(), "9000");
+        assert_eq!(reply.signature.body_len(), 2);
+        assert_eq!(reply.exchanges, 2);
+    }
+
+    /// **A `91 xx` is the probe's answer and nothing is fetched.** The scan is
+    /// no CAT terminal; a FETCH it never answers is not sent to a live card.
+    #[test]
+    fn a_91xx_is_recorded_as_the_answer_and_never_fetched() {
+        let mut card = Scripted::new(&[&[0x91, 0x80]]);
+        let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
+            .expect("no transport error")
+            .expect("answered");
+        assert_eq!(card.sent().len(), 1, "no FETCH, no loop");
+        assert_eq!(reply.signature.status().expect("sw").to_string(), "9180");
+        assert_eq!(reply.exchanges, 1);
+    }
+
+    /// The differential still works on the whole-APDU path: a reader that
+    /// answers every TAR alike has a baseline and reports nothing accepted.
+    #[test]
+    fn a_whole_apdu_audit_builds_a_baseline_and_accepts_nothing() {
+        let mut card = StrictIfd::new(&[0x91, 0x10]);
+        let audit = audit(
+            &mut card,
+            &Selection::focused(),
+            &Policy::default(),
+            &mut never,
+        )
+        .expect("no transport error");
+        assert!(audit.baseline.is_established());
+        assert_eq!(
+            audit.baseline.signature().expect("baseline").to_string(),
+            "9110"
+        );
+        assert_eq!(audit.accepted_count(), 0);
+        assert!(audit.is_complete());
+        assert_eq!(audit.probes.len(), FOCUSED_PROBES);
+        assert!(
+            card.sent.iter().all(|apdu| apdu.len() > 5),
+            "every transmit was a complete APDU"
+        );
+    }
+
+    /// swicc-pcsc only: the header, then the data. The card answers the
+    /// opening with `61 3A` and a status word once it has the envelope.
+    #[test]
+    fn a_probe_on_swicc_is_the_opening_then_the_envelope_then_the_answer() {
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]).swicc();
         let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
             .expect("no transport error")
             .expect("the card cooperated");
@@ -2402,7 +2526,7 @@ mod tests {
     /// says so rather than continuing into a card that is mid-command.
     #[test]
     fn a_card_that_wants_a_different_length_stops_the_probe() {
-        let mut card = Scripted::new(&[&[0x61, 0x10]]);
+        let mut card = Scripted::new(&[&[0x61, 0x10]]).swicc();
         let reason = probe(&mut card, 0, Class::Etsi, &Policy::default())
             .expect("no transport error")
             .expect_err("the card wanted 16 octets, not 58");
@@ -2424,7 +2548,7 @@ mod tests {
     /// used. It is not a second exchange this tool invents.
     #[test]
     fn a_card_that_does_not_ask_for_data_is_taken_at_its_word() {
-        let mut card = Scripted::new(&[&[0x6D, 0x00]]);
+        let mut card = Scripted::new(&[&[0x6D, 0x00]]).swicc();
         let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
             .expect("no transport error")
             .expect("the card answered");
@@ -2441,11 +2565,11 @@ mod tests {
     /// is holding something, so it is drained before the next probe rather than
     /// left for the next probe to trip over.
     #[test]
-    fn a_pending_proactive_command_is_drained_before_the_next_probe() {
+    fn on_swicc_a_pending_proactive_command_is_drained_before_the_next_probe() {
         // Opening, 91 80 (a proactive command of 128 octets is pending), the
         // 128 data octets, then the FETCH and its answer.
         let fetch_answer = [0xD0u8, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00];
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x91, 0x80], &fetch_answer]);
+        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x91, 0x80], &fetch_answer]).swicc();
         let reply = probe(&mut card, 0, Class::Etsi, &Policy::default())
             .expect("no transport error")
             .expect("the card cooperated");
@@ -2474,7 +2598,7 @@ mod tests {
     #[test]
     fn a_card_that_answers_every_tar_identically_reports_nothing_accepted() {
         // 61 3A then 9000, forever.
-        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]).swicc();
         let audit = audit(
             &mut card,
             &Selection::focused(),
@@ -2535,7 +2659,7 @@ mod tests {
     /// finish rather than rendering a shorter one as a whole.
     #[test]
     fn an_interrupted_tar_scan_is_reported_as_interrupted_not_as_short() {
-        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]).swicc();
         let mut calls = 0usize;
         let audit = audit(
             &mut card,
@@ -2559,7 +2683,7 @@ mod tests {
     #[test]
     fn a_card_that_stops_answering_ends_the_scan_with_a_reason() {
         // 61 3A, then a procedure byte where a status word belongs.
-        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x60]]);
+        let mut card = Scripted::new(&[&[0x61, 0x3A], &[0x60]]).swicc();
         let audit = audit(
             &mut card,
             &Selection::focused(),
@@ -2607,7 +2731,7 @@ mod tests {
     /// it assumed, so a reader never has to take any of them on trust.
     #[test]
     fn the_report_block_carries_the_bound_the_class_and_the_baseline() {
-        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]).swicc();
         let audit = audit(
             &mut card,
             &Selection::focused(),
@@ -2635,7 +2759,7 @@ mod tests {
     /// The per-probe list is bounded, and the block says how long it really is.
     #[test]
     fn the_probe_list_a_report_carries_is_bounded() {
-        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]);
+        let mut card = Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]).swicc();
         let audit = audit(
             &mut card,
             &Selection::focused(),
@@ -2688,7 +2812,7 @@ mod tests {
     impl SwimsMsZero {
         fn new() -> Self {
             Self {
-                inner: Scripted::new(&[&[0x61, 0x3A]]),
+                inner: Scripted::new(&[&[0x61, 0x3A]]).swicc(),
             }
         }
     }
@@ -2732,7 +2856,46 @@ mod tests {
         data.get(tar_at..tar_at + 3) == Some(&[0x00, 0x00, 0x00])
     }
 
-    /// A reader that has gone away.
+    /// A real reader's IFD handler: it takes whole APDUs and refuses a bare
+    /// five-octet header with data owed, as `SCardTransmit` does on a CCID
+    /// reader (issue #96). Every APDU gets the same answer.
+    struct StrictIfd {
+        reader: ReaderName,
+        answer: Vec<u8>,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl StrictIfd {
+        fn new(answer: &[u8]) -> Self {
+            Self {
+                reader: ReaderName::new("OMNIKEY 3x21 Smart Card Reader").expect("a name"),
+                answer: answer.to_vec(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl CardSession for StrictIfd {
+        fn reader(&self) -> &ReaderName {
+            &self.reader
+        }
+
+        fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.sent.push(command.to_vec());
+            if command.len() == 5 && command[1] == 0xC2 && command[4] != 0 {
+                return Err(TransportError::Transmit {
+                    reader: self.reader.clone(),
+                    detail: "An attempt was made to end a non-existent transaction".to_owned(),
+                });
+            }
+            Ok(self.answer.clone())
+        }
+
+        fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
     /// A reader that has gone away.
     ///
     /// Carries its reader name in a field rather than rebuilding one per call,
@@ -2806,7 +2969,7 @@ mod tests {
         }
 
         let mut card = FailsAfterFirst {
-            inner: Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]),
+            inner: Scripted::cycling(&[&[0x61, 0x3A], &[0x90, 0x00]]).swicc(),
             sent: 0,
         };
         let audit = audit(

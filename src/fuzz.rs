@@ -1,7 +1,7 @@
 //! OTA/SMS fuzzing: a bounded TAR x keyset x mechanism sweep.
 //!
 //! **Owns.** The sweep loop and its bound, built directly on
-//! [`crate::tar`]'s envelope builder ([`crate::tar::envelope_exchange_with`])
+//! [`crate::tar`]'s envelope builder ([`crate::tar::envelope_apdu_with`])
 //! and wire mechanics ([`crate::tar::probe_envelope`]), and the differential
 //! ([`crate::tar::Baseline`]) that decides whether a (TAR, keyset, mechanism)
 //! triple got a response unlike the one this card gives to combinations it
@@ -16,13 +16,13 @@
 //! # Why this reuses `tar.rs` rather than re-deriving the wire format
 //!
 //! Every fact [`crate::tar`]'s module documentation records about the
-//! ENVELOPE protocol - the two-exchange `61 Lc` handshake, draining a pending
-//! proactive command before the next probe, abandoning the scan rather than
-//! continuing on a mismatched length - applies here unchanged. The only thing
+//! ENVELOPE protocol - one complete APDU per probe (the swicc-pcsc-only
+//! header/data split included), a `91 xx` recorded as the answer, abandoning
+//! the scan rather than continuing mid-command - applies here unchanged. The only thing
 //! an OTA fuzz sweep varies that a TAR audit does not is the keyset and the
 //! SPI1/SPI2 "mechanism" octets inside the Command Packet, so [`tar`] exposes
 //! that as parameters ([`tar::command_packet_with`],
-//! [`tar::envelope_data_with`], [`tar::envelope_exchange_with`]) instead of
+//! [`tar::envelope_data_with`], [`tar::envelope_apdu_with`]) instead of
 //! this module rebuilding the TS 03.48 / TS 23.040 / `D1` chain a second time.
 //!
 //! # The mechanism table is unverified, and says so
@@ -215,12 +215,12 @@ fn probe_triple<S: CardSession + ?Sized>(
     policy: &Policy,
 ) -> Result<Result<(Signature, usize), String>, tar::Error> {
     let (spi1, spi2) = mechanism;
-    let Some((opening, data)) = tar::envelope_exchange_with(tar, class, keyset, spi1, spi2) else {
+    let Some(apdu) = tar::envelope_apdu_with(tar, class, keyset, spi1, spi2) else {
         return Err(tar::Error::UnbuildableEnvelope(
             "the SMS-PP-DOWNLOAD envelope for this triple does not fit a short APDU data field",
         ));
     };
-    match tar::probe_envelope(session, &opening, &data, policy) {
+    match tar::probe_envelope(session, &apdu, policy) {
         Ok(Ok(reply)) => Ok(Ok((reply.signature, reply.exchanges))),
         Ok(Err(reason)) => Ok(Err(reason)),
         Err(err) => Err(err),
@@ -420,7 +420,8 @@ mod tests {
                 }
             }
             Self {
-                reader: ReaderName::new("loopback").expect("a reader name"),
+                reader: ReaderName::new("swICC PC/SC IFD Driver v1.2.0 00 00")
+                    .expect("a reader name"),
                 replies: RefCell::new(replies),
                 sent: RefCell::new(Vec::new()),
             }
@@ -446,7 +447,7 @@ mod tests {
         }
     }
 
-    /// A card like swSIM: it has no notion of a TAR at all and answers every
+    /// A card like swSIM behind swicc-pcsc (header and data apart): it has no notion of a TAR at all and answers every
     /// envelope `61 Lc` then `90 00`, so every probe looks alike and nothing
     /// is reported accepted. Mirrors `tar.rs`'s own fixture-shaped test.
     fn swsim_like() -> Scripted {
