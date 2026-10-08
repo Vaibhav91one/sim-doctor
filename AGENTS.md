@@ -984,7 +984,8 @@ TS.48's file structure is not GCF or PTCRB conformance, and an operator SIM is n
 
 Walk budget (issue #90): `--max-nodes` (default 16384) counts files the card SELECTED. Absent probes are
 recorded in the tree but spend no budget; walk time is bounded by `max_directories` x `max_children`
-(64 x 1280 probes by default). A real card is ~30 directories, so defaults must report `complete=true`.
+(64 x 1280 probes by default). A real card is ~30 directories, so defaults must report `complete=true`. Repeated-ancestor answers do not spend the budget either, and
+identifiers 7FF0-7FFF are application aliases (TS 102 221 clause 8.3 defines 7FFF), never probed or descended.
 
 ---
 

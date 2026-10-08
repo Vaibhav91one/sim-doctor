@@ -1303,7 +1303,12 @@ pub fn walk<S: CardSession + ?Sized>(
     while let Some(mut frame) = stack.pop() {
         let aid = frame.pending.next();
         let next = if aid.is_none() {
-            frame.remaining.next()
+            // 7FF0..=7FFF are application aliases, never children (see
+            // `is_application_alias`): skip them without a probe.
+            frame
+                .remaining
+                .by_ref()
+                .find(|id| !is_application_alias(*id))
         } else {
             None
         };
@@ -1382,6 +1387,21 @@ pub fn walk<S: CardSession + ?Sized>(
     }
 
     Ok(builder.into_tree())
+}
+
+/// Whether `id` is in 7FF0..=7FFF, which this walk treats as an alias of an
+/// application rather than a child file (issue #90).
+///
+/// ETSI TS 102 221 clause 8.3 defines 7FFF as the special file identifier that
+/// selects the ADF of the current application (verified against V14.2.0). The
+/// wider 7FF0-7FFF range is treated the same way on the strength of a live
+/// card, whose ADF answered SELECT 7FF0 as a DF and re-presented the whole
+/// application beneath it (39% of a truncated walk); the spec text for the
+/// range beyond 7FFF was not checked. A real DF at one of these identifiers
+/// would be invisible to the walk, the same trade-off as the candidate set.
+fn is_application_alias(id: FileId) -> bool {
+    let [high, low] = id.to_bytes();
+    high == 0x7F && low >= 0xF0
 }
 
 /// One answer to one SELECT, plus what had to be noted to reach it.
@@ -1785,7 +1805,7 @@ struct Builder<'a> {
     options: &'a Options,
     dialect: &'a TagSet,
     nodes: Vec<Node>,
-    /// Nodes the card selected: the only ones `max_nodes` counts.
+    /// Selected nodes that are not repeated-ancestor answers: all `max_nodes` counts.
     selected: usize,
     directories: usize,
     truncated_by: Option<Limit>,
@@ -1808,7 +1828,12 @@ impl<'a> Builder<'a> {
 
     fn push(&mut self, path: Path, state: NodeState, notes: Vec<Note>) -> NodeId {
         let id = NodeId(self.nodes.len());
-        self.selected += usize::from(state.is_selected());
+        self.selected += usize::from(
+            state.is_selected()
+                && !notes
+                    .iter()
+                    .any(|n| matches!(n, Note::RepeatedAncestor { .. })),
+        );
         self.nodes.push(Node {
             id,
             path,
@@ -3589,6 +3614,26 @@ mod tests {
         // The two are not equal as values, so a baseline or a diff built on
         // Tree cannot confuse one for the other either.
         assert_ne!(complete, truncated);
+    }
+
+    #[test]
+    fn application_aliases_7ff0_to_7fff_are_neither_probed_nor_descended() {
+        // A card whose 7FF0 and 7FFF answer as directories (the live USIM
+        // re-presented the whole application under 7FF0, issue #90).
+        let mut card = sample_card()
+            .with("3F00/7FF0", fcp(id("7FF0"), DIRECTORY_DESCRIPTOR, None))
+            .with("3F00/7FFF", fcp(id("7FFF"), DIRECTORY_DESCRIPTOR, None))
+            .with(
+                "3F00/7FFF/6F3A",
+                fcp(id("6F3A"), TRANSPARENT_DESCRIPTOR, Some(10)),
+            );
+        let tree = walk(&mut card, &dialect(), &Options::default()).unwrap();
+        for alias in ["3F00/7FF0", "3F00/7FFF", "3F00/7FFF/6F3A"] {
+            let path: Path = alias.parse().unwrap();
+            assert!(!tree.contains(&path), "{alias} must not be walked");
+        }
+        assert!(tree.at(&"3F00/7F20/6F3A".parse().unwrap()).is_some());
+        assert!(tree.is_complete());
     }
 
     #[test]
