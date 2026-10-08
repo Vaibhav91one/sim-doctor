@@ -66,6 +66,7 @@ use serde_json::{json, Value};
 
 use crate::access;
 use crate::baseline;
+use crate::ef;
 use crate::fcp::{self, TagSet};
 use crate::fs;
 use crate::rules;
@@ -425,6 +426,54 @@ const TAR_PARTIAL_REASON: &str =
 /// The ID of the PIN rule.
 pub const PIN1_DISABLED_RULE: &str = "auth/pin1-disabled";
 
+/// The ID of the identity-readable rule.
+pub const IDENTITY_READABLE_RULE: &str = "identity/readable-without-pin";
+
+/// EF.MSISDN readable under ALWays (low).
+///
+/// EF.MSISDN is READ PIN in TS 31.102 clause 4.2.26. Decided from the access
+/// rule alone, so it needs no read of the file. **The IMSI is deliberately not
+/// here**: `filesystem/sensitive-ef-always` already owns it, and a second
+/// finding would score one fact twice. Evidence is the path and the access
+/// rule, never the value.
+fn identity_readable(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    subject
+        .tree
+        .selected()
+        .filter_map(|node| {
+            let ef = ef::classify(node.path())?;
+            if ef != ef::Ef::Msisdn {
+                return None;
+            }
+            let severity = rules::Severity::Low;
+            let access = access::access_of(subject.tree, node)?;
+            (access.read == access::Condition::Always).then(|| {
+                rules::Finding::new(
+                    rules::RuleId::new(IDENTITY_READABLE_RULE).expect("a validated constant"),
+                    severity,
+                    format!(
+                        "{} is readable without a PIN, so the subscriber identity is open to anyone holding the card",
+                        ef.name()
+                    ),
+                    rules::Location::selected_file(node.path().to_string()),
+                    rules::Evidence::text(format!(
+                        "read={} update={}",
+                        access.read.label(),
+                        access.update.label()
+                    )),
+                )
+            })
+        })
+        .collect()
+}
+
+fn identity_evidence(subject: &Subject<'_>) -> bool {
+    subject.tree.selected().any(|node| {
+        ef::classify(node.path()) == Some(ef::Ef::Msisdn)
+            && access::access_of(subject.tree, node).is_some()
+    })
+}
+
 /// The ID of the sensitive-EF access rule.
 pub const SENSITIVE_EF_RULE: &str = "filesystem/sensitive-ef-always";
 
@@ -475,7 +524,7 @@ fn sensitive_name(node: &walk::Node) -> Option<&'static str> {
 /// **High when UPDATE is open, medium when only READ is.** Open UPDATE lets
 /// anyone holding the card rewrite the identity or the keys; open READ only
 /// exposes them. Evidence is the file path (the location) and the decoded
-/// access rule; the file's contents are never read.
+/// access rule; this rule never reads the file's contents.
 fn sensitive_ef_always(subject: &Subject<'_>) -> Vec<rules::Finding> {
     subject
         .tree
@@ -636,6 +685,20 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             sensitive_ef_evidence,
         )
         .expect("the sensitive EF rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(IDENTITY_READABLE_RULE).expect("a validated constant"),
+                rules::Severity::Medium,
+                "the MSISDN is readable without a PIN (TS 31.102 gives it a PIN READ condition)",
+            )
+            .with_remediation(
+                "set the file's READ access rule (its EF.ARR record) to PIN, then re-scan",
+            ),
+            identity_readable,
+            identity_evidence,
+        )
+        .expect("the identity rule ID is unique in this registry");
     registry
 }
 
@@ -1184,6 +1247,8 @@ pub fn to_json(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> Value {
         "refused": refused,
         "notes": notes,
         "files": files,
+        // Additive: the security-relevant EFs, decoded and redacted (src/ef.rs).
+        "ef_contents": ef::to_json(tree),
     });
 
     // The verdict is spliced in rather than named in the literal above, so
@@ -2830,7 +2895,7 @@ mod tests {
         assert_eq!(id.rule(), "msl-zero-allowed");
 
         let registry = rules();
-        assert_eq!(registry.len(), 4, "four rules are registered over a card");
+        assert_eq!(registry.len(), 5, "five rules are registered over a card");
         let rule = registry.get(&id).expect("the rule is registered");
         assert_eq!(rule.severity(), rules::Severity::Critical);
         assert!(
@@ -2877,7 +2942,7 @@ mod tests {
         // rules_run is 1 because a rule really ran, so the 100 it sits beside
         // is a score over an audit rather than an absence of one. That is the
         // whole difference NO_RULES_WARNING was written to make visible.
-        assert_eq!(rules_run(), 4);
+        assert_eq!(rules_run(), 5);
 
         let mut card = sample_card();
         let tree = walk_sample(&mut card, Limits::default());
@@ -2901,7 +2966,7 @@ mod tests {
             .tar_audit(audit);
         let block = verdict.fields();
         let score = &block["score"];
-        assert_eq!(score["rules_run"], serde_json::json!(4));
+        assert_eq!(score["rules_run"], serde_json::json!(5));
         assert_eq!(score["value"], serde_json::json!(rules::SCORE_MAX));
         assert_eq!(
             score["warning"],

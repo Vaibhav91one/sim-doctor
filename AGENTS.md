@@ -436,6 +436,19 @@ exists because getting it wrong breaks somebody downstream:
 sim-doctor scan --json | jq '.data.findings[] | select(.rule == "gsma/msl-zero-allowed")'
 ```
 
+### EF contents are evidence, redacted (issue #108, #102)
+
+`scan --json` carries an additive `ef_contents` array: the security-relevant EFs
+([src/ef.rs](src/ef.rs): ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST) read with SELECT,
+READ BINARY and READ RECORD only, each as `{path, ef, access, read, evidence, fields}`.
+**Redaction is binding:** an IMSI shows MCC + MNC (MNC length from EF.AD, else 2) and its last 2
+digits; an ICCID its first 6 and last 2; an MSISDN its TON/NPI, digit count and last 2. Never a
+full IMSI/ICCID/MSISDN in output, tests, fixtures or docs. EF.Keys and EF.KeysPS are reported as
+presence and access conditions only and are never read by `ef::read`. `identity/readable-without-pin` fires
+from the access rule alone and covers the MSISDN only (low); the IMSI stays with
+`filesystem/sensitive-ef-always`, so one fact is never scored twice. `read` is `decoded`, `refused` (with the status word),
+`malformed`, `not-read` or `presence-only`.
+
 ### TAR scanning and MSL=0
 
 A TAR is a three-octet value a network uses to route an SMS payload to one

@@ -40,7 +40,7 @@
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "access";
 
-use crate::apdu::{Command, Header, Le};
+use crate::apdu::{Command, Header, Le, StatusWord};
 use crate::fs::{self, Path};
 use crate::session::{self, Policy};
 use crate::tlv::{Stream, Tlv};
@@ -420,6 +420,22 @@ pub fn resolve<S: CardSession + ?Sized>(
     Ok(())
 }
 
+/// SELECTs `path` (under an application: SELECT by AID, then by path from it).
+/// The inner `Err` is the refusing status word, when there was one.
+pub(crate) fn select_file<S: CardSession + ?Sized>(
+    session: &mut S,
+    path: &Path,
+    policy: &Policy,
+) -> Result<Result<(), Option<StatusWord>>, session::Error> {
+    for command in walk::select_commands(walk::Addressing::PathFromMasterFile, path) {
+        let select = session::send(session, &command, policy)?;
+        if !select.status().is_some_and(|s| s.is_normal_processing()) {
+            return Ok(Err(select.status()));
+        }
+    }
+    Ok(Ok(()))
+}
+
 fn read_records<S: CardSession + ?Sized>(
     session: &mut S,
     path: &Path,
@@ -430,12 +446,8 @@ fn read_records<S: CardSession + ?Sized>(
     let Some(le) = Le::for_byte_count(u32::from(length)).filter(|_| length > 0) else {
         return Ok(records);
     };
-    // Under an application this is SELECT by AID, then by path from it.
-    for command in walk::select_commands(walk::Addressing::PathFromMasterFile, path) {
-        let select = session::send(session, &command, policy)?;
-        if !select.status().is_some_and(|s| s.is_normal_processing()) {
-            return Ok(records);
-        }
+    if select_file(session, path, policy)?.is_err() {
+        return Ok(records);
     }
     for number in 1..=usize::from(count).min(MAX_ARR_RECORDS) {
         // `number` is at most 254 here.

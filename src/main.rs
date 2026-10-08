@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    access, apdu_scan, baseline, ci, contract, fix, fuzz, gp, rules, sarif, scan, session, signals,
-    skill, tar, trace,
+    access, apdu_scan, baseline, ci, contract, ef, fix, fuzz, gp, rules, sarif, scan, session,
+    signals, skill, tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -1509,6 +1509,15 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     if let Err(err) = access::resolve(&mut *session, &mut tree, &session::Policy::default()) {
         return report_failure(
             &scan::Failure::new("access-rules-failed", err.to_string()),
+            args.json,
+        );
+    }
+
+    // The security-relevant EFs' contents, read-only (SELECT, READ BINARY, READ
+    // RECORD), decoded later and only ever shown redacted.
+    if let Err(err) = ef::read(&mut *session, &mut tree, &session::Policy::default()) {
+        return report_failure(
+            &scan::Failure::new("ef-read-failed", err.to_string()),
             args.json,
         );
     }

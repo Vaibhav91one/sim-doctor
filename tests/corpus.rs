@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use sim_doctor::access;
+use sim_doctor::ef;
 use sim_doctor::rules::Location;
 use sim_doctor::scan::{self, Dialect, Subject};
 use sim_doctor::session::Policy;
@@ -25,6 +26,8 @@ struct Card {
     files: HashMap<Vec<u8>, Vec<u8>>,
     /// Records of a linear fixed EF, by path.
     records: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Contents of a transparent EF, by path (READ BINARY).
+    binary: HashMap<Vec<u8>, Vec<u8>>,
     /// What the last SELECT chose, for READ RECORD.
     current: Vec<u8>,
     queued: VecDeque<Vec<u8>>,
@@ -63,6 +66,7 @@ impl Card {
         Self {
             files: HashMap::new(),
             records: HashMap::new(),
+            binary: HashMap::new(),
             current: Vec::new(),
             queued: VecDeque::new(),
             msl0,
@@ -140,6 +144,29 @@ impl Card {
         self
     }
 
+    /// A transparent EF (`path`) holding `bytes`.
+    fn transparent(mut self, path: &str, bytes: &[u8]) -> Self {
+        let size = u16::try_from(bytes.len()).unwrap();
+        self = self.described(path, Fcp::Ts102221, Some(size), &[0x01, 0x21], &[]);
+        self.binary.insert(path_bytes(path), bytes.to_vec());
+        self
+    }
+
+    /// A linear fixed EF (`path`) holding `records`, all of one length.
+    fn linear(mut self, path: &str, records: &[Vec<u8>]) -> Self {
+        let (count, len) = (u8::try_from(records.len()).unwrap(), records[0].len());
+        let descriptor = [0x02, 0x21, 0x00, u8::try_from(len).unwrap(), count];
+        self = self.described(
+            path,
+            Fcp::Ts102221,
+            Some(u16::from(count) * len as u16),
+            &descriptor,
+            &[],
+        );
+        self.records.insert(path_bytes(path), records.to_vec());
+        self
+    }
+
     fn target(&self, command: &[u8]) -> Vec<u8> {
         let body = command.get(5..).unwrap_or_default();
         if command.get(2) == Some(&0x08) {
@@ -168,6 +195,10 @@ impl CardSession for Card {
                     body
                 }
                 None => vec![0x6F, 0x00],
+            }),
+            Some(0xB0) => Ok(match self.binary.get(&self.current) {
+                Some(bytes) => [bytes.as_slice(), &[0x90, 0x00]].concat(),
+                None => vec![0x69, 0x82],
             }),
             Some(0xB2) => {
                 let record = self
@@ -235,6 +266,7 @@ struct Case {
 }
 
 const BASIC_PROBE: &[&str] = &["2F01", "2FE2", "6F07", "7F20"];
+const USIM_IDENTITY_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F07", "6F40"];
 const USIM_PROBE: &[&str] = &[
     "2F06", "6F06", "7FFF", "5F3B", "5F3C", "4F20", "6F07", "6F08", "6F73", "6F7E",
 ];
@@ -454,6 +486,41 @@ fn corpus() -> Vec<Case> {
             vec![],
             41,
         ),
+        // Issue #108: identity files readable without a PIN, decided from the access rule.
+        Case {
+            probe: USIM_IDENTITY_PROBE,
+            ..usim_case(
+                "usim-msisdn-readable",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/6F40", arr_ref([0x6F, 0x06], 2)),
+                        ("3F00/7FFF/6F07", arr_ref([0x6F, 0x06], 1)),
+                    ],
+                    &[ARR_ALWAYS, ARR_PIN_ADM],
+                    &[ARR_PIN_ADM, ARR_READ_OPEN],
+                ),
+                vec![(scan::IDENTITY_READABLE_RULE, file("3F00/7FFF/6F40"))],
+                11,
+            )
+        },
+        Case {
+            probe: USIM_IDENTITY_PROBE,
+            ..usim_case(
+                "usim-identity-protected",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/6F40", arr_ref([0x6F, 0x06], 1)),
+                        ("3F00/7FFF/6F07", arr_ref([0x6F, 0x06], 1)),
+                    ],
+                    &[ARR_ALWAYS, ARR_PIN_ADM],
+                    &[ARR_PIN_ADM, ARR_READ_OPEN],
+                ),
+                vec![],
+                11,
+            )
+        },
         usim_case(
             "usim-pin1-off-universal-in-use",
             usim(pin_status(false, true), &[], &[ARR_ALWAYS], &[ARR_ALWAYS]),
@@ -562,6 +629,7 @@ fn run(mut case: Case) -> (Vec<Found>, Vec<Found>, Vec<String>) {
     };
     let mut tree = walk::walk(&mut case.card, &case.dialect.tag_set(), &options).expect("walk");
     access::resolve(&mut case.card, &mut tree, &Policy::default()).expect("access rules");
+    ef::read(&mut case.card, &mut tree, &Policy::default()).expect("ef contents");
     let audit = tar::audit(
         &mut case.card,
         &Selection::focused(),
@@ -653,4 +721,123 @@ fn the_gate_fails_on_a_missed_finding_and_on_a_spurious_one() {
         unscored.contains("b/y"),
         "a rule with no case is a warning, not a score"
     );
+}
+
+// ---------------------------------------------------------------------------
+// EF contents (issue #108): read-only, decoded, redacted
+// ---------------------------------------------------------------------------
+
+const SYNTHETIC_IMSI: &str = "001010123456789";
+
+#[test]
+fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
+    let imsi = [0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98];
+    let iccid = [0x98, 0x99, 0x99, 0x21, 0x43, 0x65, 0x87, 0x09, 0x21, 0xF3];
+    let mut msisdn = vec![0xFF, 0xFF, 0x07, 0x91, 0x51, 0x55, 0x55, 0x05, 0x01, 0xF0];
+    msisdn.resize(16, 0xFF);
+    let mut card = Card::new(false)
+        .file("3F00", Fcp::Ts102221, None)
+        .transparent("3F00/2FE2", &iccid)
+        .file("3F00/7FFF", Fcp::Ts102221, None)
+        .transparent("3F00/7FFF/6F07", &imsi)
+        .transparent("3F00/7FFF/6FAD", &[0x00, 0x00, 0x00, 0x02])
+        .transparent("3F00/7FFF/6F46", &[0x01, b'T', b'e', b's', b't', 0xFF])
+        .transparent("3F00/7FFF/6F38", &[0x9E, 0x1D, 0x01, 0x08])
+        .linear("3F00/7FFF/6F40", &[msisdn]);
+    // A key file is selected by the walk but must never be read.
+    card = card.file("3F00/7FFF/6F08", Fcp::Ts102221, Some(9));
+    let options = walk::Options {
+        candidates: Candidates::List(
+            [
+                "2FE2", "7FFF", "6F07", "6FAD", "6F46", "6F38", "6F40", "6F08",
+            ]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect::<Vec<_>>(),
+        ),
+        ..walk::Options::default()
+    };
+    let mut tree = walk::walk(&mut card, &Dialect::Ts102221.tag_set(), &options).expect("walk");
+    ef::read(&mut card, &mut tree, &Policy::default()).expect("ef contents");
+
+    let json = ef::to_json(&tree);
+    let text = json.to_string();
+    for secret in [
+        SYNTHETIC_IMSI,
+        "8999991234567890123",
+        "15555550100",
+        "1234567",
+    ] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let entry = |name: &str| {
+        json.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["ef"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {text}"))
+    };
+    assert_eq!(entry("EF.IMSI")["evidence"], "IMSI 00101..89 (15 digits)");
+    // EF.AD says the MNC is 2 digits, so the cut is MCC + 2.
+    assert_eq!(entry("EF.IMSI")["fields"]["mnc_len_source"], "EF.AD");
+    assert_eq!(
+        entry("EF.ICCID")["evidence"],
+        "ICCID 899999..23 (19 digits)"
+    );
+    assert_eq!(entry("EF.SPN")["fields"]["name"], "Test");
+    assert_eq!(
+        entry("EF.UST")["fields"]["enabled"],
+        serde_json::json!([2, 3, 4, 5, 8, 9, 11, 12, 13, 17, 28])
+    );
+    assert_eq!(
+        entry("EF.MSISDN")["fields"]["numbers"][0]["digits"],
+        11,
+        "{text}"
+    );
+    // Keys: presence only, with no read.
+    assert_eq!(entry("EF.Keys")["read"], "presence-only");
+    assert!(tree
+        .content_read(&"3F00/7FFF/6F08".parse().unwrap())
+        .is_none());
+}
+
+#[test]
+fn a_short_malformed_iccid_is_not_leaked_by_the_scan_json() {
+    // 8 digits "89123456" (swapped nibbles, F-padded to 10 octets): too short to redact.
+    let iccid = [0x98, 0x21, 0x43, 0x65, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    let mut card = Card::new(false)
+        .file("3F00", Fcp::Ts102221, None)
+        .transparent("3F00/2FE2", &iccid);
+    let options = walk::Options {
+        candidates: Candidates::List(vec!["2FE2".parse().unwrap()]),
+        ..walk::Options::default()
+    };
+    let mut tree = walk::walk(&mut card, &Dialect::Ts102221.tag_set(), &options).expect("walk");
+    ef::read(&mut card, &mut tree, &Policy::default()).expect("ef contents");
+    let audit = tar::audit(
+        &mut card,
+        &Selection::focused(),
+        &Policy::default(),
+        &mut || false,
+    )
+    .expect("tar audit");
+    let found = scan::findings(&Subject {
+        tree: &tree,
+        tar: &audit,
+        scp03: None,
+    })
+    .expect("rules");
+    let verdict = scan::Verdict::new(found, scan::rules_run());
+    let context = scan::Context::new(
+        "corpus card",
+        None,
+        Dialect::Ts102221,
+        options.candidates.clone(),
+        options.limits,
+    );
+    let text = scan::to_json(&tree, &context, &verdict).to_string();
+    assert!(text.contains("ICCID (8 digits)"), "{text}");
+    for secret in ["89123456", "8912", "3456"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
 }

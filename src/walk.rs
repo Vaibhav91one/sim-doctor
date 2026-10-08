@@ -995,6 +995,30 @@ pub struct Tree {
     limits: Limits,
     dialect: String,
     access_rule_files: Vec<(Path, Vec<Vec<u8>>)>,
+    content_reads: Vec<(Path, ContentRead)>,
+}
+
+/// What one read-only attempt at an EF's contents came back with
+/// ([`crate::ef::read`]).
+///
+/// `Debug` prints sizes only: these octets can be an IMSI or an ICCID, and a
+/// `{:?}` of a tree must not put either in a log.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ContentRead {
+    /// The card answered; one element for a transparent EF, one per record
+    /// (record 1 first) for a linear fixed EF.
+    Records(Vec<Vec<u8>>),
+    /// The card refused the SELECT or the READ, with this status word.
+    Refused(Option<StatusWord>),
+}
+
+impl fmt::Debug for ContentRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Records(r) => write!(f, "Records({} redacted)", r.len()),
+            Self::Refused(sw) => write!(f, "Refused({sw:?})"),
+        }
+    }
 }
 
 impl Tree {
@@ -1113,6 +1137,20 @@ impl Tree {
             .iter()
             .find(|(known, _)| known == path)
             .map(|(_, records)| records.as_slice())
+    }
+
+    /// Records what [`crate::ef::read`] got back from the EF at `path`.
+    pub fn record_content_read(&mut self, path: Path, read: ContentRead) {
+        self.content_reads.retain(|(known, _)| *known != path);
+        self.content_reads.push((path, read));
+    }
+
+    /// What [`crate::ef::read`] got back from the EF at `path`, if it tried.
+    pub fn content_read(&self, path: &Path) -> Option<&ContentRead> {
+        self.content_reads
+            .iter()
+            .find(|(known, _)| known == path)
+            .map(|(_, read)| read)
     }
 
     /// What was found.
@@ -1918,6 +1956,7 @@ impl<'a> Builder<'a> {
             limits: self.options.limits,
             dialect: self.dialect.name().to_owned(),
             access_rule_files: Vec::new(),
+            content_reads: Vec::new(),
         }
     }
 
