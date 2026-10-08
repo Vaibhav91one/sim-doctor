@@ -1514,7 +1514,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     }
 
     // The security-relevant EFs' contents, read-only (SELECT, READ BINARY, READ
-    // RECORD), decoded later and only ever shown redacted.
+    // RECORD), decoded later and shown in full (key files included).
     if let Err(err) = ef::read(&mut *session, &mut tree, &session::Policy::default()) {
         return report_failure(
             &scan::Failure::new("ef-read-failed", err.to_string()),

@@ -1247,7 +1247,7 @@ pub fn to_json(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> Value {
         "refused": refused,
         "notes": notes,
         "files": files,
-        // Additive: the security-relevant EFs, decoded and redacted (src/ef.rs).
+        // Additive: the security-relevant EFs, decoded, full values (src/ef.rs).
         "ef_contents": ef::to_json(tree),
     });
 

@@ -1,5 +1,5 @@
 //! Elementary-file decoders: what the security-relevant EFs hold, as bounded,
-//! redacted evidence.
+//! full-value evidence.
 //!
 //! **Owns.** A map from a walked file to the decoder that reads it
 //! ([`classify`]), the pure decoders over bytes ([`decode`]), and the one
@@ -10,24 +10,14 @@
 //! ([`crate::access`], whose SELECT helper this reuses) or the rules that judge
 //! a file ([`crate::scan`]).
 //!
-//! # Redaction rule (binding)
+//! # Full visibility
 //!
-//! A decoded value is **evidence, not a dump**. The typed values in this module
-//! do hold the full digits (a rule or a test may need them), but nothing that
-//! leaves the module does:
-//!
-//! - **IMSI**: MCC + MNC (the MNC length from EF.AD byte 4, else assumed 2) and
-//!   the last 2 digits, and the digit count. Never the MSIN.
-//! - **ICCID**: the first 6 digits (industry identifier, country and issuer
-//!   prefix) and the last 2, and the digit count.
-//! - **MSISDN**: TON/NPI, the digit count and the last 2 digits. The alpha
-//!   identifier (a name) is never read out.
-//! - **EF.KEYS / EF.KEYSPS**: presence and access conditions only. The file is
-//!   never read by [`read`].
-//! - A value too short to hide anything (fewer than head + 4 digits) shows its
-//!   digit count only, in evidence and in JSON alike.
-//!
-//! [`Digits`]' `Debug` prints a count, so a stray `{:?}` cannot leak either.
+//! sim-doctor is an authorized tool run on the owner's own card, so nothing
+//! here is masked: IMSI, ICCID and MSISDN show every digit, and EF.Keys,
+//! EF.KeysPS (and any other key file) are read like any other EF with SELECT
+//! and READ BINARY and shown as hex. A read the card refuses is reported with
+//! its status word and never retried. Real card data is still never committed
+//! to the repo; tests use synthetic values.
 //!
 //! # Sources
 //!
@@ -72,13 +62,12 @@ impl fmt::Display for Malformed {
 
 /// Decimal digits that identify a subscriber or a card.
 ///
-/// Holds the whole value; every way out of this type is redacted except
-/// [`Digits::as_str`], whose name is the warning.
-#[derive(Clone, PartialEq, Eq)]
+/// Holds the whole value.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Digits(String);
 
 impl Digits {
-    /// The full value. For rules and tests; never for output.
+    /// The full value.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -91,30 +80,6 @@ impl Digits {
     /// Whether there are no digits (an unprovisioned file).
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// The first `head` digits and the last 2, with the count: the only form
-    /// evidence uses. A value too short to hide anything shows only its count.
-    pub fn redacted(&self, head: usize) -> String {
-        let n = self.0.len();
-        match self.parts(head) {
-            Some((first, last)) => format!("{first}..{last} ({n} digits)"),
-            None => format!("({n} digits)"),
-        }
-    }
-
-    /// The first `head` digits and the last 2, or `None` when the value is too
-    /// short to show anything without showing most of it (fewer than
-    /// `head + 4` digits). Every output path goes through this guard.
-    pub fn parts(&self, head: usize) -> Option<(&str, &str)> {
-        let n = self.0.len();
-        (n >= head + 4).then(|| (&self.0[..head], &self.0[n - 2..]))
-    }
-}
-
-impl fmt::Debug for Digits {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Digits({} redacted)", self.0.len())
     }
 }
 
@@ -137,9 +102,9 @@ pub enum Ef {
     Ust,
     /// EF.EST `6F56`, under an application.
     Est,
-    /// EF.Keys `6F08`: access conditions only.
+    /// EF.Keys `6F08`, read as raw bytes.
     Keys,
-    /// EF.KeysPS `6F09`: access conditions only.
+    /// EF.KeysPS `6F09`, read as raw bytes.
     KeysPs,
 }
 
@@ -147,8 +112,6 @@ pub enum Ef {
 enum Shape {
     Transparent,
     LinearFixed,
-    /// Never read.
-    Presence,
 }
 
 impl Ef {
@@ -171,7 +134,6 @@ impl Ef {
     const fn shape(self) -> Shape {
         match self {
             Self::Dir | Self::Msisdn => Shape::LinearFixed,
-            Self::Keys | Self::KeysPs => Shape::Presence,
             _ => Shape::Transparent,
         }
     }
@@ -546,12 +508,14 @@ pub enum Decoded {
     Ad(Ad),
     /// EF.SPN.
     Spn(Spn),
+    /// A key file (EF.Keys, EF.KeysPS): the bytes as read.
+    Raw(Vec<u8>),
     /// EF.UST or EF.EST.
     Services(Services),
 }
 
 /// Decodes the bytes read from an EF `ef` (a record per element for a linear
-/// fixed EF). `mnc_len` is EF.AD's, used only to redact an IMSI at the right place.
+/// fixed EF). `mnc_len` is EF.AD's, used only to split the IMSI into MCC/MNC.
 ///
 /// # Errors
 ///
@@ -584,7 +548,7 @@ pub fn decode(ef: Ef, records: &[Vec<u8>], mnc_len: Option<u8>) -> Result<Decode
                 .flatten()
                 .collect(),
         ),
-        Ef::Keys | Ef::KeysPs => return Err(Malformed("key files are never decoded")),
+        Ef::Keys | Ef::KeysPs => Decoded::Raw(first.to_vec()),
     })
 }
 
@@ -596,21 +560,26 @@ fn imsi_head(mnc_len: Option<u8>) -> usize {
     3 + usize::from(mnc_len.unwrap_or(2))
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
 impl Decoded {
-    /// The short, bounded, redacted line a finding or a report shows.
+    /// The short, bounded, full-value line a finding or a report shows.
     pub fn evidence(&self) -> String {
         match self {
-            Self::Iccid(d) => format!("ICCID {}", d.redacted(6)),
-            Self::Imsi(d, mnc) => format!("IMSI {}", d.redacted(imsi_head(*mnc))),
+            Self::Iccid(d) => format!("ICCID {}", d.as_str()),
+            Self::Imsi(d, _) => format!("IMSI {}", d.as_str()),
             Self::Msisdn(list) => format!(
                 "{} number(s){}",
                 list.len(),
                 list.first().map_or(String::new(), |m| format!(
                     ", first: TON/NPI {:02X}, {}",
                     m.ton_npi,
-                    m.number.redacted(0)
+                    m.number.as_str()
                 ))
             ),
+            Self::Raw(b) => hex(b),
             Self::Dir(apps) => {
                 let mut out = format!("{} application(s)", apps.len());
                 for a in apps.iter().take(EVIDENCE_ITEMS) {
@@ -663,21 +632,20 @@ impl Decoded {
         }
     }
 
-    /// The typed fields as JSON, redacted by the same rule as [`Decoded::evidence`].
+    /// The typed fields as JSON, full value, as in [`Decoded::evidence`].
     pub fn fields(&self) -> Value {
         match self {
             Self::Iccid(d) => json!({
                 "digits": d.len(),
-                "prefix": d.parts(6).map(|p| p.0),
-                "last2": d.parts(6).map(|p| p.1),
+                "iccid": d.as_str(),
             }),
             Self::Imsi(d, mnc) => {
                 let head = imsi_head(*mnc);
                 json!({
                     "digits": d.len(),
-                    "mcc_mnc": d.parts(head).map(|p| p.0),
+                    "imsi": d.as_str(),
+                    "mcc_mnc": d.as_str().get(..head),
                     "mnc_len_source": if mnc.is_some() { "EF.AD" } else { "assumed 2" },
-                    "last2": d.parts(head).map(|p| p.1),
                 })
             }
             Self::Msisdn(list) => json!({
@@ -685,9 +653,10 @@ impl Decoded {
                 "numbers": list.iter().map(|m| json!({
                     "ton_npi": format!("{:02X}", m.ton_npi),
                     "digits": m.number.len(),
-                    "last2": m.number.parts(0).map(|p| p.1),
+                    "number": m.number.as_str(),
                 })).collect::<Vec<_>>(),
             }),
+            Self::Raw(b) => json!({ "bytes": b.len(), "hex": hex(b) }),
             Self::Dir(apps) => json!({
                 "applications": apps.iter().map(|a| json!({
                     "aid": aid_hex(&a.aid),
@@ -723,8 +692,6 @@ impl Decoded {
 pub enum Outcome {
     /// Not read: the FCP gave no size, the read was not reached, or the walk stopped.
     NotRead,
-    /// Presence and access conditions only, by design.
-    PresenceOnly,
     /// The card refused the SELECT or READ.
     Refused(Option<crate::apdu::StatusWord>),
     /// Read, and not the layout the clause gives.
@@ -754,7 +721,6 @@ pub fn entries(tree: &Tree) -> Vec<Entry> {
         .map(|(node, ef)| {
             let path = node.path().clone();
             let outcome = match (ef.shape(), tree.content_read(&path)) {
-                (Shape::Presence, _) => Outcome::PresenceOnly,
                 (_, None) => Outcome::NotRead,
                 (_, Some(ContentRead::Refused(sw))) => Outcome::Refused(*sw),
                 (_, Some(ContentRead::Records(records))) => {
@@ -787,7 +753,7 @@ fn ad_mnc_len(tree: &Tree, imsi_path: &Path) -> Option<u8> {
 }
 
 impl Entry {
-    /// The entry as the `ef_contents` element of the scan JSON. Redacted.
+    /// The entry as the `ef_contents` element of the scan JSON.
     pub fn to_json(&self) -> Value {
         let mut v = json!({
             "path": self.path.to_string(),
@@ -799,7 +765,6 @@ impl Entry {
         });
         let (read, extra): (&str, Vec<(&str, Value)>) = match &self.outcome {
             Outcome::NotRead => ("not-read", vec![]),
-            Outcome::PresenceOnly => ("presence-only", vec![]),
             Outcome::Refused(sw) => (
                 "refused",
                 vec![("status", json!(sw.map(|s| s.to_string())))],
@@ -828,8 +793,8 @@ pub fn to_json(tree: &Tree) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Reads every recognised EF once and stores the bytes on the tree. Sends only
-/// SELECT, READ BINARY (`B0`) and READ RECORD (`B2`). EF.Keys and EF.KeysPS are
-/// never read by this function (the walk still SELECTs them for their FCP). A refusal is recorded and not retried.
+/// SELECT, READ BINARY (`B0`) and READ RECORD (`B2`), key files included. A
+/// refusal is recorded and not retried.
 ///
 /// # Errors
 ///
@@ -845,7 +810,6 @@ pub fn read<S: CardSession + ?Sized>(
             let shape = classify(node.path())?.shape();
             Some((node.path().clone(), shape, plan(node, shape)?))
         })
-        .filter(|(_, shape, _)| *shape != Shape::Presence)
         .collect();
     for (path, shape, (length, count)) in wanted {
         let outcome = read_one(session, &path, shape, length, count, policy)?;
@@ -866,7 +830,6 @@ fn plan(node: &Node, shape: Shape) -> Option<(u16, u8)> {
             [_, _, hi, lo, count, ..] => Some((u16::from_be_bytes([*hi, *lo]), *count)),
             _ => None,
         },
-        Shape::Presence => None,
     }
 }
 
@@ -924,7 +887,7 @@ mod tests {
         let d =
             decode_iccid(&[0x98, 0x99, 0x99, 0x21, 0x43, 0x65, 0x87, 0x09, 0x21, 0xF3]).unwrap();
         assert_eq!(d.as_str(), "8999991234567890123");
-        assert_eq!(d.redacted(6), "899999..23 (19 digits)");
+        assert_eq!(Decoded::Iccid(d).evidence(), "ICCID 8999991234567890123");
         assert!(decode_iccid(&[0x98; 9]).is_err());
         assert!(decode_iccid(&[0xAB; 10]).is_err());
     }
@@ -953,37 +916,34 @@ mod tests {
     }
 
     #[test]
-    fn a_full_imsi_or_iccid_never_reaches_evidence_or_json_or_debug() {
+    fn full_imsi_iccid_msisdn_reach_evidence_json_and_debug() {
         let imsi = decode_imsi(&[0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98]).unwrap();
         let iccid =
             decode_iccid(&[0x98, 0x99, 0x99, 0x21, 0x43, 0x65, 0x87, 0x09, 0x21, 0xF3]).unwrap();
         let msisdn = decode_msisdn_record(&msisdn_record()).unwrap().unwrap();
         let all = [
             Decoded::Imsi(imsi.clone(), Some(2)),
-            Decoded::Imsi(imsi.clone(), None),
             Decoded::Iccid(iccid.clone()),
             Decoded::Msisdn(vec![msisdn.clone()]),
         ];
-        let mut text = String::new();
-        for d in &all {
-            text += &format!("{} {} {d:?}", d.evidence(), d.fields());
+        for (d, full) in all
+            .iter()
+            .zip([imsi.as_str(), iccid.as_str(), msisdn.number.as_str()])
+        {
+            let text = format!("{} {} {d:?}", d.evidence(), d.fields());
+            assert!(text.contains(full), "{full} missing from: {text}");
+            assert!(d.evidence().contains(full));
         }
-        for secret in [
-            imsi.as_str(),
-            iccid.as_str(),
-            msisdn.number.as_str(),
-            "123456789",
-            "34567890123",
-        ] {
-            assert!(!text.contains(secret), "{secret} leaked into: {text}");
-        }
-        assert_eq!(all[0].evidence(), "IMSI 00101..89 (15 digits)");
-        assert_eq!(all[1].evidence(), all[0].evidence());
-        // A 3-digit MNC from EF.AD moves the cut by one digit.
-        assert_eq!(
-            Decoded::Imsi(imsi, Some(3)).evidence(),
-            "IMSI 001010..89 (15 digits)"
-        );
+        assert_eq!(all[0].evidence(), "IMSI 001010123456789");
+        assert_eq!(all[0].fields()["mcc_mnc"], "00101");
+        assert_eq!(Decoded::Imsi(imsi, Some(3)).fields()["mcc_mnc"], "001010");
+    }
+
+    #[test]
+    fn key_files_decode_to_their_bytes() {
+        let d = decode(Ef::Keys, &[vec![0x07, 0xAB, 0xCD]], None).unwrap();
+        assert_eq!(d.evidence(), "07ABCD");
+        assert_eq!(d.fields()["hex"], "07ABCD");
     }
 
     fn msisdn_record() -> Vec<u8> {

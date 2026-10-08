@@ -177,35 +177,6 @@ fn hex_short(b: &[u8]) -> String {
     }
 }
 
-/// Instructions whose data field is a secret: PIN/PUK (20/24/26/28/2C), PUT KEY
-/// (D8) and EXTERNAL AUTHENTICATE (82, a cryptogram). AUTHENTICATE (88) carries
-/// RAND/AUTN in the command (not secret) but CK/IK in the response (secret).
-fn secret_command(cmd: &[u8]) -> bool {
-    cmd.len() > 4 && matches!(cmd[1], 0x20 | 0x24 | 0x26 | 0x28 | 0x2C | 0xD8 | 0x82)
-}
-
-fn redact_command(cmd: &[u8]) -> String {
-    if secret_command(cmd) {
-        format!(
-            "{} <{} bytes redacted>",
-            hex::encode_upper(&cmd[..4]),
-            cmd.len() - 4
-        )
-    } else {
-        hex::encode_upper(cmd)
-    }
-}
-
-fn redact_response(cmd: &[u8], rsp: &[u8]) -> String {
-    let secret = secret_command(cmd) || cmd.get(1) == Some(&0x88);
-    if secret && rsp.len() > 2 {
-        let n = rsp.len() - 2;
-        format!("<{n} bytes redacted> {}", hex::encode_upper(&rsp[n..]))
-    } else {
-        hex::encode_upper(rsp)
-    }
-}
-
 fn decode_one(sel: &mut Selected, step: Option<String>, cmd: &[u8], rsp: &[u8]) -> Decoded {
     let status =
         (rsp.len() >= 2).then(|| StatusWord::from_bytes([rsp[rsp.len() - 2], rsp[rsp.len() - 1]]));
@@ -220,8 +191,8 @@ fn decode_one(sel: &mut Selected, step: Option<String>, cmd: &[u8], rsp: &[u8]) 
     };
     Decoded {
         step,
-        command: redact_command(cmd),
-        response: redact_response(cmd, rsp),
+        command: hex::encode_upper(cmd),
+        response: hex::encode_upper(rsp),
         name,
         detail,
         status: status.map(|s| s.to_string()),
@@ -395,8 +366,8 @@ fn describe(
             0xD8 => n(
                 "GP PUT KEY",
                 format!(
-                    "key set version {p1:02X}, key id {p2:02X}, {} bytes (redacted)",
-                    data.len()
+                    "key set version {p1:02X}, key id {p2:02X}, key data {}",
+                    hex::encode_upper(data)
                 ),
             ),
             0xF2 => n(
@@ -522,11 +493,10 @@ fn describe(
                 0x28 => "ENABLE PIN",
                 _ => "UNBLOCK PIN",
             };
-            // PIN and PUK octets are secrets: length only, never the value.
             let d = if data.is_empty() {
                 "status query".into()
             } else {
-                format!("{} bytes (redacted)", data.len())
+                format!("value {}", hex::encode_upper(data))
             };
             n(name, format!("{}, {d}", key_ref(p2)))
         }
@@ -608,10 +578,7 @@ fn describe(
         ),
         0xE2 => n("APPEND RECORD", hex_short(data)),
         0xE4 => n("DELETE FILE", hex_short(data)),
-        0x82 => n(
-            "EXTERNAL AUTHENTICATE",
-            format!("{} bytes (redacted)", data.len()),
-        ),
+        0x82 => n("EXTERNAL AUTHENTICATE", hex::encode_upper(data)),
         0x04 => n("DEACTIVATE FILE", String::new()),
         0x44 => n("ACTIVATE FILE", String::new()),
         0xA2 => n("SEARCH RECORD", hex_short(data)),
@@ -676,11 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn pin_values_are_redacted_and_retries_decoded() {
+    fn pin_values_are_shown_in_full_and_retries_decoded() {
         let rows = run("002000010831323334FFFFFFFF\n63C2");
         assert_eq!(rows[0].name, "VERIFY PIN");
-        assert!(rows[0].detail.contains("redacted"));
-        assert!(!rows[0].detail.contains("31323334"));
+        assert!(rows[0].detail.contains("31323334FFFFFFFF"));
+        assert_eq!(rows[0].command, "002000010831323334FFFFFFFF");
         assert_eq!(rows[0].meaning, "verification failed, 2 tries left");
     }
 
@@ -729,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn secrets_never_reach_json() {
+    fn secrets_reach_json_in_full() {
         let rows = run("
             002000010831323334FFFFFFFF
             9000
@@ -746,10 +713,10 @@ mod tests {
             .map(|(i, r)| r.to_json(i + 1).to_string())
             .collect();
         for secret in ["31323334", "CAFEBABE", "DEADBEEF", "C1C2C3C4"] {
-            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains(secret), "{secret} missing: {out}");
         }
-        assert!(out.contains("bytes redacted>"));
-        assert!(out.contains("AABBCCDD")); // RAND is not a secret
+        assert!(!out.contains("redacted"));
+        assert!(out.contains("AABBCCDD"));
     }
 
     #[test]
