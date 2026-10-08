@@ -72,12 +72,14 @@ impl Card {
         }
     }
 
-    /// This card answers every ENVELOPE `6F 00` (issue #98).
+    /// This card alternates its ENVELOPE answer each probe, so the 20 calibration
+    /// probes tie 10/10 and no baseline is established (issue #101).
     fn tied_envelope(mut self) -> Self {
         self.tied_envelope = Some(0);
         self
     }
 
+    /// This card answers every ENVELOPE `6F 00` (issue #98).
     fn generic_envelope(mut self) -> Self {
         self.generic_envelope = true;
         self
