@@ -26,6 +26,7 @@
 pub const NAME: &str = "transport";
 
 pub mod pcsc;
+pub mod replay;
 
 use std::fmt;
 

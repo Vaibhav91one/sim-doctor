@@ -32,7 +32,7 @@ use sim_doctor::{
     skill, tar,
     transport::{
         pcsc::{Pcsc, PcscSession},
-        Error as TransportError, ReaderName, ReaderProvider,
+        replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
     },
     ts48,
     walk::{self, Limits},
@@ -1427,7 +1427,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         Err(failure) => return report_failure(&failure, args.json),
     };
 
-    let mut session = match PcscSession::open(reader) {
+    let session = match PcscSession::open(reader) {
         Ok(session) => session,
         Err(err) => {
             let kind = match err {
@@ -1444,6 +1444,25 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // even be opened has already failed above.
     let atr = session.atr().ok();
 
+    // Opt-in capture for issue #120: SIM_DOCTOR_RECORD=<path> logs every
+    // exchange of this scan (JSON lines, see transport::replay). The log is
+    // raw card output; it is never written unless the operator asks.
+    let mut session: Box<dyn CardSession> = match std::env::var_os("SIM_DOCTOR_RECORD") {
+        Some(path) => match record_log_file(&path) {
+            Ok(file) => Box::new(replay::Record::new(session, file)),
+            Err(err) => {
+                return report_failure(
+                    &scan::Failure::new(
+                        "record-log-unwritable",
+                        format!("SIM_DOCTOR_RECORD {}: {err}", path.to_string_lossy()),
+                    ),
+                    args.json,
+                )
+            }
+        },
+        None => Box::new(session),
+    };
+
     let options = walk::Options {
         addressing: walk::Addressing::PathFromMasterFile,
         // Spelled out rather than inherited: this is the set that can miss a
@@ -1456,7 +1475,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         ..walk::Options::default()
     };
 
-    let mut tree = match walk::walk(&mut session, &args.dialect.tag_set(), &options) {
+    let mut tree = match walk::walk(&mut *session, &args.dialect.tag_set(), &options) {
         Ok(tree) => tree,
         Err(err) => {
             return report_failure(
@@ -1468,7 +1487,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
 
     // EF.ARR, read-only (SELECT and READ RECORD), so that the access rules the
     // FCPs only reference can be decoded by the rules.
-    if let Err(err) = access::resolve(&mut session, &mut tree, &session::Policy::default()) {
+    if let Err(err) = access::resolve(&mut *session, &mut tree, &session::Policy::default()) {
         return report_failure(
             &scan::Failure::new("access-rules-failed", err.to_string()),
             args.json,
@@ -1490,7 +1509,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // 592 probes of two exchanges each - see src/tar.rs, which is where the
     // wire sequence, the bound and the differential are argued.
     let audit = match tar::audit_with(
-        &mut session,
+        &mut *session,
         &args.tar,
         &session::Policy::default(),
         args.terminal_profile,
@@ -1991,6 +2010,16 @@ fn open_fuzz_session(
         }
     };
     Ok((reader, session))
+}
+
+/// Creates (truncating) the `SIM_DOCTOR_RECORD` log. Its content is sensitive
+/// raw card data (ICCID, IMSI, file contents), so on unix it is owner-only 0600.
+fn record_log_file(path: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Runs `sim-doctor fuzz apdu`: CLA discovery (level 1) or CLA+INS discovery

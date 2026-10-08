@@ -171,6 +171,13 @@ behaviour, and are flagged as such so nobody generalises them.
 `.gitignore` blocks `*.key`, `*.der`, `*.crt`, `*.pem`, `*.pvk`, `profile.json`,
 `secrets.toml`. Keys, profiles, and PKI material stay out of git, always.
 
+`SIM_DOCTOR_RECORD=<path> sim-doctor scan ...` logs every APDU exchange of the scan
+as JSON lines (replayable through `transport::replay::Replay`, issue #120). The
+log is raw, sensitive card data (ICCID, IMSI, file contents): it is created
+0600 on unix, truncated on re-record, and must be reviewed before it is
+committed. If it cannot be created the scan fails with error kind
+`record-log-unwritable`.
+
 ---
 
 ## 3. The output contract
