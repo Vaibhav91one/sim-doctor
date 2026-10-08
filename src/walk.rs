@@ -1302,13 +1302,14 @@ pub fn walk<S: CardSession + ?Sized>(
     // is the only place a tree grows. Nothing here calls itself.
     while let Some(mut frame) = stack.pop() {
         let aid = frame.pending.next();
+        let in_adf = frame.path.adf().is_some();
         let next = if aid.is_none() {
-            // 7FF0..=7FFF are application aliases, never children (see
-            // `is_application_alias`): skip them without a probe.
+            // Inside an application 7FF0..=7FFF are aliases of it, never
+            // children (see `is_application_alias`): skip them without a probe.
             frame
                 .remaining
                 .by_ref()
-                .find(|id| !is_application_alias(*id))
+                .find(|id| !(in_adf && is_application_alias(*id)))
         } else {
             None
         };
@@ -1389,8 +1390,10 @@ pub fn walk<S: CardSession + ?Sized>(
     Ok(builder.into_tree())
 }
 
-/// Whether `id` is in 7FF0..=7FFF, which this walk treats as an alias of an
-/// application rather than a child file (issue #90).
+/// Whether `id` is in 7FF0..=7FFF, which this walk treats, beneath an
+/// application, as an alias of that application rather than a child file
+/// (issue #90). Under the master file they are still probed: swSIM exposes its
+/// USIM as `3F00/7FFF` and the corpus cards do the same.
 ///
 /// ETSI TS 102 221 clause 8.3 defines 7FFF as the special file identifier that
 /// selects the ADF of the current application (verified against V14.2.0). The
@@ -3617,23 +3620,55 @@ mod tests {
     }
 
     #[test]
-    fn application_aliases_7ff0_to_7fff_are_neither_probed_nor_descended() {
-        // A card whose 7FF0 and 7FFF answer as directories (the live USIM
-        // re-presented the whole application under 7FF0, issue #90).
-        let mut card = sample_card()
-            .with("3F00/7FF0", fcp(id("7FF0"), DIRECTORY_DESCRIPTOR, None))
-            .with("3F00/7FFF", fcp(id("7FFF"), DIRECTORY_DESCRIPTOR, None))
+    fn application_aliases_7ff0_to_7fff_are_not_followed_inside_an_application() {
+        let aid = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0xFF];
+        let mut record = tlv(0x61, &tlv(0x4F, &aid));
+        record.resize(0x20, 0xFF);
+        record.extend_from_slice(&[0x90, 0x00]);
+        let mut card = FakeCard::default()
+            .with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None))
             .with(
-                "3F00/7FFF/6F3A",
-                fcp(id("6F3A"), TRANSPARENT_DESCRIPTOR, Some(10)),
+                "3F00/2F00",
+                tlv(
+                    0x62,
+                    &[
+                        tlv(0x82, &[0x42, 0x21, 0x00, 0x20, 0x01]),
+                        tlv(0x83, &[0x2F, 0x00]),
+                    ]
+                    .concat(),
+                ),
+            )
+            .with("3F00/7FF0", fcp(id("7FF0"), DIRECTORY_DESCRIPTOR, None))
+            .with(
+                "3F00/7FF0/6F07",
+                fcp(id("6F07"), TRANSPARENT_DESCRIPTOR, Some(9)),
+            )
+            .with(
+                "3F00/7FF0/7FF0",
+                fcp(id("7FF0"), DIRECTORY_DESCRIPTOR, None),
+            )
+            .with(
+                "3F00/7FF0/7FFF",
+                fcp(id("7FFF"), DIRECTORY_DESCRIPTOR, None),
+            )
+            .script(&[0x00, 0xB2, 0x01, 0x04, 0x20], &record);
+        card.adfs.push((aid.to_vec(), path_segments("3F00/7FF0")));
+
+        let tree = walk(
+            &mut card,
+            &dialect(),
+            &options_for(&["2F00", "6F07", "7FF0", "7FFF"]),
+        )
+        .unwrap();
+
+        let app = "3F00/ADF:A0000000871002FFFF";
+        assert!(tree.contains(&path_of(&format!("{app}/6F07"))));
+        for alias in ["7FF0", "7FFF"] {
+            assert!(
+                !tree.contains(&path_of(&format!("{app}/{alias}"))),
+                "{alias} inside an application is an alias, not a child"
             );
-        let tree = walk(&mut card, &dialect(), &Options::default()).unwrap();
-        for alias in ["3F00/7FF0", "3F00/7FFF", "3F00/7FFF/6F3A"] {
-            let path: Path = alias.parse().unwrap();
-            assert!(!tree.contains(&path), "{alias} must not be walked");
         }
-        assert!(tree.at(&"3F00/7F20/6F3A".parse().unwrap()).is_some());
-        assert!(tree.is_complete());
     }
 
     #[test]
