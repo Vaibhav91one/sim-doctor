@@ -980,6 +980,11 @@ Implemented (issue #25): `sim-doctor ts48 compare` diffs a walked card against t
 pinned commit. The package itself is never committed (it carries public test keys); only the derived
 list is. Rules `ts48/file-missing`, `ts48/file-different` (low) and `ts48/file-extra` (info). Matching
 TS.48's file structure is not GCF or PTCRB conformance, and an operator SIM is not a TS.48 card.
+`ts48 compare` takes the same `--max-depth/--max-children/--max-nodes/--max-directories` flags as `scan`.
+
+Walk budget (issue #90): `--max-nodes` (default 16384) counts files the card SELECTED. Absent probes are
+recorded in the tree but spend no budget; walk time is bounded by `max_directories` x `max_children`
+(64 x 1280 probes by default). A real card is ~30 directories, so defaults must report `complete=true`.
 
 ---
 

@@ -623,9 +623,9 @@ fn walks_the_file_system_of_a_real_card() {
 
     // And the bounds themselves held.
     assert!(
-        report.nodes <= options.limits.max_nodes,
-        "{} nodes is past the bound of {}",
-        report.nodes,
+        report.selected <= options.limits.max_nodes,
+        "{} selected files is past the bound of {}",
+        report.selected,
         options.limits.max_nodes
     );
     assert!(

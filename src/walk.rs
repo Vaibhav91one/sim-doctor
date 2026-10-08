@@ -71,12 +71,14 @@
 //! this one, rather than replacing it.
 //!
 //! **The cost is bounded in time as well as memory.** Every probe creates
-//! exactly one node, so [`Limits::max_nodes`] is a bound on the total number of
-//! exchanges a walk can issue, not only on the size of what it returns. There is
-//! no configuration of [`Candidates`] that makes a walk longer than that, and a
-//! test asserts it. (Applications from EF.DIR add one SELECT for EF.DIR up
-//! front, up to sixteen READ RECORDs, and a second SELECT per probe under an
-//! application, so there the bound is twice `max_nodes`.)
+//! exactly one node, but [`Limits::max_nodes`] counts only the files the card
+//! selected (issue #90): an absent probe is recorded in the tree and costs an
+//! exchange, yet spends no budget, because a real card has ~30 directories and
+//! 1280 absent probes in each would exhaust any sane budget on nothing. The
+//! time bound is instead [`Limits::max_directories`] x [`Limits::max_children`]
+//! probes (64 x 1280 by default), since only an expanded directory is probed.
+//! (Applications from EF.DIR add one SELECT for EF.DIR up front, up to sixteen
+//! READ RECORDs, and a second SELECT per probe under an application.)
 //!
 //! **Applications.** A UICC exposes USIM and ISIM as applications selected by
 //! AID, listed in EF.DIR (`2F00`, ETSI TS 102 221 clause 13.1), not as a DF under
@@ -122,10 +124,10 @@ pub const DEFAULT_MAX_DEPTH: usize = 16;
 
 /// How many files a walk records unless told otherwise.
 ///
-/// Sixteen thousand. A card with a full USIM application is a few hundred
-/// files, so this is two orders of magnitude above a real card and exists only
-/// so that a card advertising an unbounded tree produces a bounded tree and a
-/// [`Note::Limit`].
+/// Sixteen thousand files the card SELECTED; absent probes do not count. A card
+/// with a full USIM application is a few hundred files, so this is two orders
+/// of magnitude above a real card and exists only so that a card advertising an
+/// unbounded tree produces a bounded tree and a [`Note::Limit`].
 pub const DEFAULT_MAX_NODES: usize = 16_384;
 
 /// How many directories a walk expands unless told otherwise.
@@ -404,7 +406,8 @@ pub struct Limits {
     /// Most identifiers probed under one directory.
     pub max_children: usize,
 
-    /// Most files recorded in the tree, across the whole walk.
+    /// Most files the card selected, across the whole walk (absent probes are
+    /// recorded but not counted).
     pub max_nodes: usize,
 
     /// Most directories whose children will be enumerated.
@@ -1309,7 +1312,7 @@ pub fn walk<S: CardSession + ?Sized>(
             continue;
         }
 
-        if builder.nodes.len() >= options.limits.max_nodes {
+        if builder.selected >= options.limits.max_nodes {
             frame.stopped_by = Some(Limit::Nodes);
             builder.finish(frame);
             continue;
@@ -1782,6 +1785,8 @@ struct Builder<'a> {
     options: &'a Options,
     dialect: &'a TagSet,
     nodes: Vec<Node>,
+    /// Nodes the card selected: the only ones `max_nodes` counts.
+    selected: usize,
     directories: usize,
     truncated_by: Option<Limit>,
     limits_hit: Vec<Limit>,
@@ -1793,6 +1798,7 @@ impl<'a> Builder<'a> {
             options,
             dialect,
             nodes: Vec::new(),
+            selected: 0,
             // The master file is already being enumerated.
             directories: 1,
             truncated_by: None,
@@ -1802,6 +1808,7 @@ impl<'a> Builder<'a> {
 
     fn push(&mut self, path: Path, state: NodeState, notes: Vec<Note>) -> NodeId {
         let id = NodeId(self.nodes.len());
+        self.selected += usize::from(state.is_selected());
         self.nodes.push(Node {
             id,
             path,
@@ -2736,7 +2743,11 @@ mod tests {
         };
         let tree = walk(&mut card, &dialect(), &nodes).unwrap();
         assert_eq!(tree.report().truncated_by, Some(Limit::Nodes));
-        assert_eq!(tree.len(), 3, "the tree stops at the bound, not past it");
+        assert_eq!(
+            tree.report().selected,
+            3,
+            "the budget counts selected files and stops at the bound, not past it"
+        );
 
         let mut card = sample_card();
         let directories = Options {
@@ -3581,10 +3592,28 @@ mod tests {
     }
 
     #[test]
-    fn the_number_of_exchanges_a_walk_issues_is_bounded_by_its_node_bound() {
-        // A card that answers every single probe with a directory. Every probe
-        // creates a node, so the node bound is also the exchange bound and a
-        // hostile card cannot make a scan long in time as well as in memory.
+    fn absent_probes_do_not_spend_the_node_budget() {
+        // Four files exist; the default candidates probe 1280 identifiers per
+        // directory. A budget of 5 files must complete (issue #90).
+        let mut card = sample_card();
+        let options = Options {
+            limits: Limits {
+                max_nodes: 5,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        let tree = walk(&mut card, &dialect(), &options).unwrap();
+        assert!(tree.len() > 1000, "absent probes are still recorded");
+        assert!(tree.is_complete(), "{:?}", tree.limits_hit());
+    }
+
+    #[test]
+    fn the_number_of_exchanges_a_walk_issues_is_bounded_by_directories_times_children() {
+        // A card that answers every single probe with a directory. Absent
+        // probes spend no node budget (issue #90), so the exchange bound is
+        // max_directories x max_children and a hostile card cannot make a scan
+        // long in time as well as in memory.
         let mut card =
             FakeCard::default().with("3F00", fcp(FileId::MASTER_FILE, DIRECTORY_DESCRIPTOR, None));
         for high in [0x2Fu8, 0x4F, 0x5F, 0x6F, 0x7F] {
@@ -3616,13 +3645,12 @@ mod tests {
         let tree = walk(&mut card, &dialect(), &options).unwrap();
 
         let selects = card.with_instruction(0xA4).len();
-        // One more than the node bound: the EF.DIR probe that finds applications.
+        // Plus the master file and the EF.DIR probe that finds applications.
+        let bound = limits.max_directories * limits.max_children + 2;
         assert!(
-            selects <= limits.max_nodes + 1,
-            "{selects} SELECTs against a node bound of {}",
-            limits.max_nodes
+            selects <= bound,
+            "{selects} SELECTs against a bound of {bound}"
         );
-        assert!(selects <= limits.max_nodes + limits.max_directories);
         assert!(!tree.is_complete());
         assert!(tree.truncated_by().is_some());
     }
@@ -3718,7 +3746,7 @@ mod tests {
                 // Deep enough to reach the depth bound first, small enough that
                 // the node bound is then hit as well. The point of the test is
                 // that BOTH are reported.
-                max_nodes: 1100,
+                max_nodes: 300,
                 max_directories: 64,
                 ..Limits::default()
             },

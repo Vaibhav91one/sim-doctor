@@ -325,7 +325,9 @@ fn corpus() -> Vec<Case> {
             tight,
             vec![msl0_finding()],
             false,
-            2,
+            // Two selected files spend the budget of 2; the probe that finds
+            // the budget spent is recorded too.
+            3,
         ),
         case(
             "dialect-ts-102-221",
