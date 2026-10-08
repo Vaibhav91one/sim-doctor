@@ -444,9 +444,9 @@ READ BINARY and READ RECORD only, each as `{path, ef, access, read, evidence, fi
 **Redaction is binding:** an IMSI shows MCC + MNC (MNC length from EF.AD, else 2) and its last 2
 digits; an ICCID its first 6 and last 2; an MSISDN its TON/NPI, digit count and last 2. Never a
 full IMSI/ICCID/MSISDN in output, tests, fixtures or docs. EF.Keys and EF.KeysPS are reported as
-presence and access conditions only and are never read. `identity/readable-without-pin` fires
-from the access rule alone (IMSI medium, MSISDN low; the IMSI is also seen by
-`filesystem/sensitive-ef-always`). `read` is `decoded`, `refused` (with the status word),
+presence and access conditions only and are never read by `ef::read`. `identity/readable-without-pin` fires
+from the access rule alone and covers the MSISDN only (low); the IMSI stays with
+`filesystem/sensitive-ef-always`, so one fact is never scored twice. `read` is `decoded`, `refused` (with the status word),
 `malformed`, `not-read` or `presence-only`.
 
 ### TAR scanning and MSL=0

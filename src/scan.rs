@@ -429,26 +429,23 @@ pub const PIN1_DISABLED_RULE: &str = "auth/pin1-disabled";
 /// The ID of the identity-readable rule.
 pub const IDENTITY_READABLE_RULE: &str = "identity/readable-without-pin";
 
-/// The IMSI and MSISDN files readable under ALWays.
+/// EF.MSISDN readable under ALWays (low).
 ///
-/// TS 31.102 gives EF.IMSI READ PIN (clause 4.2.2); EF.MSISDN is READ PIN too
-/// (clause 4.2.26). Decided from the access rule alone, so it needs no read of
-/// the file and holds when the read is refused. **Medium for the IMSI** (it
-/// identifies the subscriber to anyone holding the card), **low for the
-/// MSISDN**. The IMSI is also covered by `filesystem/sensitive-ef-always`; this
-/// rule is the identity-focused view and also covers the MSISDN. Evidence is
-/// the path and the access rule, never the value.
+/// EF.MSISDN is READ PIN in TS 31.102 clause 4.2.26. Decided from the access
+/// rule alone, so it needs no read of the file. **The IMSI is deliberately not
+/// here**: `filesystem/sensitive-ef-always` already owns it, and a second
+/// finding would score one fact twice. Evidence is the path and the access
+/// rule, never the value.
 fn identity_readable(subject: &Subject<'_>) -> Vec<rules::Finding> {
     subject
         .tree
         .selected()
         .filter_map(|node| {
             let ef = ef::classify(node.path())?;
-            let severity = match ef {
-                ef::Ef::Imsi => rules::Severity::Medium,
-                ef::Ef::Msisdn => rules::Severity::Low,
-                _ => return None,
-            };
+            if ef != ef::Ef::Msisdn {
+                return None;
+            }
+            let severity = rules::Severity::Low;
             let access = access::access_of(subject.tree, node)?;
             (access.read == access::Condition::Always).then(|| {
                 rules::Finding::new(
@@ -472,10 +469,8 @@ fn identity_readable(subject: &Subject<'_>) -> Vec<rules::Finding> {
 
 fn identity_evidence(subject: &Subject<'_>) -> bool {
     subject.tree.selected().any(|node| {
-        matches!(
-            ef::classify(node.path()),
-            Some(ef::Ef::Imsi | ef::Ef::Msisdn)
-        ) && access::access_of(subject.tree, node).is_some()
+        ef::classify(node.path()) == Some(ef::Ef::Msisdn)
+            && access::access_of(subject.tree, node).is_some()
     })
 }
 
@@ -529,7 +524,7 @@ fn sensitive_name(node: &walk::Node) -> Option<&'static str> {
 /// **High when UPDATE is open, medium when only READ is.** Open UPDATE lets
 /// anyone holding the card rewrite the identity or the keys; open READ only
 /// exposes them. Evidence is the file path (the location) and the decoded
-/// access rule; the file's contents are never read.
+/// access rule; this rule never reads the file's contents.
 fn sensitive_ef_always(subject: &Subject<'_>) -> Vec<rules::Finding> {
     subject
         .tree
@@ -695,7 +690,7 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             rules::RuleSpec::new(
                 rules::RuleId::new(IDENTITY_READABLE_RULE).expect("a validated constant"),
                 rules::Severity::Medium,
-                "the IMSI or MSISDN is readable without a PIN (TS 31.102 gives both a PIN READ condition)",
+                "the MSISDN is readable without a PIN (TS 31.102 gives it a PIN READ condition)",
             )
             .with_remediation(
                 "set the file's READ access rule (its EF.ARR record) to PIN, then re-scan",

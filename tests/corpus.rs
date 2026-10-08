@@ -461,7 +461,6 @@ fn corpus() -> Vec<Case> {
             vec![
                 (scan::PIN1_DISABLED_RULE, file("3F00/7FFF")),
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F07")),
-                (scan::IDENTITY_READABLE_RULE, file("3F00/7FFF/6F07")),
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F08")),
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F7E")),
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/5F3B/4F20")),
@@ -800,4 +799,45 @@ fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
     assert!(tree
         .content_read(&"3F00/7FFF/6F08".parse().unwrap())
         .is_none());
+}
+
+#[test]
+fn a_short_malformed_iccid_is_not_leaked_by_the_scan_json() {
+    // 8 digits "89123456" (swapped nibbles, F-padded to 10 octets): too short to redact.
+    let iccid = [0x98, 0x21, 0x43, 0x65, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    let mut card = Card::new(false)
+        .file("3F00", Fcp::Ts102221, None)
+        .transparent("3F00/2FE2", &iccid);
+    let options = walk::Options {
+        candidates: Candidates::List(vec!["2FE2".parse().unwrap()]),
+        ..walk::Options::default()
+    };
+    let mut tree = walk::walk(&mut card, &Dialect::Ts102221.tag_set(), &options).expect("walk");
+    ef::read(&mut card, &mut tree, &Policy::default()).expect("ef contents");
+    let audit = tar::audit(
+        &mut card,
+        &Selection::focused(),
+        &Policy::default(),
+        &mut || false,
+    )
+    .expect("tar audit");
+    let found = scan::findings(&Subject {
+        tree: &tree,
+        tar: &audit,
+        scp03: None,
+    })
+    .expect("rules");
+    let verdict = scan::Verdict::new(found, scan::rules_run());
+    let context = scan::Context::new(
+        "corpus card",
+        None,
+        Dialect::Ts102221,
+        options.candidates.clone(),
+        options.limits,
+    );
+    let text = scan::to_json(&tree, &context, &verdict).to_string();
+    assert!(text.contains("ICCID (8 digits)"), "{text}");
+    for secret in ["89123456", "8912", "3456"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
 }

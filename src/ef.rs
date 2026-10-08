@@ -23,7 +23,9 @@
 //! - **MSISDN**: TON/NPI, the digit count and the last 2 digits. The alpha
 //!   identifier (a name) is never read out.
 //! - **EF.KEYS / EF.KEYSPS**: presence and access conditions only. The file is
-//!   not read.
+//!   never read by [`read`].
+//! - A value too short to hide anything (fewer than head + 4 digits) shows its
+//!   digit count only, in evidence and in JSON alike.
 //!
 //! [`Digits`]' `Debug` prints a count, so a stray `{:?}` cannot leak either.
 //!
@@ -95,10 +97,18 @@ impl Digits {
     /// evidence uses. A value too short to hide anything shows only its count.
     pub fn redacted(&self, head: usize) -> String {
         let n = self.0.len();
-        if n < head + 4 {
-            return format!("({n} digits)");
+        match self.parts(head) {
+            Some((first, last)) => format!("{first}..{last} ({n} digits)"),
+            None => format!("({n} digits)"),
         }
-        format!("{}..{} ({n} digits)", &self.0[..head], &self.0[n - 2..])
+    }
+
+    /// The first `head` digits and the last 2, or `None` when the value is too
+    /// short to show anything without showing most of it (fewer than
+    /// `head + 4` digits). Every output path goes through this guard.
+    pub fn parts(&self, head: usize) -> Option<(&str, &str)> {
+        let n = self.0.len();
+        (n >= head + 4).then(|| (&self.0[..head], &self.0[n - 2..]))
     }
 }
 
@@ -392,7 +402,8 @@ impl OperationMode {
 pub struct Ad {
     /// Octet 1.
     pub mode: OperationMode,
-    /// The ciphering indicator, octet 3 b1. [U] Position taken from pySim's
+    /// The ciphering indicator, octet 3 b1. Decoded but NOT emitted in evidence
+    /// or JSON while unverified. [U] Position taken from pySim's
     /// `EF_AD` test vector `01000102` (octets 2-3 read as a 16-bit flag word
     /// whose bit 0 is the indicator), not from the spec text.
     pub ciphering_indicator: bool,
@@ -614,10 +625,9 @@ impl Decoded {
                 out
             }
             Self::Ad(ad) => format!(
-                "mode={} mnc_len={} ciphering_indicator={}",
+                "mode={} mnc_len={}",
                 ad.mode.label(),
-                ad.mnc_len.map_or("absent".to_owned(), |n| n.to_string()),
-                if ad.ciphering_indicator { "on" } else { "off" }
+                ad.mnc_len.map_or("absent".to_owned(), |n| n.to_string())
             ),
             Self::Spn(s) => format!(
                 "display_condition={:02X} name={:?}",
@@ -658,16 +668,16 @@ impl Decoded {
         match self {
             Self::Iccid(d) => json!({
                 "digits": d.len(),
-                "prefix": d.as_str().get(..6),
-                "last2": d.as_str().get(d.len().saturating_sub(2)..),
+                "prefix": d.parts(6).map(|p| p.0),
+                "last2": d.parts(6).map(|p| p.1),
             }),
             Self::Imsi(d, mnc) => {
                 let head = imsi_head(*mnc);
                 json!({
                     "digits": d.len(),
-                    "mcc_mnc": d.as_str().get(..head),
+                    "mcc_mnc": d.parts(head).map(|p| p.0),
                     "mnc_len_source": if mnc.is_some() { "EF.AD" } else { "assumed 2" },
-                    "last2": d.as_str().get(d.len().saturating_sub(2)..).filter(|_| d.len() >= head + 2),
+                    "last2": d.parts(head).map(|p| p.1),
                 })
             }
             Self::Msisdn(list) => json!({
@@ -675,7 +685,7 @@ impl Decoded {
                 "numbers": list.iter().map(|m| json!({
                     "ton_npi": format!("{:02X}", m.ton_npi),
                     "digits": m.number.len(),
-                    "last2": m.number.as_str().get(m.number.len().saturating_sub(2)..),
+                    "last2": m.number.parts(0).map(|p| p.1),
                 })).collect::<Vec<_>>(),
             }),
             Self::Dir(apps) => json!({
@@ -691,7 +701,6 @@ impl Decoded {
                     _ => None,
                 },
                 "mnc_len": ad.mnc_len,
-                "ciphering_indicator": ad.ciphering_indicator,
             }),
             Self::Spn(s) => json!({
                 "display_condition": format!("{:02X}", s.display_condition),
@@ -820,7 +829,7 @@ pub fn to_json(tree: &Tree) -> Value {
 
 /// Reads every recognised EF once and stores the bytes on the tree. Sends only
 /// SELECT, READ BINARY (`B0`) and READ RECORD (`B2`). EF.Keys and EF.KeysPS are
-/// never selected. A refusal is recorded and not retried.
+/// never read by this function (the walk still SELECTs them for their FCP). A refusal is recorded and not retried.
 ///
 /// # Errors
 ///
