@@ -1831,6 +1831,9 @@ fn run_trace(args: &TraceArgs) -> contract::ExitCode {
         Ok(pairs) => trace::decode(&pairs),
         Err(message) => return refuse(message),
     };
+    if rows.last().is_some_and(|r| r.response.is_empty()) {
+        eprintln!("sim-doctor: warning: the trace ends on a command with no response (odd number of hex lines?)");
+    }
     let rendered = if args.json {
         let exchanges: Vec<_> = rows
             .iter()

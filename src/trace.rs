@@ -177,6 +177,35 @@ fn hex_short(b: &[u8]) -> String {
     }
 }
 
+/// Instructions whose data field is a secret: PIN/PUK (20/24/26/28/2C), PUT KEY
+/// (D8) and EXTERNAL AUTHENTICATE (82, a cryptogram). AUTHENTICATE (88) carries
+/// RAND/AUTN in the command (not secret) but CK/IK in the response (secret).
+fn secret_command(cmd: &[u8]) -> bool {
+    cmd.len() > 4 && matches!(cmd[1], 0x20 | 0x24 | 0x26 | 0x28 | 0x2C | 0xD8 | 0x82)
+}
+
+fn redact_command(cmd: &[u8]) -> String {
+    if secret_command(cmd) {
+        format!(
+            "{} <{} bytes redacted>",
+            hex::encode_upper(&cmd[..4]),
+            cmd.len() - 4
+        )
+    } else {
+        hex::encode_upper(cmd)
+    }
+}
+
+fn redact_response(cmd: &[u8], rsp: &[u8]) -> String {
+    let secret = secret_command(cmd) || cmd.get(1) == Some(&0x88);
+    if secret && rsp.len() > 2 {
+        let n = rsp.len() - 2;
+        format!("<{n} bytes redacted> {}", hex::encode_upper(&rsp[n..]))
+    } else {
+        hex::encode_upper(rsp)
+    }
+}
+
 fn decode_one(sel: &mut Selected, step: Option<String>, cmd: &[u8], rsp: &[u8]) -> Decoded {
     let status =
         (rsp.len() >= 2).then(|| StatusWord::from_bytes([rsp[rsp.len() - 2], rsp[rsp.len() - 1]]));
@@ -191,8 +220,8 @@ fn decode_one(sel: &mut Selected, step: Option<String>, cmd: &[u8], rsp: &[u8]) 
     };
     Decoded {
         step,
-        command: hex::encode_upper(cmd),
-        response: hex::encode_upper(rsp),
+        command: redact_command(cmd),
+        response: redact_response(cmd, rsp),
         name,
         detail,
         status: status.map(|s| s.to_string()),
@@ -249,6 +278,7 @@ fn key_ref(p2: u8) -> String {
     match p2 {
         0x01..=0x08 => format!("PIN appl {p2}"),
         0x0A..=0x0E => format!("ADM {}", p2 - 9),
+        0x8A..=0x8E => format!("ADM {}", p2 - 0x84),
         0x11 => "universal PIN".into(),
         0x81..=0x88 => format!("2nd PIN appl {}", p2 - 0x80),
         _ => format!("key ref {p2:02X}"),
@@ -325,9 +355,10 @@ fn describe(
     let [cla, ins, p1, p2] = h;
     let ok = sw.is_some_and(|s| s.is_normal_processing());
     // GET STATUS shares INS F2 with UICC STATUS; P1 tells them apart.
-    let gp = (matches!(cla, 0x80 | 0x84 | 0x00)
-        && matches!(ins, 0xE6 | 0xE8 | 0xD8 | 0xE2 | 0xE4 | 0xF0 | 0x50 | 0x82))
-        || (matches!(cla, 0x80 | 0x84) && ins == 0xF2 && matches!(p1, 0x80 | 0x40 | 0x20 | 0x10));
+    // GP only at CLA 80/84; CLA 00 E2/E4/82 are ISO (APPEND RECORD, DELETE FILE, EXTERNAL AUTHENTICATE).
+    let gp = matches!(cla, 0x80 | 0x84)
+        && (matches!(ins, 0xE6 | 0xE8 | 0xD8 | 0xE2 | 0xE4 | 0xF0 | 0x50 | 0x82)
+            || (ins == 0xF2 && matches!(p1, 0x80 | 0x40 | 0x20 | 0x10)));
     let n = |s: &str, d: String| (s.to_owned(), d);
     if gp {
         return match ins {
@@ -576,6 +607,11 @@ fn describe(
             format!("{} channel {p2}", if p1 == 0 { "open" } else { "close" }),
         ),
         0xE2 => n("APPEND RECORD", hex_short(data)),
+        0xE4 => n("DELETE FILE", hex_short(data)),
+        0x82 => n(
+            "EXTERNAL AUTHENTICATE",
+            format!("{} bytes (redacted)", data.len()),
+        ),
         0x04 => n("DEACTIVATE FILE", String::new()),
         0x44 => n("ACTIVATE FILE", String::new()),
         0xA2 => n("SEARCH RECORD", hex_short(data)),
@@ -689,5 +725,45 @@ mod tests {
     #[test]
     fn bad_hex_is_an_error() {
         assert!(parse("zz").is_err());
+        assert!(parse("A0A\n9000").is_err()); // odd-length hex
+    }
+
+    #[test]
+    fn secrets_never_reach_json() {
+        let rows = run("
+            002000010831323334FFFFFFFF
+            9000
+            80D80000 04 CAFEBABE
+            9000
+            0082000008 DEADBEEF01020304
+            9000
+            008800 0010 AABBCCDDEEFF00112233445566778899
+            DB08 C1C2C3C4C5C6C7C8 9000
+        ");
+        let out: String = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r.to_json(i + 1).to_string())
+            .collect();
+        for secret in ["31323334", "CAFEBABE", "DEADBEEF", "C1C2C3C4"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("bytes redacted>"));
+        assert!(out.contains("AABBCCDD")); // RAND is not a secret
+    }
+
+    #[test]
+    fn iso_cla_00_is_not_labelled_gp() {
+        let rows = run("00E2000002AABB\n9000\n00E4000002AABB\n9000\n0082000002AABB\n9000");
+        assert_eq!(rows[0].name, "APPEND RECORD");
+        assert_eq!(rows[1].name, "DELETE FILE");
+        assert_eq!(rows[2].name, "EXTERNAL AUTHENTICATE");
+    }
+
+    #[test]
+    fn truncated_apdu_is_an_unknown_row_and_does_not_desync() {
+        let rows = run("00A4\n6700\n00A40000023F00\n9000");
+        assert_eq!(rows[0].name, "UNKNOWN");
+        assert_eq!(rows[1].selected, "3F00");
     }
 }
