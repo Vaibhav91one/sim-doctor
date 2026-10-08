@@ -205,9 +205,16 @@ fn interrupt(args: &[&str]) -> Run {
 /// [`interrupt`] with a chosen signal.
 #[cfg(unix)]
 fn interrupt_with(args: &[&str], signal: libc::c_int) -> Run {
+    interrupt_env(args, signal, &[])
+}
+
+/// [`interrupt_with`] plus extra environment for the child.
+#[cfg(unix)]
+fn interrupt_env(args: &[&str], signal: libc::c_int, env: &[(&str, &str)]) -> Run {
     let _guard = spawn_lock();
     let mut child = Command::new(binary())
         .args(hermetic(args))
+        .envs(env.iter().copied())
         .env("SIM_DOCTOR_TEST_SIGNAL_HOLD_MS", HOLD_MS.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -885,6 +892,28 @@ fn interrupting_a_scan_exits_130_and_emits_no_partial_tree() {
          reader it had found"
     );
     assert!(run.stderr.contains("interrupted"), "{:?}", run.stderr);
+}
+
+/// Issue #88: a command wedged where no checkpoint can run (standing in for a
+/// PC/SC transmit that never returns; `SIM_DOCTOR_TEST_WEDGE` blocks the main
+/// thread forever) still ends with exit 130 and one envelope, within seconds.
+#[test]
+#[cfg(unix)]
+fn a_scan_wedged_in_an_exchange_still_exits_130_within_seconds() {
+    let started = Instant::now();
+    let run = interrupt_env(
+        &["scan", "--json"],
+        libc::SIGINT,
+        &[("SIM_DOCTOR_TEST_WEDGE", "1")],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(run.status.signal(), None, "{:?}", run.status);
+    assert_eq!(run.code(), 130);
+    assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
 }
 
 /// Issue #59: SIGTERM is treated like SIGINT by a scan: checkpoint, exit 130.

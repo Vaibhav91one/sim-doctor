@@ -83,6 +83,23 @@ const PARKED_MARKER: &str = "parked at the interrupt checkpoint";
 /// what the tests that set it actually mean.
 static PARKED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only, and only honoured together with [`SIGNAL_HOLD_ENV`]: after parking,
+/// block this thread forever instead of polling the interrupt flag, standing in
+/// for a PC/SC transmit that never returns. Unset in every normal invocation.
+const WEDGE_ENV: &str = "SIM_DOCTOR_TEST_WEDGE";
+
+/// How long a card command gets to unwind on its own after SIGINT/SIGTERM
+/// before [`guard_exchange`] ends the process (issue #88).
+///
+/// Long enough for a transmit in flight to return and reach a checkpoint
+/// (the safe order, see `signals::install`), short enough to be "within seconds".
+const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
+
+/// Set once an interrupted envelope has been written, so the watchdog and the
+/// normal checkpoint path can never both write one.
+static INTERRUPT_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Parser)]
 #[command(
     name = "sim-doctor",
@@ -912,6 +929,12 @@ fn hold_for_the_signal_test() {
 
     eprintln!("sim-doctor: {PARKED_MARKER} for {milliseconds}ms");
 
+    if env::var_os(WEDGE_ENV).is_some() {
+        loop {
+            thread::park();
+        }
+    }
+
     let deadline = Instant::now() + Duration::from_millis(milliseconds);
     while Instant::now() < deadline {
         if signals::interrupted() {
@@ -921,6 +944,34 @@ fn hold_for_the_signal_test() {
     }
 }
 
+/// Makes a card command interruptible even while it is stuck inside an exchange
+/// (issue #88).
+///
+/// The signal handler only sets a flag, and the flag is read between steps, so a
+/// PC/SC transmit that never returns would block the run forever. This starts a
+/// watchdog thread: once the flag is set it waits [`INTERRUPT_GRACE`] for the
+/// command to unwind through its own checkpoints, and if the process is still
+/// alive it writes the interrupted envelope and exits 130 itself. Process exit
+/// closes the PC/SC socket, which releases the reader.
+///
+/// Why not `SCardCancel` (`pcsc::Context::cancel`): pcsc-lite documents it as
+/// cancelling pending `SCardGetStatusChange` calls only, and a transmit made
+/// through a `Card` is not on that path, so it would not unblock this. The
+/// watchdog is correct on both macOS and Linux without depending on either
+/// daemon's behaviour.
+fn guard_exchange(kind: &'static str, json: bool) {
+    let _ = thread::Builder::new()
+        .name("interrupt-watchdog".into())
+        .spawn(move || {
+            while !signals::interrupted() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            thread::sleep(INTERRUPT_GRACE);
+            let code = report_interrupted(kind, json);
+            process::exit(i32::from(code.process_code()));
+        });
+}
+
 /// Reports an interrupted run and returns [`contract::ExitCode::Interrupted`].
 ///
 /// Exactly one envelope under `--json`, carrying code 130 and an empty `data`,
@@ -928,6 +979,9 @@ fn hold_for_the_signal_test() {
 /// on [`contract::INTERRUPTED_MESSAGE`], and `tests/process_contract.rs` pins
 /// both halves of it.
 fn report_interrupted(kind: &str, json: bool) -> contract::ExitCode {
+    if INTERRUPT_REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return contract::ExitCode::Interrupted;
+    }
     if json {
         let envelope = contract::Envelope::new(
             kind,
@@ -1182,6 +1236,7 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 /// refusal that used to stand in for them is now reached only by real failures
 /// - no card, an unreadable baseline, an incomparable pair.
 fn run_scan(args: ScanArgs) -> contract::ExitCode {
+    guard_exchange(scan::KIND, args.json);
     // Read the baseline before a reader is opened, and refuse before one is.
     // A --baseline naming a file that is not there, is not JSON, or was written
     // by another format version has an answer before a card exists, and an
@@ -1517,6 +1572,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
 /// `sim-doctor gp info`: one read-only GlobalPlatform pass over one card.
 fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitCode {
     const KIND: &str = "gp";
+    guard_exchange(KIND, json);
     let refuse =
         |failure: scan::Failure| report_refusal(KIND, &failure.message, failure.data(), json);
     let readers = match Pcsc::readers() {
@@ -1593,6 +1649,7 @@ fn all_specs() -> Vec<rules::RuleSpec> {
 /// The walk is the one `run_scan` does (same candidates, same status meaning,
 /// same default bounds) and nothing after it touches the card: no TAR audit.
 fn run_ts48_compare(args: Ts48CompareArgs) -> contract::ExitCode {
+    guard_exchange(ts48::KIND, args.json);
     let fixture = match ts48::Fixture::bundled() {
         Ok(fixture) => fixture,
         Err(err) => {
