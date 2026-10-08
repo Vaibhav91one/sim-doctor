@@ -600,6 +600,13 @@ fn walks_the_file_system_of_a_real_card() {
         .filter(|node| node.state().is_selected())
         // Application files are addressed by AID, not by this two-level layout.
         .filter(|node| node.path().adf().is_none())
+        // Beneath a repeated DF the card answers for itself at every depth the
+        // bound allows (the node budget used to stop this early, #90), so skip
+        // any path that repeats an identifier.
+        .filter(|node| {
+            let ids = node.path().segments();
+            ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id))
+        })
         .filter(|node| {
             !node
                 .notes()
