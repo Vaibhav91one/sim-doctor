@@ -1,0 +1,1098 @@
+//! Elementary-file decoders: what the security-relevant EFs hold, as bounded,
+//! redacted evidence.
+//!
+//! **Owns.** A map from a walked file to the decoder that reads it
+//! ([`classify`]), the pure decoders over bytes ([`decode`]), and the one
+//! read-only step that fetches the bytes ([`read`]: SELECT, READ BINARY and
+//! READ RECORD, nothing else). Issues #108 and #102.
+//!
+//! **Does not own.** The tree ([`crate::walk`]), access conditions
+//! ([`crate::access`], whose SELECT helper this reuses) or the rules that judge
+//! a file ([`crate::scan`]).
+//!
+//! # Redaction rule (binding)
+//!
+//! A decoded value is **evidence, not a dump**. The typed values in this module
+//! do hold the full digits (a rule or a test may need them), but nothing that
+//! leaves the module does:
+//!
+//! - **IMSI**: MCC + MNC (the MNC length from EF.AD byte 4, else assumed 2) and
+//!   the last 2 digits, and the digit count. Never the MSIN.
+//! - **ICCID**: the first 6 digits (industry identifier, country and issuer
+//!   prefix) and the last 2, and the digit count.
+//! - **MSISDN**: TON/NPI, the digit count and the last 2 digits. The alpha
+//!   identifier (a name) is never read out.
+//! - **EF.KEYS / EF.KEYSPS**: presence and access conditions only. The file is
+//!   not read.
+//!
+//! [`Digits`]' `Debug` prints a count, so a stray `{:?}` cannot leak either.
+//!
+//! # Sources
+//!
+//! Layouts are from 3GPP TS 31.102 (USIM) and ETSI TS 51.011 (SIM) and ETSI
+//! TS 102 221, cited per decoder, cross-checked against pySim
+//! (`osmocom/pysim@3c437d4`, `ts_31_102.py`, GPL: layouts read, code written
+//! here). Each decoder's tests use bytes synthesised from the clause's layout.
+
+/// This module's name, as recorded in [`crate::MODULES`].
+pub const NAME: &str = "ef";
+
+use std::fmt;
+
+use serde_json::{json, Value};
+
+use crate::access::{self, Access};
+use crate::apdu::{Command, Header, Le};
+use crate::fs::{FileId, Path};
+use crate::session::{self, Policy};
+use crate::tlv::Stream;
+use crate::transport::CardSession;
+use crate::walk::{ContentRead, Node, Tree};
+
+/// The most records of one linear fixed EF read (EF.DIR and EF.MSISDN hold a
+/// handful).
+const MAX_RECORDS: usize = 16;
+/// The most octets of one transparent EF read. The longest decoded here is a
+/// service table (19 octets covers 146 UST services).
+const MAX_BINARY: u32 = 64;
+/// The most items an evidence string lists before saying "+N more".
+const EVIDENCE_ITEMS: usize = 24;
+
+/// A decoder could not read the bytes it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Malformed(pub &'static str);
+
+impl fmt::Display for Malformed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Decimal digits that identify a subscriber or a card.
+///
+/// Holds the whole value; every way out of this type is redacted except
+/// [`Digits::as_str`], whose name is the warning.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Digits(String);
+
+impl Digits {
+    /// The full value. For rules and tests; never for output.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// How many digits.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no digits (an unprovisioned file).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The first `head` digits and the last 2, with the count: the only form
+    /// evidence uses. A value too short to hide anything shows only its count.
+    pub fn redacted(&self, head: usize) -> String {
+        let n = self.0.len();
+        if n < head + 4 {
+            return format!("({n} digits)");
+        }
+        format!("{}..{} ({n} digits)", &self.0[..head], &self.0[n - 2..])
+    }
+}
+
+impl fmt::Debug for Digits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Digits({} redacted)", self.0.len())
+    }
+}
+
+/// The EFs this module understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ef {
+    /// EF.ICCID `2FE2`, under the master file.
+    Iccid,
+    /// EF.DIR `2F00`, under the master file.
+    Dir,
+    /// EF.IMSI `6F07`.
+    Imsi,
+    /// EF.MSISDN `6F40`.
+    Msisdn,
+    /// EF.AD `6FAD`.
+    Ad,
+    /// EF.SPN `6F46`.
+    Spn,
+    /// EF.UST `6F38`, under an application.
+    Ust,
+    /// EF.EST `6F56`, under an application.
+    Est,
+    /// EF.Keys `6F08`: access conditions only.
+    Keys,
+    /// EF.KeysPS `6F09`: access conditions only.
+    KeysPs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Transparent,
+    LinearFixed,
+    /// Never read.
+    Presence,
+}
+
+impl Ef {
+    /// The name evidence and JSON use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Iccid => "EF.ICCID",
+            Self::Dir => "EF.DIR",
+            Self::Imsi => "EF.IMSI",
+            Self::Msisdn => "EF.MSISDN",
+            Self::Ad => "EF.AD",
+            Self::Spn => "EF.SPN",
+            Self::Ust => "EF.UST",
+            Self::Est => "EF.EST",
+            Self::Keys => "EF.Keys",
+            Self::KeysPs => "EF.KeysPS",
+        }
+    }
+
+    const fn shape(self) -> Shape {
+        match self {
+            Self::Dir | Self::Msisdn => Shape::LinearFixed,
+            Self::Keys | Self::KeysPs => Shape::Presence,
+            _ => Shape::Transparent,
+        }
+    }
+}
+
+/// Which decoder, if any, reads the file at `path`.
+///
+/// By identifier plus where it sits, because an identifier is only meaningful
+/// under its directory: `6F38` is EF.UST under an application and EF.SST under
+/// DF.GSM `7F20` (not decoded here). An application is a path with an AID or,
+/// as the corpus cards and `7FFF` aliases have it, a directory `7FFF`.
+pub fn classify(path: &Path) -> Option<Ef> {
+    let seg = path.segments();
+    let leaf = path.leaf().to_bytes();
+    let (adf, gsm, telecom, mf) = match seg.len() {
+        2 => (path.adf().is_some(), false, false, path.adf().is_none()),
+        n if n >= 3 => {
+            let parent = seg[n - 2].to_bytes();
+            (
+                parent == [0x7F, 0xFF],
+                parent == [0x7F, 0x20],
+                parent == [0x7F, 0x10],
+                false,
+            )
+        }
+        _ => return None,
+    };
+    match leaf {
+        [0x2F, 0xE2] if mf => Some(Ef::Iccid),
+        [0x2F, 0x00] if mf => Some(Ef::Dir),
+        [0x6F, 0x07] if adf || gsm => Some(Ef::Imsi),
+        [0x6F, 0xAD] if adf || gsm => Some(Ef::Ad),
+        [0x6F, 0x46] if adf || gsm => Some(Ef::Spn),
+        [0x6F, 0x40] if adf || telecom => Some(Ef::Msisdn),
+        [0x6F, 0x38] if adf => Some(Ef::Ust),
+        [0x6F, 0x56] if adf => Some(Ef::Est),
+        [0x6F, 0x08] if adf => Some(Ef::Keys),
+        [0x6F, 0x09] if adf => Some(Ef::KeysPs),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoders (pure)
+// ---------------------------------------------------------------------------
+
+/// Digits from nibbles, stopping at the `F` filler.
+fn digits_of(nibbles: impl Iterator<Item = u8>) -> Result<String, Malformed> {
+    let mut out = String::new();
+    for n in nibbles {
+        match n {
+            0..=9 => out.push(char::from(b'0' + n)),
+            0xF => break,
+            _ => return Err(Malformed("a nibble that is not a decimal digit")),
+        }
+    }
+    Ok(out)
+}
+
+/// Low nibble first, then high, for each octet (swapped-nibble BCD).
+fn swapped(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    bytes.iter().flat_map(|b| [b & 0x0F, b >> 4])
+}
+
+/// EF.ICCID: ETSI TS 102 221 clause 13.2. Ten octets, up to 20 digits, swapped
+/// nibbles, `F`-padded (ITU-T E.118).
+pub fn decode_iccid(bytes: &[u8]) -> Result<Digits, Malformed> {
+    if bytes.len() != 10 {
+        return Err(Malformed("EF.ICCID is 10 octets"));
+    }
+    digits_of(swapped(bytes)).map(Digits)
+}
+
+/// EF.IMSI: 3GPP TS 31.102 clause 4.2.2 / ETSI TS 51.011 clause 10.3.2, whose
+/// octet 2 onward is the TS 24.008 clause 10.5.1.4 mobile identity: octet 1 the
+/// number of octets that follow, octet 2 the first digit in b8..b5 with the
+/// odd/even indicator in b4 and type of identity `001` in b3..b1, then two
+/// digits per octet, low nibble first, an even count ending in `F`.
+pub fn decode_imsi(bytes: &[u8]) -> Result<Digits, Malformed> {
+    let (&len, rest) = bytes.split_first().ok_or(Malformed("EF.IMSI is empty"))?;
+    if len == 0 || len == 0xFF {
+        return Ok(Digits(String::new()));
+    }
+    let body = rest
+        .get(..usize::from(len))
+        .ok_or(Malformed("EF.IMSI is shorter than its length octet"))?;
+    if body[0] & 0x07 != 0x01 {
+        return Err(Malformed("EF.IMSI type of identity is not IMSI"));
+    }
+    let odd = body[0] & 0x08 != 0;
+    let nibbles = std::iter::once(body[0] >> 4).chain(swapped(&body[1..]));
+    let digits = digits_of(nibbles)?;
+    if digits.len() > 15 || digits.len() % 2 != usize::from(odd) {
+        return Err(Malformed("EF.IMSI digit count disagrees with its parity"));
+    }
+    Ok(Digits(digits))
+}
+
+/// One used EF.MSISDN record (TS 31.102 clause 4.2.26 / TS 51.011 clause
+/// 10.5.5: alpha identifier, then 14 octets: BCD length, TON/NPI, 10 octets of
+/// number, capability id, extension id). The alpha identifier is not kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Msisdn {
+    /// Type of number and numbering plan identification octet.
+    pub ton_npi: u8,
+    /// The dialling number (`*`, `#` and `a`..`c` kept as written).
+    pub number: Digits,
+}
+
+/// `None` for an unused record. BCD of a dialling number: `A` `*`, `B` `#`, `C` pause.
+pub fn decode_msisdn_record(record: &[u8]) -> Result<Option<Msisdn>, Malformed> {
+    let tail = record
+        .len()
+        .checked_sub(14)
+        .map(|at| &record[at..])
+        .ok_or(Malformed("EF.MSISDN record shorter than 14 octets"))?;
+    let (len, ton_npi) = (tail[0], tail[1]);
+    if len == 0 || len == 0xFF {
+        return Ok(None);
+    }
+    // The length counts the TON/NPI octet and the number octets.
+    let number = tail[2..12]
+        .get(..usize::from(len) - 1)
+        .ok_or(Malformed("EF.MSISDN BCD length exceeds the number field"))?;
+    let mut out = String::new();
+    for n in swapped(number) {
+        match n {
+            0..=9 => out.push(char::from(b'0' + n)),
+            0xA => out.push('*'),
+            0xB => out.push('#'),
+            0xC => out.push('p'),
+            0xF => break,
+            _ => return Err(Malformed("EF.MSISDN reserved BCD nibble")),
+        }
+    }
+    Ok(Some(Msisdn {
+        ton_npi,
+        number: Digits(out),
+    }))
+}
+
+/// One application EF.DIR lists (ETSI TS 102 221 clause 13.1: an application
+/// template `61` holding the AID in `4F` and optionally a label in `50`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Application {
+    /// The AID, 5 to 16 octets.
+    pub aid: Vec<u8>,
+    /// The label, printable ASCII only, at most 16 characters.
+    pub label: Option<String>,
+}
+
+/// `None` for an unused (`FF`-padded) record.
+pub fn decode_dir_record(record: &[u8]) -> Result<Option<Application>, Malformed> {
+    if record.first().is_none_or(|b| *b == 0xFF) {
+        return Ok(None);
+    }
+    let bad = Malformed("EF.DIR record is not an application template");
+    let template = crate::tlv::Tlv::decode(record).map_err(|_| bad)?.0;
+    if template.tag().octet() != 0x61 {
+        return Err(bad);
+    }
+    let (mut aid, mut label) = (None, None);
+    let mut atoms = Stream::new(template.value());
+    while let Ok(Some(atom)) = atoms.next_atom() {
+        match atom.tag().octet() {
+            0x4F => aid = Some(atom.value().to_vec()),
+            0x50 => label = Some(printable(atom.value(), 16)),
+            _ => {}
+        }
+    }
+    match aid {
+        Some(aid) if (5..=16).contains(&aid.len()) => Ok(Some(Application { aid, label })),
+        _ => Err(Malformed("EF.DIR application has no AID of 5 to 16 octets")),
+    }
+}
+
+/// Printable ASCII, other octets as `?`, at most `max` characters.
+fn printable(bytes: &[u8], max: usize) -> String {
+    bytes
+        .iter()
+        .take(max)
+        .map(|b| {
+            if (0x20..0x7F).contains(b) {
+                char::from(*b)
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// What mode EF.AD says the terminal operates in (TS 31.102 clause 4.2.18;
+/// values as in pySim's `EF_AD.OP_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationMode {
+    /// `00`.
+    Normal,
+    /// `80`.
+    TypeApproval,
+    /// `01`.
+    NormalSpecificFacilities,
+    /// `81`.
+    TypeApprovalSpecificFacilities,
+    /// `02`.
+    MaintenanceOffLine,
+    /// `04`.
+    CellTest,
+    /// Any other value, as read.
+    Other(u8),
+}
+
+impl OperationMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::TypeApproval => "type-approval",
+            Self::NormalSpecificFacilities => "normal-specific-facilities",
+            Self::TypeApprovalSpecificFacilities => "type-approval-specific-facilities",
+            Self::MaintenanceOffLine => "maintenance-off-line",
+            Self::CellTest => "cell-test",
+            Self::Other(_) => "other",
+        }
+    }
+}
+
+/// EF.AD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ad {
+    /// Octet 1.
+    pub mode: OperationMode,
+    /// The ciphering indicator, octet 3 b1. [U] Position taken from pySim's
+    /// `EF_AD` test vector `01000102` (octets 2-3 read as a 16-bit flag word
+    /// whose bit 0 is the indicator), not from the spec text.
+    pub ciphering_indicator: bool,
+    /// Octet 4 b4..b1, when present and 2 or 3: the length of the MNC in the IMSI.
+    pub mnc_len: Option<u8>,
+}
+
+/// EF.AD: at least octets 1 to 3.
+pub fn decode_ad(bytes: &[u8]) -> Result<Ad, Malformed> {
+    let [mode, _, info, rest @ ..] = bytes else {
+        return Err(Malformed("EF.AD is shorter than 3 octets"));
+    };
+    Ok(Ad {
+        mode: match mode {
+            0x00 => OperationMode::Normal,
+            0x80 => OperationMode::TypeApproval,
+            0x01 => OperationMode::NormalSpecificFacilities,
+            0x81 => OperationMode::TypeApprovalSpecificFacilities,
+            0x02 => OperationMode::MaintenanceOffLine,
+            0x04 => OperationMode::CellTest,
+            other => OperationMode::Other(*other),
+        },
+        ciphering_indicator: info & 1 == 1,
+        mnc_len: rest
+            .first()
+            .map(|b| b & 0x0F)
+            .filter(|n| (2..=3).contains(n)),
+    })
+}
+
+/// EF.SPN (TS 31.102 clause 4.2.12): octet 1 the display condition, octets 2..
+/// the name, `FF`-padded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spn {
+    /// Octet 1, as read.
+    pub display_condition: u8,
+    /// The name; printable ASCII only. A name in UCS-2 (first octet `80`..`82`)
+    /// is not decoded and reads as empty. ponytail: SMS default alphabet is
+    /// treated as ASCII; add the GSM 03.38 table if a card needs it.
+    pub name: String,
+}
+
+/// EF.SPN.
+pub fn decode_spn(bytes: &[u8]) -> Result<Spn, Malformed> {
+    let (&display_condition, name) = bytes.split_first().ok_or(Malformed("EF.SPN is empty"))?;
+    let end = name.iter().position(|b| *b == 0xFF).unwrap_or(name.len());
+    let name = &name[..end];
+    Ok(Spn {
+        display_condition,
+        name: if name.first().is_some_and(|b| (0x80..=0x82).contains(b)) {
+            String::new()
+        } else {
+            printable(name, 16)
+        },
+    })
+}
+
+/// Which service table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Table {
+    /// EF.UST, TS 31.102 clause 4.2.8.
+    Ust,
+    /// EF.EST, TS 31.102 clause 4.2.47.
+    Est,
+}
+
+/// The services a table marks available (UST) or enabled (EST).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Services {
+    /// Which table.
+    pub table: Table,
+    /// Service numbers, ascending. Service `n` is bit `((n-1) % 8) + 1` of
+    /// octet `((n-1) / 8) + 1` (TS 31.102 clause 4.2.8).
+    pub enabled: Vec<u16>,
+}
+
+/// EF.UST / EF.EST.
+pub fn decode_services(table: Table, bytes: &[u8]) -> Result<Services, Malformed> {
+    if bytes.is_empty() {
+        return Err(Malformed("a service table is empty"));
+    }
+    let enabled = bytes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            (0..8)
+                .filter(move |bit| b >> bit & 1 == 1)
+                .map(move |bit| (i * 8 + bit + 1) as u16)
+        })
+        .collect();
+    Ok(Services { table, enabled })
+}
+
+/// The name of a service, for the ones a security report cares about
+/// (TS 31.102 clause 4.2.8 table; names as in pySim `EF_UST_map` / `EF_EST_map`).
+/// The other numbers are listed without a name rather than guessed.
+pub fn service_name(table: Table, n: u16) -> Option<&'static str> {
+    match (table, n) {
+        (Table::Ust, 2) | (Table::Est, 1) => Some("Fixed Dialling Numbers (FDN)"),
+        (Table::Ust, 6) | (Table::Est, 2) => Some("Barred Dialling Numbers (BDN)"),
+        (Table::Ust, 35) | (Table::Est, 3) => Some("APN Control List (ACL)"),
+        (Table::Ust, 10) => Some("Short Message Storage (SMS)"),
+        (Table::Ust, 19) => Some("Service Provider Name"),
+        (Table::Ust, 21) => Some("MSISDN"),
+        (Table::Ust, 27) => Some("GSM Access"),
+        (Table::Ust, 28) => Some("Data download via SMS-PP"),
+        (Table::Ust, 29) => Some("Data download via SMS-CB"),
+        (Table::Ust, 30) => Some("Call Control by USIM"),
+        (Table::Ust, 31) => Some("MO-SMS Control by USIM"),
+        (Table::Ust, 32) => Some("RUN AT COMMAND command"),
+        (Table::Ust, 34) => Some("Enabled Services Table"),
+        (Table::Ust, 38) => Some("GSM security context"),
+        (Table::Ust, 68) => Some("Generic Bootstrapping Architecture (GBA)"),
+        (Table::Ust, 70) => Some("Data download via USSD and USSD application mode"),
+        (Table::Ust, 85) => Some("EPS Mobility Management Information"),
+        (Table::Ust, 122) => Some("5GS Mobility Management Information"),
+        (Table::Ust, 123) => Some("5G Security Parameters"),
+        (Table::Ust, 124) => Some("Subscription identifier privacy support"),
+        (Table::Ust, 125) => Some("SUCI calculation by the USIM"),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoded values, evidence and JSON
+// ---------------------------------------------------------------------------
+
+/// A decoded EF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decoded {
+    /// EF.ICCID.
+    Iccid(Digits),
+    /// EF.IMSI and the MNC length EF.AD gave for it, when it did.
+    Imsi(Digits, Option<u8>),
+    /// The used records of EF.MSISDN.
+    Msisdn(Vec<Msisdn>),
+    /// The applications EF.DIR lists.
+    Dir(Vec<Application>),
+    /// EF.AD.
+    Ad(Ad),
+    /// EF.SPN.
+    Spn(Spn),
+    /// EF.UST or EF.EST.
+    Services(Services),
+}
+
+/// Decodes the bytes read from an EF `ef` (a record per element for a linear
+/// fixed EF). `mnc_len` is EF.AD's, used only to redact an IMSI at the right place.
+///
+/// # Errors
+///
+/// [`Malformed`] when the bytes are not the layout the clause gives. A caller
+/// reports that; it never treats it as "no data".
+pub fn decode(ef: Ef, records: &[Vec<u8>], mnc_len: Option<u8>) -> Result<Decoded, Malformed> {
+    let first = records.first().map_or(&[][..], Vec::as_slice);
+    Ok(match ef {
+        Ef::Iccid => Decoded::Iccid(decode_iccid(first)?),
+        Ef::Imsi => Decoded::Imsi(decode_imsi(first)?, mnc_len),
+        Ef::Ad => Decoded::Ad(decode_ad(first)?),
+        Ef::Spn => Decoded::Spn(decode_spn(first)?),
+        Ef::Ust => Decoded::Services(decode_services(Table::Ust, first)?),
+        Ef::Est => Decoded::Services(decode_services(Table::Est, first)?),
+        Ef::Msisdn => Decoded::Msisdn(
+            records
+                .iter()
+                .map(|r| decode_msisdn_record(r))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        Ef::Dir => Decoded::Dir(
+            records
+                .iter()
+                .map(|r| decode_dir_record(r))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        Ef::Keys | Ef::KeysPs => return Err(Malformed("key files are never decoded")),
+    })
+}
+
+fn aid_hex(aid: &[u8]) -> String {
+    aid.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+fn imsi_head(mnc_len: Option<u8>) -> usize {
+    3 + usize::from(mnc_len.unwrap_or(2))
+}
+
+impl Decoded {
+    /// The short, bounded, redacted line a finding or a report shows.
+    pub fn evidence(&self) -> String {
+        match self {
+            Self::Iccid(d) => format!("ICCID {}", d.redacted(6)),
+            Self::Imsi(d, mnc) => format!("IMSI {}", d.redacted(imsi_head(*mnc))),
+            Self::Msisdn(list) => format!(
+                "{} number(s){}",
+                list.len(),
+                list.first().map_or(String::new(), |m| format!(
+                    ", first: TON/NPI {:02X}, {}",
+                    m.ton_npi,
+                    m.number.redacted(0)
+                ))
+            ),
+            Self::Dir(apps) => {
+                let mut out = format!("{} application(s)", apps.len());
+                for a in apps.iter().take(EVIDENCE_ITEMS) {
+                    out += &format!(
+                        " {}{}",
+                        aid_hex(&a.aid),
+                        a.label
+                            .as_ref()
+                            .map_or(String::new(), |l| format!(" ({l})"))
+                    );
+                }
+                out
+            }
+            Self::Ad(ad) => format!(
+                "mode={} mnc_len={} ciphering_indicator={}",
+                ad.mode.label(),
+                ad.mnc_len.map_or("absent".to_owned(), |n| n.to_string()),
+                if ad.ciphering_indicator { "on" } else { "off" }
+            ),
+            Self::Spn(s) => format!(
+                "display_condition={:02X} name={:?}",
+                s.display_condition, s.name
+            ),
+            Self::Services(s) => {
+                let shown: Vec<String> = s
+                    .enabled
+                    .iter()
+                    .take(EVIDENCE_ITEMS)
+                    .map(u16::to_string)
+                    .collect();
+                let more = s.enabled.len().saturating_sub(EVIDENCE_ITEMS);
+                format!(
+                    "{} {} service(s): {}{}",
+                    s.enabled.len(),
+                    match s.table {
+                        Table::Ust => "available",
+                        Table::Est => "enabled",
+                    },
+                    if shown.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        shown.join(",")
+                    },
+                    if more > 0 {
+                        format!(" (+{more} more)")
+                    } else {
+                        String::new()
+                    }
+                )
+            }
+        }
+    }
+
+    /// The typed fields as JSON, redacted by the same rule as [`Decoded::evidence`].
+    pub fn fields(&self) -> Value {
+        match self {
+            Self::Iccid(d) => json!({
+                "digits": d.len(),
+                "prefix": d.as_str().get(..6),
+                "last2": d.as_str().get(d.len().saturating_sub(2)..),
+            }),
+            Self::Imsi(d, mnc) => {
+                let head = imsi_head(*mnc);
+                json!({
+                    "digits": d.len(),
+                    "mcc_mnc": d.as_str().get(..head),
+                    "mnc_len_source": if mnc.is_some() { "EF.AD" } else { "assumed 2" },
+                    "last2": d.as_str().get(d.len().saturating_sub(2)..).filter(|_| d.len() >= head + 2),
+                })
+            }
+            Self::Msisdn(list) => json!({
+                "used_records": list.len(),
+                "numbers": list.iter().map(|m| json!({
+                    "ton_npi": format!("{:02X}", m.ton_npi),
+                    "digits": m.number.len(),
+                    "last2": m.number.as_str().get(m.number.len().saturating_sub(2)..),
+                })).collect::<Vec<_>>(),
+            }),
+            Self::Dir(apps) => json!({
+                "applications": apps.iter().map(|a| json!({
+                    "aid": aid_hex(&a.aid),
+                    "label": a.label,
+                })).collect::<Vec<_>>(),
+            }),
+            Self::Ad(ad) => json!({
+                "mode": ad.mode.label(),
+                "mode_octet": match ad.mode {
+                    OperationMode::Other(b) => Some(format!("{b:02X}")),
+                    _ => None,
+                },
+                "mnc_len": ad.mnc_len,
+                "ciphering_indicator": ad.ciphering_indicator,
+            }),
+            Self::Spn(s) => json!({
+                "display_condition": format!("{:02X}", s.display_condition),
+                "name": s.name,
+            }),
+            Self::Services(s) => json!({
+                "table": match s.table { Table::Ust => "UST", Table::Est => "EST" },
+                "count": s.enabled.len(),
+                "enabled": s.enabled,
+                "named": s.enabled.iter().filter_map(|n| {
+                    service_name(s.table, *n).map(|name| json!({ "service": n, "name": name }))
+                }).collect::<Vec<_>>(),
+            }),
+        }
+    }
+}
+
+/// What became of one recognised EF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Not read: the FCP gave no size, the read was not reached, or the walk stopped.
+    NotRead,
+    /// Presence and access conditions only, by design.
+    PresenceOnly,
+    /// The card refused the SELECT or READ.
+    Refused(Option<crate::apdu::StatusWord>),
+    /// Read, and not the layout the clause gives.
+    Malformed(Malformed),
+    /// Read and decoded.
+    Decoded(Decoded),
+}
+
+/// One recognised EF of a walked card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Where it is.
+    pub path: Path,
+    /// Which EF.
+    pub ef: Ef,
+    /// Its READ and UPDATE conditions, when they decode.
+    pub access: Option<Access>,
+    /// What reading it came to.
+    pub outcome: Outcome,
+}
+
+/// Every recognised EF in the tree, decoded from what [`read`] stored.
+/// Pure: sends nothing.
+pub fn entries(tree: &Tree) -> Vec<Entry> {
+    tree.selected()
+        .filter_map(|node| Some((node, classify(node.path())?)))
+        .map(|(node, ef)| {
+            let path = node.path().clone();
+            let outcome = match (ef.shape(), tree.content_read(&path)) {
+                (Shape::Presence, _) => Outcome::PresenceOnly,
+                (_, None) => Outcome::NotRead,
+                (_, Some(ContentRead::Refused(sw))) => Outcome::Refused(*sw),
+                (_, Some(ContentRead::Records(records))) => {
+                    match decode(ef, records, ad_mnc_len(tree, &path)) {
+                        Ok(d) => Outcome::Decoded(d),
+                        Err(m) => Outcome::Malformed(m),
+                    }
+                }
+            };
+            Entry {
+                access: access::access_of(tree, node),
+                path,
+                ef,
+                outcome,
+            }
+        })
+        .collect()
+}
+
+/// The MNC length EF.AD (next to `imsi_path`) gives.
+fn ad_mnc_len(tree: &Tree, imsi_path: &Path) -> Option<u8> {
+    let ad = imsi_path
+        .parent()?
+        .child(FileId::from_bytes([0x6F, 0xAD]))
+        .ok()?;
+    let ContentRead::Records(records) = tree.content_read(&ad)? else {
+        return None;
+    };
+    decode_ad(records.first()?).ok()?.mnc_len
+}
+
+impl Entry {
+    /// The entry as the `ef_contents` element of the scan JSON. Redacted.
+    pub fn to_json(&self) -> Value {
+        let mut v = json!({
+            "path": self.path.to_string(),
+            "ef": self.ef.name(),
+            "access": self.access.map(|a| json!({
+                "read": a.read.label(),
+                "update": a.update.label(),
+            })),
+        });
+        let (read, extra): (&str, Vec<(&str, Value)>) = match &self.outcome {
+            Outcome::NotRead => ("not-read", vec![]),
+            Outcome::PresenceOnly => ("presence-only", vec![]),
+            Outcome::Refused(sw) => (
+                "refused",
+                vec![("status", json!(sw.map(|s| s.to_string())))],
+            ),
+            Outcome::Malformed(m) => ("malformed", vec![("reason", json!(m.0))]),
+            Outcome::Decoded(d) => (
+                "decoded",
+                vec![("evidence", json!(d.evidence())), ("fields", d.fields())],
+            ),
+        };
+        v["read"] = json!(read);
+        for (k, val) in extra {
+            v[k] = val;
+        }
+        v
+    }
+}
+
+/// The `ef_contents` array of the scan JSON.
+pub fn to_json(tree: &Tree) -> Value {
+    Value::Array(entries(tree).iter().map(Entry::to_json).collect())
+}
+
+// ---------------------------------------------------------------------------
+// The read (the only part that touches a card)
+// ---------------------------------------------------------------------------
+
+/// Reads every recognised EF once and stores the bytes on the tree. Sends only
+/// SELECT, READ BINARY (`B0`) and READ RECORD (`B2`). EF.Keys and EF.KeysPS are
+/// never selected. A refusal is recorded and not retried.
+///
+/// # Errors
+///
+/// Whatever [`session::send`] returns.
+pub fn read<S: CardSession + ?Sized>(
+    session: &mut S,
+    tree: &mut Tree,
+    policy: &Policy,
+) -> Result<(), session::Error> {
+    let wanted: Vec<(Path, Shape, (u16, u8))> = tree
+        .selected()
+        .filter_map(|node| {
+            let shape = classify(node.path())?.shape();
+            Some((node.path().clone(), shape, plan(node, shape)?))
+        })
+        .filter(|(_, shape, _)| *shape != Shape::Presence)
+        .collect();
+    for (path, shape, (length, count)) in wanted {
+        let outcome = read_one(session, &path, shape, length, count, policy)?;
+        tree.record_content_read(path, outcome);
+    }
+    Ok(())
+}
+
+/// (octets per read, records) from the FCP; `None` when it does not say.
+fn plan(node: &Node, shape: Shape) -> Option<(u16, u8)> {
+    let caps = node.state().capabilities()?;
+    match shape {
+        Shape::Transparent => {
+            let size = caps.size.reported()?.octets().min(MAX_BINARY);
+            Some((u16::try_from(size).ok().filter(|s| *s > 0)?, 1))
+        }
+        Shape::LinearFixed => match caps.descriptor.reported()?.octets.as_slice() {
+            [_, _, hi, lo, count, ..] => Some((u16::from_be_bytes([*hi, *lo]), *count)),
+            _ => None,
+        },
+        Shape::Presence => None,
+    }
+}
+
+fn read_one<S: CardSession + ?Sized>(
+    session: &mut S,
+    path: &Path,
+    shape: Shape,
+    length: u16,
+    count: u8,
+    policy: &Policy,
+) -> Result<ContentRead, session::Error> {
+    if let Err(sw) = access::select_file(session, path, policy)? {
+        return Ok(ContentRead::Refused(sw));
+    }
+    let Some(le) = Le::for_byte_count(u32::from(length)).filter(|_| length > 0) else {
+        return Ok(ContentRead::Records(Vec::new()));
+    };
+    let mut records = Vec::new();
+    let reads = if shape == Shape::Transparent {
+        1
+    } else {
+        usize::from(count).min(MAX_RECORDS)
+    };
+    for number in 1..=reads {
+        let header = if shape == Shape::Transparent {
+            // READ BINARY, offset 0 (TS 102 221 clause 11.1.3).
+            Header::new(0x00, 0xB0, 0x00, 0x00)
+        } else {
+            // READ RECORD, absolute mode; `number` is at most 16.
+            Header::new(0x00, 0xB2, u8::try_from(number).unwrap_or(0xFF), 0x04)
+        };
+        let read = session::send(session, &Command::case2(header, le), policy)?;
+        if !read.status().is_some_and(|s| s.is_normal_processing()) {
+            return Ok(if records.is_empty() {
+                ContentRead::Refused(read.status())
+            } else {
+                ContentRead::Records(records)
+            });
+        }
+        records.push(read.data().to_vec());
+    }
+    Ok(ContentRead::Records(records))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Synthesised from each clause's layout; the digits are a test network
+    // (MCC 001 / MNC 01) or obviously fictional.
+
+    #[test]
+    fn iccid_swapped_nibbles_with_f_padding() {
+        // 19 digits 8999991234567890123, padded with F (TS 102 221 clause 13.2).
+        let d =
+            decode_iccid(&[0x98, 0x99, 0x99, 0x21, 0x43, 0x65, 0x87, 0x09, 0x21, 0xF3]).unwrap();
+        assert_eq!(d.as_str(), "8999991234567890123");
+        assert_eq!(d.redacted(6), "899999..23 (19 digits)");
+        assert!(decode_iccid(&[0x98; 9]).is_err());
+        assert!(decode_iccid(&[0xAB; 10]).is_err());
+    }
+
+    #[test]
+    fn imsi_odd_even_and_unset() {
+        // 15 digits 001010123456789: len 8, octet 2 = digit 1 + (odd, IMSI) = 09.
+        let odd = decode_imsi(&[0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98]).unwrap();
+        assert_eq!(odd.as_str(), "001010123456789");
+        // 14 digits 00101012345678: octet 2 = 01 (even), last nibble F.
+        let even = decode_imsi(&[0x08, 0x01, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0xF8]).unwrap();
+        assert_eq!(even.as_str(), "00101012345678");
+        assert!(decode_imsi(&[0x00, 0xFF, 0xFF]).unwrap().is_empty());
+        assert!(
+            decode_imsi(&[0x08, 0x09]).is_err(),
+            "shorter than its length"
+        );
+        assert!(
+            decode_imsi(&[0x08, 0x08, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98]).is_err(),
+            "type of identity is not IMSI"
+        );
+        assert!(
+            decode_imsi(&[0x08, 0x01, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98]).is_err(),
+            "even flag on 15 digits"
+        );
+    }
+
+    #[test]
+    fn a_full_imsi_or_iccid_never_reaches_evidence_or_json_or_debug() {
+        let imsi = decode_imsi(&[0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98]).unwrap();
+        let iccid =
+            decode_iccid(&[0x98, 0x99, 0x99, 0x21, 0x43, 0x65, 0x87, 0x09, 0x21, 0xF3]).unwrap();
+        let msisdn = decode_msisdn_record(&msisdn_record()).unwrap().unwrap();
+        let all = [
+            Decoded::Imsi(imsi.clone(), Some(2)),
+            Decoded::Imsi(imsi.clone(), None),
+            Decoded::Iccid(iccid.clone()),
+            Decoded::Msisdn(vec![msisdn.clone()]),
+        ];
+        let mut text = String::new();
+        for d in &all {
+            text += &format!("{} {} {d:?}", d.evidence(), d.fields());
+        }
+        for secret in [
+            imsi.as_str(),
+            iccid.as_str(),
+            msisdn.number.as_str(),
+            "123456789",
+            "34567890123",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked into: {text}");
+        }
+        assert_eq!(all[0].evidence(), "IMSI 00101..89 (15 digits)");
+        assert_eq!(all[1].evidence(), all[0].evidence());
+        // A 3-digit MNC from EF.AD moves the cut by one digit.
+        assert_eq!(
+            Decoded::Imsi(imsi, Some(3)).evidence(),
+            "IMSI 001010..89 (15 digits)"
+        );
+    }
+
+    fn msisdn_record() -> Vec<u8> {
+        // Alpha "FF FF", then len 7, TON/NPI 91, 15555550100, padding, CCP, ext.
+        let mut r = vec![0xFF, 0xFF, 0x07, 0x91, 0x51, 0x55, 0x55, 0x05, 0x01, 0xF0];
+        r.extend([0xFF; 4]);
+        r.extend([0xFF, 0xFF]);
+        r
+    }
+
+    #[test]
+    fn msisdn_used_and_unused_records() {
+        let m = decode_msisdn_record(&msisdn_record()).unwrap().unwrap();
+        assert_eq!(m.ton_npi, 0x91);
+        assert_eq!(m.number.as_str(), "15555550100");
+        assert_eq!(decode_msisdn_record(&[0xFF; 16]).unwrap(), None);
+        assert!(decode_msisdn_record(&[0x07; 5]).is_err());
+        let mut long = msisdn_record();
+        long[2] = 0x0C;
+        assert!(decode_msisdn_record(&long).is_err());
+    }
+
+    #[test]
+    fn dir_application_template() {
+        // 61 0F { 4F 07 A0000000871002, 50 04 "USIM" } (TS 102 221 clause 13.1).
+        let record = [
+            0x61, 0x0F, 0x4F, 0x07, 0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0x50, 0x04, b'U',
+            b'S', b'I', b'M', 0xFF, 0xFF,
+        ];
+        let app = decode_dir_record(&record).unwrap().unwrap();
+        assert_eq!(aid_hex(&app.aid), "A0000000871002");
+        assert_eq!(app.label.as_deref(), Some("USIM"));
+        assert_eq!(decode_dir_record(&[0xFF; 8]).unwrap(), None);
+        assert!(decode_dir_record(&[0x62, 0x00]).is_err());
+        assert!(decode_dir_record(&[0x61, 0x04, 0x4F, 0x02, 0x01, 0x02]).is_err());
+    }
+
+    #[test]
+    fn ad_matches_pysim_vectors() {
+        let normal = decode_ad(&[0x00, 0x00, 0x00, 0x02]).unwrap();
+        assert_eq!(normal.mode, OperationMode::Normal);
+        assert_eq!(
+            (normal.ciphering_indicator, normal.mnc_len),
+            (false, Some(2))
+        );
+        let specific = decode_ad(&[0x01, 0x00, 0x01, 0x02]).unwrap();
+        assert_eq!(specific.mode, OperationMode::NormalSpecificFacilities);
+        assert!(specific.ciphering_indicator);
+        assert_eq!(decode_ad(&[0x04, 0, 0]).unwrap().mnc_len, None);
+        assert_eq!(
+            decode_ad(&[0x04, 0, 0]).unwrap().mode,
+            OperationMode::CellTest
+        );
+        assert_eq!(
+            decode_ad(&[0x55, 0, 0, 0x07]).unwrap().mode,
+            OperationMode::Other(0x55)
+        );
+        assert_eq!(decode_ad(&[0, 0, 0, 0x07]).unwrap().mnc_len, None);
+        assert!(decode_ad(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn spn_name_and_padding() {
+        let s = decode_spn(&[0x01, b'T', b'e', b's', b't', 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!((s.display_condition, s.name.as_str()), (1, "Test"));
+        assert_eq!(decode_spn(&[0x00, 0x80, 0x00, 0x41]).unwrap().name, "");
+        assert_eq!(decode_spn(&[0x00, 0xFF]).unwrap().name, "");
+        assert!(decode_spn(&[]).is_err());
+    }
+
+    #[test]
+    fn service_tables() {
+        // TS 31.102 clause 4.2.8: service n is b((n-1)%8+1) of octet (n-1)/8+1.
+        let typical = decode_services(Table::Ust, &[0x9E, 0x1D, 0x01, 0x08]).unwrap();
+        assert_eq!(typical.enabled, [2, 3, 4, 5, 8, 9, 11, 12, 13, 17, 28]);
+        let off = decode_services(Table::Ust, &[0x00; 17]).unwrap();
+        assert!(off.enabled.is_empty());
+        assert_eq!(
+            Decoded::Services(off).evidence(),
+            "0 available service(s): none"
+        );
+        assert!(decode_services(Table::Est, &[]).is_err());
+        let est = decode_services(Table::Est, &[0b101]).unwrap();
+        assert_eq!(est.enabled, [1, 3]);
+        assert_eq!(
+            service_name(Table::Est, 1),
+            Some("Fixed Dialling Numbers (FDN)")
+        );
+        assert_eq!(
+            service_name(Table::Ust, 28),
+            Some("Data download via SMS-PP")
+        );
+        assert_eq!(service_name(Table::Ust, 3), None);
+    }
+
+    #[test]
+    fn long_service_lists_are_bounded() {
+        let all = decode_services(Table::Ust, &[0xFF; 19]).unwrap();
+        let line = Decoded::Services(all).evidence();
+        assert!(
+            line.contains("152 available") && line.ends_with("(+128 more)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn classification_is_by_identifier_and_place() {
+        let p = |s: &str| s.parse::<Path>().unwrap();
+        assert_eq!(classify(&p("3F00/2FE2")), Some(Ef::Iccid));
+        assert_eq!(classify(&p("3F00/7FFF/6F07")), Some(Ef::Imsi));
+        assert_eq!(classify(&p("3F00/7F20/6F07")), Some(Ef::Imsi));
+        assert_eq!(classify(&p("3F00/7F10/6F40")), Some(Ef::Msisdn));
+        assert_eq!(classify(&p("3F00/7FFF/6F38")), Some(Ef::Ust));
+        // EF.SST under DF.GSM and an IMSI under an unrelated DF are not these EFs.
+        assert_eq!(classify(&p("3F00/7F20/6F38")), None);
+        assert_eq!(classify(&p("3F00/5F3A/6F07")), None);
+        assert_eq!(classify(&p("3F00/7FFF/5F3B/6F07")), None);
+        assert_eq!(classify(&p("3F00/7FFF/6F08")), Some(Ef::Keys));
+        assert_eq!(classify(&Path::master_file()), None);
+    }
+}

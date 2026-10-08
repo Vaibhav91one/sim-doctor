@@ -32,6 +32,7 @@
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
 //! layer 1  access      file access conditions and PIN status decoded from the FCP (EF.ARR read-only)
+//! layer 1  ef          EF content decoders (ICCID, IMSI, MSISDN, DIR, AD, SPN, UST/EST), redacted; read-only
 //! layer 1  baseline     a saved run, and the rules for comparing a later
 //!                one against it honestly
 //! layer 1  tui        a terminal view over the scan data (reads JSON only)
@@ -112,6 +113,7 @@ pub mod cap;
 pub mod ci;
 pub mod contract;
 pub mod der;
+pub mod ef;
 pub mod es10;
 pub mod es9;
 pub mod fcp;
@@ -259,6 +261,11 @@ pub const MODULES: &[ModuleInfo] = &[
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fs::NAME, session::NAME, walk::NAME],
     },
     ModuleInfo {
+        name: ef::NAME,
+        owns: "Pure decoders for the security-relevant EFs (ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST) with redacted bounded evidence, and the read-only SELECT/READ BINARY/READ RECORD that fetches them; EF.Keys and EF.KeysPS are never read.",
+        depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fs::NAME, session::NAME, walk::NAME, access::NAME],
+    },
+    ModuleInfo {
         name: baseline::NAME,
         owns: "A saved run, what it actually did, and the rules for refusing a comparison two runs cannot honestly support.",
         depends_on: &[rules::NAME],
@@ -320,6 +327,7 @@ pub const MODULES: &[ModuleInfo] = &[
             tar::NAME,
             walk::NAME,
             access::NAME,
+            ef::NAME,
             baseline::NAME,
             scp03::NAME,
         ],
