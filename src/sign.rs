@@ -4,16 +4,15 @@
 //! GPCS v2.2 Amendment E 3.1.3). A DER signature here is a real bug: it starts
 //! with the SEQUENCE tag `0x30` and has a variable length.
 //!
-//! # SGP.26 test PKI fixtures: pending
+//! # SGP.26 test PKI fixtures: fetched at test time, never committed
 //!
-//! The SGP.26 test certificates (public home: `waigel/euicc-rsp`,
-//! `testdata/sgp26/`) are NOT vendored. AGENTS.md ("Never commit card secrets")
-//! states PKI material stays out of git and `.gitignore` blocks `*.pem`,
-//! `*.der`, `*.crt`; no licence for redistributing the files has been verified,
-//! and certificate bytes are never invented. The "SGP.26 vectors validate"
-//! acceptance item therefore waits on a decision to carry them. Note the real
-//! test certs expire 30 March 2030: a future failure mode, not a today problem.
-//! This is test PKI material, not a conformance harness.
+//! The SGP.26 test certificates carry no stated redistribution licence and
+//! AGENTS.md keeps PKI material out of git (`.gitignore` blocks `*.pem`,
+//! `*.der`, `*.crt`), so they are not vendored. The ignored test
+//! `sgp26_fixtures_from_gsma` in `tests/sgp26_fixtures.rs` downloads the GSMA
+//! zip, checks its SHA-256 and validates this module against the
+//! CI/EUM/eUICC/DP chain; its docs say how to run it and give the real expiry
+//! dates. This is test PKI material, not a conformance harness.
 
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
