@@ -724,13 +724,13 @@ fn the_gate_fails_on_a_missed_finding_and_on_a_spurious_one() {
 }
 
 // ---------------------------------------------------------------------------
-// EF contents (issue #108): read-only, decoded, redacted
+// EF contents (issue #108): read-only, decoded, full values
 // ---------------------------------------------------------------------------
 
 const SYNTHETIC_IMSI: &str = "001010123456789";
 
 #[test]
-fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
+fn ef_contents_are_decoded_end_to_end_with_full_values() {
     let imsi = [0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98];
     let iccid = [0x98, 0x99, 0x99, 0x21, 0x43, 0x65, 0x87, 0x09, 0x21, 0xF3];
     let mut msisdn = vec![0xFF, 0xFF, 0x07, 0x91, 0x51, 0x55, 0x55, 0x05, 0x01, 0xF0];
@@ -744,8 +744,8 @@ fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
         .transparent("3F00/7FFF/6F46", &[0x01, b'T', b'e', b's', b't', 0xFF])
         .transparent("3F00/7FFF/6F38", &[0x9E, 0x1D, 0x01, 0x08])
         .linear("3F00/7FFF/6F40", &[msisdn]);
-    // A key file is selected by the walk but must never be read.
-    card = card.file("3F00/7FFF/6F08", Fcp::Ts102221, Some(9));
+    // A key file is read like any other EF (synthetic bytes).
+    card = card.transparent("3F00/7FFF/6F08", &[0x07, 0xAB, 0xCD, 0xEF]);
     let options = walk::Options {
         candidates: Candidates::List(
             [
@@ -768,7 +768,7 @@ fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
         "15555550100",
         "1234567",
     ] {
-        assert!(!text.contains(secret), "{secret} leaked: {text}");
+        assert!(text.contains(secret), "{secret} missing: {text}");
     }
     let entry = |name: &str| {
         json.as_array()
@@ -777,13 +777,10 @@ fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
             .find(|e| e["ef"] == name)
             .unwrap_or_else(|| panic!("{name} missing from {text}"))
     };
-    assert_eq!(entry("EF.IMSI")["evidence"], "IMSI 00101..89 (15 digits)");
-    // EF.AD says the MNC is 2 digits, so the cut is MCC + 2.
+    assert_eq!(entry("EF.IMSI")["evidence"], "IMSI 001010123456789");
+    // EF.AD says the MNC is 2 digits.
     assert_eq!(entry("EF.IMSI")["fields"]["mnc_len_source"], "EF.AD");
-    assert_eq!(
-        entry("EF.ICCID")["evidence"],
-        "ICCID 899999..23 (19 digits)"
-    );
+    assert_eq!(entry("EF.ICCID")["evidence"], "ICCID 8999991234567890123");
     assert_eq!(entry("EF.SPN")["fields"]["name"], "Test");
     assert_eq!(
         entry("EF.UST")["fields"]["enabled"],
@@ -794,16 +791,14 @@ fn ef_contents_are_decoded_end_to_end_and_never_carry_a_full_identity() {
         11,
         "{text}"
     );
-    // Keys: presence only, with no read.
-    assert_eq!(entry("EF.Keys")["read"], "presence-only");
-    assert!(tree
-        .content_read(&"3F00/7FFF/6F08".parse().unwrap())
-        .is_none());
+    // Keys: read like any other EF and shown in full.
+    assert_eq!(entry("EF.Keys")["read"], "decoded");
+    assert_eq!(entry("EF.Keys")["fields"]["hex"], "07ABCDEF");
 }
 
 #[test]
-fn a_short_malformed_iccid_is_not_leaked_by_the_scan_json() {
-    // 8 digits "89123456" (swapped nibbles, F-padded to 10 octets): too short to redact.
+fn a_short_iccid_is_shown_in_full_by_the_scan_json() {
+    // 8 digits "89123456" (swapped nibbles, F-padded to 10 octets): shown in full.
     let iccid = [0x98, 0x21, 0x43, 0x65, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
     let mut card = Card::new(false)
         .file("3F00", Fcp::Ts102221, None)
@@ -836,8 +831,5 @@ fn a_short_malformed_iccid_is_not_leaked_by_the_scan_json() {
         options.limits,
     );
     let text = scan::to_json(&tree, &context, &verdict).to_string();
-    assert!(text.contains("ICCID (8 digits)"), "{text}");
-    for secret in ["89123456", "8912", "3456"] {
-        assert!(!text.contains(secret), "{secret} leaked: {text}");
-    }
+    assert!(text.contains("ICCID 89123456"), "{text}");
 }

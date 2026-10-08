@@ -754,7 +754,7 @@ pub const MAX_EVIDENCE_BYTES: usize = 64;
 /// Evidence text is a decoded value - `"MSL=0"`, `"9804"`, `"EF.SMS"` -
 /// not a sentence, and the message beside it is where prose belongs. Bounded
 /// for the same reason as [MAX_EVIDENCE_BYTES]: this also reaches a terminal.
-pub const MAX_EVIDENCE_CHARS: usize = 64;
+pub const MAX_EVIDENCE_CHARS: usize = 256;
 
 /// Raw octets read off a card, bounded at construction.
 ///

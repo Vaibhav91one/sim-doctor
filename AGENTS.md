@@ -436,18 +436,26 @@ exists because getting it wrong breaks somebody downstream:
 sim-doctor scan --json | jq '.data.findings[] | select(.rule == "gsma/msl-zero-allowed")'
 ```
 
-### EF contents are evidence, redacted (issue #108, #102)
+### EF contents, full visibility (issue #108, #102, #128)
 
 `scan --json` carries an additive `ef_contents` array: the security-relevant EFs
-([src/ef.rs](src/ef.rs): ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST) read with SELECT,
-READ BINARY and READ RECORD only, each as `{path, ef, access, read, evidence, fields}`.
-**Redaction is binding:** an IMSI shows MCC + MNC (MNC length from EF.AD, else 2) and its last 2
-digits; an ICCID its first 6 and last 2; an MSISDN its TON/NPI, digit count and last 2. Never a
-full IMSI/ICCID/MSISDN in output, tests, fixtures or docs. EF.Keys and EF.KeysPS are reported as
-presence and access conditions only and are never read by `ef::read`. `identity/readable-without-pin` fires
+([src/ef.rs](src/ef.rs): ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST, and the key files
+EF.Keys / EF.KeysPS) read with SELECT, READ BINARY and READ RECORD only, each as
+`{path, ef, access, read, evidence, fields}`.
+**Full visibility is binding (owner decision 2026-10-08):** sim-doctor is an authorized security
+tool run on the owner's own card, so at runtime it shows full card values everywhere (table,
+`--json`, SARIF, `trace`): the whole IMSI, ICCID and MSISDN, file contents, key material when the
+card allows the read, and full PIN/key/cryptogram hex in `trace`. Nothing is masked, truncated
+or redacted. A read the card refuses is reported (`refused` + status word), never retried;
+sim-doctor still never sends VERIFY/UPDATE. `identity/readable-without-pin` fires
 from the access rule alone and covers the MSISDN only (low); the IMSI stays with
 `filesystem/sensitive-ef-always`, so one fact is never scored twice. `read` is `decoded`, `refused` (with the status word),
-`malformed`, `not-read` or `presence-only`.
+`malformed` or `not-read`.
+
+**Separate rule, unchanged: real card data is NEVER committed.** No real ICCID/IMSI/MSISDN/key
+bytes in the repo, tests, fixtures, docs, issues or PRs. Test fixtures are synthetic or generated
+(e.g. IMSI `001010...`). That is version-control hygiene, not runtime behaviour. Keep any real
+capture under `/tmp/sim-doctor-<n>/`.
 
 ### TAR scanning and MSL=0
 

@@ -1001,8 +1001,7 @@ pub struct Tree {
 /// What one read-only attempt at an EF's contents came back with
 /// ([`crate::ef::read`]).
 ///
-/// `Debug` prints sizes only: these octets can be an IMSI or an ICCID, and a
-/// `{:?}` of a tree must not put either in a log.
+/// `Debug` prints the octets in full (full-visibility policy, issue #128).
 #[derive(Clone, PartialEq, Eq)]
 pub enum ContentRead {
     /// The card answered; one element for a transparent EF, one per record
@@ -1015,7 +1014,7 @@ pub enum ContentRead {
 impl fmt::Debug for ContentRead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Records(r) => write!(f, "Records({} redacted)", r.len()),
+            Self::Records(r) => write!(f, "Records({r:02X?})"),
             Self::Refused(sw) => write!(f, "Refused({sw:?})"),
         }
     }

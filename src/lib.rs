@@ -32,7 +32,7 @@
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
 //! layer 1  access      file access conditions and PIN status decoded from the FCP (EF.ARR read-only)
-//! layer 1  ef          EF content decoders (ICCID, IMSI, MSISDN, DIR, AD, SPN, UST/EST), redacted; read-only
+//! layer 1  ef          EF content decoders (ICCID, IMSI, MSISDN, DIR, AD, SPN, UST/EST, EF.Keys bytes), full values; read-only
 //! layer 1  baseline     a saved run, and the rules for comparing a later
 //!                one against it honestly
 //! layer 1  tui        a terminal view over the scan data (reads JSON only)
@@ -262,7 +262,7 @@ pub const MODULES: &[ModuleInfo] = &[
     },
     ModuleInfo {
         name: ef::NAME,
-        owns: "Pure decoders for the security-relevant EFs (ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST) with redacted bounded evidence, and the read-only SELECT/READ BINARY/READ RECORD that fetches them; EF.Keys and EF.KeysPS are never read.",
+        owns: "Pure decoders for the security-relevant EFs (ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST) with full-value bounded evidence, and the read-only SELECT/READ BINARY/READ RECORD that fetches them; EF.Keys and EF.KeysPS are read like any other EF.",
         depends_on: &[tlv::NAME, apdu::NAME, transport::NAME, fs::NAME, session::NAME, walk::NAME, access::NAME],
     },
     ModuleInfo {
