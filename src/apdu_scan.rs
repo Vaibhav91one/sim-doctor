@@ -16,7 +16,8 @@
 //! A discovery probe asks one question - "does this CLA/INS pair exist at
 //! all" - and a data field or a non-zero P1/P2 would let a command's *parser*
 //! answer instead of its dispatcher. So every candidate is sent as ISO/IEC
-//! 7816-4 case 1: four octets, `CLA INS 00 00`, no Lc, no data, no Le. That is
+//! 7816-4 case 1: `CLA INS 00 00`, no Lc, no data, no Le (on the T=0 wire that
+//! is five octets, P3 = 00, see `probe`). That is
 //! [`crate::apdu::Command::case1`], and nothing in this module builds any
 //! other case.
 //!
@@ -290,9 +291,17 @@ fn probe<S: CardSession + ?Sized>(
     // was fixed). Discovery sends exactly one APDU per candidate and reads
     // exactly one response; nothing here drains a 61xx or a 9x.
     let command = Command::case1(Header::new(class, instruction, 0x00, 0x00));
-    let bytes = command
+    let mut bytes = command
         .encode()
         .expect("a CASE 1 command has no data field and cannot fail to encode");
+    // The session is opened with Protocols::T0 (src/transport/pcsc.rs), and a
+    // T=0 command header is always five octets: CLA INS P1 P2 P3. ISO/IEC
+    // 7816-3 sends case 1 as P3 = 00 with no data. Every other command this
+    // crate sends is at least five octets, which is why only discovery hit
+    // this: the swicc-pcsc driver rejected the bare four-octet form on the
+    // very first probe ("An attempt was made to end a non-existent
+    // transaction"), for every candidate.
+    bytes.push(0x00);
     let raw = session.transmit(&bytes)?;
     let status = Response::parse(&raw)
         .ok()
@@ -590,10 +599,10 @@ mod tests {
     }
 
     #[test]
-    fn every_probe_is_a_bare_four_octet_case_1_header() {
+    fn every_probe_is_a_t0_case_1_header_with_p3_zero_and_no_data() {
         let mut card = Scripted::new(&[&[0x90, 0x00]]);
         let outcome = probe(&mut card, 0x00, 0xA4).unwrap();
-        assert_eq!(card.sent.borrow()[0], vec![0x00, 0xA4, 0x00, 0x00]);
+        assert_eq!(card.sent.borrow()[0], vec![0x00, 0xA4, 0x00, 0x00, 0x00]);
         assert!(outcome.is_interesting());
     }
 

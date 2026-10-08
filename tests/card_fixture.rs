@@ -1794,12 +1794,11 @@ fn fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card() {
         reconnects <= sim_doctor::apdu_scan::MAX_RECONNECTS as u64,
         "{data}"
     );
-    if reconnects > 0 {
-        eprintln!(
-            "fuzz apdu --quick: survived {reconnects} transport failure(s): {}",
-            audit["transport_errors"]
-        );
-    }
+    // But surviving is the fallback, not the expectation: swSIM must answer
+    // every CASE 1 probe (sent as the five-octet T=0 form), so any transport
+    // error here is a bug in how discovery talks to the card.
+    assert_eq!(reconnects, 0, "{data}");
+    assert_eq!(audit["transport_errors"], serde_json::json!([]), "{data}");
 
     // Every probe is a bare four-octet CASE 1 header: no Lc, no data, no Le,
     // and P1 = P2 = 00 - "discovery never carries a payload" (issue #16),
@@ -1809,6 +1808,11 @@ fn fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card() {
     assert!(!probes.is_empty(), "{data}");
     for probe in probes {
         assert!(probe["cla"].as_str().is_some(), "{probe}");
-        assert!(probe["outcome"].as_str().is_some(), "{probe}");
+        let outcome = probe["outcome"].as_str().expect("outcome");
+        assert_ne!(outcome, "transport-error", "{probe}");
+        eprintln!(
+            "fuzz apdu --quick: CLA {} -> {outcome} {}",
+            probe["cla"], probe["status"]
+        );
     }
 }
