@@ -239,8 +239,13 @@ reports a table or one `--json` envelope with a meaningful exit code. It is card
 the swSIM fixture in CI and against a live operator USIM. On that card the default walk completes in
 about 2 minutes with nothing truncated.
 
-Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always` and
-`gsma/msl-zero-allowed` (behind `--tar`). Every rule is gated by the corpus precision/recall test
+**Full visibility.** As an authorized on-card security tool, sim-doctor shows card values in full
+(IMSI, ICCID, file and key-file contents) with no runtime masking. It never commits real card data to
+a repo; test fixtures are synthetic.
+
+Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always`,
+`identity/readable-without-pin` and `gsma/msl-zero-allowed` (behind `--tar`). `scan` also decodes the
+security-relevant EFs (identity, service tables) and reads key files where the card allows. Every rule is gated by the corpus precision/recall test
 (`tests/corpus.rs`). `auth/scp03-missing-mac` is registered, but no scan path records SCP03, so it
 has no evidence on a real card. Still missing ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)):
 crypto rules (COMP128/Milenage, weak keys) and eUICC/SGP.22 rules. The MSL 0 check runs on a real
