@@ -124,13 +124,17 @@ against an in-memory backend; the interactive loop is **not** tested against a r
 | --- | --- |
 | npx | `npx sim-doctor <args>` downloads the matching release binary once into `~/.cache/sim-doctor` and checks its SHA-256 |
 | cargo | `cargo install sim-doctor` |
-| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/Vaibhav91one/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` |
+| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/Vaibhav91one/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
 
 The npm package, the crate and the binaries are all published by the tagged-release workflow.
 From a checkout, `cargo build --release` builds the same binary.
 
 Linux needs `libpcsclite` (build: `libpcsclite-dev`, run: `pcscd`). macOS uses the
 built-in PCSC framework.
+
+Raspberry Pi 4/5 (Debian 13 trixie, aarch64): `sudo apt install pcscd libccid`, then download the
+`aarch64-unknown-linux-gnu` binary or run `npx sim-doctor`. The Linux binaries are built on Ubuntu 24.04,
+so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, build from source there).
 
 ## CLI reference
 

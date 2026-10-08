@@ -17,6 +17,10 @@ test("asset names match what release.yml publishes", () => {
   assert.ok(wf.includes("sim-doctor-${{ matrix.target }}.tar.gz"));
 });
 
+test("linux/arm64 maps to the aarch64 Linux asset", () => {
+  assert.strictEqual(targets["linux-arm64"], "aarch64-unknown-linux-gnu");
+});
+
 test("asset url is the tagged GitHub release download", () => {
   assert.strictEqual(
     assetUrl("x86_64-unknown-linux-gnu", version),

@@ -132,3 +132,37 @@ jobs:
 
       - name: cargo test --locked
         run: cargo test --locked
+
+  # Proves the release workflow's aarch64-unknown-linux-gnu build (native ARM runner) on every PR.
+  # Build only, no tests: the unit/integration tests already run on x86_64 above.
+  build-aarch64:
+    name: build (linux aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install libpcsclite build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends pkg-config libpcsclite-dev
+
+      - name: cargo build --release --locked --target aarch64-unknown-linux-gnu
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Show the produced binary
+        run: |
+          file target/aarch64-unknown-linux-gnu/release/sim-doctor
+          objdump -T target/aarch64-unknown-linux-gnu/release/sim-doctor | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
