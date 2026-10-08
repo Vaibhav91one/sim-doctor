@@ -18,7 +18,7 @@ CLI-first SIM/UICC/eUICC security testing tool.
 
 `sim-doctor` examines a card over PC/SC and reports what it found through both a
 terminal table and one stable JSON envelope with a meaningful exit code, so the same
-binary serves an operator and an automated agent. **It is structure-only today: see
+binary serves an operator and an automated agent. **Its rule set is still small: see
 [Status](#status) before you trust a clean result.**
 
 ```sh
@@ -211,7 +211,7 @@ block. `--print-only` shows what would be written.
 - **The default dialect and candidate set are assumptions.** The output names the ones used;
   a file outside the default identifier families is never probed and cannot be reported missing.
 - **`--tar` is bounded.** The full TAR space is 16 777 216 values; the tool sends at most 4096.
-- Verified against the swSIM software card in CI and read-only against one live operator USIM.
+- Verified against the swSIM software card in CI and against one live operator USIM (read-only, plus a consented `--tar focused` run).
 - **SCP03 never runs against a card.** `src/scp03.rs` is a library (key derivation,
   cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders) verified by
   known-answer vectors. The `auth/scp03-missing-mac` rule is registered, but a scan has no
@@ -221,18 +221,20 @@ block. `--print-only` shows what would be written.
 
 ## Status
 
-**Structure plus a first rule set.** `sim-doctor scan` opens a real PC/SC session, selects the
-master file, walks the file system, and reports it as a table or, under `--json`, as one envelope
-with a meaningful exit code. It is card-verified against the swSIM fixture in CI and, read-only
-(`--tar off`), against a live operator USIM: the walk completes under the default
-`ts-102-221` FCP dialect.
+**Structure plus a first rule set, verified on a live card.** `sim-doctor scan` opens a real PC/SC
+session, walks the master file and the USIM/ISIM applications (selected by AID from EF.DIR), and
+reports a table or one `--json` envelope with a meaningful exit code. It is card-verified against
+the swSIM fixture in CI and against a live operator USIM. On that card the default walk completes in
+about 2 minutes with nothing truncated.
 
-What it is **not** yet: a full security rule engine. Registered rules: `gsma/msl-zero-allowed`
-(behind `--tar`) and `auth/scp03-missing-mac` (registered; no scan path records SCP03 yet, so
-it has no evidence on a real card). Access-condition and PIN-status rules are in progress
-([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)); every rule is gated by the corpus
-precision/recall test (`tests/corpus.rs`). Library modules without a card path yet: SCP03
-(`src/scp03.rs`), Milenage (`src/aka.rs`), RFC 6979 signing (`src/sign.rs`).
+Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always` and
+`gsma/msl-zero-allowed` (behind `--tar`). Every rule is gated by the corpus precision/recall test
+(`tests/corpus.rs`). `auth/scp03-missing-mac` is registered, but no scan path records SCP03, so it
+has no evidence on a real card. Still missing ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)):
+crypto rules (COMP128/Milenage, weak keys) and eUICC/SGP.22 rules. The MSL 0 check runs on a real
+card, but a card that answers every ENVELOPE with `6F00` gives an inconclusive result
+([#98](https://github.com/Vaibhav91one/sim-doctor/issues/98)). The eUICC stack (SCP03t, BPP, ES10x,
+ES9+) is library code with no card or network path yet.
 See [CONTEXT.md](CONTEXT.md) for the plan.
 
 `sim-doctor scan --sarif FILE` also writes the findings as SARIF 2.1.0, using logical locations
