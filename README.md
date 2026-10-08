@@ -186,6 +186,16 @@ reads EF.DIR (`2F00`, READ RECORD only), SELECTs each AID, and lists its files a
 `3F00/ADF:<AID>/6F07`; for the comparison the 3GPP USIM (`A0000000871002`) maps to the
 profile's `7FD0` and ISIM (`A0000000871004`) to `7FC0`.
 
+### `trace`
+
+Decodes a captured APDU trace offline: no card, no reader. Input is hex lines (command, then
+response, alternating; `#` comments) or sim-doctor's own `gp info --json --trace` output, from a
+file or stdin. Each exchange is named (ISO 7816-4, TS 102 221, TS 31.102 and GlobalPlatform
+commands), the status word is explained, and the selected file is tracked. PIN and PUT KEY values
+are never printed. `--json` adds `data.exchanges[]`. pcap/GSMTAP input is not supported yet.
+
+    printf 'A0A40000023F00\n9F16\n' | sim-doctor trace
+
 ## Exit codes
 
 | | |

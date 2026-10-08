@@ -29,7 +29,7 @@ use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
     access, apdu_scan, baseline, ci, contract, fix, fuzz, gp, rules, sarif, scan, session, signals,
-    skill, tar,
+    skill, tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -206,6 +206,14 @@ enum Command {
     /// Sends SELECT, GET RESPONSE and GET DATA only. Never an authenticating
     /// or writing command.
     Gp(GpArgs),
+
+    /// Decode a captured APDU trace offline (no card, no reader).
+    ///
+    /// Reads hex lines (alternating command, response) or our own `--trace`
+    /// JSON from FILE or stdin, names each command, tracks the selected file
+    /// and explains each status word. PIN values are never printed. pcap/GSMTAP
+    /// input is not supported yet.
+    Trace(TraceArgs),
 
     /// APDU discovery and the OTA/SMS fuzz sweep.
     ///
@@ -812,6 +820,16 @@ enum RulesAction {
     },
 }
 
+/// Everything `sim-doctor trace` takes.
+#[derive(Args)]
+struct TraceArgs {
+    /// A trace file; stdin when omitted or "-".
+    file: Option<String>,
+    /// Emit one JSON envelope of kind "trace" on stdout.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Everything `sim-doctor why` takes.
 #[derive(Args)]
 struct WhyArgs {
@@ -961,6 +979,7 @@ fn main() -> process::ExitCode {
                 trace,
             } => run_gp_info(reader.as_deref(), json, trace),
         },
+        Command::Trace(args) => run_trace(&args),
         Command::Mcp => run_mcp(),
         Command::Fuzz(args) => match args.action {
             FuzzAction::Apdu(args) => run_fuzz_apdu(args),
@@ -1790,6 +1809,61 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
         return contract::ExitCode::Findings;
     }
     contract::ExitCode::Success
+}
+
+/// `sim-doctor trace`: decode a saved APDU trace. Touches no card.
+fn run_trace(args: &TraceArgs) -> contract::ExitCode {
+    use std::io::Read;
+    const KIND: &str = "trace";
+    let refuse = |m: String| report_refusal(KIND, &m, serde_json::json!({ "error": m }), args.json);
+    let mut input = String::new();
+    let read = match args.file.as_deref() {
+        None | Some("-") => io::stdin()
+            .take(MAX_WHY_FILE_BYTES)
+            .read_to_string(&mut input),
+        Some(path) => std::fs::File::open(path)
+            .and_then(|f| f.take(MAX_WHY_FILE_BYTES).read_to_string(&mut input)),
+    };
+    if let Err(err) = read {
+        return refuse(format!("cannot read the trace: {err}"));
+    }
+    let rows = match trace::parse(&input) {
+        Ok(pairs) => trace::decode(&pairs),
+        Err(message) => return refuse(message),
+    };
+    if rows.last().is_some_and(|r| r.response.is_empty()) {
+        eprintln!("sim-doctor: warning: the trace ends on a command with no response (odd number of hex lines?)");
+    }
+    let rendered = if args.json {
+        let exchanges: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r.to_json(i + 1))
+            .collect();
+        let data = serde_json::json!({
+            "card_touched": false,
+            "count": rows.len(),
+            "selected": rows.last().map(|r| r.selected.clone()),
+            "exchanges": exchanges,
+        });
+        match contract::Envelope::new(
+            KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        )
+        .to_json()
+        {
+            Ok(line) => line,
+            Err(err) => return refuse(err.to_string()),
+        }
+    } else {
+        trace::render(&rows).trim_end().to_owned()
+    };
+    match emit_stdout(&rendered, "the decoded trace") {
+        Ok(()) => contract::ExitCode::Success,
+        Err(message) => refuse(message),
+    }
 }
 
 /// Every rule `rules list`, `rules explain`, `why` and `fix` know: the scan's,
