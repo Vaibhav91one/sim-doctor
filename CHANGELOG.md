@@ -17,22 +17,28 @@ All notable changes to this project are documented here. The format follows
 - A card command stuck in a PC/SC exchange can be interrupted: after SIGINT/SIGTERM a watchdog ends the run about 3 s later with exit 130 and releases the reader (#88).
 - The TAR probe and the fuzz OTA sweep send ENVELOPE as one APDU, so `--tar` works through real readers. Before, the header/data split was rejected by PC/SC and nothing was probed. The split is kept for the swicc-pcsc software reader only (#96).
 - The no-TAR-evidence score warning no longer claims a value of 100 (#84).
+- A tied or unusable TAR calibration is reported as a blind spot with no MSL-0 verdict, instead of classing every TAR as accepted and raising a false critical finding (#101).
 
 ### Added
 
 - SCP03 core (key derivation, cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders), Milenage wrapper and the `auth/scp03-missing-mac` rule; vector-tested, never sent to a card. `rules_run` is now 2, so older baselines are refused by `--diff` (#22).
 - RFC 6979 deterministic ECDSA P-256/SHA-256 signing, 64-byte r||s (#21).
 - A generated-card corpus with a per-rule precision/recall gate (#47).
-- Rules `auth/pin1-disabled` (from the FCP PIN status template) and `filesystem/sensitive-ef-always` (sensitive EFs readable or updatable under ALWays, decoded from compact, expanded and EF.ARR-referenced access rules). EF.ARR is read with READ RECORD only; file contents are never read (#40, partial).
-- `sim-doctor gp info [--trace]`: read-only GlobalPlatform pass (ISD select, GET DATA for CPLC / card data / key information, decoders, AES key check value). It sends only SELECT, GET RESPONSE and GET DATA (#19, partial).
+- Rules `auth/pin1-disabled`, `filesystem/sensitive-ef-always` and `identity/readable-without-pin`, decoded from compact/expanded/EF.ARR-referenced access rules (#40, partial).
+- `sim-doctor gp info [--trace]`: read-only GlobalPlatform pass — ISD select, GET DATA for CPLC / card data / key information / sequence+confirmation counters / extended card resources, Card Recognition Data decode, AES+3DES key check values. Sends only SELECT, GET RESPONSE and GET DATA. Plus offline builders (CAP→load file, INSTALL/LOAD, MANAGE CHANNEL) for later use (#19, partial).
 - `sim-doctor ts48 compare`: diffs a card's file system against the public GSMA TS.48 v7.0 test profile, using a derived file list with no keys. It takes the same walk-limit flags as `scan`. Matching TS.48 is not GCF/PTCRB conformance (#25).
 - `sim-doctor fuzz apdu|ota`: CLA/INS discovery and a TAR × keyset × SPI sweep, bounded. It refuses to run without `--i-understand-this-can-brick-the-card`, and on any reader other than the swicc-pcsc software card it also needs `--allow-real-hardware` (#16).
+- `sim-doctor scan` decodes the security-relevant EFs (ICCID, IMSI, MSISDN, EF.DIR, EF.AD, EF.SPN, service tables UST/EST) into `ef_contents`, and reads key files (EF.Keys/KeysPS) where the card allows; read-only (SELECT/READ only) (#108, #102).
+- `sim-doctor trace`: an offline APDU-trace decoder (hex or `gp info --json --trace` input) that names ISO/UICC/GlobalPlatform commands and tracks the selected file; pcap input deferred (#109).
+- A record/replay transport for hardware-free regression tests: `SIM_DOCTOR_RECORD` captures a session (0600, raw), and a recorded log replays through the walk in CI (#120).
+- An SGP.26 test-PKI check: a committed manifest (URL + pinned SHA-256) and an ignored test that fetches the GSMA certs at run time and validates signing against the chain; no certs are committed (#73).
 - Library modules, vector-tested and sending nothing on their own: SCP03t (#23), the SGP.22 Bound Profile Package builder (#17), ES10x STORE DATA and ES10b/ES10c codecs (#18), and the ES9+ message layer behind a transport trait (#20, partial; no HTTPS backend yet).
 - Prebuilt `aarch64-unknown-linux-gnu` binary (Raspberry Pi, glibc 2.39 or later); CI uploads it as an artifact on every run (#91).
 
 ### Changed
 
 - SGP.22 and TS.48 are public; the recorded GSMA member-access blockers were wrong and are resolved; TS.48 work is re-scoped to comparing a card with the public test profile (#26, #25).
+- Full-visibility output: as an authorized on-card security tool, sim-doctor shows card values in full (IMSI, ICCID, MSISDN, file and key-file contents) with no runtime redaction. Real card data is still never committed to the repo; test fixtures are synthetic (#128).
 
 ## [0.2.0] - 2026-10-07
 
