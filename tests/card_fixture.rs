@@ -602,10 +602,14 @@ fn walks_the_file_system_of_a_real_card() {
         .filter(|node| node.path().adf().is_none())
         // Beneath a repeated DF the card answers for itself at every depth the
         // bound allows (the node budget used to stop this early, #90), so skip
-        // any path that repeats an identifier.
+        // any file whose parent path repeats an identifier.
         .filter(|node| {
             let ids = node.path().segments();
-            ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id))
+            let parent = &ids[..ids.len() - 1];
+            parent
+                .iter()
+                .enumerate()
+                .all(|(i, id)| !parent[..i].contains(id))
         })
         .filter(|node| {
             !node
@@ -626,7 +630,10 @@ fn walks_the_file_system_of_a_real_card() {
         tree.nodes()
             .iter()
             .filter(|n| n.state().is_selected() && n.path().adf().is_none())
-            .filter(|n| n.path().depth() > 2)
+            .filter(|n| n.path().depth() > 2
+                && n.path().segments()[..n.path().depth() - 1]
+                    .windows(2)
+                    .all(|w| w[0] != w[1]))
             .take(12)
             .map(|n| n.path().to_string())
             .collect::<Vec<_>>()
