@@ -166,3 +166,11 @@ jobs:
         run: |
           file target/aarch64-unknown-linux-gnu/release/sim-doctor
           objdump -T target/aarch64-unknown-linux-gnu/release/sim-doctor | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+
+      # Lets a Pi test a PR's binary before a release exists (no room to build on the device).
+      - name: Upload the aarch64 binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sim-doctor-aarch64-unknown-linux-gnu
+          path: target/aarch64-unknown-linux-gnu/release/sim-doctor
+          retention-days: 14
