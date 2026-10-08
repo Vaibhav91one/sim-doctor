@@ -165,18 +165,6 @@ impl Selected {
     }
 }
 
-fn hex_short(b: &[u8]) -> String {
-    if b.len() > 24 {
-        format!(
-            "{}...(+{} bytes)",
-            hex::encode_upper(&b[..24]),
-            b.len() - 24
-        )
-    } else {
-        hex::encode_upper(b)
-    }
-}
-
 fn decode_one(sel: &mut Selected, step: Option<String>, cmd: &[u8], rsp: &[u8]) -> Decoded {
     let status =
         (rsp.len() >= 2).then(|| StatusWord::from_bytes([rsp[rsp.len() - 2], rsp[rsp.len() - 1]]));
@@ -384,14 +372,14 @@ fn describe(
                 "GP STORE DATA",
                 format!("P1={p1:02X} block {p2}, {} bytes", data.len()),
             ),
-            0xE4 => n("GP DELETE", hex_short(data)),
+            0xE4 => n("GP DELETE", hex::encode_upper(data)),
             0xF0 => n(
                 "GP SET STATUS",
-                format!("P1={p1:02X} P2={p2:02X} {}", hex_short(data)),
+                format!("P1={p1:02X} P2={p2:02X} {}", hex::encode_upper(data)),
             ),
             0x50 => n(
                 "GP INITIALIZE UPDATE",
-                format!("host challenge {}", hex_short(data)),
+                format!("host challenge {}", hex::encode_upper(data)),
             ),
             _ => n(
                 "GP EXTERNAL AUTHENTICATE",
@@ -509,7 +497,7 @@ fn describe(
                     0x80 => "UMTS",
                     _ => "other",
                 },
-                hex_short(data)
+                hex::encode_upper(data)
             ),
         ),
         0xC0 => n("GET RESPONSE", format!("{} bytes received", rsp.len())),
@@ -576,13 +564,13 @@ fn describe(
             "MANAGE CHANNEL",
             format!("{} channel {p2}", if p1 == 0 { "open" } else { "close" }),
         ),
-        0xE2 => n("APPEND RECORD", hex_short(data)),
-        0xE4 => n("DELETE FILE", hex_short(data)),
+        0xE2 => n("APPEND RECORD", hex::encode_upper(data)),
+        0xE4 => n("DELETE FILE", hex::encode_upper(data)),
         0x82 => n("EXTERNAL AUTHENTICATE", hex::encode_upper(data)),
         0x04 => n("DEACTIVATE FILE", String::new()),
         0x44 => n("ACTIVATE FILE", String::new()),
-        0xA2 => n("SEARCH RECORD", hex_short(data)),
-        0x32 => n("INCREASE", hex_short(data)),
+        0xA2 => n("SEARCH RECORD", hex::encode_upper(data)),
+        0x32 => n("INCREASE", hex::encode_upper(data)),
         _ => n(
             "UNKNOWN",
             format!("CLA {cla:02X} INS {ins:02X} P1 {p1:02X} P2 {p2:02X}"),

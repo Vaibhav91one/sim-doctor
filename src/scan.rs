@@ -434,8 +434,8 @@ pub const IDENTITY_READABLE_RULE: &str = "identity/readable-without-pin";
 /// EF.MSISDN is READ PIN in TS 31.102 clause 4.2.26. Decided from the access
 /// rule alone, so it needs no read of the file. **The IMSI is deliberately not
 /// here**: `filesystem/sensitive-ef-always` already owns it, and a second
-/// finding would score one fact twice. Evidence is the path and the access
-/// rule, never the value.
+/// finding would score one fact twice. Evidence is the path, the access
+/// rule and, when the file was read, its full decoded value (issue #128).
 fn identity_readable(subject: &Subject<'_>) -> Vec<rules::Finding> {
     subject
         .tree
@@ -448,23 +448,29 @@ fn identity_readable(subject: &Subject<'_>) -> Vec<rules::Finding> {
             let severity = rules::Severity::Low;
             let access = access::access_of(subject.tree, node)?;
             (access.read == access::Condition::Always).then(|| {
+                let value = ef::decoded_evidence(subject.tree, node.path());
                 rules::Finding::new(
                     rules::RuleId::new(IDENTITY_READABLE_RULE).expect("a validated constant"),
                     severity,
                     format!(
-                        "{} is readable without a PIN, so the subscriber identity is open to anyone holding the card",
-                        ef.name()
+                        "{} is readable without a PIN, so the subscriber identity is open to anyone holding the card{}",
+                        ef.name(),
+                        value.as_ref().map_or(String::new(), |v| format!(" ({v})"))
                     ),
                     rules::Location::selected_file(node.path().to_string()),
-                    rules::Evidence::text(format!(
-                        "read={} update={}",
-                        access.read.label(),
-                        access.update.label()
+                    rules::Evidence::text(with_value(
+                        format!("read={} update={}", access.read.label(), access.update.label()),
+                        value,
                     )),
                 )
             })
         })
         .collect()
+}
+
+/// `access` with the file's full decoded value appended, when it was read.
+fn with_value(access: String, value: Option<String>) -> String {
+    value.map_or(access.clone(), |v| format!("{access} {v}"))
 }
 
 fn identity_evidence(subject: &Subject<'_>) -> bool {
@@ -523,8 +529,8 @@ fn sensitive_name(node: &walk::Node) -> Option<&'static str> {
 ///
 /// **High when UPDATE is open, medium when only READ is.** Open UPDATE lets
 /// anyone holding the card rewrite the identity or the keys; open READ only
-/// exposes them. Evidence is the file path (the location) and the decoded
-/// access rule; this rule never reads the file's contents.
+/// exposes them. Evidence is the file path (the location), the decoded
+/// access rule and, when the file was read, its full decoded value.
 fn sensitive_ef_always(subject: &Subject<'_>) -> Vec<rules::Finding> {
     subject
         .tree
@@ -542,17 +548,18 @@ fn sensitive_ef_always(subject: &Subject<'_>) -> Vec<rules::Finding> {
                 (false, true) => (rules::Severity::High, "updatable"),
                 _ => (rules::Severity::Medium, "readable"),
             };
+            let value = ef::decoded_evidence(subject.tree, node.path());
             Some(rules::Finding::new(
                 rules::RuleId::new(SENSITIVE_EF_RULE).expect("a validated constant"),
                 severity,
                 format!(
-                    "{name} is {what} without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays"
+                    "{name} is {what} without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays{}",
+                    value.as_ref().map_or(String::new(), |v| format!(" ({v})"))
                 ),
                 rules::Location::selected_file(node.path().to_string()),
-                rules::Evidence::text(format!(
-                    "read={} update={}",
-                    access.read.label(),
-                    access.update.label()
+                rules::Evidence::text(with_value(
+                    format!("read={} update={}", access.read.label(), access.update.label()),
+                    value,
                 )),
             ))
         })

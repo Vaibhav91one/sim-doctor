@@ -548,6 +548,9 @@ pub fn decode(ef: Ef, records: &[Vec<u8>], mnc_len: Option<u8>) -> Result<Decode
                 .flatten()
                 .collect(),
         ),
+        Ef::Keys | Ef::KeysPs if first.is_empty() => {
+            return Err(Malformed("key file read back empty"))
+        }
         Ef::Keys | Ef::KeysPs => Decoded::Raw(first.to_vec()),
     })
 }
@@ -738,6 +741,15 @@ pub fn entries(tree: &Tree) -> Vec<Entry> {
             }
         })
         .collect()
+}
+
+/// The full decoded value of the EF at `path`, when it was read and decoded
+/// (what a finding about that file appends to its message and evidence).
+pub fn decoded_evidence(tree: &Tree, path: &Path) -> Option<String> {
+    entries(tree).into_iter().find_map(|e| match e.outcome {
+        Outcome::Decoded(d) if &e.path == path => Some(d.evidence()),
+        _ => None,
+    })
 }
 
 /// The MNC length EF.AD (next to `imsi_path`) gives.
