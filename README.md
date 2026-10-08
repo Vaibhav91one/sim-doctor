@@ -176,8 +176,10 @@ differences are the expected result and the exit code is 0 whenever the walk fin
 
 **Matching the TS.48 file structure is not GCF or PTCRB conformance.** This compares a file
 system with a public test profile and certifies nothing. The walk's limits apply (the default
-candidate set can miss a file, and an application directory is compared at the profile's
-identifier, so a USIM ADF that a card exposes under another identifier reads as missing plus extra).
+candidate set can miss a file). Applications are found the way a UICC exposes them: the walk
+reads EF.DIR (`2F00`, READ RECORD only), SELECTs each AID, and lists its files as
+`3F00/ADF:<AID>/6F07`; for the comparison the 3GPP USIM (`A0000000871002`) maps to the
+profile's `7FD0` and ISIM (`A0000000871004`) to `7FC0`.
 
 ## Exit codes
 

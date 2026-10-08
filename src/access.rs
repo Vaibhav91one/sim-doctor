@@ -45,7 +45,7 @@ use crate::fs::{self, Path};
 use crate::session::{self, Policy};
 use crate::tlv::{Stream, Tlv};
 use crate::transport::CardSession;
-use crate::walk::{Node, Tree};
+use crate::walk::{self, Node, Tree};
 
 /// How deep an OR/AND template may nest before it is called restricted.
 const MAX_TEMPLATE_DEPTH: usize = 4;
@@ -430,19 +430,12 @@ fn read_records<S: CardSession + ?Sized>(
     let Some(le) = Le::for_byte_count(u32::from(length)).filter(|_| length > 0) else {
         return Ok(records);
     };
-    let target: Vec<u8> = path
-        .segments()
-        .iter()
-        .skip(1)
-        .flat_map(|id| id.to_bytes())
-        .collect();
-    let select = session::send(
-        session,
-        &Command::case3(fs::select_path_header(), target),
-        policy,
-    )?;
-    if !select.status().is_some_and(|s| s.is_normal_processing()) {
-        return Ok(records);
+    // Under an application this is SELECT by AID, then by path from it.
+    for command in walk::select_commands(walk::Addressing::PathFromMasterFile, path) {
+        let select = session::send(session, &command, policy)?;
+        if !select.status().is_some_and(|s| s.is_normal_processing()) {
+            return Ok(records);
+        }
     }
     for number in 1..=usize::from(count).min(MAX_ARR_RECORDS) {
         // `number` is at most 254 here.

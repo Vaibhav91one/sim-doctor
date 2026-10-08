@@ -598,6 +598,8 @@ fn walks_the_file_system_of_a_real_card() {
         .nodes()
         .iter()
         .filter(|node| node.state().is_selected())
+        // Application files are addressed by AID, not by this two-level layout.
+        .filter(|node| node.path().adf().is_none())
         .filter(|node| {
             !node
                 .notes()
@@ -788,7 +790,7 @@ fn walks_the_file_system_of_a_real_card() {
     let probed: Vec<&sim_doctor::walk::Node> = tree
         .nodes()
         .iter()
-        .filter(|node| node.path().depth() == 2)
+        .filter(|node| node.path().depth() == 2 && node.path().adf().is_none())
         .collect();
     // The master file was probed exactly once per candidate the walker was
     // given, in order, until a bound said it could not go on. Asserted as a
