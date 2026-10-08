@@ -1374,9 +1374,13 @@ impl Audit {
     /// that says so by definition; every other accepted TAR is a different
     /// problem with a different rule ID that has not been agreed.
     pub fn msl_zero_allowed(&self) -> bool {
-        self.probes
-            .iter()
-            .any(|probe| probe.tar == TAR_MIN && probe.verdict.is_accepted())
+        // No baseline means no verdict: "accepted" is only meaningful against a
+        // measured refusal (issue #101).
+        self.baseline.is_established()
+            && self
+                .probes
+                .iter()
+                .any(|probe| probe.tar == TAR_MIN && probe.verdict.is_accepted())
     }
 
     /// What to say about this audit when it could not decide anything.
@@ -1397,7 +1401,7 @@ impl Audit {
         }
         if !self.baseline.is_established() {
             return Some(
-                "every calibration probe answered the same, or with no status word at all, so this card's answer to an ACCEPTED TAR cannot be told apart from its answer to an UNKNOWN one; no TAR is reported as accepted, and that is not a clean card",
+                "the calibration did not yield a single most-common response (the answers tied, or none carried a status word), so this card's answer to an ACCEPTED TAR cannot be told apart from its answer to an UNKNOWN one; no TAR is reported as accepted, and that is not a clean card",
             );
         }
         if !self.is_complete() {
@@ -1970,10 +1974,10 @@ pub fn audit_with<S: CardSession + ?Sized>(
 
     let baseline = Baseline::of(&calibration);
 
-    // A generic-error baseline means the card did not process envelopes at
-    // all, so the sweep would only repeat that answer 600 times. It is not
-    // sent: fewer commands on the card, and the rule then has no evidence.
-    let skipped = halted.is_none() && baseline.generic_error().is_some();
+    // Without an established baseline (a generic error, a tie, or no status
+    // words) every probe would be classed Accepted, so the sweep is not sent:
+    // fewer commands on the card, and the rule then has no evidence (#98, #101).
+    let skipped = halted.is_none() && !baseline.is_established();
 
     // 2. The probes themselves.
     let mut probes = Vec::with_capacity(tars.len());
@@ -2015,10 +2019,12 @@ pub fn audit_with<S: CardSession + ?Sized>(
     let stopped = if exhausted {
         None
     } else if skipped {
-        Some(
+        Some(if baseline.generic_error().is_some() {
             "the calibration ENVELOPEs were answered with a generic error, so the TAR sweep was not sent (see blind_spot)"
-                .to_owned(),
-        )
+        } else {
+            "the calibration did not yield a single most-common response, so the TAR sweep was not sent (see blind_spot)"
+        }
+        .to_owned())
     } else if let Some(reason) = halted {
         Some(match reason {
             Stop::Interrupted => "the scan was interrupted".to_owned(),
@@ -3502,6 +3508,62 @@ mod tests {
         assert_eq!(block["baseline"]["generic_error"], "6F00");
         assert_eq!(block["terminal_profile"], Value::Null);
         assert!(audit.to_human().contains("--terminal-profile"));
+    }
+
+    /// **Issue #101.** Calibration answers that tie (10 x 9404, 10 x 6D00)
+    /// give no baseline: nothing is probed beyond the 20 calibration
+    /// ENVELOPEs, nothing is accepted, and MSL 0 is not claimed.
+    #[test]
+    fn a_tied_calibration_is_a_blind_spot_with_no_verdict() {
+        let mut card = Scripted::cycling(&[&[0x94, 0x04], &[0x6D, 0x00]]);
+        let audit = audit(
+            &mut card,
+            &Selection::focused(),
+            &Policy::default(),
+            &mut never,
+        )
+        .expect("no transport error");
+
+        assert_eq!(card.sent().len(), CALIBRATION_PROBES);
+        assert!(audit.probes.is_empty());
+        assert!(!audit.baseline.is_established());
+        assert!(!audit.msl_zero_allowed());
+        assert!(audit
+            .blind_spot()
+            .expect("blind")
+            .contains("single most-common"));
+    }
+
+    /// Even if probes exist, an unestablished baseline never yields MSL 0.
+    #[test]
+    fn msl_zero_needs_an_established_baseline() {
+        let mut audit = Audit::not_run("x");
+        audit.probes.push(Probe {
+            tar: TAR_MIN,
+            verdict: Verdict::Accepted {
+                status: None,
+                body_len: 0,
+            },
+        });
+        assert!(!audit.msl_zero_allowed());
+    }
+
+    /// A clear majority (not a tie) still establishes the baseline, and the
+    /// sweep is sent.
+    #[test]
+    fn a_clear_majority_calibration_still_establishes_a_baseline() {
+        let mut card = Scripted::new(&[&[0x94, 0x04]]);
+        let audit = audit(
+            &mut card,
+            &Selection::focused(),
+            &Policy::default(),
+            &mut never,
+        )
+        .expect("no transport error");
+
+        assert!(audit.baseline.is_established());
+        assert_eq!(audit.probes.len(), FOCUSED_PROBES);
+        assert_eq!(audit.blind_spot(), None);
     }
 
     /// With the flag the same card answers per TAR: the baseline is
