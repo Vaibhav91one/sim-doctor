@@ -70,11 +70,14 @@ fn scan_flags(scan: &Command) -> Vec<(String, String, &'static str)> {
         .collect()
 }
 
-/// The read-only eUICC tools: (tool name, `euicc` subcommand, description).
-const EUICC_TOOLS: [(&str, &str, &str); 3] = [
-    ("euicc_info", "info", "Read the EID, EUICCInfo1 and EUICCInfo2 of the eUICC in a PC/SC reader (lpac chip info), as the sim-doctor lpac envelope. Read-only. Needs an eUICC and a reader."),
-    ("euicc_profiles", "profiles", "List the profiles on the eUICC in a PC/SC reader (lpac profile list), as the sim-doctor lpac envelope. Read-only. Needs an eUICC and a reader."),
-    ("euicc_notifications", "notifications", "List pending notification metadata on the eUICC in a PC/SC reader (lpac notification list), as the sim-doctor lpac envelope. Nothing is retrieved or removed. Needs an eUICC and a reader."),
+/// The read-only reader tools: (tool name, command, subcommand, description).
+const READER_TOOLS: [(&str, &str, &str, &str); 6] = [
+    ("euicc_info", "euicc", "info", "Read the EID, EUICCInfo1 and EUICCInfo2 of the eUICC in a PC/SC reader (lpac chip info), as the sim-doctor lpac envelope. Read-only. Needs an eUICC and a reader."),
+    ("euicc_profiles", "euicc", "profiles", "List the profiles on the eUICC in a PC/SC reader (lpac profile list), as the sim-doctor lpac envelope. Read-only. Needs an eUICC and a reader."),
+    ("euicc_notifications", "euicc", "notifications", "List pending notification metadata on the eUICC in a PC/SC reader (lpac notification list), as the sim-doctor lpac envelope. Nothing is retrieved or removed. Needs an eUICC and a reader."),
+    ("gp_info", "gp", "info", "Read the GlobalPlatform ISD, CPLC, card data, key information and counters of the card in a PC/SC reader, as the sim-doctor gp envelope. Read-only: SELECT and GET DATA only. Needs a card and a reader."),
+    ("gp_ara", "gp", "ara", "Select the ARA-M and read every applet access rule (GET DATA all), decoded, as the sim-doctor gp envelope. Read-only, no keys. Needs a card and a reader."),
+    ("gp_status", "gp", "status", "List the GlobalPlatform ISD, applications and load files (GET STATUS) and decode Card Recognition Data, as the sim-doctor gp envelope. Read-only, no keys; a scope that needs a secure channel is reported as requiring authentication. Needs a card and a reader."),
 ];
 
 /// The tools this server exposes, in MCP `tools/list` shape.
@@ -105,7 +108,7 @@ pub fn tool_list(scan: &Command) -> Value {
             },
         }),
     ];
-    for (name, _, description) in EUICC_TOOLS {
+    for (name, _, _, description) in READER_TOOLS {
         tools.push(json!({
             "name": name,
             "description": description,
@@ -153,12 +156,12 @@ fn build_argv(scan: &Command, name: &str, args: &Value) -> Result<Vec<String>, S
                 "--json".into(),
             ])
         }
-        _ if EUICC_TOOLS.iter().any(|(n, _, _)| *n == name) => {
-            let sub = EUICC_TOOLS.iter().find(|(n, _, _)| *n == name).unwrap().1;
+        _ if READER_TOOLS.iter().any(|(n, ..)| *n == name) => {
+            let (_, cmd, sub, _) = READER_TOOLS.iter().find(|(n, ..)| *n == name).unwrap();
             if let Some(k) = obj.keys().find(|k| *k != "reader") {
                 return Err(format!("unknown argument \"{k}\""));
             }
-            let mut argv = vec!["euicc".to_string(), sub.to_string(), "--json".to_string()];
+            let mut argv = vec![cmd.to_string(), sub.to_string(), "--json".to_string()];
             if let Some(reader) = obj.get("reader") {
                 let reader = reader
                     .as_str()
@@ -487,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_exactly_the_six_tools_with_object_schemas() {
+    fn tools_list_has_exactly_the_nine_tools_with_object_schemas() {
         let r = handle(&req("tools/list", Some(2)), &fake_scan(), &never).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -499,7 +502,10 @@ mod tests {
                 "rules_explain",
                 "euicc_info",
                 "euicc_profiles",
-                "euicc_notifications"
+                "euicc_notifications",
+                "gp_info",
+                "gp_ara",
+                "gp_status"
             ]
         );
         for t in tools {
@@ -731,6 +737,24 @@ mod tests {
             json!({"reader": 1}),
         ] {
             let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"euicc_info","arguments":args}});
+            let r = handle(&req, &fake_scan(), &never).unwrap();
+            assert_eq!(r["result"]["isError"], true);
+        }
+    }
+
+    #[test]
+    fn gp_tools_run_the_read_only_subcommands() {
+        for (tool, sub) in [
+            ("gp_info", "info"),
+            ("gp_ara", "ara"),
+            ("gp_status", "status"),
+        ] {
+            assert_eq!(call(tool, json!({}), 0).1.unwrap(), ["gp", sub, "--json"]);
+            assert_eq!(
+                call(tool, json!({"reader": "R 1"}), 1).1.unwrap(),
+                ["gp", sub, "--json", "--reader", "R 1"]
+            );
+            let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":{"trace":true}}});
             let r = handle(&req, &fake_scan(), &never).unwrap();
             assert_eq!(r["result"]["isError"], true);
         }
