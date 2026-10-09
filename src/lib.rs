@@ -27,6 +27,7 @@
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
 //! layer 1  es10        ES10x: STORE DATA segmentation, ES10b/ES10c encoders and decoders
+//! layer 1  euicc      read-only eUICC queries (ISD-R, ES10) behind `sim-doctor euicc`
 //! layer 1  es9         ES9+: the JSON-over-HTTPS messages to an SM-DP+, behind a transport trait
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
@@ -112,6 +113,7 @@ pub mod der;
 pub mod ef;
 pub mod es10;
 pub mod es9;
+pub mod euicc;
 pub mod fcp;
 pub mod fix;
 pub mod fs;
@@ -310,6 +312,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: es10::NAME,
         owns: "ES10x (SGP.22 v2.5): generic STORE DATA segmentation and response reassembly, and the ES10b/ES10c request encoders and typed response decoders; sends nothing unless a caller hands it a session.",
         depends_on: &[apdu::NAME, transport::NAME, session::NAME],
+    },
+    ModuleInfo {
+        name: euicc::NAME,
+        owns: "Read-only eUICC queries: select the ISD-R on a logical channel and run GetEID, GetEuiccInfo1/2, GetProfilesInfo and ListNotification (metadata only) through es10; changes no profile and no notification.",
+        depends_on: &[apdu::NAME, session::NAME, es10::NAME, ef::NAME, contract::NAME, transport::NAME],
     },
     ModuleInfo {
         name: scan::NAME,

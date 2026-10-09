@@ -1794,7 +1794,17 @@ mod mcp_server {
 
         let tools = lines[1]["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["scan", "rules_list", "rules_explain"]);
+        assert_eq!(
+            names,
+            [
+                "scan",
+                "rules_list",
+                "rules_explain",
+                "euicc_info",
+                "euicc_profiles",
+                "euicc_notifications"
+            ]
+        );
         let props = tools[0]["inputSchema"]["properties"].as_object().unwrap();
         for hidden in ["tui", "json", "diff"] {
             assert!(!props.contains_key(hidden), "{hidden} exposed");
@@ -2182,4 +2192,29 @@ mod fuzz_safety {
         assert_eq!(run.code(), 1);
         assert!(run.stderr.contains("--class"), "{}", run.stderr);
     }
+}
+
+#[test]
+fn euicc_commands_without_a_reader_exit_1_with_one_lpa_envelope() {
+    // Issues #116/#132. A reader name that cannot exist, so no card is touched
+    // whatever hardware is attached; the lpac envelope carries the cause.
+    for sub in ["info", "profiles", "notifications"] {
+        let run = run_piped(&["euicc", sub, "--json", "--reader", NO_SUCH_READER]);
+        assert_eq!(run.code(), 1, "euicc {sub}: {}", run.stderr);
+        let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+        assert_eq!(envelope.kind(), "lpa");
+        assert!(
+            envelope.payload().data()["error"]["kind"].is_string(),
+            "{}",
+            run.stdout
+        );
+    }
+    let run = run_piped(&["euicc", "info", "--aid", "zz", "--json"]);
+    assert_eq!(run.code(), 1);
+    assert_eq!(
+        assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings)
+            .payload()
+            .data()["error"]["kind"],
+        "bad-aid"
+    );
 }

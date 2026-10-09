@@ -716,6 +716,18 @@ pub fn get_euicc_info2_request() -> Vec<u8> {
     tlv(0xBF22, &[])
 }
 
+/// `GetEuiccDataRequest` asking for the EID only, `BF3E 03 5C 01 5A`
+/// ([SGP.22 v2.5 §5.7.20], the frame pySim sends).
+pub fn get_eid_request() -> Vec<u8> {
+    tlv(0xBF3E, &tlv(0x5C, &[0x5A]))
+}
+
+/// `ListNotificationRequest` with no filter, `BF28 00`: every pending
+/// notification's metadata, nothing retrieved or removed ([SGP.22 v2.5 §5.7.11]).
+pub fn list_notification_request() -> Vec<u8> {
+    tlv(0xBF28, &[])
+}
+
 /// `PrepareDownloadRequest`, `BF21` ([SGP.22 v2.5 §5.7.5]). The signed and
 /// certificate parts come from the SM-DP+ (`ES9+.GetBoundProfilePackage`
 /// input) and are passed through as DER, because the signature covers their
@@ -1161,6 +1173,113 @@ fn info2_from_nodes(nodes: Vec<Node<'_>>) -> Result<EuiccInfo2, DecodeError> {
         tre_properties,
         tre_product_reference: tre_reference,
         additional_euicc_profile_package_versions: additional,
+        unknown,
+    })
+}
+
+/// Decodes the response data of GetEuiccData asked for tag `5A` only: the
+/// 16-byte EID ([SGP.22 v2.5 §5.7.20]).
+///
+/// # Errors
+///
+/// A [`DecodeError`] when the data is not a `BF3E` holding a 16-byte `5A`.
+pub fn decode_get_eid(data: &[u8]) -> Result<[u8; 16], DecodeError> {
+    let mut eid = None;
+    for node in only(data, 0xBF3E)? {
+        if node.tag == 0x5A && eid.is_none() {
+            eid = Some(exact(node.value, "eidValue")?);
+        }
+    }
+    require(eid, "eidValue")
+}
+
+/// One `NotificationMetadata` (`BF2F`) of a ListNotification response
+/// ([SGP.22 v2.5 §5.7.11]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationMetadata {
+    /// `seqNumber`.
+    pub seq_number: u32,
+    /// `profileManagementOperation`: bit 0 install, 1 enable, 2 disable, 3 delete.
+    pub operation: BitString,
+    /// `notificationAddress`, the SM-DP+ or other recipient.
+    pub address: String,
+    /// `iccid`, tag `5A`, when present.
+    pub iccid: Option<Vec<u8>>,
+    /// Tags this decoder does not know.
+    pub unknown: Vec<Unknown>,
+}
+
+/// `ListNotificationResponse` ([SGP.22 v2.5 §5.7.11]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListNotificationResponse {
+    /// `notificationMetadataList` (`A0`); empty when none are pending.
+    Ok(Vec<NotificationMetadata>),
+    /// `listNotificationsResultError` (`81`), 127 being undefinedError.
+    Error(u8),
+}
+
+/// Decodes the response data of ListNotification (`BF28`).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed structure.
+pub fn decode_list_notification(data: &[u8]) -> Result<ListNotificationResponse, DecodeError> {
+    let outer = only(data, 0xBF28)?;
+    let [choice] = outer.as_slice() else {
+        return Err(DecodeError::MissingField("listNotificationResponse"));
+    };
+    match choice.tag {
+        0x81 => Ok(ListNotificationResponse::Error(small_int(
+            choice.value,
+            "listNotificationsResultError",
+        )?)),
+        0xA0 => parse(choice.value)?
+            .into_iter()
+            .map(|node| match node.tag {
+                0xBF2F => decode_notification_metadata(node.value),
+                found => Err(DecodeError::UnexpectedTag {
+                    context: "notificationMetadataList",
+                    found,
+                }),
+            })
+            .collect::<Result<_, _>>()
+            .map(ListNotificationResponse::Ok),
+        found => Err(DecodeError::UnexpectedTag {
+            context: "ListNotificationResponse",
+            found,
+        }),
+    }
+}
+
+fn decode_notification_metadata(value: &[u8]) -> Result<NotificationMetadata, DecodeError> {
+    let (mut seq, mut operation, mut address, mut iccid) = (None, None, None, None);
+    let mut unknown = Vec::new();
+    for node in parse(value)? {
+        let v = node.value;
+        match node.tag {
+            0x80 if seq.is_none() => {
+                if v.is_empty() || v.len() > 4 {
+                    return Err(DecodeError::BadLength {
+                        field: "seqNumber",
+                        expected: "1 to 4",
+                        got: v.len(),
+                    });
+                }
+                seq = Some(v.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)));
+            }
+            0x81 if operation.is_none() => {
+                operation = Some(BitString::decode(v, "profileManagementOperation")?);
+            }
+            0x0C if address.is_none() => address = Some(utf8(v, "notificationAddress")?),
+            0x5A if iccid.is_none() => iccid = Some(ranged(v, "iccid", "10", 10..=10)?),
+            _ => keep(&mut unknown, node),
+        }
+    }
+    Ok(NotificationMetadata {
+        seq_number: require(seq, "seqNumber")?,
+        operation: require(operation, "profileManagementOperation")?,
+        address: require(address, "notificationAddress")?,
+        iccid,
         unknown,
     })
 }
