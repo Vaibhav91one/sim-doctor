@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-732",
+  "description": "a file holding the IMSI, ciphering keys or location (TS 31.102 gives them PIN or ADM conditions) is readable or updatable under ALWays",
+  "id": "filesystem/sensitive-ef-always",
+  "reference": "3GPP TS 31.102 clauses 4.2.2, 4.2.3, 4.2.4, 4.2.17, 4.2.23, 4.4.3.1, 4.4.3.2, 4.4.11.2 to 4.4.11.6",
+  "remediation": "set the file's READ and UPDATE access rule (its EF.ARR record) back to the TS 31.102 conditions, PIN for READ and PIN or ADM for UPDATE, then re-scan",
+  "severity": "high"
+}

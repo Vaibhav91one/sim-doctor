@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-306",
+  "description": "PIN Appl 1 is disabled, so files protected by PIN1 are open to anyone holding the card",
+  "id": "auth/pin1-disabled",
+  "reference": "ETSI TS 102 221 clauses 9.5 and 11.1.1.4.10 (PIN status); 3GPP TS 31.102 clause 4",
+  "remediation": "enable PIN1 (key reference 01) on the application, or confirm the universal PIN is enabled and in use, then re-scan",
+  "severity": "medium"
+}

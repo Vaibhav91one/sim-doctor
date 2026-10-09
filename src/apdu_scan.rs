@@ -479,7 +479,9 @@ pub fn specs() -> Vec<crate::rules::RuleSpec> {
         .with_remediation(
             "confirm this class is intentionally exposed; an undocumented class a tool can \
              discover is one an attacker can too",
-        ),
+        )
+        .with_cwe("CWE-912")
+        .with_reference("ISO/IEC 7816-4 clauses 5.1 and 7.1 (class and instruction bytes)"),
         crate::rules::RuleSpec::new(
             crate::rules::RuleId::new(UNDOCUMENTED_INS_RULE).expect("a validated constant"),
             crate::rules::Severity::Medium,
@@ -489,7 +491,9 @@ pub fn specs() -> Vec<crate::rules::RuleSpec> {
         .with_remediation(
             "confirm this instruction is intentionally exposed on this card; an undocumented \
              instruction a tool can discover is one an attacker can too",
-        ),
+        )
+        .with_cwe("CWE-912")
+        .with_reference("ISO/IEC 7816-4 clauses 5.1 and 7.1 (class and instruction bytes)"),
     ]
 }
 

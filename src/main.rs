@@ -1895,11 +1895,7 @@ fn run_trace(args: &TraceArgs) -> contract::ExitCode {
 /// Every rule `rules list`, `rules explain`, `why` and `fix` know: the scan's,
 /// then the TS.48 comparison's. A scan still runs and scores only its own.
 fn all_specs() -> Vec<rules::RuleSpec> {
-    let mut specs = scan::specs();
-    specs.extend(ts48::specs());
-    specs.extend(apdu_scan::specs());
-    specs.extend(fuzz::specs());
-    specs
+    scan::all_specs()
 }
 
 /// Runs `sim-doctor ts48 compare`: the scan's walk, then the diff.
@@ -2375,17 +2371,21 @@ fn rule_json(spec: &sim_doctor::rules::RuleSpec) -> serde_json::Value {
         "severity": spec.severity().id(),
         "summary": spec.summary(),
         "remediation": spec.remediation(),
+        "cwe": spec.cwe(),
+        "reference": spec.reference(),
     })
 }
 
 /// One rule's page, as text.
 fn rule_page(spec: &sim_doctor::rules::RuleSpec) -> String {
     format!(
-        "{}  [{}]\n\nWhat it means\n  {}\n\nHow to fix\n  {}\n",
+        "{}  [{}]\n\nWhat it means\n  {}\n\nHow to fix\n  {}\n\nWeakness\n  {}\n\nSpecification\n  {}\n",
         spec.id().as_str(),
         spec.severity().id(),
         spec.summary(),
         spec.remediation().unwrap_or("(none declared)"),
+        spec.cwe().unwrap_or("(not a weakness class)"),
+        spec.reference().unwrap_or("(none cited)"),
     )
 }
 

@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-912",
+  "description": "an INS byte outside this crate's documented set reached a handler at a class that accepts commands, rather than being refused with 6D00",
+  "id": "apdu/undocumented-ins-accepted",
+  "reference": "ISO/IEC 7816-4 clauses 5.1 and 7.1 (class and instruction bytes)",
+  "remediation": "confirm this instruction is intentionally exposed on this card; an undocumented instruction a tool can discover is one an attacker can too",
+  "severity": "medium"
+}

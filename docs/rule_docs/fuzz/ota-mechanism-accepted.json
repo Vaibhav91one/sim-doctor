@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-757",
+  "description": "the card answered a (TAR, keyset, mechanism) OTA triple differently from the way it answers triples it has no opinion about, under an explicit opt-in sweep",
+  "id": "fuzz/ota-mechanism-accepted",
+  "reference": "ETSI TS 102 225 clauses 5.1.1 and 5.1.2 (SPI, security mechanisms)",
+  "remediation": "confirm this TAR/keyset/mechanism combination is one this card is meant to accept; if not, tighten the TAR allow-list or the keyset's SPI requirements and re-run with --i-understand-this-can-brick-the-card against the software card only",
+  "severity": "high"
+}

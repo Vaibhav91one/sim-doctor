@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-912",
+  "description": "a CLA byte outside this crate's documented set (00, 80, A0) reached a handler rather than being refused with 6E00",
+  "id": "apdu/undocumented-cla-accepted",
+  "reference": "ISO/IEC 7816-4 clauses 5.1 and 7.1 (class and instruction bytes)",
+  "remediation": "confirm this class is intentionally exposed; an undocumented class a tool can discover is one an attacker can too",
+  "severity": "medium"
+}

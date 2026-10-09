@@ -343,7 +343,9 @@ pub fn specs() -> Vec<crate::rules::RuleSpec> {
         "confirm this TAR/keyset/mechanism combination is one this card is meant to accept; if \
          not, tighten the TAR allow-list or the keyset's SPI requirements and re-run with \
          --i-understand-this-can-brick-the-card against the software card only",
-    )]
+    )
+    .with_cwe("CWE-757")
+    .with_reference("ETSI TS 102 225 clauses 5.1.1 and 5.1.2 (SPI, security mechanisms)")]
 }
 
 /// Findings for every accepted triple in `audit`.

@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-359",
+  "description": "the MSISDN or a phonebook number list (EF.ADN, EF.FDN) is readable without a PIN (TS 31.102 gives them a PIN READ condition)",
+  "id": "identity/readable-without-pin",
+  "reference": "3GPP TS 31.102 clauses 4.2.26 (MSISDN), 4.2.24 (FDN), 4.4.2.3 (ADN)",
+  "remediation": "set the file's READ access rule (its EF.ARR record) to PIN, then re-scan",
+  "severity": "medium"
+}

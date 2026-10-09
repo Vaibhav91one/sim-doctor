@@ -46,7 +46,7 @@ use crate::walk::{ContentRead, Node, Tree};
 const MAX_RECORDS: usize = 16;
 /// The most octets of one transparent EF read. The longest decoded here is a
 /// service table (19 octets covers 146 UST services).
-const MAX_BINARY: u32 = 64;
+const MAX_BINARY: u32 = 255;
 /// The most items an evidence string lists before saying "+N more".
 const EVIDENCE_ITEMS: usize = 24;
 
@@ -133,6 +133,10 @@ pub enum Ef {
     /// EF.MANUAREA `0002` under the master file, read as raw bytes. Not a
     /// 3GPP/ETSI file: SIMTester reads it where a card has it (issue #102).
     ManuArea,
+    /// EF.SUCI_Calc_Info `4F07` under DF.5GS `5FC0` (TS 31.102 clause 4.4.11.8).
+    SuciCalcInfo,
+    /// EF.Routing_Indicator `4F0A` under DF.5GS `5FC0` (TS 31.102 clause 4.4.11.11).
+    RoutingIndicator,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,6 +172,8 @@ impl Ef {
             Self::Impu => "EF.IMPU",
             Self::Pcscf => "EF.P-CSCF",
             Self::ManuArea => "EF.MANUAREA",
+            Self::SuciCalcInfo => "EF.SUCI_Calc_Info",
+            Self::RoutingIndicator => "EF.Routing_Indicator",
         }
     }
 
@@ -201,6 +207,8 @@ pub fn classify(path: &Path) -> Option<Ef> {
         && (path.adf().is_some() && seg.len() == 3
             || seg.len() >= 4
                 && matches!(seg[seg.len() - 3].to_bytes(), [0x7F, 0x10] | [0x7F, 0xFF]));
+    // DF.5GS `5FC0` below an application: the 5G files are meaningful only there.
+    let five_gs = seg.len() >= 3 && seg[seg.len() - 2].to_bytes() == [0x5F, 0xC0];
     let (adf, gsm, telecom, mf) = match seg.len() {
         2 => (path.adf().is_some(), false, false, path.adf().is_none()),
         n if n >= 3 => {
@@ -218,6 +226,8 @@ pub fn classify(path: &Path) -> Option<Ef> {
         [0x6F, 0x02] if isim => Some(Ef::Impi),
         [0x6F, 0x04] if isim => Some(Ef::Impu),
         [0x6F, 0x09] if isim => Some(Ef::Pcscf),
+        [0x4F, 0x07] if five_gs => Some(Ef::SuciCalcInfo),
+        [0x4F, 0x0A] if five_gs => Some(Ef::RoutingIndicator),
         [0x4F, 0x3A] if phonebook => Some(Ef::Adn),
         [0x00, 0x02] if mf => Some(Ef::ManuArea),
         [0x2F, 0xE2] if mf => Some(Ef::Iccid),
@@ -747,6 +757,86 @@ pub fn decode_pcscf_record(record: &[u8]) -> Result<Option<String>, Malformed> {
     }))
 }
 
+/// EF.SUCI_Calc_Info (TS 31.102 clause 4.4.11.8): what a 5G terminal needs to
+/// conceal the SUPI as a SUCI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuciCalcInfo {
+    /// Protection scheme identifiers in priority order, highest first, each
+    /// with its home network public key index (`0` none, `1` the first key of
+    /// the key list): scheme `0` is the null scheme (the SUPI goes out in the
+    /// clear), `1` Profile A, `2` Profile B (the numbering pySim uses; the
+    /// clause defers the coding to TS 24.501).
+    pub schemes: Vec<(u8, u8)>,
+    /// The home network public key identifiers in the key list (tag `A1`).
+    pub keys: Vec<u8>,
+}
+
+impl SuciCalcInfo {
+    /// Whether the card's own configuration conceals the SUPI: a non-null
+    /// scheme leads the priority list and at least one home network public
+    /// key is provisioned. `None` is "yes"; `Some(reason)` says why not.
+    pub fn clear_reason(&self) -> Option<&'static str> {
+        match self.schemes.first() {
+            None => Some("no protection scheme is listed"),
+            Some((0, _)) => Some("the null scheme has the highest priority"),
+            _ if !self.schemes.iter().any(|(id, key)| {
+                *id != 0 && (1..=self.keys.len()).contains(&usize::from(*key))
+            }) =>
+            {
+                Some("no non-null scheme points at a provisioned home network public key")
+            }
+            _ => None,
+        }
+    }
+}
+
+fn scheme_name(id: u8) -> String {
+    match id {
+        0 => "null".to_owned(),
+        1 => "A".to_owned(),
+        2 => "B".to_owned(),
+        n => format!("{n:#04X}"),
+    }
+}
+
+/// EF.SUCI_Calc_Info: TLV `A0` (pairs of scheme id and key id) and `A1` (a
+/// list of `80` key id and `81` public key). Trailing `FF` is padding.
+pub fn decode_suci_calc_info(bytes: &[u8]) -> Result<SuciCalcInfo, Malformed> {
+    let bad = Malformed("EF.SUCI_Calc_Info is not the A0/A1 layout of TS 31.102 clause 4.4.11.8");
+    let (mut schemes, mut keys) = (Vec::new(), Vec::new());
+    let mut atoms = Stream::new(bytes);
+    while bytes.get(atoms.offset()).is_some_and(|b| *b != 0xFF) {
+        let atom = atoms.next_atom().map_err(|_| bad)?.ok_or(bad)?;
+        match atom.tag().octet() {
+            0xA0 => {
+                if atom.value().len() % 2 != 0 {
+                    return Err(bad);
+                }
+                schemes = atom.value().chunks_exact(2).map(|p| (p[0], p[1])).collect();
+            }
+            0xA1 => {
+                let mut inner = Stream::new(atom.value());
+                while let Some(item) = inner.next_atom().map_err(|_| bad)? {
+                    if item.tag().octet() == 0x80 {
+                        keys.push(*item.value().first().ok_or(bad)?);
+                    }
+                }
+            }
+            _ => return Err(bad),
+        }
+    }
+    Ok(SuciCalcInfo { schemes, keys })
+}
+
+/// EF.Routing_Indicator (TS 31.102 clause 4.4.11.11): 1 to 4 decimal digits in
+/// two octets, swapped-nibble BCD, unused digits `F`.
+pub fn decode_routing_indicator(bytes: &[u8]) -> Result<Digits, Malformed> {
+    let [a, b, ..] = bytes else {
+        return Err(Malformed("EF.Routing_Indicator is shorter than 2 octets"));
+    };
+    Ok(Digits(digits_of(swapped(&[*a, *b]))?))
+}
+
 /// Which service table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
@@ -828,6 +918,10 @@ pub enum Decoded {
     Msisdn(Vec<Msisdn>),
     /// The applications EF.DIR lists.
     Dir(Vec<Application>),
+    /// EF.SUCI_Calc_Info.
+    Suci(SuciCalcInfo),
+    /// EF.Routing_Indicator.
+    RoutingIndicator(Digits),
     /// EF.AD.
     Ad(Ad),
     /// EF.SPN.
@@ -917,6 +1011,8 @@ pub fn decode(ef: Ef, records: &[Vec<u8>], mnc_len: Option<u8>) -> Result<Decode
                 .flatten()
                 .collect(),
         ),
+        Ef::SuciCalcInfo => Decoded::Suci(decode_suci_calc_info(first)?),
+        Ef::RoutingIndicator => Decoded::RoutingIndicator(decode_routing_indicator(first)?),
         Ef::ManuArea => Decoded::Raw(first.to_vec()),
         Ef::Keys | Ef::KeysPs if first.is_empty() => {
             return Err(Malformed("key file read back empty"))
@@ -1012,6 +1108,16 @@ impl Decoded {
                     .join(", ")
             ),
             Self::Raw(b) => hex(b),
+            Self::Suci(s) => format!(
+                "schemes by priority [{}], {} home network public key(s)",
+                s.schemes
+                    .iter()
+                    .map(|(id, key)| format!("{} key {key}", scheme_name(*id)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                s.keys.len()
+            ),
+            Self::RoutingIndicator(d) => format!("routing indicator {}", d.as_str()),
             Self::Dir(apps) => {
                 let mut out = format!("{} application(s)", apps.len());
                 for a in apps.iter().take(EVIDENCE_ITEMS) {
@@ -1116,6 +1222,15 @@ impl Decoded {
             Self::Impi(nai) => json!({ "impi": nai }),
             Self::Uris(_, list) => json!({ "count": list.len(), "values": list }),
             Self::Raw(b) => json!({ "bytes": b.len(), "hex": hex(b) }),
+            Self::Suci(s) => json!({
+                "schemes": s.schemes.iter().map(|(id, key)| json!({
+                    "scheme": scheme_name(*id),
+                    "key_index": key,
+                })).collect::<Vec<_>>(),
+                "public_key_identifiers": s.keys,
+                "conceals": s.clear_reason().is_none(),
+            }),
+            Self::RoutingIndicator(d) => json!({ "routing_indicator": d.as_str() }),
             Self::Dir(apps) => json!({
                 "applications": apps.iter().map(|a| json!({
                     "aid": aid_hex(&a.aid),
@@ -1806,5 +1921,89 @@ mod tests {
         let d = decode(Ef::Fplmn, &[PLMN_001_01.repeat(30)], None).unwrap();
         assert!(d.evidence().starts_with("30 PLMN(s): "));
         assert!(d.evidence().ends_with("(+6 more)"), "{}", d.evidence());
+    }
+
+    // EF.SUCI_Calc_Info: TS 31.102 clause 4.4.11.8. Synthetic keys (a repeated octet).
+    fn suci(schemes: &[u8], keys: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xA0, schemes.len() as u8];
+        out.extend_from_slice(schemes);
+        let list: Vec<u8> = keys
+            .iter()
+            .flat_map(|id| [&[0x80, 0x01, *id][..], &[0x81, 0x03, 7, 7, 7]].concat())
+            .collect();
+        out.extend([0xA1, list.len() as u8]);
+        out.extend(list);
+        out
+    }
+
+    #[test]
+    fn suci_calc_info_conceals_only_with_a_leading_real_scheme_and_a_key() {
+        // Profile A with key 1, then the null scheme: concealed, FF padding tolerated.
+        let mut good = suci(&[1, 1, 0, 0], &[10]);
+        good.extend([0xFF; 4]);
+        let info = decode_suci_calc_info(&good).unwrap();
+        assert_eq!(info.schemes, [(1, 1), (0, 0)]);
+        assert_eq!(info.keys, [10]);
+        assert_eq!(info.clear_reason(), None);
+        assert!(Decoded::Suci(info)
+            .evidence()
+            .contains("A key 1, null key 0"));
+        // The null scheme first: clear, whatever follows.
+        let null_first = decode_suci_calc_info(&suci(&[0, 0, 1, 1], &[10])).unwrap();
+        assert!(null_first.clear_reason().unwrap().contains("null scheme"));
+        // A real scheme whose key index points past the list, or at none (0).
+        for bad in [&[1u8, 2][..], &[2, 0]] {
+            let info = decode_suci_calc_info(&suci(bad, &[10])).unwrap();
+            assert!(
+                info.clear_reason().unwrap().contains("public key"),
+                "{bad:?}"
+            );
+        }
+        // Empty lists (the card has no scheme provisioned).
+        let empty = decode_suci_calc_info(&[0xA0, 0x00, 0xA1, 0x00, 0xFF, 0xFF]).unwrap();
+        assert!(empty
+            .clear_reason()
+            .unwrap()
+            .contains("no protection scheme"));
+        // Malformed: an odd scheme list, a truncated TLV, a tag the clause does not give.
+        for bad in [&[0xA0, 0x03, 1, 1, 1][..], &[0xA0, 0x05, 1], &[0xB0, 0x00]] {
+            assert!(decode_suci_calc_info(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn routing_indicator_is_swapped_nibble_bcd_with_f_padding() {
+        assert_eq!(
+            decode_routing_indicator(&[0x21, 0x43]).unwrap().as_str(),
+            "1234"
+        );
+        assert_eq!(
+            decode_routing_indicator(&[0x21, 0xFF]).unwrap().as_str(),
+            "12"
+        );
+        assert_eq!(
+            decode_routing_indicator(&[0x00, 0x00]).unwrap().as_str(),
+            "0000"
+        );
+        assert!(decode_routing_indicator(&[0x21]).is_err());
+        assert!(decode_routing_indicator(&[0xAB, 0xCD]).is_err());
+    }
+
+    #[test]
+    fn the_5gs_files_are_classified_only_below_df_5gs() {
+        let path = |text: &str| {
+            text.split('/').fold(Path::master_file(), |p, seg| {
+                p.child(FileId::from_bytes(
+                    u16::from_str_radix(seg, 16).unwrap().to_be_bytes(),
+                ))
+                .unwrap()
+            })
+        };
+        assert_eq!(classify(&path("7FFF/5FC0/4F07")), Some(Ef::SuciCalcInfo));
+        assert_eq!(
+            classify(&path("7FFF/5FC0/4F0A")),
+            Some(Ef::RoutingIndicator)
+        );
+        assert_eq!(classify(&path("7FFF/5F3B/4F07")), None);
     }
 }

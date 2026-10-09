@@ -430,9 +430,10 @@ pub const PIN1_DISABLED_RULE: &str = "auth/pin1-disabled";
 /// The ID of the identity-readable rule.
 pub const IDENTITY_READABLE_RULE: &str = "identity/readable-without-pin";
 
-/// EF.MSISDN readable under ALWays (low).
+/// EF.MSISDN, EF.ADN and EF.FDN readable under ALWays (low).
 ///
-/// EF.MSISDN is READ PIN in TS 31.102 clause 4.2.26. Decided from the access
+/// EF.MSISDN is READ PIN in TS 31.102 clause 4.2.26, EF.FDN in clause 4.2.24
+/// and EF.ADN in clause 4.4.2.3. Decided from the access
 /// rule alone, so it needs no read of the file. **The IMSI is deliberately not
 /// here**: `filesystem/sensitive-ef-always` already owns it, and a second
 /// finding would score one fact twice. Evidence is the path, the access
@@ -443,7 +444,7 @@ fn identity_readable(subject: &Subject<'_>) -> Vec<rules::Finding> {
         .selected()
         .filter_map(|node| {
             let ef = ef::classify(node.path())?;
-            if ef != ef::Ef::Msisdn {
+            if !matches!(ef, ef::Ef::Msisdn | ef::Ef::Adn | ef::Ef::Fdn) {
                 return None;
             }
             let severity = rules::Severity::Low;
@@ -476,8 +477,10 @@ fn with_value(access: String, value: Option<String>) -> String {
 
 fn identity_evidence(subject: &Subject<'_>) -> bool {
     subject.tree.selected().any(|node| {
-        ef::classify(node.path()) == Some(ef::Ef::Msisdn)
-            && access::access_of(subject.tree, node).is_some()
+        matches!(
+            ef::classify(node.path()),
+            Some(ef::Ef::Msisdn | ef::Ef::Adn | ef::Ef::Fdn)
+        ) && access::access_of(subject.tree, node).is_some()
     })
 }
 
@@ -557,7 +560,7 @@ pub const SENSITIVE_EF_RULE: &str = "filesystem/sensitive-ef-always";
 /// (required parent directory, file identifier, name).
 type SensitiveEf = (Option<[u8; 2]>, [u8; 2], &'static str);
 
-const SENSITIVE_EFS: [SensitiveEf; 7] = [
+const SENSITIVE_EFS: [SensitiveEf; 12] = [
     (None, [0x6F, 0x07], "EF.IMSI"),
     (None, [0x6F, 0x08], "EF.Keys"),
     (None, [0x6F, 0x09], "EF.KeysPS"),
@@ -565,6 +568,13 @@ const SENSITIVE_EFS: [SensitiveEf; 7] = [
     (None, [0x6F, 0x73], "EF.PSLOCI"),
     (Some([0x5F, 0x3B]), [0x4F, 0x20], "EF.Kc"),
     (Some([0x5F, 0x3B]), [0x4F, 0x52], "EF.KcGPRS"),
+    // DF.5GS `5FC0`, clauses 4.4.11.2 to 4.4.11.6: READ PIN, UPDATE PIN. The
+    // 5G location information, the NAS security contexts and the K_AUSF/K_SEAF keys.
+    (Some([0x5F, 0xC0]), [0x4F, 0x01], "EF.5GS3GPPLOCI"),
+    (Some([0x5F, 0xC0]), [0x4F, 0x02], "EF.5GSN3GPPLOCI"),
+    (Some([0x5F, 0xC0]), [0x4F, 0x03], "EF.5GS3GPPNSC"),
+    (Some([0x5F, 0xC0]), [0x4F, 0x04], "EF.5GSN3GPPNSC"),
+    (Some([0x5F, 0xC0]), [0x4F, 0x05], "EF.5GAUTHKEYS"),
 ];
 
 /// The name of the sensitive EF a node is, if it is one.
@@ -685,12 +695,246 @@ fn pin1_evidence(subject: &Subject<'_>) -> bool {
     })
 }
 
-/// The rules this scan runs over one card.
+// ---------------------------------------------------------------------------
+// Configuration EFs, other EFs, and 5G SUCI privacy (issues #40, #110)
+// ---------------------------------------------------------------------------
+
+/// The ID of the configuration-EF update rule.
+pub const CONFIG_EF_RULE: &str = "filesystem/config-ef-updatable-always";
+
+/// The ID of the any-other-EF update rule.
+pub const EF_UPDATABLE_RULE: &str = "filesystem/ef-updatable-always";
+
+/// The ID of the SUCI null-scheme rule.
+pub const SUCI_NULL_RULE: &str = "privacy/suci-null-scheme";
+
+/// The ID of the SUCI not-provisioned rule.
+pub const SUCI_NOT_PROVISIONED_RULE: &str = "privacy/suci-not-provisioned";
+
+/// The configuration EFs whose UPDATE condition TS 31.102 sets to ADM (PIN2 for
+/// EF.EST) and never to ALWays, with the severity of leaving one open.
 ///
-/// **One rule today, and that is what makes the score mean something.**
-/// Issue #13 built the vocabulary a rule needs and shipped none, because a
-/// rule that guessed would manufacture findings this repository cannot justify.
-/// Issue #24 adds the first one, `gsma/msl-zero-allowed`.
+/// EF.UST 4.2.8 and EF.EST 4.2.47 switch services on (including SMS-PP download),
+/// EF.SUCI_Calc_Info 4.4.11.8 decides whether the SUPI is concealed, so those are
+/// high. EF.AD 4.2.18, EF.ACC 4.2.15, EF.SPN 4.2.12, EF.OPLMNwAcT 4.2.53 and
+/// EF.Routing_Indicator 4.4.11.11 change behaviour without opening a new
+/// exposure by themselves, so those are medium.
+const CONFIG_EFS: [(ef::Ef, rules::Severity); 8] = [
+    (ef::Ef::Ust, rules::Severity::High),
+    (ef::Ef::Est, rules::Severity::High),
+    (ef::Ef::SuciCalcInfo, rules::Severity::High),
+    (ef::Ef::Ad, rules::Severity::Medium),
+    (ef::Ef::Acc, rules::Severity::Medium),
+    (ef::Ef::Spn, rules::Severity::Medium),
+    (ef::Ef::OplmnWact, rules::Severity::Medium),
+    (ef::Ef::RoutingIndicator, rules::Severity::Medium),
+];
+
+/// A configuration EF that anyone holding the card can rewrite.
+fn config_ef_updatable(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    subject
+        .tree
+        .selected()
+        .filter_map(|node| {
+            let ef = ef::classify(node.path())?;
+            let (_, severity) = CONFIG_EFS.iter().find(|(e, _)| *e == ef)?;
+            let access = access::access_of(subject.tree, node)?;
+            (access.update == access::Condition::Always).then(|| {
+                rules::Finding::new(
+                    rules::RuleId::new(CONFIG_EF_RULE).expect("a validated constant"),
+                    *severity,
+                    format!(
+                        "{} is updatable without verification: TS 31.102 gives it an ADM condition (PIN2 for EF.EST), not ALWays, so anyone holding the card can rewrite what the terminal is told to do",
+                        ef.name()
+                    ),
+                    rules::Location::selected_file(node.path().to_string()),
+                    rules::Evidence::text(format!(
+                        "read={} update={}",
+                        access.read.label(),
+                        access.update.label()
+                    )),
+                )
+            })
+        })
+        .collect()
+}
+
+fn config_ef_evidence(subject: &Subject<'_>) -> bool {
+    subject.tree.selected().any(|node| {
+        ef::classify(node.path()).is_some_and(|ef| CONFIG_EFS.iter().any(|(e, _)| *e == ef))
+            && access::access_of(subject.tree, node).is_some()
+    })
+}
+
+/// How many paths the aggregate EF finding names.
+const EF_UPDATABLE_PATHS: usize = 5;
+
+/// Whether `node` is an elementary file no more specific rule already judges.
+fn other_ef(node: &walk::Node) -> bool {
+    node.state().kind().is_some_and(|k| !k.is_container())
+        && sensitive_name(node).is_none()
+        && ef::classify(node.path()).is_none_or(|ef| CONFIG_EFS.iter().all(|(e, _)| *e != ef))
+}
+
+/// Every other EF that can be updated under ALWays, as one finding per scan.
+///
+/// **One finding, not one per file**, for the reason `auth/pin1-disabled` is
+/// one: a card that leaves a whole directory open would otherwise score one
+/// mistake as many. Almost no standardised EF has an ALWays UPDATE (TS 31.102
+/// and TS 102 221 give PIN, PIN2, ADM or NEVer), so an open one is a
+/// misconfiguration or a proprietary file the operator should confirm. The
+/// files the specific rules already judge are left out so nothing is counted twice.
+fn ef_updatable_always(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    let open: Vec<&walk::Node> = subject
+        .tree
+        .selected()
+        .filter(|node| other_ef(node))
+        .filter(|node| {
+            access::access_of(subject.tree, node)
+                .is_some_and(|a| a.update == access::Condition::Always)
+        })
+        .collect();
+    let Some(first) = open.first() else {
+        return Vec::new();
+    };
+    let shown: Vec<String> = open
+        .iter()
+        .take(EF_UPDATABLE_PATHS)
+        .map(|n| n.path().to_string())
+        .collect();
+    vec![rules::Finding::new(
+        rules::RuleId::new(EF_UPDATABLE_RULE).expect("a validated constant"),
+        rules::Severity::Medium,
+        format!(
+            "{} elementary file(s) can be updated without verification (UPDATE is ALWays), where the standards give files PIN, ADM or NEVer",
+            open.len()
+        ),
+        rules::Location::selected_file(first.path().to_string()),
+        rules::Evidence::text(format!(
+            "{} file(s) with update=ALW: {}{}",
+            open.len(),
+            shown.join(", "),
+            open.len()
+                .checked_sub(EF_UPDATABLE_PATHS)
+                .filter(|n| *n > 0)
+                .map_or(String::new(), |n| format!(" (+{n} more)"))
+        )),
+    )]
+}
+
+fn ef_updatable_evidence(subject: &Subject<'_>) -> bool {
+    subject
+        .tree
+        .selected()
+        .any(|node| other_ef(node) && access::access_of(subject.tree, node).is_some())
+}
+
+/// The first decoded EF.UST of the scan, with its path.
+fn ust_of(subject: &Subject<'_>) -> Option<(fs::Path, ef::Services)> {
+    ef::entries(subject.tree)
+        .into_iter()
+        .find_map(|e| match e.outcome {
+            ef::Outcome::Decoded(ef::Decoded::Services(s)) if s.table == ef::Table::Ust => {
+                Some((e.path, s))
+            }
+            _ => None,
+        })
+}
+
+/// Whether the terminal calculates the SUCI itself from EF.SUCI_Calc_Info:
+/// service 124 available and 125 not (TS 31.102 clauses 4.2.8 and 5.3.47).
+/// With 125 the USIM calculates it and the file is not used; without 124 the
+/// terminal does not use the card for SUCI at all.
+fn terminal_calculates_suci(services: &ef::Services) -> bool {
+    services.enabled.contains(&124) && !services.enabled.contains(&125)
+}
+
+/// EF.SUCI_Calc_Info that leaves the SUPI unconcealed (issue #110).
+///
+/// **High: this is the IMSI going out in the clear.** Decided from the card's own
+/// configuration: the terminal takes the highest-priority scheme (TS 31.102
+/// clause 4.4.11.8); if that is the null scheme, or no non-null scheme points
+/// at a provisioned home network public key, nothing is concealed. A card that
+/// calculates the SUCI itself (service 125) is not judged, since the scheme is
+/// then not readable here.
+fn suci_null_scheme(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    let Some((_, services)) = ust_of(subject) else {
+        return Vec::new();
+    };
+    if !terminal_calculates_suci(&services) {
+        return Vec::new();
+    }
+    ef::entries(subject.tree)
+        .into_iter()
+        .filter_map(|e| match e.outcome {
+            ef::Outcome::Decoded(ef::Decoded::Suci(info)) => {
+                let reason = info.clear_reason()?;
+                let evidence = ef::Decoded::Suci(info).evidence();
+                Some(rules::Finding::new(
+                    rules::RuleId::new(SUCI_NULL_RULE).expect("a validated constant"),
+                    rules::Severity::High,
+                    format!(
+                        "EF.SUCI_Calc_Info does not conceal the SUPI ({reason}), so the IMSI is sent in the clear when a 5G terminal registers"
+                    ),
+                    rules::Location::selected_file(e.path.to_string()),
+                    rules::Evidence::text(evidence),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn suci_null_evidence(subject: &Subject<'_>) -> bool {
+    ust_of(subject).is_some_and(|(_, s)| terminal_calculates_suci(&s))
+        && ef::entries(subject.tree)
+            .iter()
+            .any(|e| matches!(e.outcome, ef::Outcome::Decoded(ef::Decoded::Suci(_))))
+}
+
+/// A 5G card that does not offer SUCI calculation (issue #110).
+///
+/// **Medium, because the card alone cannot prove the SUPI is exposed.** Service
+/// 124 is how a USIM tells the terminal to conceal the SUPI (TS 31.102 clause
+/// 4.2.8); without it the terminal does not read the SUCI files, and whether
+/// the IMSI is concealed then depends on a configuration this scan cannot
+/// see. The rule fires only when EF.UST marks 5GS services (122 or 123)
+/// available, so a 4G-only SIM is not flagged for lacking a 5G feature.
+fn suci_not_provisioned(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    let Some((path, services)) = ust_of(subject) else {
+        return Vec::new();
+    };
+    let five_g = services.enabled.iter().any(|n| matches!(n, 122 | 123));
+    if !five_g || services.enabled.contains(&124) {
+        return Vec::new();
+    }
+    let state = |n| {
+        if services.enabled.contains(&n) {
+            "available"
+        } else {
+            "unavailable"
+        }
+    };
+    vec![rules::Finding::new(
+        rules::RuleId::new(SUCI_NOT_PROVISIONED_RULE).expect("a validated constant"),
+        rules::Severity::Medium,
+        "EF.UST marks 5GS services available but not service 124 (Subscription identifier privacy support), so the card gives the terminal no SUCI configuration and the IMSI may be sent in the clear on 5G",
+        rules::Location::selected_file(path.to_string()),
+        rules::Evidence::text(format!(
+            "EF.UST service 122={} 123={} 124=unavailable",
+            state(122),
+            state(123)
+        )),
+    )]
+}
+
+fn suci_not_provisioned_evidence(subject: &Subject<'_>) -> bool {
+    ust_of(subject).is_some()
+}
+
+/// The rules this scan runs over one card: the TAR and SCP03 rules, the access
+/// and PIN rules over the walk, the risky-service rule and the 5G SUCI rules
+/// over the decoded EFs. `docs/rule_docs/` documents each.
 ///
 /// **Which is why the score carries `rules_run`.** A score of 100 from an empty
 /// set is indistinguishable from a card that passed, which is precisely the
@@ -713,7 +957,9 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             .with_remediation(
                 "raise MSL and load the card's TAR allow-list, then re-scan; a card at MSL 0 \
                  accepts any command under any TAR with no cryptographic verification",
-            ),
+            )
+            .with_cwe("CWE-306")
+            .with_reference("ETSI TS 102 225 (minimum security level, TAR); ETSI TS 102 226"),
             msl_zero_allowed,
             msl_zero_evidence,
         )
@@ -734,7 +980,9 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             )
             .with_remediation(
                 "enable PIN1 (key reference 01) on the application, or confirm the universal PIN is enabled and in use, then re-scan",
-            ),
+            )
+            .with_cwe("CWE-306")
+            .with_reference("ETSI TS 102 221 clauses 9.5 and 11.1.1.4.10 (PIN status); 3GPP TS 31.102 clause 4"),
             pin1_disabled,
             pin1_evidence,
         )
@@ -748,7 +996,9 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             )
             .with_remediation(
                 "set the file's READ and UPDATE access rule (its EF.ARR record) back to the TS 31.102 conditions, PIN for READ and PIN or ADM for UPDATE, then re-scan",
-            ),
+            )
+            .with_cwe("CWE-732")
+            .with_reference("3GPP TS 31.102 clauses 4.2.2, 4.2.3, 4.2.4, 4.2.17, 4.2.23, 4.4.3.1, 4.4.3.2, 4.4.11.2 to 4.4.11.6"),
             sensitive_ef_always,
             sensitive_ef_evidence,
         )
@@ -758,11 +1008,13 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             rules::RuleSpec::new(
                 rules::RuleId::new(IDENTITY_READABLE_RULE).expect("a validated constant"),
                 rules::Severity::Medium,
-                "the MSISDN is readable without a PIN (TS 31.102 gives it a PIN READ condition)",
+                "the MSISDN or a phonebook number list (EF.ADN, EF.FDN) is readable without a PIN (TS 31.102 gives them a PIN READ condition)",
             )
             .with_remediation(
                 "set the file's READ access rule (its EF.ARR record) to PIN, then re-scan",
-            ),
+            )
+            .with_cwe("CWE-359")
+            .with_reference("3GPP TS 31.102 clauses 4.2.26 (MSISDN), 4.2.24 (FDN), 4.4.2.3 (ADN)"),
             identity_readable,
             identity_evidence,
         )
@@ -776,11 +1028,77 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             )
             .with_remediation(
                 "if the operator does not use the service, clear its bit in EF.UST; for service 28 keep the card at a non-zero MSL with a TAR allow-list (run `scan --tar`), then re-scan",
-            ),
+            )
+            .with_cwe("CWE-749")
+            .with_reference("3GPP TS 31.102 clause 4.2.8 (EF.UST services 28 and 32)"),
             risky_services,
             risky_service_evidence,
         )
         .expect("the risky-service rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(CONFIG_EF_RULE).expect("a validated constant"),
+                rules::Severity::High,
+                "a configuration file (EF.UST, EF.EST, EF.SUCI_Calc_Info, EF.AD, EF.ACC, EF.SPN, EF.OPLMNwAcT, EF.Routing_Indicator) can be updated under ALWays (TS 31.102 gives them ADM)",
+            )
+            .with_remediation(
+                "set the file's UPDATE access rule (its EF.ARR record) back to ADM (PIN2 for EF.EST), then re-scan",
+            )
+            .with_cwe("CWE-732")
+            .with_reference("3GPP TS 31.102 clauses 4.2.8, 4.2.12, 4.2.15, 4.2.18, 4.2.47, 4.2.53, 4.4.11.8, 4.4.11.11"),
+            config_ef_updatable,
+            config_ef_evidence,
+        )
+        .expect("the config EF rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(EF_UPDATABLE_RULE).expect("a validated constant"),
+                rules::Severity::Medium,
+                "elementary files not judged by a more specific rule can be updated under ALWays, where the standards give PIN, ADM or NEVer",
+            )
+            .with_remediation(
+                "set each listed file's UPDATE access rule (its EF.ARR record) to PIN or ADM as the standard or the operator profile requires; confirm a proprietary file is meant to be world-writable, then re-scan",
+            )
+            .with_cwe("CWE-732")
+            .with_reference("ETSI TS 102 221 clause 9.2 (access rules); 3GPP TS 31.102 clause 4"),
+            ef_updatable_always,
+            ef_updatable_evidence,
+        )
+        .expect("the EF update rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(SUCI_NULL_RULE).expect("a validated constant"),
+                rules::Severity::High,
+                "EF.SUCI_Calc_Info puts the null scheme first or lists no scheme with a provisioned home network public key, so the IMSI is sent in the clear on 5G",
+            )
+            .with_remediation(
+                "provision a Profile A or B protection scheme first in EF.SUCI_Calc_Info with its home network public key (or enable SUCI calculation by the USIM, service 125), then re-scan",
+            )
+            .with_cwe("CWE-319")
+            .with_reference("3GPP TS 31.102 clauses 4.2.8, 4.4.11.8, 5.3.47; TS 33.501 clause 6.12; TS 23.003 clause 2.2B"),
+            suci_null_scheme,
+            suci_null_evidence,
+        )
+        .expect("the SUCI null-scheme rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(SUCI_NOT_PROVISIONED_RULE).expect("a validated constant"),
+                rules::Severity::Medium,
+                "EF.UST marks 5GS services available but not service 124 (Subscription identifier privacy support), so the card offers no SUCI configuration",
+            )
+            .with_remediation(
+                "if the operator uses SUPI concealment, set service 124 in EF.UST and provision EF.SUCI_Calc_Info (or set 125 for USIM calculation); otherwise confirm the terminal is configured to conceal the SUPI, then re-scan",
+            )
+            .with_cwe("CWE-319")
+            .with_reference("3GPP TS 31.102 clauses 4.2.8, 5.3.47; TS 33.501 clause 6.12"),
+            suci_not_provisioned,
+            suci_not_provisioned_evidence,
+        )
+        .expect("the SUCI not-provisioned rule ID is unique in this registry");
     registry
 }
 
@@ -816,6 +1134,17 @@ pub fn specs() -> Vec<rules::RuleSpec> {
         .iter()
         .map(|rule| rule.spec().clone())
         .collect()
+}
+
+/// Every rule any command knows: the scan's, then the TS.48 comparison's, the
+/// APDU audits' and the fuzzer's. `rules list`, `rules explain` and the
+/// generated `docs/rule_docs` read this one list.
+pub fn all_specs() -> Vec<rules::RuleSpec> {
+    let mut all = specs();
+    all.extend(crate::ts48::specs());
+    all.extend(crate::apdu_scan::specs());
+    all.extend(crate::fuzz::specs());
+    all
 }
 
 /// The findings one card produces, before any filtering.
@@ -3187,7 +3516,7 @@ mod tests {
         assert_eq!(id.rule(), "msl-zero-allowed");
 
         let registry = rules();
-        assert_eq!(registry.len(), 6, "six rules are registered over a card");
+        assert_eq!(registry.len(), 10, "ten rules are registered over a card");
         let rule = registry.get(&id).expect("the rule is registered");
         assert_eq!(rule.severity(), rules::Severity::Critical);
         assert!(
@@ -3228,13 +3557,49 @@ mod tests {
         assert!(rule.run(&none).is_empty());
     }
 
+    /// Issue #40 acceptance: ten violations of the weaknesses this crate scores (medium or
+    /// above, at the severities the rules declare) leave a score under 30. Ten `low`
+    /// findings do not (they are advisory: 10 x 3 = 30 points), and this pins that too.
+    #[test]
+    fn ten_violations_score_under_30_and_ten_advisories_do_not() {
+        let at = |severity| {
+            rules::Findings::complete(
+                (0..10)
+                    .map(|i| {
+                        rules::Finding::new(
+                            rules::RuleId::new(SENSITIVE_EF_RULE).unwrap(),
+                            severity,
+                            "x",
+                            rules::Location::selected_file(format!("3F00/7FFF/6F{i:02X}")),
+                            rules::Evidence::None,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let declared: Vec<_> = specs()
+            .iter()
+            .filter(|spec| spec.severity() >= rules::Severity::Medium)
+            .map(|spec| spec.severity())
+            .collect();
+        assert!(declared.len() >= 8, "{declared:?}");
+        for severity in [
+            rules::Severity::Medium,
+            rules::Severity::High,
+            rules::Severity::Critical,
+        ] {
+            assert!(rules::Score::of(&at(severity)).value() < 30, "{severity}");
+        }
+        assert_eq!(rules::Score::of(&at(rules::Severity::Low)).value(), 70);
+    }
+
     #[test]
     fn a_scan_evaluates_its_rules_so_the_no_rules_warning_cannot_fire() {
         // **The warning going null here is CORRECT rather than defeated.**
         // rules_run is 1 because a rule really ran, so the 100 it sits beside
         // is a score over an audit rather than an absence of one. That is the
         // whole difference NO_RULES_WARNING was written to make visible.
-        assert_eq!(rules_run(), 6);
+        assert_eq!(rules_run(), 10);
 
         let mut card = sample_card();
         let tree = walk_sample(&mut card, Limits::default());
@@ -3258,7 +3623,7 @@ mod tests {
             .tar_audit(audit);
         let block = verdict.fields();
         let score = &block["score"];
-        assert_eq!(score["rules_run"], serde_json::json!(6));
+        assert_eq!(score["rules_run"], serde_json::json!(10));
         assert_eq!(score["value"], serde_json::json!(rules::SCORE_MAX));
         assert_eq!(
             score["warning"],

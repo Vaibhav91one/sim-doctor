@@ -628,7 +628,8 @@ pub fn specs() -> Vec<RuleSpec> {
         )
         .with_remediation(
             "expected for an operator SIM, which is not a TS.48 card; matching TS.48 is not GCF or PTCRB conformance",
-        ),
+        )
+        .with_reference("GSMA TS.48 generic test profile"),
         RuleSpec::new(
             id(DIFFERENT_RULE),
             Severity::Low,
@@ -636,7 +637,8 @@ pub fn specs() -> Vec<RuleSpec> {
         )
         .with_remediation(
             "expected for an operator SIM, which is not a TS.48 card; matching TS.48 is not GCF or PTCRB conformance",
-        ),
+        )
+        .with_reference("GSMA TS.48 generic test profile"),
         RuleSpec::new(
             id(EXTRA_RULE),
             Severity::Info,
@@ -644,7 +646,8 @@ pub fn specs() -> Vec<RuleSpec> {
         )
         .with_remediation(
             "expected for an operator SIM, which is not a TS.48 card; matching TS.48 is not GCF or PTCRB conformance",
-        ),
+        )
+        .with_reference("GSMA TS.48 generic test profile"),
     ]
 }
 

@@ -1,0 +1,8 @@
+{
+  "cwe": null,
+  "description": "a file exists on the card and in the TS.48 profile but differs in type, layout, size or record length",
+  "id": "ts48/file-different",
+  "reference": "GSMA TS.48 generic test profile",
+  "remediation": "expected for an operator SIM, which is not a TS.48 card; matching TS.48 is not GCF or PTCRB conformance",
+  "severity": "low"
+}
