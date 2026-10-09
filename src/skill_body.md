@@ -11,7 +11,7 @@ sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, noth
 sim-doctor scan --json --severity high   # drop findings below a level
 sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
 sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
-sim-doctor scan --json > baseline.json   # save a baseline; later: scan --baseline baseline.json
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
 sim-doctor scan --help              # the full contract, including what it cannot do
 ```
 

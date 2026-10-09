@@ -10,6 +10,7 @@
 #      GITHUB_STEP_SUMMARY.
 # Exit: 0 ok, 1 gate failed (the CLI exited 3: a new finding against the baseline), 2 tool failure (CLI exit 2/130,
 #       an error envelope, an unreadable or incomplete envelope, missing baseline, bad input).
+# The reduced baseline to commit is written to $OUT/baseline.json (jq scripts/reduce-baseline.jq; needs jq).
 # Without a baseline the run only reports: a CLI exit 1 (findings at or above --fail-on) is shown as NOT GATED.
 set -uo pipefail
 
@@ -55,7 +56,7 @@ if [ -f "$baseline" ]; then
   args+=(--baseline "$baseline")
   gated=1
 elif [ "$require" != false ]; then
-  early "baseline file not found: $(san "$baseline") (commit one saved with sim-doctor scan --json, or set require-baseline to false)"
+  early "baseline file not found: $(san "$baseline") (commit the reduced baseline this action writes, or one made with sim-doctor scan --json | jq -f scripts/reduce-baseline.jq, or set require-baseline to false)"
 else
   echo "::warning::no baseline file at $(san "$baseline"); this run reports but cannot fail on new findings"
 fi
@@ -152,6 +153,19 @@ case "$pystatus" in 0) status=0 ;; 10) status=1 ;; *) status=2 ;; esac
 if [ ! -s "$summary" ]; then
   printf '<!-- sim-doctor -->\n### sim-doctor\n\n| | |\n|---|---|\n| Result | TOOL FAILURE |\n| Error | the summary could not be written |\n' > "$summary"
   status=2
+fi
+
+# The baseline this run offers for committing, in REDUCED form (no ATR, EF contents, messages or evidence: see
+# scripts/reduce-baseline.jq). Written only from an envelope of a scan that ran; a refusal has no run record.
+baseline_out="$out/baseline.json"
+if [ "$status" != 2 ] && command -v jq > /dev/null 2>&1; then
+  if jq -f "$(dirname "$0")/reduce-baseline.jq" "$out/envelope.json" > "$baseline_out" 2> /dev/null; then
+    [ -n "${GITHUB_OUTPUT:-}" ] && echo "baseline=$baseline_out" >> "$GITHUB_OUTPUT"
+  else
+    rm -f "$baseline_out"
+  fi
+elif [ "$status" != 2 ]; then
+  echo "::warning::jq is not installed, so no reduced baseline was written; save one with sim-doctor scan --json and reduce it with scripts/reduce-baseline.jq"
 fi
 
 publish

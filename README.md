@@ -240,13 +240,12 @@ closest default that keeps a scan with only lower findings (swSIM can produce no
 passing. The other commands (`rules`, `why`, `fix`, `gp`, `ts48`, `fuzz`, `modules`, ...) keep their lpac-style envelope
 `{type, payload:{code, message, data}}` and the codes 0 / 1 (could not run) / 129 (bad usage) / 130.
 
-**Baseline.** Save one with `sim-doctor scan --json > baseline.json`, compare with
+**Baseline.** Save one (see below), compare with
 `sim-doctor scan --baseline baseline.json`: findings match by `fingerprint`, each gets
 `baseline_state` (`new` or `unchanged`), the envelope gets `baseline: {new, unchanged, fixed}`, and
 exit 3 means a new finding at or above `--fail-on`. A baseline from a truncated walk, a different
 `--severity`, `--dialect` or `--tar`, or one where a rule had no evidence is refused (exit 2),
-as before. **A saved envelope carries the ATR and EF contents**; keep it out of the repository
-or reduce it first (`AGENTS.md`, section 3, "A baseline is a full envelope").
+as before. A baseline needs only `schema`, `data.run` and each finding's `id`, `fingerprint` and `severity`, so the loader reads nothing else and a reduced file works as well as a full one. **A full envelope carries the ATR and EF contents**: the Action writes the reduced form, and for a manual baseline use `sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json`. Do not commit a full envelope.
 
 **SARIF.** Each result carries `partialFingerprints["doctorFinding/v1"]` (the finding's JSON
 `fingerprint`) and the run carries `properties.score`. Locations stay logical (the card path).
@@ -328,7 +327,7 @@ steps:
 | Input | Default | Meaning |
 |---|---|---|
 | `swsim` | `false` | `true` builds the pinned swSIM + swicc-pcsc and starts pcscd (same pins as `card-fixture.yml`, see [docs/swsim-fixture.md](docs/swsim-fixture.md)). `false` needs a reader already on the runner. |
-| `baseline` | `.sim-doctor/baseline.json` | Committed baseline: a `scan --json` envelope saved with `sim-doctor scan --json > FILE` (reduce it first if the card holds real data, see Machine output). With `require-baseline: "false"` and no file there is no gate. (This repo's `.gitignore` ignores `baseline.json`; use another path or `git add -f`.) |
+| `baseline` | `.sim-doctor/baseline.json` | Committed baseline: a doctor/1 envelope, ideally the reduced one (the Action writes the reduced form to its `baseline` output; see Machine output). With `require-baseline: "false"` and no file there is no gate. (This repo's `.gitignore` ignores `baseline.json`; use another path or `git add -f`.) |
 | `require-baseline` | `true` | A missing baseline file (typo, directory, not committed) fails the job with an error naming the path: the baseline is part of the contract of a gating action. `false` scans and reports without gating, with a warning and a NOT GATED row in the summary. |
 | `reader` | none | Passed to `--reader` (must not start with a dash). |
 | `severity` | none | Passed to `--severity`. |
@@ -336,7 +335,7 @@ steps:
 | `comment` | `true` | One PR comment, updated in place (found by a hidden marker); a missing permission does not fail the job. |
 | `upload-sarif` | `true` | Upload `sim-doctor.sarif` (category `sim-doctor`); non-fatal, private repositories need code scanning enabled. |
 
-Output: `summary`, the path of the markdown summary.
+Outputs: `summary`, the path of the markdown summary; `baseline`, the path of this run's **reduced** baseline (rule ids, fingerprints, severities and the run record, no card data; needs `jq`, present on GitHub-hosted runners), ready to commit.
 
 The card is the subject, so there is no per-capture file: the baseline is a committed file. Gate contract: CLI exit 3 (a new finding
 against the baseline) fails the job ("GATE FAILED"); a CLI exit 2 or 130, an error envelope, an unreadable envelope, an `exit_code` that disagrees with the status, or a gated run whose envelope carries no `baseline` block is a tool failure
@@ -368,7 +367,7 @@ symlink anywhere from `--dir` down to the file (exit 1). A differing existing fi
 identical one is not a conflict. `--print-only` prints the workflow and writes nothing. Output is plain text
 (`wrote <path>`), not an envelope.
 
-The file is written atomically (a temp file renamed over the target); a directory at the path is always refused. After a write, two hints go to stderr: commit a baseline first with `sim-doctor scan --json > <path>` (with the default `--require-baseline true` the first run fails without one), and the pinned ref `v<version>` exists only once that release is tagged; until then pass `--ref main` or another existing ref. `--baseline` and `--ref` also refuse `__`, and `--baseline` refuses `.` and a trailing `/`; `--ref` refuses `..`, a trailing `/` and `.lock`.
+The file is written atomically (a temp file renamed over the target); a directory at the path is always refused. After a write, two hints go to stderr: commit a baseline first with `sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > <path>` (with the default `--require-baseline true` the first run fails without one), and the pinned ref `v<version>` exists only once that release is tagged; until then pass `--ref main` or another existing ref. `--baseline` and `--ref` also refuse `__`, and `--baseline` refuses `.` and a trailing `/`; `--ref` refuses `..`, a trailing `/` and `.lock`.
 
 ## Documentation
 

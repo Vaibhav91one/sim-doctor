@@ -301,7 +301,7 @@ finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 | `--sarif <file>` | implemented | also write SARIF 2.1.0 (`doctorFinding/v1` fingerprints, `properties.score`) |
 
 `--diff` is removed (doctor/1 has none: `--baseline` alone gates). To take a baseline, save the
-envelope: `sim-doctor scan --json > baseline.json`.
+envelope, reduced (see "What a baseline reads"): `sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json`.
 
 No flag on the surface is deferred any more. The rule that a flag must exist from day one and
 refuse honestly until it is built is unchanged and is kept here because the pattern was right
@@ -313,8 +313,8 @@ The scoring and severity contract is [Severity and score](#severity-and-score).
 ### Baseline
 
 `--baseline <file>` reads a previous `scan --json` envelope **before a reader is opened** and
-compares this run with it. The file's `data.run` (a record of what that run did) and
-`data.findings_detail.findings` are what the comparison reads; a file that is not a `doctor/1`
+compares this run with it. The file's `data.run` (a record of what that run did) and the
+fingerprints of its top-level findings are what the comparison reads; a file that is not a `doctor/1`
 envelope of a scan that finished (an lpac envelope, an error envelope) is refused with
 `baseline-malformed`. Matching is by `fingerprint` (a multiset: the surplus on either side is new
 or fixed). Each finding of the new run carries `baseline_state` (`new` or `unchanged`), the
@@ -359,31 +359,44 @@ looks like - and also what a withdrawn rule plus an unrelated new one looks like
 cannot tell apart. That is where AGENTS.md's "an ID must never be renamed casually" gets
 enforced, because a baseline outlives the release that wrote it.
 
-#### Evidence is bounded on the way IN
+#### What a baseline reads, and why it holds no card data
 
-A baseline file is **untrusted input**. A finding's `message` is an unbounded `String` in the wire
-type, so a hand-edited file could otherwise put a megabyte of prose into a CI log. The file is read
-through a `take` with an **8 MiB** ceiling (an envelope carries the whole file tree, so the old
-1 MiB was too small) rather than `fs::read`, so the ceiling holds while reading. From the envelope
-only `data.run` and `data.findings_detail.findings` are used, and `parse` walks exactly those and
-refuses any string over **1024 characters** or any array over **4096 items** before the typed
-parse. `RuleId` re-validates itself on the way in, which is issue #13's deliberate choice and the
-reason reading one back is safe at all.
+A baseline loader reads **only** `schema`, `data.run` and, per top-level finding, `id`,
+`fingerprint` and `severity` (`baseline::BaselineFinding`). The ATR, `ef_contents`, messages,
+evidence and locations are never read, so any envelope with those fields loads: the full
+`scan --json` output for local use, or the **reduced** form
+`{schema, tool, version, findings:[{id, fingerprint, severity}], data:{run}}`. Both give the
+same baseline and the same comparison and exit code (`baseline::tests::a_reduced_envelope_loads_and_gates_like_the_full_one`).
 
-#### A baseline is a full envelope, and that is a secrets decision
+`data.run` is comparability facts only: `reader` (the PC/SC reader name, not the card),
+`dialect`, `candidates`, `severity_threshold`, `tar_selection`, `complete`, `truncated_by`,
+`limits_hit`, `rules_run` and `rules` (rule id plus whether it had evidence). No ATR, ICCID,
+IMSI, EF contents or key material; a test asserts the key set. The old pre-contract baseline
+record was the reference.
 
-The old baseline file deliberately held no ATR, file tree or EF contents. A doctor/1 baseline is
-the `--json` envelope, which carries all of them, including `data.ef_contents` (key files too,
-under the full-visibility rule below). **Treat a saved envelope as sensitive and do not commit
-one taken from a card with real data** (see "Never commit card secrets"). The comparison needs
-only two parts, so a committed baseline can be reduced to them:
+**The GitHub Action writes the reduced form for you** (`$OUT/baseline.json`, the `baseline`
+output; it uses `jq -f scripts/reduce-baseline.jq`), and that is the file to commit. For a manual
+baseline use the same filter:
 
 ```sh
-sim-doctor scan --json | jq '{schema, findings: [], data: {run: .data.run, findings_detail: .data.findings_detail}}' > baseline.json
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > .sim-doctor/baseline.json
 ```
 
-(`findings_detail` holds messages and bounded evidence, never EF values.) `*.baseline.json`,
-`baseline.json`, `baseline-*.json`, `*-baseline.json` and `.baselines/` stay in `.gitignore`.
+A plain `scan --json > baseline.json` also works as a baseline but is a full envelope, which
+carries the ATR and EF contents under full visibility: **do not commit it**. (A reduced file
+could still be committed unreduced by mistake; the Action and the filter above are how to avoid
+that.)
+
+#### Evidence is bounded on the way IN
+
+A baseline file is **untrusted input**. The file is read through a `take` with an **8 MiB**
+ceiling rather than `fs::read`, so the ceiling holds while reading. A reduced baseline is a few
+kilobytes, but the full envelope (which carries the whole file tree) must still load for local
+use, so the ceiling stays at 8 MiB instead of returning to 1 MiB. From the envelope only the
+fields above are used, and `parse` refuses any string over **1024 characters**, any array over
+**4096 items**, and any fingerprint that is not 16 lowercase hex digits, before the typed parse.
+`RuleId` re-validates itself on the way in, which is issue #13's deliberate choice and the reason
+reading one back is safe at all.
 
 ### Rule IDs
 

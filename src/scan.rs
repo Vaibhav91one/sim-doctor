@@ -3527,4 +3527,70 @@ mod tests {
         assert_eq!(score["value"], 100);
         assert_eq!(score["label"], "incomplete");
     }
+
+    /// The reduced form the Action writes (`scripts/reduce-baseline.jq`) holds
+    /// no card data, and loads as the same baseline as the full envelope.
+    /// Built from a real walk of the sample card with known values planted where
+    /// card data can appear: the ATR, EF contents, a message and evidence.
+    #[test]
+    fn the_reduced_baseline_holds_no_card_data_and_loads_like_the_full_one() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+        const ICCID: &str = "8988211000000123456";
+        const IMSI: &str = "001010123456789";
+        let leaky = rules::Finding::new(
+            rules::RuleId::new("identity/readable-without-pin").unwrap(),
+            rules::Severity::Medium,
+            format!("IMSI {IMSI} readable"),
+            rules::Location::selected_file("3F00/7F20/6F07"),
+            rules::Evidence::text(format!("ICCID {ICCID}")),
+        );
+        let verdict = Verdict::new(rules::Findings::complete(vec![leaky]), 3);
+        let facts = run_facts(&tree, &context, &verdict);
+        let mut full = doctor_json(&tree, &context, &verdict, &facts, ExitCode::Success);
+        full["data"]["ef_contents"] =
+            json!([{"ef": "EF.IMSI", "fields": {"imsi": IMSI, "iccid": ICCID}}]);
+        let full_text = full.to_string();
+        // The full envelope does carry them (under full visibility), and the ATR.
+        assert!(full_text.contains(IMSI) && full_text.contains(ICCID));
+        let atr = full["data"]["atr"]
+            .as_str()
+            .expect("the sample ATR")
+            .to_owned();
+        assert!(!atr.is_empty());
+
+        let jq = Command::new("jq")
+            .args([
+                "-c",
+                "-f",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/reduce-baseline.jq"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn();
+        let Ok(mut jq) = jq else {
+            eprintln!("jq is not installed; skipping");
+            return;
+        };
+        jq.stdin
+            .take()
+            .unwrap()
+            .write_all(full_text.as_bytes())
+            .unwrap();
+        let reduced = String::from_utf8(jq.wait_with_output().unwrap().stdout).unwrap();
+        for secret in [IMSI, ICCID, atr.as_str(), "3F00/7F20/6F07", "IMSI 0"] {
+            assert!(!reduced.contains(secret), "{secret} leaked: {reduced}");
+        }
+        // And what is left is enough: both load to the same baseline.
+        let a = baseline::Baseline::from_envelope(&full_text).expect("full");
+        let b = baseline::Baseline::from_envelope(&reduced).expect("reduced");
+        assert_eq!(a.findings(), b.findings());
+        assert_eq!(a.run(), b.run());
+        assert_eq!(b.findings().len(), 1);
+    }
 }

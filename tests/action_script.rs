@@ -417,3 +417,68 @@ fn a_hostile_baseline_path_is_not_shown_raw() {
     assert_clean(&r.summary);
     assert_clean(&r.stdout);
 }
+
+/// The baseline the Action offers for committing is REDUCED: rule ids,
+/// fingerprints, severities and the run record. No ATR, ICCID, IMSI, EF contents
+/// or key bytes, wherever they sit in the envelope.
+#[test]
+fn the_baseline_the_action_writes_holds_no_card_data() {
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("jq is not installed; skipping");
+        return;
+    }
+    const SECRETS: [&str; 5] = [
+        "3b9f96801fc78031a073be21136743200718000001a5",
+        "8988211000000123456",
+        "001010123456789",
+        "00112233445566778899aabbccddeeff",
+        "secret-message-text",
+    ];
+    let body = serde_json::json!({
+        "schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":1,
+        "score":{"value":75,"label":"needs work","model":"sim/1","coverage_gaps":0},
+        "findings":[{"id":"filesystem/sensitive-ef-always","fingerprint":"0123456789abcdef","severity":"high",
+            "message":"secret-message-text IMSI 001010123456789","category":"filesystem",
+            "location":{"kind":"card-path","ref":"3F00/7F20/6F07"},
+            "location_detail":{"kind":"file","path":"3F00/7F20/6F07"},
+            "evidence":[{"ref":"text","value":"ICCID 8988211000000123456"}],"remedy":null}],
+        "data":{
+            "atr":SECRETS[0],
+            "ef_contents":[{"ef":"EF.Keys","fields":{"ki":SECRETS[3],"iccid":SECRETS[1]}}],
+            "run":{"reader":"fake reader","dialect":"ts-102-221","candidates":"sim-families",
+                   "severity_threshold":null,"tar_selection":"off","complete":true,
+                   "truncated_by":null,"limits_hit":[],"rules_run":1,
+                   "rules":[{"id":"filesystem/sensitive-ef-always","evidence":true}]}}
+    })
+    .to_string();
+    let r = case("reduced", 1, body.clone()).run();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    let reduced = fs::read_to_string(r.out.join("baseline.json")).expect("a reduced baseline");
+    for secret in SECRETS {
+        assert!(body.contains(secret), "the fixture must hold {secret}");
+        assert!(
+            !reduced.contains(secret),
+            "{secret} leaked into the baseline: {reduced}"
+        );
+    }
+    let v: serde_json::Value = serde_json::from_str(&reduced).unwrap();
+    assert_eq!(v["schema"], "doctor/1");
+    assert_eq!(
+        v["findings"],
+        serde_json::json!([{"id":"filesystem/sensitive-ef-always","fingerprint":"0123456789abcdef","severity":"high"}])
+    );
+    assert_eq!(v["data"]["run"]["rules_run"], 1);
+    assert_eq!(
+        v["data"].as_object().unwrap().len(),
+        1,
+        "only data.run survives"
+    );
+    assert!(r.outputs.contains("baseline="), "{}", r.outputs);
+}
+
+#[test]
+fn a_failed_run_writes_no_baseline() {
+    let r = case("nobl", 2, error_body("no reader")).run();
+    assert_eq!(r.code, 2);
+    assert!(!r.out.join("baseline.json").exists());
+}

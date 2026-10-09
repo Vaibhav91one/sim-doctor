@@ -2044,7 +2044,7 @@ mod ci_install {
             run.stdout
         );
         assert!(
-            run.stderr.contains("sim-doctor scan --json > ci/b.json"),
+            run.stderr.contains("reduce-baseline.jq > ci/b.json"),
             "{}",
             run.stderr
         );
