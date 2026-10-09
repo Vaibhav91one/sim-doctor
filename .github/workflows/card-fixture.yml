@@ -372,13 +372,14 @@ jobs:
           # than only names because `--ignored` against a deleted test still
           # exits 0; the names pin the set and the count is what fails when a
           # fifth test is added and not wired up here (6 with issue #25's ts48
-          # compare, 7 with issue #16's fuzz apdu --quick).
-          grep -q '7 passed' "$log"
+          # compare, 7 with issue #16's fuzz apdu --quick, 8 with the doctor/1 conformance test).
+          grep -q '8 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
           grep -q 'scans_a_real_card_end_to_end' "$log"
           grep -q 'the_score_and_severity_flags_reach_the_envelope_against_a_real_card' "$log"
-          grep -q 'a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused' "$log"
+          grep -q 'a_saved_envelope_is_a_baseline_and_a_truncated_one_is_refused' "$log"
+          grep -q 'scan_json_conforms_to_doctor_1_against_a_real_card' "$log"
           grep -q 'ts48_compare_accounts_for_every_profile_file_against_a_real_card' "$log"
           grep -q 'fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card' "$log"
 
@@ -418,8 +419,8 @@ jobs:
           # Issue #12's baseline test: it saved a baseline and read it back, and
           # the diff against that truncated baseline was refused. These are the
           # lines it prints on the way, so a green job means both ran.
-          grep -q 'baseline/diff: saved a baseline to' "$log"
-          grep -q 'baseline/diff: diffed a second run against the truncated baseline' "$log"
+          grep -q 'baseline: saved an envelope to' "$log"
+          grep -q 'baseline: compared a second run against the truncated baseline' "$log"
 
           # Issue #4's test got as far as the SELECT MF and READ BINARY round
           # trips.
