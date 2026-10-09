@@ -509,7 +509,7 @@ enum GpAction {
         trace: bool,
     },
     /// GlobalPlatform registry inventory: GET STATUS for the ISD, applications
-    /// and load files, plus Card Recognition Data (read-only, no keys). A scope
+    /// and load files, plus Card Recognition Data (read-only). A scope
     /// the card only gives over a secure channel is reported as requiring
     /// authentication.
     ///
