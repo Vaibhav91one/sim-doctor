@@ -980,7 +980,7 @@ sends one ES10 STORE DATA request ([src/euicc.rs](src/euicc.rs) over [src/es10.r
 closes the channel on every path. `euicc info` also reads ES10a GetEuiccConfiguredAddresses (default SM-DP+, root SM-DS); `--max-segment` (1-255, default 120 as lpac) sets the STORE DATA block size. They speak the lpac envelope (`type` `lpa`), human table without
 `--json`. Exit 0 answered; 1 not an eUICC (`data.error.kind` `not-an-euicc`), no channel, ISD-R
 refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Never sent:
-DeleteProfile, RetrieveNotificationsList, RemoveNotification (the rest of #117, #119).
+RetrieveNotificationsList (#119).
 The writes are `euicc nickname <iccid> <name>` (ES10c SetNickname, `profile nickname`), the first PR of #117 and
 the owner's safeguards, all binding: **dry run by default** (reads EID and profile list, prints EID, ICCID, current and new
 nickname, sends no SetNickname); `--yes` sends it, then re-reads the profile list and fails (`verify-failed`) if the nickname
@@ -995,8 +995,17 @@ error kind (`profile-not-found`, `profile-not-in-disabled-state`/`-enabled-state
 `wrong-profile-reenabling`, `cat-busy`, `undefined-error`; unlisted codes `es10-refused`), re-reads and fails
 `verify-failed` on no change; not on MCP. Encoding `BFxx { A0 { 4F|5A id } 81 01 FF|00 }` checked against pySim `rsp.asn` and
 lpac `es10c.c` (cited in `es10.rs`); `catBusy(5)` is in the SGP.22 enum this repo already used for enable but not in
-pySim's `rsp.asn`, so the disable decoder keeps it as an extension. Every later #117 write (delete, purge,
-notifications) takes the same safeguards.
+pySim's `rsp.asn`, so the disable decoder keeps it as an extension.
+The third and last #117 PR adds the erasing writes with the same safeguards (dry run, `--yes`, re-read, validation first, one error
+kind per result code, not on MCP): `euicc delete <iccid|aid>` (DeleteProfile `BF33 { 4F|5A id }`; an enabled profile is refused,
+`profile-enabled`, nothing sent; the dry run says the erase is permanent), `euicc reset` (eUICCMemoryReset `BF34 { 82 02 <unused> <bits> }`,
+bits 0 operational / 1 field-loaded test / 2 default SM-DP+ address, each opt-in by `--operational` / `--test` / `--smdp-address`, none
+by default and none is refused; sending needs BOTH `--yes` AND `--confirm-eid <EID>` matching the card, `eid-mismatch` otherwise; the dry
+run lists every profile that would be erased, provisioning ones are never erased) and `euicc notifications remove <seq>`
+(RemoveNotificationFromList, `NotificationSentRequest` `BF30 { 80 <seq> }`; the list is pre-read and an unknown sequence number is
+`notification-not-found`; the dry run says a removed notification is never sent to the operator). Result codes: delete
+1/2/3/127, reset and remove 1 `nothing-to-delete` / 127 `undefined-error`; all other codes `es10-refused`. Encodings checked
+2026-10-10 against pySim `rsp.asn` and lpac `es10b.c` / `es10c.c` (cited in `es10.rs`).
 The swSIM fixture is not an eUICC, so the card-side check is the live-card item on #92; the tests
 use synthetic ES10 responses through the replay transport.
 

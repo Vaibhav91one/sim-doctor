@@ -229,12 +229,13 @@ enum Command {
     /// command line, 130 if interrupted.
     Fuzz(FuzzArgs),
 
-    /// eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the nickname, enable and disable writes.
+    /// eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes.
     ///
     /// Opens a logical channel, selects the ISD-R by AID, sends STORE DATA
     /// requests, and closes the channel. info, profiles and notifications only
-    /// read. `nickname`, `enable` and `disable` are the writes: dry runs unless --yes.
-    /// Never deletes a profile and never retrieves or removes a notification. The output is the
+    /// read. `nickname`, `enable`, `disable`, `delete`, `reset` and
+    /// `notifications remove` are the writes: dry runs unless --yes (`reset` also
+    /// needs --confirm-eid). Never retrieves a notification. The output is the
     /// lpac envelope under --json. Exit codes: 0 answered, 1 the card is not an
     /// eUICC, refused, or answered something malformed (the envelope carries
     /// `data.error.kind`), 129 for a bad command line, 130 if interrupted.
@@ -254,8 +255,9 @@ enum EuiccAction {
     Info(EuiccFlags),
     /// Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`).
     Profiles(EuiccFlags),
-    /// Pending notification metadata, nothing retrieved or removed (lpac `notification list`).
-    Notifications(EuiccFlags),
+    /// Pending notification metadata, nothing retrieved (lpac `notification list`);
+    /// `notifications remove <seq>` removes one.
+    Notifications(NotificationsArgs),
     /// Set a profile's nickname (lpac `profile nickname`). A write: a dry
     /// run unless `--yes`, never exposed over MCP.
     Nickname(NicknameArgs),
@@ -267,6 +269,82 @@ enum EuiccAction {
     /// REFRESH). A dry run unless `--yes`: disabling the only enabled profile
     /// leaves no active profile. Never exposed over MCP.
     Disable(StateArgs),
+    /// Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run
+    /// unless `--yes`: the profile is erased permanently and can only come back
+    /// by downloading it again from the operator. An enabled profile is refused.
+    /// Never exposed over MCP.
+    Delete(DeleteArgs),
+    /// Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can
+    /// erase every profile: nothing is selected by default, and sending needs
+    /// both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP.
+    Reset(ResetArgs),
+}
+
+/// Everything `sim-doctor euicc notifications` takes: the list, or `remove`.
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct NotificationsArgs {
+    #[command(subcommand)]
+    action: Option<NotificationAction>,
+    #[command(flatten)]
+    flags: EuiccFlags,
+}
+
+#[derive(Subcommand)]
+enum NotificationAction {
+    /// Remove a notification from the eUICC's list (lpac `notification remove`,
+    /// ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed
+    /// notification is never sent to the operator's server. Never exposed over MCP.
+    Remove(RemoveArgs),
+}
+
+/// Everything `sim-doctor euicc notifications remove` takes.
+#[derive(Args)]
+struct RemoveArgs {
+    /// Sequence number of the notification, as `euicc notifications` lists it.
+    seq: u32,
+    /// Send the request, then re-read the list and confirm. Without it
+    /// nothing is changed.
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    flags: EuiccFlags,
+}
+
+/// Everything `sim-doctor euicc delete` takes.
+#[derive(Args)]
+struct DeleteArgs {
+    /// ICCID (18 to 20 digits) or ISD-P AID (hex) of the profile.
+    id: String,
+    /// Send DeleteProfile, then re-read the profile list and confirm. Without
+    /// it nothing is changed: the profile and its consequence are printed.
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    flags: EuiccFlags,
+}
+
+/// Everything `sim-doctor euicc reset` takes.
+#[derive(Args)]
+struct ResetArgs {
+    /// Delete the operational profiles (resetOptions bit 0).
+    #[arg(long)]
+    operational: bool,
+    /// Delete the field-loaded test profiles (resetOptions bit 1).
+    #[arg(long)]
+    test: bool,
+    /// Reset the default SM-DP+ address (resetOptions bit 2).
+    #[arg(long)]
+    smdp_address: bool,
+    /// The card's EID (32 hex digits); must match the EID read from the card.
+    #[arg(long, value_name = "EID")]
+    confirm_eid: Option<String>,
+    /// Send the reset (needs `--confirm-eid`), then re-read and confirm.
+    /// Without it nothing is changed: the profiles that would be erased are listed.
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    flags: EuiccFlags,
 }
 
 /// Everything `sim-doctor euicc enable` and `disable` take.
@@ -1031,10 +1109,15 @@ fn main() -> process::ExitCode {
         Command::Euicc(args) => match args.action {
             EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
             EuiccAction::Profiles(f) => run_euicc(euicc::Query::Profiles, &f),
-            EuiccAction::Notifications(f) => run_euicc(euicc::Query::Notifications, &f),
+            EuiccAction::Notifications(n) => match n.action {
+                None => run_euicc(euicc::Query::Notifications, &n.flags),
+                Some(NotificationAction::Remove(a)) => run_euicc_remove(&a),
+            },
             EuiccAction::Nickname(n) => run_euicc_nickname(&n),
             EuiccAction::Enable(a) => run_euicc_state(euicc::Action::Enable, &a),
             EuiccAction::Disable(a) => run_euicc_state(euicc::Action::Disable, &a),
+            EuiccAction::Delete(a) => run_euicc_delete(&a),
+            EuiccAction::Reset(a) => run_euicc_reset(&a),
         },
         Command::Trace(args) => run_trace(&args),
         Command::Mcp => run_mcp(),
@@ -1907,6 +1990,59 @@ fn run_euicc_state(action: euicc::Action, args: &StateArgs) -> contract::ExitCod
         &args.flags,
         |session, aid| euicc::set_state(session, aid, max, &request),
         euicc::state_to_human,
+    )
+}
+
+/// `sim-doctor euicc delete <iccid|aid> [--yes]`: a dry run unless `--yes`.
+fn run_euicc_delete(args: &DeleteArgs) -> contract::ExitCode {
+    let request = match euicc::ProfileDelete::new(&args.id, args.yes) {
+        Ok(request) => request,
+        Err(f) => {
+            return report_refusal(contract::DEFAULT_KIND, &f.message, f.data, args.flags.json)
+        }
+    };
+    let max = usize::from(args.flags.max_segment);
+    run_euicc_op(
+        &args.flags,
+        |session, aid| euicc::delete_profile(session, aid, max, &request),
+        euicc::erase_to_human,
+    )
+}
+
+/// `sim-doctor euicc reset [--operational] [--test] [--smdp-address]
+/// [--confirm-eid EID] [--yes]`. Options and confirmation are checked before a
+/// reader is opened.
+fn run_euicc_reset(args: &ResetArgs) -> contract::ExitCode {
+    let options = sim_doctor::es10::ResetOptions {
+        delete_operational_profiles: args.operational,
+        delete_field_loaded_test_profiles: args.test,
+        reset_default_smdp_address: args.smdp_address,
+    };
+    let request = match euicc::MemoryReset::new(options, args.confirm_eid.as_deref(), args.yes) {
+        Ok(request) => request,
+        Err(f) => {
+            return report_refusal(contract::DEFAULT_KIND, &f.message, f.data, args.flags.json)
+        }
+    };
+    let max = usize::from(args.flags.max_segment);
+    run_euicc_op(
+        &args.flags,
+        |session, aid| euicc::memory_reset(session, aid, max, &request),
+        euicc::erase_to_human,
+    )
+}
+
+/// `sim-doctor euicc notifications remove <seq> [--yes]`: a dry run unless `--yes`.
+fn run_euicc_remove(args: &RemoveArgs) -> contract::ExitCode {
+    let request = euicc::NotificationRemoval {
+        seq_number: args.seq,
+        apply: args.yes,
+    };
+    let max = usize::from(args.flags.max_segment);
+    run_euicc_op(
+        &args.flags,
+        |session, aid| euicc::remove_notification(session, aid, max, request),
+        euicc::erase_to_human,
     )
 }
 
