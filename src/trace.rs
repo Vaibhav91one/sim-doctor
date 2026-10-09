@@ -7,7 +7,7 @@
 //! GlobalPlatform; the code is written here, not copied. Status words reuse
 //! [`crate::apdu::StatusWord`].
 //!
-//! **Not done.** pcap/GSMTAP input (follow-up of issue #109). The selected
+//! **Not done.** GSMTAP TPDU sub-types (see [`pcap`]). The selected
 //! file is tracked from SELECT parameters only; whether a FID is a DF or an EF
 //! is guessed from its first octet (3F/7F/5F are DFs), because the FCP is not
 //! read.
@@ -16,6 +16,8 @@
 pub const NAME: &str = "trace";
 
 use serde_json::{json, Value};
+
+pub mod pcap;
 
 use crate::apdu::{Command, StatusWord};
 
@@ -58,6 +60,21 @@ impl Decoded {
             "selected": self.selected,
         })
     }
+}
+
+/// Reads a trace file's bytes: a pcap or pcapng capture of GSMTAP SIM APDUs
+/// (detected by magic number), otherwise the text formats of [`parse`].
+///
+/// # Errors
+///
+/// A sentence naming what is wrong with the capture or the text.
+pub fn parse_bytes(input: &[u8]) -> Result<Vec<Pair>, String> {
+    if pcap::is_capture(input) {
+        return pcap::parse(input);
+    }
+    let text = std::str::from_utf8(input)
+        .map_err(|_| "the trace is neither a pcap/pcapng capture nor UTF-8 text".to_owned())?;
+    parse(text)
 }
 
 /// Reads a trace: JSON (array of `{step,command,response}`, `{trace:[..]}` or a

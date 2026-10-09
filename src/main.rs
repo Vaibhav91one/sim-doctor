@@ -208,10 +208,11 @@ enum Command {
 
     /// Decode a captured APDU trace offline (no card, no reader).
     ///
-    /// Reads hex lines (alternating command, response) or our own `--trace`
-    /// JSON from FILE or stdin, names each command, tracks the selected file
-    /// and explains each status word. PIN values are never printed. pcap/GSMTAP
-    /// input is not supported yet.
+    /// Reads hex lines (alternating command, response), our own `--trace`
+    /// JSON, or a pcap/pcapng capture of GSMTAP SIM APDUs (UDP 4729, as from
+    /// SIMtrace2 or pySim-trace; detected automatically) from FILE or stdin,
+    /// names each command, tracks the selected file and explains each status
+    /// word.
     Trace(TraceArgs),
 
     /// APDU discovery and the OTA/SMS fuzz sweep.
@@ -1892,18 +1893,16 @@ fn run_trace(args: &TraceArgs) -> contract::ExitCode {
     use std::io::Read;
     const KIND: &str = "trace";
     let refuse = |m: String| report_refusal(KIND, &m, serde_json::json!({ "error": m }), args.json);
-    let mut input = String::new();
+    let mut input = Vec::new();
     let read = match args.file.as_deref() {
-        None | Some("-") => io::stdin()
-            .take(MAX_WHY_FILE_BYTES)
-            .read_to_string(&mut input),
+        None | Some("-") => io::stdin().take(MAX_WHY_FILE_BYTES).read_to_end(&mut input),
         Some(path) => std::fs::File::open(path)
-            .and_then(|f| f.take(MAX_WHY_FILE_BYTES).read_to_string(&mut input)),
+            .and_then(|f| f.take(MAX_WHY_FILE_BYTES).read_to_end(&mut input)),
     };
     if let Err(err) = read {
         return refuse(format!("cannot read the trace: {err}"));
     }
-    let rows = match trace::parse(&input) {
+    let rows = match trace::parse_bytes(&input) {
         Ok(pairs) => trace::decode(&pairs),
         Err(message) => return refuse(message),
     };
