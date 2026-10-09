@@ -1,8 +1,9 @@
 //! A Model Context Protocol server: JSON-RPC 2.0 over stdio, no new crates.
 //!
 //! `sim-doctor mcp` lets a coding agent call the scan and the rule catalogue as
-//! tools instead of shelling out. Three tools only: `scan`, `rules_list` and
-//! `rules_explain`.
+//! tools instead of shelling out: `scan`, `rules_list`, `rules_explain` and the
+//! three read-only eUICC queries `euicc_info`, `euicc_profiles` and
+//! `euicc_notifications`.
 //!
 //! Each call runs this same binary as a subprocess (`scan --json ...`), so the
 //! envelope an agent receives is byte for byte the one the CLI prints, and no
@@ -69,24 +70,31 @@ fn scan_flags(scan: &Command) -> Vec<(String, String, &'static str)> {
         .collect()
 }
 
+/// The read-only eUICC tools: (tool name, `euicc` subcommand, description).
+const EUICC_TOOLS: [(&str, &str, &str); 3] = [
+    ("euicc_info", "info", "Read the EID, EUICCInfo1 and EUICCInfo2 of the eUICC in a PC/SC reader (lpac chip info), as the sim-doctor lpac envelope. Read-only. Needs an eUICC and a reader."),
+    ("euicc_profiles", "profiles", "List the profiles on the eUICC in a PC/SC reader (lpac profile list), as the sim-doctor lpac envelope. Read-only. Needs an eUICC and a reader."),
+    ("euicc_notifications", "notifications", "List pending notification metadata on the eUICC in a PC/SC reader (lpac notification list), as the sim-doctor lpac envelope. Nothing is retrieved or removed. Needs an eUICC and a reader."),
+];
+
 /// The tools this server exposes, in MCP `tools/list` shape.
 pub fn tool_list(scan: &Command) -> Value {
     let props: Map<String, Value> = scan_flags(scan)
         .into_iter()
         .map(|(name, help, kind)| (name, json!({ "type": kind, "description": help })))
         .collect();
-    json!({ "tools": [
-        {
+    let mut tools = vec![
+        json!({
             "name": "scan",
             "description": "Scan the card in a PC/SC reader and return the sim-doctor JSON envelope. Needs a card and a reader.",
             "inputSchema": { "type": "object", "properties": props, "additionalProperties": false },
-        },
-        {
+        }),
+        json!({
             "name": "rules_list",
             "description": "List the rules a scan runs, as the sim-doctor JSON envelope. No card needed.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
-        },
-        {
+        }),
+        json!({
             "name": "rules_explain",
             "description": "Explain one rule by id (for example gsma/msl-zero-allowed), as the sim-doctor JSON envelope. No card needed.",
             "inputSchema": {
@@ -95,8 +103,20 @@ pub fn tool_list(scan: &Command) -> Value {
                 "required": ["id"],
                 "additionalProperties": false,
             },
-        },
-    ] })
+        }),
+    ];
+    for (name, _, description) in EUICC_TOOLS {
+        tools.push(json!({
+            "name": name,
+            "description": description,
+            "inputSchema": {
+                "type": "object",
+                "properties": { "reader": { "type": "string", "description": "The reader to use, matched against the driver's own name." } },
+                "additionalProperties": false,
+            },
+        }));
+    }
+    json!({ "tools": tools })
 }
 
 /// Validate a tool call and build the child argv, or say why it is refused.
@@ -132,6 +152,23 @@ fn build_argv(scan: &Command, name: &str, args: &Value) -> Result<Vec<String>, S
                 id.into(),
                 "--json".into(),
             ])
+        }
+        _ if EUICC_TOOLS.iter().any(|(n, _, _)| *n == name) => {
+            let sub = EUICC_TOOLS.iter().find(|(n, _, _)| *n == name).unwrap().1;
+            if let Some(k) = obj.keys().find(|k| *k != "reader") {
+                return Err(format!("unknown argument \"{k}\""));
+            }
+            let mut argv = vec!["euicc".to_string(), sub.to_string(), "--json".to_string()];
+            if let Some(reader) = obj.get("reader") {
+                let reader = reader
+                    .as_str()
+                    .ok_or_else(|| "\"reader\" must be a string".to_string())?;
+                if reader.starts_with('-') {
+                    return Err("\"reader\" must not start with '-'".into());
+                }
+                argv.extend(["--reader".to_string(), reader.to_string()]);
+            }
+            Ok(argv)
         }
         "scan" => {
             let flags = scan_flags(scan);
@@ -450,11 +487,21 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_exactly_the_three_tools_with_object_schemas() {
+    fn tools_list_has_exactly_the_six_tools_with_object_schemas() {
         let r = handle(&req("tools/list", Some(2)), &fake_scan(), &never).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["scan", "rules_list", "rules_explain"]);
+        assert_eq!(
+            names,
+            [
+                "scan",
+                "rules_list",
+                "rules_explain",
+                "euicc_info",
+                "euicc_profiles",
+                "euicc_notifications"
+            ]
+        );
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
         }
@@ -660,6 +707,33 @@ mod tests {
             call("rules_explain", json!({"id": "gsma/x"}), 0).1.unwrap(),
             ["rules", "explain", "gsma/x", "--json"]
         );
+    }
+
+    #[test]
+    fn euicc_tools_run_the_read_only_subcommands() {
+        for (tool, sub) in [
+            ("euicc_info", "info"),
+            ("euicc_profiles", "profiles"),
+            ("euicc_notifications", "notifications"),
+        ] {
+            assert_eq!(
+                call(tool, json!({}), 0).1.unwrap(),
+                ["euicc", sub, "--json"]
+            );
+            assert_eq!(
+                call(tool, json!({"reader": "R 1"}), 1).1.unwrap(),
+                ["euicc", sub, "--json", "--reader", "R 1"]
+            );
+        }
+        for args in [
+            json!({"aid": "A0"}),
+            json!({"reader": "--json"}),
+            json!({"reader": 1}),
+        ] {
+            let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"euicc_info","arguments":args}});
+            let r = handle(&req, &fake_scan(), &never).unwrap();
+            assert_eq!(r["result"]["isError"], true);
+        }
     }
 
     #[test]

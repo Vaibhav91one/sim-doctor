@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `sim-doctor euicc info|profiles|notifications`: read-only ES10 queries to the ISD-R on a logical channel (lpac `chip info`, `profile list`, `notification list`): EID, EUICCInfo1/2, profile list, notification metadata. lpac envelope under `--json`, sanitized table otherwise; a non-eUICC card is a clean `not-an-euicc` error, exit 1. Never changes a profile or notification. New ES10 codecs `get_eid_request`/`decode_get_eid` and `list_notification_request`/`decode_list_notification` (#116, #132).
+- MCP: `euicc_info`, `euicc_profiles` and `euicc_notifications` tools (six tools in total).
 - `scan` decodes more EFs, read-only (SELECT, READ BINARY, READ RECORD) and shown in full in `ef_contents`: EF.FPLMN, EF.OPLMNwAcT, EF.HPLMNwAcT, EF.ACC, EF.LOCI, EF.PSLOCI, EF.EPSLOCI, EF.ADN (`6F3A`, and `4F3A` in a phonebook), EF.FDN, and the ISIM EF.IMPI, EF.IMPU and EF.P-CSCF (told apart from the USIM's EF.KeysPS by the ISIM AID) (#108).
 - EF.MANUAREA (`3F00/0002`, a vendor-specific file with no standard identifier, as SIMTester reads it) is probed with one SELECT and READ BINARY and shown as hex when the card has it; a card without it is not an error (#102).
 - Rule `exposure/risky-service-available` (low): EF.UST marks service 28 (SMS-PP data download) or 32 (RUN AT COMMAND) available, one finding per service (#108). EF.EST is decoded but not judged.

@@ -265,7 +265,7 @@ only new findings count: 3 or 0, never 1.
 
 **What changed from the old table.** The old `129` (invalid usage) is gone **for `scan`**: a
 usage error there is exit 2, as is a failed run (it was 1). The lpa-envelope commands (`modules`,
-`rules`, `why`, `fix`, `gp`, `ts48`, `fuzz`, `trace`, `ci`, `install`, `completions`, `mcp`) keep
+`rules`, `why`, `fix`, `gp`, `euicc`, `ts48`, `fuzz`, `trace`, `ci`, `install`, `completions`, `mcp`) keep
 their lpac envelope `{type, payload:{code,message,data}}` and the old codes 0/1/129/130 (1 means
 the run could not deliver). `scan`'s exit-0-for-findings decision, issues #14/#24/#12 and
 reasons 1 to 3, is superseded; its history stays in CONTEXT.md.
@@ -739,7 +739,7 @@ body. Those commands keep it for lpa compatibility; they are not findings comman
 
 ### MCP
 
-`sim-doctor mcp` serves MCP over stdio with three tools, `scan`, `rules_list` and `rules_explain`.
+`sim-doctor mcp` serves MCP over stdio with six tools: `scan`, `rules_list`, `rules_explain` and the read-only eUICC queries `euicc_info`, `euicc_profiles` and `euicc_notifications` (each takes an optional `reader`; they return the `euicc ... --json` lpac envelope unchanged).
 `scan` runs this binary as `scan --json ...` and returns the doctor/1 envelope **byte for byte**
 (exit 0, 1 and 3 are results; anything else is an error carrying stderr). It accepts every scan
 flag as an argument **except** `tui`, `json` (always forced), `help` and `version`; `baseline`,
@@ -946,6 +946,17 @@ Four verb groups [V]: `chip` (info / defaultsmdp / purge), `profile` (list / nic
 disable / delete / download / discovery), `notification` (list / process / remove), `driver`
 (apdu / http / list). Backend selection via env: `LPAC_APDU` = pcsc|at|at_csim|stdio,
 `LPAC_HTTP` = curl|stdio.
+
+sim-doctor's read-only subset (issues #116, #132), lpac name in brackets: `euicc info` [`chip info`],
+`euicc profiles` [`profile list`], `euicc notifications` [`notification list`]. Each opens a logical
+channel (MANAGE CHANNEL), SELECTs the ISD-R (`A0000005591010FFFFFFFF8900000100`, `--aid` overrides),
+sends one ES10 STORE DATA request ([src/euicc.rs](src/euicc.rs) over [src/es10.rs](src/es10.rs)) and
+closes the channel on every path. They speak the lpac envelope (`type` `lpa`), human table without
+`--json`. Exit 0 answered; 1 not an eUICC (`data.error.kind` `not-an-euicc`), no channel, ISD-R
+refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Never sent:
+EnableProfile, DeleteProfile, RetrieveNotificationsList, RemoveNotification (those are #117/#119).
+The swSIM fixture is not an eUICC, so the card-side check is the live-card item on #92; the tests
+use synthetic ES10 responses through the replay transport.
 
 ### 5.5 GlobalPlatform C library
 
