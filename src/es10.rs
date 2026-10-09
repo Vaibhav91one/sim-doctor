@@ -39,6 +39,7 @@
 //! | GetEuiccConfiguredAddresses (ES10a) | 5.7.3 | `BF3C` | `BF3C` |
 //! | GetProfilesInfo | 5.7.15 | `BF2D` | `BF2D` |
 //! | EnableProfile | 5.7.16 | `BF31` | `BF31` |
+//! | DisableProfile | 5.7.17 | `BF32` | `BF32` |
 //! | DeleteProfile | 5.7.18 | `BF33` | `BF33` |
 //! | SetNickname | 5.7.21 | `BF29` | `BF29` |
 //!
@@ -711,6 +712,17 @@ code_enum! {
     }
 }
 code_enum! {
+    /// `disableResult`. pySim's `rsp.asn` (`DisableProfileResponse`) lists
+    /// ok(0), iccidOrAidNotFound(1), profileNotInEnabledState(2),
+    /// disallowedByPolicy(3) and undefinedError(127); `CatBusy` (5) is not in
+    /// that file for either function and is kept here, as for
+    /// [`EnableResult`], so an eUICC that answers it gets a distinct name.
+    DisableResult {
+        Ok = 0, IccidOrAidNotFound = 1, ProfileNotInEnabledState = 2,
+        DisallowedByPolicy = 3, CatBusy = 5, UndefinedError = 127,
+    }
+}
+code_enum! {
     /// `setNicknameResult` ([SGP.22 v2.5 §5.7.21]).
     SetNicknameResult { Ok = 0, IccidNotFound = 1, UndefinedError = 127 }
 }
@@ -909,6 +921,13 @@ impl ProfileIdentifier<'_> {
 /// `EnableProfileRequest`, `BF31` ([SGP.22 v2.5 §5.7.16]):
 /// `A0 <identifier> 81 <refreshFlag>`, the flag `FF` for true.
 ///
+/// Checked 2026-10-10 against pySim `pySim/esim/asn1/rsp/rsp.asn`
+/// (`EnableProfileRequest ::= [49] SEQUENCE { profileIdentifier CHOICE {
+/// isdpAid [APPLICATION 15] OctetTo16, iccid Iccid }, refreshFlag BOOLEAN }`
+/// under `AUTOMATIC TAGS`: the CHOICE is `[0]`, so `A0`; the flag is `[1]`,
+/// so `81`) and lpac `euicc/es10c.c` (`es10c_enable_disable_delete_profile`
+/// sends `BF31 { A0 { 4F|5A id } 81 01 FF|00 }`).
+///
 /// # Errors
 ///
 /// [`EncodeError::FieldLength`] for a malformed identifier.
@@ -916,9 +935,32 @@ pub fn enable_profile_request(
     profile: ProfileIdentifier<'_>,
     refresh: bool,
 ) -> Result<Vec<u8>, EncodeError> {
+    state_request(0xBF31, profile, refresh)
+}
+
+/// `DisableProfileRequest`, `BF32` ([SGP.22 v2.5 §5.7.17]): the same body as
+/// [`enable_profile_request`] (pySim `rsp.asn`: `DisableProfileRequest ::=
+/// [50] SEQUENCE { profileIdentifier CHOICE { ... }, refreshFlag BOOLEAN }`;
+/// lpac `es10c_disable_profile` passes tag `0xBF32` to the same builder).
+///
+/// # Errors
+///
+/// [`EncodeError::FieldLength`] for a malformed identifier.
+pub fn disable_profile_request(
+    profile: ProfileIdentifier<'_>,
+    refresh: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    state_request(0xBF32, profile, refresh)
+}
+
+fn state_request(
+    tag: u32,
+    profile: ProfileIdentifier<'_>,
+    refresh: bool,
+) -> Result<Vec<u8>, EncodeError> {
     let mut body = tlv(0xA0, &profile.encode()?);
     push_tlv(&mut body, 0x81, &[if refresh { 0xFF } else { 0x00 }]);
-    Ok(tlv(0xBF31, &body))
+    Ok(tlv(tag, &body))
 }
 
 /// `DeleteProfileRequest`, `BF33` ([SGP.22 v2.5 §5.7.18]): the identifier
@@ -1880,6 +1922,16 @@ pub fn decode_enable_profile(data: &[u8]) -> Result<EnableProfileResponse, Decod
     })
 }
 
+/// Decodes the response data of DisableProfile (`BF32`) into its
+/// `disableResult` ([SGP.22 v2.5 §5.7.17]).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed or incomplete structure.
+pub fn decode_disable_profile(data: &[u8]) -> Result<DisableResult, DecodeError> {
+    result_code(data, 0xBF32, "disableResult").map(|(code, _)| DisableResult::from_code(code))
+}
+
 /// `DeleteProfileResponse` ([SGP.22 v2.5 §5.7.18]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteProfileResponse {
@@ -2801,6 +2853,43 @@ mod tests {
             SetNicknameResult::IccidNotFound
         );
         assert!(decode_set_nickname(&h("BF29 00")).is_err());
+    }
+
+    #[test]
+    fn enable_and_disable_requests_and_disable_response() {
+        let iccid = h("98 00 10 32 54 76 98 10 32 14");
+        let aid = h("A0000005591010FFFFFFFF8900001000");
+        // Hand-written from pySim rsp.asn + lpac es10c.c: BFxx { A0 { 5A|4F id } 81 01 FF|00 }.
+        assert_eq!(
+            enable_profile_request(ProfileIdentifier::Iccid(&iccid), true).unwrap(),
+            h("BF31 11 A0 0C 5A0A 98001032547698103214 81 01 FF")
+        );
+        assert_eq!(
+            disable_profile_request(ProfileIdentifier::Iccid(&iccid), false).unwrap(),
+            h("BF32 11 A0 0C 5A0A 98001032547698103214 81 01 00")
+        );
+        assert_eq!(
+            enable_profile_request(ProfileIdentifier::IsdpAid(&aid), true).unwrap(),
+            h("BF31 17 A0 12 4F10 A0000005591010FFFFFFFF8900001000 81 01 FF")
+        );
+        assert!(disable_profile_request(ProfileIdentifier::Iccid(&iccid[..9]), true).is_err());
+        assert!(disable_profile_request(ProfileIdentifier::IsdpAid(&[0; 17]), true).is_err());
+        for (code, want) in [
+            ("00", DisableResult::Ok),
+            ("01", DisableResult::IccidOrAidNotFound),
+            ("02", DisableResult::ProfileNotInEnabledState),
+            ("03", DisableResult::DisallowedByPolicy),
+            ("05", DisableResult::CatBusy),
+            ("7F", DisableResult::UndefinedError),
+            ("63", DisableResult::Unknown(0x63)),
+        ] {
+            assert_eq!(
+                decode_disable_profile(&h(&format!("BF32 03 80 01 {code}"))).unwrap(),
+                want
+            );
+        }
+        assert!(decode_disable_profile(&h("BF32 00")).is_err());
+        assert!(decode_disable_profile(&h("BF31 03 80 01 00")).is_err());
     }
 
     #[test]

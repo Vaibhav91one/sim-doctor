@@ -155,6 +155,7 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `gp info\|ara\|status [--json] [--reader NAME] [--trace]` | read-only GlobalPlatform reads, see below |
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
+| `euicc enable\|disable ICCID\|AID [--yes] [...]` | enable or disable a profile; a dry run unless `--yes`, see below |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 
@@ -198,7 +199,7 @@ profile's `7FD0` and ISIM (`A0000000871004`) to `7FC0`.
 
 ### `euicc`
 
-Queries to an eUICC's ISD-R (SGP.22 ES10), named after lpac's, and one write (`nickname`):
+Queries to an eUICC's ISD-R (SGP.22 ES10), named after lpac's, and three writes (`nickname`, `enable`, `disable`):
 
 | sim-doctor | lpac | Asks the card for |
 | --- | --- | --- |
@@ -225,6 +226,18 @@ and ICCID and the current and the new nickname, and exits 0 without sending SetN
 it sends SetNickname, re-reads the profile list and exits 1 (`verify-failed`) unless the nickname
 changed. An ICCID the eUICC does not hold is `iccid-not-found`, and nothing is written. The nickname
 write is **not exposed over MCP**: the MCP server offers the three read-only `euicc_*` tools only.
+
+`euicc enable ICCID|AID` and `euicc disable ICCID|AID` (lpac `profile enable` / `profile disable`, ES10c
+EnableProfile / DisableProfile, REFRESH requested) follow the same rules. The profile is an ICCID (18 to 20
+digits) or an ISD-P AID (hex), checked before a reader is opened (`bad-profile-id`). Both read the EID and the profile
+list first and refuse, sending nothing, an unknown profile (`profile-not-found`), enabling an enabled profile
+(`already-enabled`) and disabling a disabled one (`already-disabled`). Without `--yes` they are a **dry run** that
+says what would follow: enabling switches the active profile and the device loses its current connection until it
+re-attaches; disabling the only enabled profile leaves no active profile. With `--yes` they send the request, map
+each SGP.22 result code to its own error kind (`profile-not-found`, `profile-not-in-disabled-state` /
+`profile-not-in-enabled-state`, `disallowed-by-policy`, `wrong-profile-reenabling`, `cat-busy`, `undefined-error`; an
+unlisted code is `es10-refused`), re-read the profile list and exit 1 (`verify-failed`) unless the state changed.
+Neither is exposed over MCP.
 
 ### `gp`
 

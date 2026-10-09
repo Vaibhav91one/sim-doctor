@@ -2252,3 +2252,29 @@ fn euicc_nickname_validates_before_touching_a_reader() {
     assert_eq!(run.code(), 1, "{}", run.stderr);
     assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
 }
+
+#[test]
+fn euicc_enable_and_disable_validate_before_touching_a_reader() {
+    // Issue #117. A bad identifier is refused with no reader named at all; a
+    // good one against a reader that cannot exist fails at the reader.
+    for verb in ["enable", "disable"] {
+        let run = run_piped(&["euicc", verb, "1234", "--yes", "--json"]);
+        assert_eq!(run.code(), 1, "{}", run.stderr);
+        assert_eq!(
+            assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings)
+                .payload()
+                .data()["error"]["kind"],
+            "bad-profile-id"
+        );
+        let run = run_piped(&[
+            "euicc",
+            verb,
+            "89000123456789012341",
+            "--json",
+            "--reader",
+            NO_SUCH_READER,
+        ]);
+        assert_eq!(run.code(), 1, "{}", run.stderr);
+        assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+    }
+}
