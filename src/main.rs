@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    access, apdu_scan, baseline, ci, contract, ef, fix, fuzz, gp, rules, sarif, scan, session,
-    signals, skill, tar, trace,
+    access, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, rules, sarif, scan,
+    session, signals, skill, tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -227,6 +227,47 @@ enum Command {
     /// the opt-in refusal, error kind fuzz-needs-opt-in), 129 for a bad
     /// command line, 130 if interrupted.
     Fuzz(FuzzArgs),
+
+    /// Read-only eUICC queries over ES10 (lpac: chip info, profile list, notification list).
+    ///
+    /// Opens a logical channel, selects the ISD-R by AID, sends one STORE DATA
+    /// request, and closes the channel. Never enables, disables or deletes a
+    /// profile and never retrieves or removes a notification. The output is the
+    /// lpac envelope under --json. Exit codes: 0 answered, 1 the card is not an
+    /// eUICC, refused, or answered something malformed (the envelope carries
+    /// `data.error.kind`), 129 for a bad command line, 130 if interrupted.
+    Euicc(EuiccArgs),
+}
+
+/// Everything `sim-doctor euicc` takes.
+#[derive(Args)]
+struct EuiccArgs {
+    #[command(subcommand)]
+    action: EuiccAction,
+}
+
+#[derive(Subcommand)]
+enum EuiccAction {
+    /// EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`).
+    Info(EuiccFlags),
+    /// Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`).
+    Profiles(EuiccFlags),
+    /// Pending notification metadata, nothing retrieved or removed (lpac `notification list`).
+    Notifications(EuiccFlags),
+}
+
+/// Flags every `euicc` subcommand shares.
+#[derive(Args)]
+struct EuiccFlags {
+    /// The reader to use, matched against the driver's own name.
+    #[arg(long, value_name = "NAME")]
+    reader: Option<String>,
+    /// Emit one lpac envelope on stdout, and nothing else.
+    #[arg(long)]
+    json: bool,
+    /// ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100).
+    #[arg(long, value_name = "HEX")]
+    aid: Option<String>,
 }
 
 /// Everything `sim-doctor fuzz` takes.
@@ -897,6 +938,11 @@ fn main() -> process::ExitCode {
                 json,
                 trace,
             } => run_gp_info(reader.as_deref(), json, trace),
+        },
+        Command::Euicc(args) => match args.action {
+            EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
+            EuiccAction::Profiles(f) => run_euicc(euicc::Query::Profiles, &f),
+            EuiccAction::Notifications(f) => run_euicc(euicc::Query::Notifications, &f),
         },
         Command::Trace(args) => run_trace(&args),
         Command::Mcp => run_mcp(),
@@ -1714,6 +1760,77 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
         serde_json::to_string_pretty(&data).unwrap_or_default()
     };
     if let Err(err) = emit_stdout(&rendered, "the gp info report") {
+        eprintln!("sim-doctor: {err}");
+        return contract::ExitCode::Findings;
+    }
+    contract::ExitCode::Success
+}
+
+/// `sim-doctor euicc <info|profiles|notifications>`: one read-only ES10 query.
+fn run_euicc(query: euicc::Query, flags: &EuiccFlags) -> contract::ExitCode {
+    const KIND: &str = contract::DEFAULT_KIND;
+    let json = flags.json;
+    guard_exchange(KIND, json);
+    let refuse =
+        |failure: scan::Failure| report_refusal(KIND, &failure.message, failure.data(), json);
+    let aid = match flags.aid.as_deref() {
+        None => euicc::ISDR_AID.to_vec(),
+        Some(text) => match hex::decode(text) {
+            Ok(aid) if (5..=16).contains(&aid.len()) => aid,
+            _ => {
+                return refuse(scan::Failure::new(
+                    "bad-aid",
+                    format!("--aid must be 5 to 16 bytes of hex, got {text:?}"),
+                ))
+            }
+        },
+    };
+    let readers = match Pcsc::readers() {
+        Ok(readers) => readers,
+        Err(err) => return refuse(scan::Failure::new("context-unavailable", err.to_string())),
+    };
+    let reader = match pick_reader(&readers, flags.reader.as_deref()) {
+        Ok(reader) => reader,
+        Err(failure) => return refuse(failure),
+    };
+    let mut session = match PcscSession::open(reader) {
+        Ok(session) => session,
+        Err(err) => {
+            let kind = match err {
+                TransportError::NoCard { .. } => "no-card",
+                _ => "reader-unavailable",
+            };
+            return refuse(scan::Failure::new(kind, err.to_string()));
+        }
+    };
+    let mut data = match euicc::run(&mut session, &aid, query) {
+        Ok(data) => data,
+        Err(failure) => {
+            let mut data = failure.data;
+            data["reader"] = serde_json::json!(reader.as_str());
+            return report_refusal(KIND, &failure.message, data, json);
+        }
+    };
+    data["reader"] = serde_json::json!(reader.as_str());
+    let rendered = if json {
+        match contract::Envelope::new(
+            KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        )
+        .to_json()
+        {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("sim-doctor: {err}");
+                return contract::ExitCode::Findings;
+            }
+        }
+    } else {
+        euicc::to_human(query, &data).trim_end().to_owned()
+    };
+    if let Err(err) = emit_stdout(&rendered, "the euicc report") {
         eprintln!("sim-doctor: {err}");
         return contract::ExitCode::Findings;
     }
