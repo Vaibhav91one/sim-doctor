@@ -98,15 +98,26 @@ pub enum ExitCode {
     /// The command line could not be understood.
     InvalidUsage = 129,
 
+    /// doctor/1 only (`scan`): usage error, bad input, or the run could not
+    /// complete. The lpa-style commands keep using [`ExitCode::Findings`] (1)
+    /// and [`ExitCode::InvalidUsage`] (129) for these.
+    Error = 2,
+
+    /// doctor/1 only (`scan --baseline`): at least one NEW finding at or above
+    /// `--fail-on`. Takes precedence over [`ExitCode::Findings`].
+    NewFindings = 3,
+
     /// The operator interrupted the run.
     Interrupted = 130,
 }
 
 impl ExitCode {
     /// Every exit code, numerically ascending.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Success,
         Self::Findings,
+        Self::Error,
+        Self::NewFindings,
         Self::InvalidUsage,
         Self::Interrupted,
     ];
@@ -123,6 +134,8 @@ impl ExitCode {
         match code {
             0 => Some(Self::Success),
             1 => Some(Self::Findings),
+            2 => Some(Self::Error),
+            3 => Some(Self::NewFindings),
             129 => Some(Self::InvalidUsage),
             130 => Some(Self::Interrupted),
             _ => None,
@@ -285,19 +298,147 @@ pub enum Error {
     Serialize(#[from] serde_json::Error),
 }
 
+// ---------------------------------------------------------------------------
+// doctor/1 (docs/doctor-contract.md): the envelope of a findings command
+// ---------------------------------------------------------------------------
+
+/// The `schema` value of the shared doctor envelope.
+pub const DOCTOR_SCHEMA: &str = "doctor/1";
+
+/// The doctor/1 score label for `value` and `coverage_gaps` (contract section 3).
+///
+/// `good` from 90, `needs work` from 60, `critical` below; `incomplete`
+/// replaces `good` when anything was not covered.
+pub const fn score_label(value: u8, coverage_gaps: usize) -> &'static str {
+    if value >= 90 {
+        if coverage_gaps > 0 {
+            "incomplete"
+        } else {
+            "good"
+        }
+    } else if value >= 60 {
+        "needs work"
+    } else {
+        "critical"
+    }
+}
+
+/// The doctor/1 score object.
+pub fn doctor_score(value: u8, model: &str, coverage_gaps: usize) -> serde_json::Value {
+    serde_json::json!({
+        "value": value,
+        "label": score_label(value, coverage_gaps),
+        "model": model,
+        "coverage_gaps": coverage_gaps,
+    })
+}
+
+/// The doctor/1 envelope as a [`serde_json::Value`] (`serde_json` orders keys,
+/// and key order is not significant in the contract).
+///
+/// `baseline` is the optional `{new, unchanged, fixed}` block.
+pub fn doctor_envelope(
+    exit_code: ExitCode,
+    score: serde_json::Value,
+    findings: Vec<serde_json::Value>,
+    data: serde_json::Value,
+    baseline: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "schema": DOCTOR_SCHEMA,
+        "tool": "sim-doctor",
+        "version": env!("CARGO_PKG_VERSION"),
+        "exit_code": exit_code.process_code(),
+        "score": score,
+        "findings": findings,
+        "data": data,
+    });
+    if let Some(baseline) = baseline {
+        envelope["baseline"] = baseline;
+    }
+    envelope
+}
+
+/// A doctor/1 envelope for a run that produced no result (could not run, was
+/// interrupted): no findings, a zero score with one coverage gap, and `data`
+/// carrying the reason. Not a verdict on any card.
+pub fn doctor_failure(exit_code: ExitCode, data: serde_json::Value) -> serde_json::Value {
+    doctor_envelope(
+        exit_code,
+        doctor_score(0, "sim/1", 1),
+        Vec::new(),
+        data,
+        None,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Sanitisation (docs/doctor-contract.md section 8)
+// ---------------------------------------------------------------------------
+
+/// Replaces every control and invisible character in `text` with a space.
+///
+/// **The one helper every human renderer uses** for text that came from a card
+/// (file names, labels, messages, the reader name): the scan table, the TUI and
+/// the fix prompt. It covers C0/C1 controls (so ESC), bidi controls
+/// (U+202A-U+202E, U+2066-U+2069), zero-width characters (U+200B-U+200D,
+/// U+FEFF) and the line and paragraph separators (U+2028, U+2029), plus the
+/// other format and default-ignorable characters in [`is_invisible`]. A
+/// newline is a control character too, so call this on one line at a time (see
+/// [`sanitize_lines`]). JSON and SARIF do not use it: the serialiser escapes.
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || is_invisible(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// [`sanitize`] applied to each line of a multi-line report, keeping the line
+/// structure (and a final newline, when there is one).
+pub fn sanitize_lines(report: &str) -> String {
+    let mut out: Vec<String> = report.split('\n').map(sanitize).collect();
+    if out.last().is_some_and(String::is_empty) {
+        out.pop();
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+/// Format (Cf), line/paragraph separator, private-use and default-ignorable
+/// characters.
+///
+/// std has no general-category lookup and no new crate is allowed, so this is an
+/// explicit table. Unassigned code points (Cn) are NOT covered beyond the ranges
+/// below.
+pub fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+        | '\u{180b}'..='\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}'
+        | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}'
+        | '\u{e0100}'..='\u{e01ef}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{10ffff}')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_exit_codes_are_the_four_documented_numbers() {
+    fn the_exit_codes_are_the_documented_numbers() {
         // Spelled out rather than derived, because these numbers are the
         // contract with every CI system that will ever run this binary.
         assert_eq!(ExitCode::Success.process_code(), 0);
         assert_eq!(ExitCode::Findings.process_code(), 1);
+        assert_eq!(ExitCode::Error.process_code(), 2);
+        assert_eq!(ExitCode::NewFindings.process_code(), 3);
         assert_eq!(ExitCode::InvalidUsage.process_code(), 129);
         assert_eq!(ExitCode::Interrupted.process_code(), 130);
-        assert_eq!(ExitCode::ALL.len(), 4);
+        assert_eq!(ExitCode::ALL.len(), 6);
 
         for code in ExitCode::ALL {
             assert_eq!(
@@ -309,14 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn nothing_outside_the_four_is_an_exit_code() {
-        // Exhausts all 256 possible exit statuses. 2 in particular is what
-        // clap uses by default; if it ever reached a caller through this
-        // contract, bad arguments would be indistinguishable from a crash.
+    fn nothing_outside_the_documented_six_is_an_exit_code() {
+        // Exhausts all 256 possible exit statuses. 2 and 3 exist only for the
+        // doctor/1 findings command (`scan`); the lpa-style commands never
+        // return them.
         let accepted: Vec<u8> = (u8::MIN..=u8::MAX)
             .filter(|&raw| ExitCode::from_process_code(raw).is_some())
             .collect();
-        assert_eq!(accepted, vec![0, 1, 129, 130]);
+        assert_eq!(accepted, vec![0, 1, 2, 3, 129, 130]);
     }
 
     #[test]
@@ -388,12 +529,12 @@ mod tests {
 
     #[test]
     fn reading_an_envelope_refuses_a_code_outside_the_four() {
-        let forged = r#"{"type":"lpa","payload":{"code":2,"message":"ok","data":{}}}"#;
+        let forged = r#"{"type":"lpa","payload":{"code":7,"message":"ok","data":{}}}"#;
         let error = serde_json::from_str::<Envelope>(forged).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("2 is not a sim-doctor exit code"),
+                .contains("7 is not a sim-doctor exit code"),
             "{error}",
         );
 
@@ -436,10 +577,52 @@ mod tests {
         assert!(ExitCode::Success.is_success());
         for code in [
             ExitCode::Findings,
+            ExitCode::Error,
+            ExitCode::NewFindings,
             ExitCode::InvalidUsage,
             ExitCode::Interrupted,
         ] {
             assert!(!code.is_success(), "{code:?}");
         }
+    }
+
+    #[test]
+    fn score_labels_follow_the_contract_thresholds() {
+        assert_eq!(score_label(100, 0), "good");
+        assert_eq!(score_label(90, 0), "good");
+        assert_eq!(score_label(90, 2), "incomplete");
+        assert_eq!(score_label(89, 0), "needs work");
+        assert_eq!(score_label(60, 3), "needs work");
+        assert_eq!(score_label(59, 0), "critical");
+        assert_eq!(score_label(0, 1), "critical");
+    }
+
+    #[test]
+    fn sanitize_strips_escape_bidi_zero_width_and_separators() {
+        let dirty =
+            "a\u{1b}[31mb\u{9b}c\u{202e}d\u{2066}e\u{200b}f\u{feff}g\u{2028}h\u{2029}i\u{7}j";
+        let clean = sanitize(dirty);
+        assert!(
+            !clean.chars().any(|c| c.is_control() || is_invisible(c)),
+            "{clean:?}"
+        );
+        assert!(clean.starts_with("a [31mb"));
+        assert_eq!(
+            sanitize("plain text, ok: \u{e9}\u{4e2d}"),
+            "plain text, ok: \u{e9}\u{4e2d}"
+        );
+        assert_eq!(sanitize_lines("x\u{1b}y\nz\n"), "x y\nz\n");
+    }
+
+    #[test]
+    fn a_failure_envelope_is_doctor_1_with_no_findings() {
+        let v = doctor_failure(
+            ExitCode::Error,
+            serde_json::json!({"error": {"kind": "no-card"}}),
+        );
+        assert_eq!(v["schema"], "doctor/1");
+        assert_eq!(v["exit_code"], 2);
+        assert_eq!(v["findings"], serde_json::json!([]));
+        assert_eq!(v["data"]["error"]["kind"], "no-card");
     }
 }

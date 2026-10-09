@@ -6,8 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
+### Changed (BREAKING)
+
+`sim-doctor scan` adopts the cross-tool **doctor/1** output contract (docs/doctor-contract.md), shared with luasec, pcap-doctor, android-doctor and ble-doctor so one parser reads all five (Refs Vaibhav91one/android-doctor#161). No legacy flag; the old scan JSON is gone.
+
+- `scan --json` prints `{schema:"doctor/1", tool, version, exit_code, score, findings, data}` instead of the lpac envelope `{type, payload:{code,message,data}}`. Findings are top-level with `id`, `fingerprint`, `severity`, `category`, `message`, `location:{kind,ref}`, `evidence[]`, `remedy`. `data.findings` became top-level `findings` (old shape kept as `data.findings_detail.findings`); `data.score` became top-level `score` `{value, label, model:"sim/1", coverage_gaps}` (old block: `data.score_detail`, now always present). The rest of `data` is unchanged. A scan that cannot run is also a doctor/1 envelope (exit 2, `findings: []`, `data.error`).
+- Exit codes for `scan`: `0` no finding at or above `--fail-on`, `1` at least one, `2` usage error or the scan could not run (was 129 and 1), `3` a new finding against `--baseline`, `130` interrupted. A scan with findings used to exit 0.
+- New `--fail-on <level>`, default `critical` (the closest value to the old "findings never fail the scan").
+- `--baseline <FILE>` now READS a previous `scan --json` envelope and gates on new findings (exit 3), matching by fingerprint. It no longer writes a file: save a baseline with `sim-doctor scan --json > baseline.json`. `--diff` is removed. A baseline is now a full envelope and carries the ATR and EF contents: keep it out of the repository or reduce it (see AGENTS.md).
+- SARIF: the fingerprint key is `doctorFinding/v1` (was `simDoctorFinding/v1`) and the run carries `properties.score`.
+- MCP: the `scan` tool now exposes `baseline`, `fail-on` and `sarif`; exit 3 is a normal result.
+- GitHub Action: reads the doctor/1 envelope, fails on CLI exit 3, new input `fail-on`; the baseline file is a saved envelope.
+- Card-derived text in the scan table, the TUI, `why` and the `fix` prompt goes through one sanitiser that strips control characters (ESC), bidi controls, zero-width characters and line/paragraph separators.
+- `why` and `fix` read doctor/1 envelopes saved from `scan --json`.
+
 ### Fixed
 
+- A baseline taken with `--severity` is read back with that threshold (it was written under `severity_threshold` and read under `severity`).
 - `scan` works on real cards: a GET RESPONSE rejected at the GSM class (`6E 00`/`6D 00`) re-sends a read-only command once and collects at the command's own class; swSIM is unaffected (#64).
 - The FCP tag table for real cards was wrong. The new default `--dialect ts-102-221` (ETSI TS 102 221: 80 size, 82 descriptor, 83 FID, 84 DF name) replaces it; `iec-7816-4-table-42` is a deprecated alias. A baseline taken under another dialect is refused by `--diff` (#69).
 - An empty reader is reported as `no card in reader` (error kind `no-card`) instead of an unusable reader (#64).

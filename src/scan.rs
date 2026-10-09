@@ -66,6 +66,7 @@ use serde_json::{json, Value};
 
 use crate::access;
 use crate::baseline;
+use crate::contract::{self, ExitCode};
 use crate::ef;
 use crate::fcp::{self, TagSet};
 use crate::fs;
@@ -716,7 +717,7 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
 /// there is nothing for it to compare a response against, so it is not a rule
 /// that looked and found nothing, it is a rule that could not look. A baseline
 /// written from such a run records `evidence: false` beside this rule's ID, and
-/// a later `--diff` refuses rather than reporting the first real MSL 0 finding
+/// a later `--baseline` refuses rather than reporting the first real MSL 0 finding
 /// as a regression. See [`crate::rules::HadEvidence`].
 fn msl_zero_evidence(subject: &Subject<'_>) -> bool {
     !subject.tar.probes.is_empty()
@@ -931,7 +932,7 @@ impl Verdict {
 
     /// Attaches the comparison against a saved run.
     ///
-    /// **Only under `--diff`.** A scan with no `--diff` carries no `diff` key at
+    /// **Only under `--baseline`.** A scan with no `--baseline` carries no `diff` key at
     /// all rather than an empty one, because an empty `diff` reads as a
     /// comparison that was made and found nothing, and this one was never made.
     /// That is the rule `--severity` follows when it removes a finding rather
@@ -987,6 +988,66 @@ impl Verdict {
         self.score.then(|| self.findings.score())
     }
 
+    /// The process exit code this verdict maps to under doctor/1 (contract
+    /// section 4), given the `--fail-on` threshold.
+    ///
+    /// Without a baseline: 1 when any finding in the report is at or above
+    /// `fail_on`. With one, only NEW findings count, and the code is 3 rather
+    /// than 1. The report is already filtered by `--severity`, so a finding
+    /// that filter removed cannot fail the gate.
+    #[must_use]
+    pub fn exit_code(&self, fail_on: rules::Severity) -> ExitCode {
+        match &self.diff {
+            Some(diff) if diff.new_findings().iter().any(|f| f.at_least(fail_on)) => {
+                ExitCode::NewFindings
+            }
+            Some(_) => ExitCode::Success,
+            None if self.findings.reaches(fail_on) => ExitCode::Findings,
+            None => ExitCode::Success,
+        }
+    }
+
+    /// The score block, always computed (the `--score` flag only decides
+    /// whether the legacy `data.score` and the human report show it).
+    ///
+    /// Reported under `data.score_detail` in the doctor/1 envelope; the
+    /// top-level `score` is the shared shape built by [`contract::doctor_score`].
+    #[must_use]
+    pub fn score_detail(&self) -> Value {
+        let score = self.findings.score();
+        json!({
+            "value": score.value(),
+            "max": score.max(),
+            "penalty": score.penalty(),
+            "scored_findings": score.scored(),
+            "rules_run": self.rules_run,
+            "formula": rules::SCORE_FORMULA,
+            "penalties": penalties_json(),
+            // Null as soon as one rule runs, which is now the case
+            // for every real scan. That is the whole point of the
+            // field: a 100 from an empty finding set because a rule
+            // looked and found nothing is a verdict, and a 100 from
+            // no rule having looked is not. A scan that somehow ran
+            // zero rules still gets the sentence, so the constant
+            // stays live rather than becoming dead code.
+            // THREE ways this 100 is not a verdict, not one. No rule
+            // has been implemented; a rule ran but the TAR audit probed
+            // nothing, which is the default because an ENVELOPE leaves
+            // swicc-pcsc unable to start a transaction; or a scan that
+            // somehow ran zero rules. Each gets its own sentence, because
+            // "nothing was checked" and "checked, found nothing" are
+            // different claims and an operator has to be able to tell
+            // them apart.
+            "warning": if self.rules_run == 0 {
+                Some(NO_RULES_WARNING)
+            } else if self.tar.probes.is_empty() {
+                Some(NO_TAR_EVIDENCE_WARNING)
+            } else {
+                None
+            },
+        })
+    }
+
     /// The fields a scan report carries from a verdict: `findings`, and
     /// `score` when one was asked for.
     ///
@@ -1021,46 +1082,13 @@ impl Verdict {
         // `diff` is spliced here rather than built at the call site so that a
         // report carrying a diff cannot be one where the diff is a different
         // object than the one whose counts the envelope published, and so that
-        // its absence is a single well-defined thing: no --diff was asked for.
+        // its absence is a single well-defined thing: no --baseline was asked for.
         if let Some(diff) = &self.diff {
             fields.insert("diff".to_owned(), diff.to_json());
         }
 
-        if let Some(score) = self.score() {
-            fields.insert(
-                "score".to_owned(),
-                json!({
-                    "value": score.value(),
-                    "max": score.max(),
-                    "penalty": score.penalty(),
-                    "scored_findings": score.scored(),
-                    "rules_run": self.rules_run,
-                    "formula": rules::SCORE_FORMULA,
-                    "penalties": penalties_json(),
-                    // Null as soon as one rule runs, which is now the case
-                    // for every real scan. That is the whole point of the
-                    // field: a 100 from an empty finding set because a rule
-                    // looked and found nothing is a verdict, and a 100 from
-                    // no rule having looked is not. A scan that somehow ran
-                    // zero rules still gets the sentence, so the constant
-                    // stays live rather than becoming dead code.
-                    // THREE ways this 100 is not a verdict, not one. No rule
-                    // has been implemented; a rule ran but the TAR audit probed
-                    // nothing, which is the default because an ENVELOPE leaves
-                    // swicc-pcsc unable to start a transaction; or a scan that
-                    // somehow ran zero rules. Each gets its own sentence, because
-                    // "nothing was checked" and "checked, found nothing" are
-                    // different claims and an operator has to be able to tell
-                    // them apart.
-                    "warning": if self.rules_run == 0 {
-                        Some(NO_RULES_WARNING)
-                    } else if self.tar.probes.is_empty() {
-                        Some(NO_TAR_EVIDENCE_WARNING)
-                    } else {
-                        None
-                    },
-                }),
-            );
+        if self.score {
+            fields.insert("score".to_owned(), self.score_detail());
         }
         fields
     }
@@ -1129,6 +1157,186 @@ fn penalties_json() -> Value {
     }
     Value::Object(table)
 }
+
+/// How many parts of the card, or of the rule set, this run did not cover
+/// (doctor/1 `score.coverage_gaps`).
+///
+/// One for each bound the walk hit (at least one when the walk is incomplete
+/// for any reason, e.g. `stopped`), one for a TAR scan that did not finish, one
+/// when no rule ran, and one for each rule that ran with nothing to look at (the
+/// MSL 0 rule under `--tar off`). A 100 with a gap is `incomplete`, not `good`.
+#[must_use]
+pub fn coverage_gaps(
+    tree: &Tree,
+    context: &Context<'_>,
+    verdict: &Verdict,
+    facts: &baseline::RunFacts,
+) -> usize {
+    let walk = if tree.is_complete() && context.stopped.is_none() {
+        0
+    } else {
+        tree.limits_hit().len().max(1)
+    };
+    walk + usize::from(verdict.tar().stopped.is_some())
+        + usize::from(verdict.rules_run() == 0)
+        + facts
+            .rule_runs()
+            .iter()
+            .filter(|run| !run.had_evidence())
+            .count()
+}
+
+/// The category of a rule id: the part before the first `/`, which is how every
+/// rule here is namespaced (`gsma/msl-zero-allowed` is `gsma`).
+fn category(rule: &str) -> &str {
+    rule.split('/').next().unwrap_or(rule)
+}
+
+/// One finding in the doctor/1 shape (contract section 2).
+///
+/// The old finding keys that have no contract name travel as extra keys
+/// (`severity_rank`, `coverage`, `location_detail`): consumers ignore unknown
+/// keys, and nothing the old finding said is lost.
+fn doctor_finding(finding: &rules::Finding, remedy: Option<&str>, state: Option<&str>) -> Value {
+    let old = finding.to_json();
+    let location = match finding.location() {
+        rules::Location::File { path, .. } => json!({"kind": "card-path", "ref": path}),
+        rules::Location::Card => json!({"kind": "none", "ref": "card"}),
+        other => json!({"kind": "card-path", "ref": other.to_string()}),
+    };
+    let evidence: Vec<Value> = match &old["evidence"] {
+        Value::Object(map) => {
+            let kind = map
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("evidence");
+            let value = map.get("octets").or_else(|| map.get("value"));
+            value.map_or_else(Vec::new, |v| vec![json!({"ref": kind, "value": v})])
+        }
+        _ => Vec::new(),
+    };
+    let mut out = json!({
+        "id": finding.rule().as_str(),
+        "fingerprint": crate::sarif::fingerprint(finding),
+        "severity": finding.severity().id(),
+        "category": category(finding.rule().as_str()),
+        "message": finding.message(),
+        "location": location,
+        "evidence": evidence,
+        "remedy": remedy,
+        "severity_rank": finding.severity().rank(),
+        "coverage": old["coverage"],
+        "location_detail": old["location"],
+    });
+    if let Some(state) = state {
+        out["baseline_state"] = json!(state);
+    }
+    out
+}
+
+/// The doctor/1 `score` object of this run, shared by the envelope and the SARIF
+/// run properties.
+#[must_use]
+pub fn doctor_score(
+    tree: &Tree,
+    context: &Context<'_>,
+    verdict: &Verdict,
+    facts: &baseline::RunFacts,
+) -> Value {
+    contract::doctor_score(
+        verdict.findings().score().value(),
+        SCORE_MODEL,
+        coverage_gaps(tree, context, verdict, facts),
+    )
+}
+
+/// The doctor/1 envelope for a finished scan (docs/doctor-contract.md).
+///
+/// `findings` and `score` are the shared top-level shapes; everything else the
+/// old `data` carried is still under `data`: the walk, the TAR audit, the old
+/// findings block as `findings_detail` (count, exhaustive, coverage,
+/// `severity_threshold`), the old score block as `score_detail`, the walk
+/// record a later `--baseline` run compares as `run`, and `diff` when a
+/// baseline was given.
+pub fn doctor_json(
+    tree: &Tree,
+    context: &Context<'_>,
+    verdict: &Verdict,
+    facts: &baseline::RunFacts,
+    exit_code: ExitCode,
+) -> Value {
+    let mut data = to_json(tree, context, verdict);
+    if let Some(map) = data.as_object_mut() {
+        if let Some(detail) = map.remove("findings") {
+            map.insert("findings_detail".to_owned(), detail);
+        }
+        map.remove("score");
+        map.insert("score_detail".to_owned(), verdict.score_detail());
+        map.insert("run".to_owned(), facts.to_json());
+    }
+
+    let specs = specs();
+    let remedy_of = |id: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.id().as_str() == id)
+            .and_then(rules::RuleSpec::remediation)
+    };
+
+    // Which of this run's findings the baseline already had: a multiset match on
+    // fingerprint, the same key the comparison used.
+    let mut unchanged: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    if let Some(diff) = verdict.diff() {
+        for finding in diff.persisting() {
+            *unchanged
+                .entry(crate::sarif::fingerprint(finding))
+                .or_default() += 1;
+        }
+    }
+    let (mut new, mut same) = (0usize, 0usize);
+    let mut findings: Vec<Value> = verdict
+        .findings()
+        .iter()
+        .map(|finding| {
+            let state = verdict.diff().map(|_| {
+                match unchanged.get_mut(&crate::sarif::fingerprint(finding)) {
+                    Some(left) if *left > 0 => {
+                        *left -= 1;
+                        same += 1;
+                        "unchanged"
+                    }
+                    _ => {
+                        new += 1;
+                        "new"
+                    }
+                }
+            });
+            doctor_finding(finding, remedy_of(finding.rule().as_str()), state)
+        })
+        .collect();
+    findings.sort_by(|a, b| {
+        let key = |v: &Value| {
+            (
+                std::cmp::Reverse(v["severity_rank"].as_u64()),
+                v["id"].as_str().map(str::to_owned),
+                v["fingerprint"].as_str().map(str::to_owned),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+
+    let baseline = verdict
+        .diff()
+        .map(|diff| json!({"new": new, "unchanged": same, "fixed": diff.fixed().len()}));
+    let score = doctor_score(tree, context, verdict, facts);
+    contract::doctor_envelope(exit_code, score, findings, data, baseline)
+}
+
+/// The doctor/1 `score.model` of this tool: the penalty ladder in
+/// [`rules::SCORE_PENALTY`] and [`rules::SCORE_FORMULA`]. Changes (`sim/2`)
+/// whenever either does.
+pub const SCORE_MODEL: &str = "sim/1";
 
 /// Renders a walk as the `data` a scan envelope carries.
 ///
@@ -1421,7 +1629,10 @@ pub fn to_human(tree: &Tree, context: &Context<'_>, verdict: &Verdict) -> String
     out.push('\n');
     out.push_str(&verdict.to_human());
 
-    out
+    // Everything above includes text the card chose (file names, labels, a
+    // finding's message). A report that reaches a terminal must not carry an
+    // escape sequence or a bidi override from it.
+    contract::sanitize_lines(&out)
 }
 
 /// One selected file, on one line: address, kind, size, descriptor, life cycle.
@@ -3092,5 +3303,228 @@ mod tests {
         let block = audit.to_json();
         assert_eq!(block["accepted_count"], serde_json::json!(2));
         assert_eq!(block["accepted"][1]["tar"], serde_json::json!("454452"));
+    }
+
+    // -----------------------------------------------------------------------
+    // doctor/1 (docs/doctor-contract.md)
+    // -----------------------------------------------------------------------
+
+    /// The doctor/1 envelope of the sample card under `verdict`.
+    fn doctor_of(verdict: &Verdict, fail_on: rules::Severity) -> Value {
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+        let facts = run_facts(&tree, &context, verdict);
+        doctor_json(&tree, &context, verdict, &facts, verdict.exit_code(fail_on))
+    }
+
+    /// Contract section 9: top-level keys, finding keys and enums, a 16-hex
+    /// fingerprint, `exit_code` equal to the mapped code, deterministic
+    /// output apart from `data`, and the sort order.
+    #[test]
+    fn the_envelope_conforms_to_doctor_1() {
+        let verdict = Verdict::new(mixed(), 3);
+        let a = doctor_of(&verdict, rules::Severity::Critical);
+        let b = doctor_of(&verdict, rules::Severity::Critical);
+
+        let mut keys: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "data",
+                "exit_code",
+                "findings",
+                "schema",
+                "score",
+                "tool",
+                "version"
+            ]
+        );
+        assert_eq!(a["schema"], "doctor/1");
+        assert_eq!(a["tool"], "sim-doctor");
+        assert_eq!(a["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            a["exit_code"], 1,
+            "a critical finding at --fail-on critical"
+        );
+
+        let findings = a["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 3);
+        for f in findings {
+            for key in [
+                "id",
+                "fingerprint",
+                "severity",
+                "category",
+                "message",
+                "location",
+                "remedy",
+            ] {
+                assert!(f.get(key).is_some(), "{key} missing: {f}");
+            }
+            let fp = f["fingerprint"].as_str().unwrap();
+            assert!(
+                fp.len() == 16
+                    && fp
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            assert!(["critical", "high", "medium", "low", "info"]
+                .contains(&f["severity"].as_str().unwrap()));
+            assert_eq!(f["location"]["kind"], "card-path");
+            assert!(f["location"]["ref"].is_string());
+            assert!(f.get("baseline_state").is_none(), "no --baseline, no state");
+        }
+        let order: Vec<&str> = findings
+            .iter()
+            .map(|f| f["severity"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["critical", "medium", "info"], "critical first");
+
+        let score = &a["score"];
+        assert_eq!(score["model"], SCORE_MODEL);
+        assert_eq!(score["value"], json!(100 - 50 - 10 - 1));
+        assert_eq!(score["label"], "critical", "39 is below 60");
+        assert!(score["coverage_gaps"].is_u64());
+
+        // Nothing run-varying outside `data`.
+        let strip = |mut v: Value| {
+            v.as_object_mut().unwrap().remove("data");
+            v
+        };
+        assert_eq!(strip(a.clone()), strip(b));
+        assert!(a["data"]["findings_detail"]["findings"].is_array());
+        assert!(a["data"]["score_detail"]["formula"].is_string());
+        assert!(a["data"]["run"]["rules"].is_array());
+    }
+
+    /// `--fail-on` decides the exit code; `--severity` has already removed
+    /// what it removes.
+    #[test]
+    fn fail_on_gates_the_exit_code() {
+        let v = Verdict::new(mixed(), 3);
+        assert_eq!(v.exit_code(rules::Severity::Critical), ExitCode::Findings);
+        assert_eq!(v.exit_code(rules::Severity::Info), ExitCode::Findings);
+        let only_medium = Verdict::new(mixed(), 3).at_least(Some(rules::Severity::Info));
+        assert_eq!(
+            only_medium.exit_code(rules::Severity::Critical),
+            ExitCode::Findings
+        );
+        let quiet = Verdict::new(
+            rules::Findings::complete(vec![found(rules::Severity::Medium)]),
+            3,
+        );
+        assert_eq!(quiet.exit_code(rules::Severity::High), ExitCode::Success);
+        assert_eq!(quiet.exit_code(rules::Severity::Medium), ExitCode::Findings);
+        assert_eq!(
+            Verdict::new(rules::Findings::complete(Vec::new()), 3).exit_code(rules::Severity::Info),
+            ExitCode::Success
+        );
+    }
+
+    /// Under a baseline only new findings gate, with exit 3, each finding
+    /// carries its state and the counts are on the envelope.
+    #[test]
+    fn a_baseline_gates_on_new_findings_only() {
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+
+        let old = Verdict::new(mixed(), 3);
+        let facts = run_facts(&tree, &context, &old);
+        let saved = baseline::Baseline::new(facts.clone(), old.findings().as_slice());
+
+        // Same findings: all unchanged, nothing gates even though a critical
+        // finding is present.
+        let same = old.clone().compared_against(
+            baseline::Diff::compare(&saved, &facts, old.findings().as_slice()).unwrap(),
+        );
+        assert_eq!(same.exit_code(rules::Severity::Critical), ExitCode::Success);
+        let doc = doctor_json(&tree, &context, &same, &facts, ExitCode::Success);
+        assert_eq!(
+            doc["baseline"],
+            json!({"new": 0, "unchanged": 3, "fixed": 0})
+        );
+        assert!(doc["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["baseline_state"] == "unchanged"));
+
+        // One finding gone and one new: 3 at --fail-on high, 0 at critical.
+        let newer = Verdict::new(
+            rules::Findings::complete(vec![
+                found(rules::Severity::Medium),
+                found(rules::Severity::High),
+            ]),
+            3,
+        );
+        let diff = baseline::Diff::compare(&saved, &facts, newer.findings().as_slice()).unwrap();
+        let newer = newer.compared_against(diff);
+        assert_eq!(
+            newer.exit_code(rules::Severity::High),
+            ExitCode::NewFindings
+        );
+        assert_eq!(
+            newer.exit_code(rules::Severity::Critical),
+            ExitCode::Success
+        );
+        let doc = doctor_json(&tree, &context, &newer, &facts, ExitCode::NewFindings);
+        assert_eq!(
+            doc["baseline"],
+            json!({"new": 1, "unchanged": 1, "fixed": 2})
+        );
+    }
+
+    /// Contract section 8: an ESC sequence (and a bidi override) in card text
+    /// does not reach the human report.
+    #[test]
+    fn card_text_cannot_drive_the_terminal() {
+        let mut card = sample_card();
+        let limits = Limits::default();
+        let tree = walk_sample(&mut card, limits);
+        let hostile = rules::Finding::new(
+            rules::RuleId::new("test/escape").unwrap(),
+            rules::Severity::High,
+            "boom \u{1b}[31mRED\u{1b}]0;title\u{7} \u{202e}evil \u{200b}x",
+            rules::Location::tar(1),
+            rules::Evidence::None,
+        );
+        let verdict = Verdict::new(rules::Findings::complete(vec![hostile]), 1);
+        let text = to_human(&tree, &context(probe_set(), limits), &verdict);
+        assert!(text.contains("boom"), "{text}");
+        for bad in ['\u{1b}', '\u{7}', '\u{202e}', '\u{200b}'] {
+            assert!(
+                !text.contains(bad),
+                "U+{:04X} reached the report: {text:?}",
+                bad as u32
+            );
+        }
+        assert!(
+            text.ends_with('\n') && text.contains('\n'),
+            "line structure kept"
+        );
+    }
+
+    /// Coverage gaps: a truncated walk is incomplete, and a 100 with a gap is
+    /// not `good`.
+    #[test]
+    fn a_truncated_walk_is_a_coverage_gap() {
+        let mut card = sample_card();
+        let limits = Limits {
+            max_depth: 1,
+            ..Limits::default()
+        };
+        let tree = walk_sample(&mut card, limits);
+        let context = context(probe_set(), limits);
+        let verdict = Verdict::new(rules::Findings::complete(Vec::new()), 3);
+        let facts = run_facts(&tree, &context, &verdict);
+        let score = doctor_score(&tree, &context, &verdict, &facts);
+        assert!(score["coverage_gaps"].as_u64().unwrap() >= 1);
+        assert_eq!(score["value"], 100);
+        assert_eq!(score["label"], "incomplete");
     }
 }

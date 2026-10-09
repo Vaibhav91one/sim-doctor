@@ -73,15 +73,11 @@
 //!   is still missing is the typed encode/decode that makes a session useful
 //!   for scanning (#5, landed in [`apdu`]), and the human-facing session
 //!   facade (#10, on top of [`session`]).
-//! - turning findings into an exit code for a PLAIN scan (#13, re-opened).
-//!   Issue #6 landed the command: `sim-doctor scan` walks a card and reports
-//!   it, and it exits 0 whenever the walk finished. Issue #13 gave the
-//!   vocabulary, issue #24 the first rule, issue #14 `--score` and
-//!   `--severity`, and issue #12 `--baseline` and `--diff`. **A `--diff` that
-//!   regresses does exit 1** - see `FINDINGS_FAIL_A_SCAN` in `src/main.rs` for
-//!   why that is a different decision from the one still open here, which is
-//!   whether a plain scan that *produced* findings should. It does not, and the
-//!   reasons are on that constant,
+//! - (closed 2026-10-09) turning findings into an exit code for a PLAIN scan.
+//!   `scan` adopted the cross-tool doctor/1 contract (docs/doctor-contract.md):
+//!   it exits 1 for a finding at or above `--fail-on` (default `critical`),
+//!   3 for a new one against `--baseline`, and 2 when it could not run. See
+//!   CONTEXT.md and AGENTS.md section 3,
 //! - asking [`scan`] for a candidate set other than the default. The report
 //!   states the default's coverage in three places because it can MISS a file,
 //!   but `--candidates` does not exist yet, so an operator who needs

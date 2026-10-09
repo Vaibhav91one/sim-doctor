@@ -32,7 +32,7 @@ sim-doctor install
 - [Get started](#get-started)
 - [Install](#install)
 - [CLI reference](#cli-reference)
-- [Exit codes](#exit-codes)
+- [Machine output and exit codes](#machine-output-doctor1)
 - [GitHub Action](#github-action)
 - [Agent integration](#agent-integration)
 - [What it will not tell you](#what-it-will-not-tell-you)
@@ -50,11 +50,11 @@ sim-doctor install
 - `rules_list`: the rule catalogue. No card.
 - `rules_explain`: one rule by `id`. No card.
 
-`baseline`, `diff` and `sarif` are deliberately not exposed: they read or write files, and an agent could overwrite one. `json` is always on. Each call runs `sim-doctor` itself as a subprocess and returns its JSON envelope unchanged as the tool text. Exit 0 and 1 are normal results (isError false): exit 1 from `scan` is findings, regressed, or a refusal that carries `data.error`, and the envelope is returned as is. 129, 130 or any other exit is a tool error (isError true) carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything.
+Every `scan` flag is an argument (`baseline`, `fail-on` and `sarif` included) except `tui`, `json` (always on), `help` and `version`; `baseline` and `sarif` take a file path, as on the command line. Each call runs `sim-doctor` itself as a subprocess and returns its doctor/1 envelope byte for byte as the tool text. Exit 0, 1 and 3 are normal results (isError false): findings at or above `--fail-on`, or a new finding against a baseline. 2 (the scan could not run: its envelope has `data.error`), 130 or any other exit is a tool error (isError true) carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything.
 
 Calls are handled serially, one at a time. Each child is killed after 300 seconds (override with `SIM_DOCTOR_MCP_TIMEOUT_SECONDS`; 0 or a non-number means the default) and the call returns an error saying it timed out. Captured stdout and stderr are each capped at 16 MiB; a truncated result is an error and says so. A scan holds the PC/SC reader only while its child runs, so the reader is released when the scan finishes or is killed. Ctrl-C ends the server.
 
-Tested through the real process: the initialize, tools/list and tools/call handshake, `rules_list`, refusal of file-flag arguments, and Ctrl-C. `scan` itself is not exercised through the server (it needs a card). Acceptance by specific agent clients is unverified.
+Tested through the real process: the initialize, tools/list and tools/call handshake, `rules_list`, refusal of arguments the server does not expose, and Ctrl-C. `scan` itself is not exercised through the server (it needs a card). Acceptance by specific agent clients is unverified.
 
 ## Get started
 
@@ -73,15 +73,16 @@ software card in [docs/swsim-fixture.md](docs/swsim-fixture.md).
 sim-doctor scan --json
 ```
 
-With no reader attached, this is the real output, and it exits `1`:
+With no reader attached, this is the real output, and it exits `2`:
 
 ```json
-{"type":"scan","payload":{"code":1,"message":"no PC/SC reader is attached. Start pcscd and attach a card, or see docs/swsim-fixture.md for the software SIM this project tests against","data":{"card_touched":false,"error":{"kind":"no-reader","message":"no PC/SC reader is attached. Start pcscd and attach a card, or see docs/swsim-fixture.md for the software SIM this project tests against"},"scanned":false}}}
+{"data":{"card_touched":false,"error":{"kind":"no-reader","message":"no PC/SC reader is attached. Start pcscd and attach a card, or see docs/swsim-fixture.md for the software SIM this project tests against"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"0.3.0"}
 ```
 
-With a card, `payload.code` is `0` once the walk finishes and `payload.data` carries the
-file tree, the dialect it was read under, `complete` / `truncated` / `limits_hit`, and
-`findings`. **Gate on `payload.data.complete`, not on `payload.code`.**
+With a card, `findings` and `score` are the result and `data` carries the file tree, the dialect
+it was read under, `complete` / `truncated` / `limits_hit`, and the rest of the report. The
+exit code is `0` or `1` by `--fail-on` (see [Machine output](#machine-output-doctor1)), **not** by whether
+the walk finished: read `data.complete` (or require `score.coverage_gaps` to be 0) before trusting a clean result.
 
 ### 3. Score and probe TARs
 
@@ -91,7 +92,7 @@ sim-doctor scan --json --score --tar focused
 
 `--tar focused` probes 592 TARs for MSL 0 (`gsma/msl-zero-allowed`). Without it the scan
 still checks PIN1 status (`auth/pin1-disabled`) and sensitive EFs under ALWays
-(`filesystem/sensitive-ef-always`) from the FCPs and EF.ARR, read-only. `--score` adds an integer 0-100 beside `rules_run`. A 100 with `rules_run` 0 means
+(`filesystem/sensitive-ef-always`) from the FCPs and EF.ARR, read-only. The JSON always carries `score` (an integer 0-100, `data.score_detail.rules_run` beside it); `--score` adds it to the human report. A 100 with `rules_run` 0 means
 nothing was checked, and the report says so in words.
 
 ### 4. Hand it to an agent
@@ -114,7 +115,7 @@ grey) and a detail pane for the selected finding (location, coverage reason when
 coverage and TAR-stop notes. The status area at the top always shows the score warning, walk-stop and truncation notes, candidate warning and diff counts when the JSON has them. Keys: up/down or j/k, PgUp/PgDn, Home/End, Tab to scroll the detail pane, q, Esc or Ctrl-C to quit. SIGINT and SIGTERM also exit cleanly and restore the terminal (`sim-doctor mcp` and a launched `fix` agent keep the default disposition for both and just end).
 
 It is a view over the data `--json` carries and never shows anything the envelope lacks. It cannot be combined
-with `--json` (usage error, exit 129). When stdin or stdout is not a terminal it prints the normal report and
+with `--json` (usage error, exit 2). When stdin or stdout is not a terminal it prints the normal report and
 writes `sim-doctor: --tui needs a terminal; showing the plain report` to stderr. The rendering is unit-tested
 against an in-memory backend; the interactive loop is **not** tested against a real terminal in CI.
 
@@ -157,10 +158,12 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `--dialect <TABLE>` | FCP tag table: `ts-102-221` (default, ETSI TS 102 221; real cards and swSIM) or `swicc` (same tags, own name). `iec-7816-4-table-42` is a deprecated alias for `ts-102-221` |
 | `--max-depth`, `--max-children`, `--max-nodes`, `--max-directories` | walk bounds; hitting one is reported as truncation. `--max-nodes` (default 16384) counts files the card selected, not absent probes; walk time is bounded by `--max-directories` (64) x `--max-children` (1280). `ts48 compare` takes the same four flags |
 | `--tar <SELECTION>` | TARs to probe for MSL 0: `off` (default), `focused`, `full`, `range:A-B`, `regex:P`; capped at 4096 probes |
-| `--terminal-profile` | with `--tar` other than `off` only (else exit 129): send TERMINAL PROFILE `80 10 00 00 01 13` (SMS-PP data download declared, nothing else) before the TAR audit. **Changes the card's CAT session state** (no file is written); a pending proactive command is fetched and declined, never executed. Off by default |
+| `--terminal-profile` | with `--tar` other than `off` only (else exit 2): send TERMINAL PROFILE `80 10 00 00 01 13` (SMS-PP data download declared, nothing else) before the TAR audit. **Changes the card's CAT session state** (no file is written); a pending proactive command is fetched and declined, never executed. Off by default |
 | `--severity <LEVEL>` | drop findings below `info\|low\|medium\|high\|critical` |
-| `--score` | add `data.score`, integer 0-100 |
-| `--baseline <FILE>`, `--diff` | regression gating against a saved run (in review, see the baseline PR) |
+| `--score` | show the score in the human report (the JSON always has `score`, integer 0-100) |
+| `--fail-on <LEVEL>` | exit 1 (3 under `--baseline`) on a finding at or above `info\|low\|medium\|high\|critical`; default `critical` |
+| `--baseline <FILE>` | compare with a previous `scan --json` envelope; only new findings gate (exit 3). Replaces the old `--baseline` writer and `--diff` |
+| `--sarif <FILE>` | also write SARIF 2.1.0 |
 
 ### `ts48 compare`
 
@@ -196,14 +199,60 @@ are never printed. `--json` adds `data.exchanges[]`. pcap/GSMTAP input is not su
 
     printf 'A0A40000023F00\n9F16\n' | sim-doctor trace
 
-## Exit codes
+## Machine output (doctor/1)
+
+`scan --json` prints the shared **doctor/1** envelope, the same one luasec, pcap-doctor,
+android-doctor and ble-doctor print, so one parser reads all five. The contract is
+[docs/doctor-contract.md](docs/doctor-contract.md); the sim-doctor specifics are in AGENTS.md section 3.
+
+```json
+{"schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":1,
+ "score":{"value":61,"label":"needs work","model":"sim/1","coverage_gaps":0},
+ "findings":[{"id":"...","fingerprint":"<16 hex>","severity":"critical","category":"gsma",
+              "message":"...","location":{"kind":"card-path","ref":"3F00/2F00/6F07"},
+              "evidence":[{"ref":"octets","value":"a4000a"}],"remedy":"..."}],
+ "data":{}}
+```
+
+`findings` is the failed checks only (critical first); everything else the report carries (the
+walk, `complete`/`truncated`, the TAR audit, EF contents, `findings_detail`, `score_detail`) is
+under `data`.
+
+**Score, model `sim/1`.** `max(0, 100 - sum(penalty[severity] for every finding in this report))`
+with a penalty of info 1, low 3, medium 10, high 25, critical 50 (`--severity` removes findings
+before the score is taken). Label: `good` from 90, `needs work` from 60, else `critical`;
+`incomplete` replaces `good` while `coverage_gaps > 0`. `coverage_gaps` counts each walk bound that
+fired, an unfinished TAR scan, no rule having run, and each rule that ran with nothing to look at
+(MSL 0 without `--tar`), so a default scan reads `incomplete` rather than `good`.
+
+**Exit codes.**
 
 | | |
 | --- | --- |
-| `0` | the walk finished (findings do not change this; AGENTS.md section 3 says why) |
-| `1` | the scan could not run: no reader, no card, or a flag not implemented yet |
-| `129` | the command line could not be parsed |
+| `0` | ran; no finding at or above `--fail-on` |
+| `1` | ran; at least one finding at or above `--fail-on` (default `critical`) |
+| `2` | usage error, bad input (including a bad `--baseline`), or the scan could not run: no reader, no card |
+| `3` | `--baseline` given; at least one new finding at or above `--fail-on` (instead of 1) |
 | `130` | interrupted by SIGINT or SIGTERM (SIGTERM exits 130 too, not 143) |
+
+`--fail-on` defaults to `critical` because before doctor/1 a scan with findings exited 0; this is the
+closest default that keeps a scan with only lower findings (swSIM can produce none above high)
+passing. The other commands (`rules`, `why`, `fix`, `gp`, `ts48`, `fuzz`, `modules`, ...) keep their lpac-style envelope
+`{type, payload:{code, message, data}}` and the codes 0 / 1 (could not run) / 129 (bad usage) / 130.
+
+**Baseline.** Save one with `sim-doctor scan --json > baseline.json`, compare with
+`sim-doctor scan --baseline baseline.json`: findings match by `fingerprint`, each gets
+`baseline_state` (`new` or `unchanged`), the envelope gets `baseline: {new, unchanged, fixed}`, and
+exit 3 means a new finding at or above `--fail-on`. A baseline from a truncated walk, a different
+`--severity`, `--dialect` or `--tar`, or one where a rule had no evidence is refused (exit 2),
+as before. **A saved envelope carries the ATR and EF contents**; keep it out of the repository
+or reduce it first (`AGENTS.md`, section 3, "A baseline is a full envelope").
+
+**SARIF.** Each result carries `partialFingerprints["doctorFinding/v1"]` (the finding's JSON
+`fingerprint`) and the run carries `properties.score`. Locations stay logical (the card path).
+
+**Terminal output** passes every card-derived string through one sanitiser that strips control
+characters (so ESC), bidi controls, zero-width characters and line/paragraph separators.
 
 ## Agent integration
 
@@ -271,7 +320,7 @@ permissions:
   security-events: write
 steps:
   - uses: actions/checkout@v5
-  - uses: Vaibhav91one/sim-doctor@<tag> # a release tag, e.g. v0.2.0
+  - uses: Vaibhav91one/sim-doctor@<tag> # a release tag, e.g. v0.3.0
     with:
       swsim: "true"   # build the pinned software card; omit when the runner has a real reader
 ```
@@ -279,23 +328,24 @@ steps:
 | Input | Default | Meaning |
 |---|---|---|
 | `swsim` | `false` | `true` builds the pinned swSIM + swicc-pcsc and starts pcscd (same pins as `card-fixture.yml`, see [docs/swsim-fixture.md](docs/swsim-fixture.md)). `false` needs a reader already on the runner. |
-| `baseline` | `.sim-doctor/baseline.json` | Committed file written by `sim-doctor scan --baseline FILE`. With `require-baseline: "false"` and no file there is no gate. (This repo's `.gitignore` ignores `baseline.json`; use another path or `git add -f`.) |
+| `baseline` | `.sim-doctor/baseline.json` | Committed baseline: a `scan --json` envelope saved with `sim-doctor scan --json > FILE` (reduce it first if the card holds real data, see Machine output). With `require-baseline: "false"` and no file there is no gate. (This repo's `.gitignore` ignores `baseline.json`; use another path or `git add -f`.) |
 | `require-baseline` | `true` | A missing baseline file (typo, directory, not committed) fails the job with an error naming the path: the baseline is part of the contract of a gating action. `false` scans and reports without gating, with a warning and a NOT GATED row in the summary. |
 | `reader` | none | Passed to `--reader` (must not start with a dash). |
 | `severity` | none | Passed to `--severity`. |
+| `fail-on` | none | Passed to `--fail-on` (default `critical`). Under a baseline only new findings at or above it fail the job. |
 | `comment` | `true` | One PR comment, updated in place (found by a hidden marker); a missing permission does not fail the job. |
 | `upload-sarif` | `true` | Upload `sim-doctor.sarif` (category `sim-doctor`); non-fatal, private repositories need code scanning enabled. |
 
 Output: `summary`, the path of the markdown summary.
 
-The card is the subject, so there is no per-capture file: the baseline is a committed file. Gate contract: a regressed
-`--diff` exits 1 (the job fails, "GATE FAILED"); a refusal, exit 129/130, an unreadable envelope, or a gated run whose envelope carries no `diff` is a tool failure
-(script exit 2) and shows the sanitised error text; exit 0 passes.
+The card is the subject, so there is no per-capture file: the baseline is a committed file. Gate contract: CLI exit 3 (a new finding
+against the baseline) fails the job ("GATE FAILED"); a CLI exit 2 or 130, an error envelope, an unreadable envelope, an `exit_code` that disagrees with the status, or a gated run whose envelope carries no `baseline` block is a tool failure
+(script exit 2) and shows the sanitised error text; exit 0 passes. Without a baseline file the run only reports (a CLI exit 1 shows as NOT GATED).
 
 What is verified: the script logic (gate mapping, argv, summary, sanitising of card/tool text) locally against a fake
 `sim-doctor` in `tests/action_script.rs`. The software-card build, install, scan and SARIF upload are exercised only by the
 `action-selftest` workflow on a hosted runner, with no baseline (so it reports, it does not gate). A gating run against a
-real baseline, and acceptance of the SARIF by code scanning, are not verified. Use a released tag (v0.2.0 or later) for `@<tag>`.
+real baseline, and acceptance of the SARIF by code scanning, are not verified. Use a released tag (v0.3.0 or later) for `@<tag>`.
 
 ### `sim-doctor ci install`
 
@@ -318,7 +368,7 @@ symlink anywhere from `--dir` down to the file (exit 1). A differing existing fi
 identical one is not a conflict. `--print-only` prints the workflow and writes nothing. Output is plain text
 (`wrote <path>`), not an envelope.
 
-The file is written atomically (a temp file renamed over the target); a directory at the path is always refused. After a write, two hints go to stderr: commit a baseline first with `sim-doctor scan --baseline <path>` (with the default `--require-baseline true` the first run fails without one), and the pinned ref `v<version>` exists only once that release is tagged; until then pass `--ref main` or another existing ref. `--baseline` and `--ref` also refuse `__`, and `--baseline` refuses `.` and a trailing `/`; `--ref` refuses `..`, a trailing `/` and `.lock`.
+The file is written atomically (a temp file renamed over the target); a directory at the path is always refused. After a write, two hints go to stderr: commit a baseline first with `sim-doctor scan --json > <path>` (with the default `--require-baseline true` the first run fails without one), and the pinned ref `v<version>` exists only once that release is tagged; until then pass `--ref main` or another existing ref. `--baseline` and `--ref` also refuse `__`, and `--baseline` refuses `.` and a trailing `/`; `--ref` refuses `..`, a trailing `/` and `.lock`.
 
 ## Documentation
 

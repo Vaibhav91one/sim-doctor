@@ -3,11 +3,14 @@
 # baseline file, with a markdown summary and a SARIF file.
 #
 # Local run: SIM_DOCTOR=target/release/sim-doctor BASELINE=.sim-doctor/baseline.json scripts/sim-doctor-action.sh
+# The baseline file is a saved doctor/1 envelope: `sim-doctor scan --json > .sim-doctor/baseline.json`.
 # Env: SIM_DOCTOR (command, default sim-doctor), BASELINE (default .sim-doctor/baseline.json), REQUIRE_BASELINE
 #      (default true: a missing baseline file is a tool failure; false: scan and report without a gate), SEVERITY,
-#      READER, OUT (default ./sim-doctor-out, emptied at the start), GITHUB_OUTPUT, GITHUB_STEP_SUMMARY.
-# Exit: 0 ok, 1 gate failed (regressed --diff), 2 tool failure (refusal, exit 129/130, unreadable or incomplete
-#       envelope, missing baseline, bad input).
+#      FAIL_ON (passed to --fail-on), READER, OUT (default ./sim-doctor-out, emptied at the start), GITHUB_OUTPUT,
+#      GITHUB_STEP_SUMMARY.
+# Exit: 0 ok, 1 gate failed (the CLI exited 3: a new finding against the baseline), 2 tool failure (CLI exit 2/130,
+#       an error envelope, an unreadable or incomplete envelope, missing baseline, bad input).
+# Without a baseline the run only reports: a CLI exit 1 (findings at or above --fail-on) is shown as NOT GATED.
 set -uo pipefail
 
 read -ra sd <<< "${SIM_DOCTOR:-sim-doctor}"
@@ -41,16 +44,18 @@ early() {
 }
 
 case "${READER:-}" in -*) early "the reader name must not start with a dash" ;; esac
+case "${FAIL_ON:-}" in ""|info|low|medium|high|critical) ;; *) early "fail-on must be one of info, low, medium, high, critical" ;; esac
 
 args=(scan --json --sarif "$sarif")
 [ -n "${SEVERITY:-}" ] && args+=(--severity "$SEVERITY")
 [ -n "${READER:-}" ] && args+=(--reader "$READER")
+[ -n "${FAIL_ON:-}" ] && args+=(--fail-on "$FAIL_ON")
 gated=0
 if [ -f "$baseline" ]; then
-  args+=(--baseline "$baseline" --diff)
+  args+=(--baseline "$baseline")
   gated=1
 elif [ "$require" != false ]; then
-  early "baseline file not found: $(san "$baseline") (commit one written by sim-doctor scan --baseline, or set require-baseline to false)"
+  early "baseline file not found: $(san "$baseline") (commit one saved with sim-doctor scan --json, or set require-baseline to false)"
 else
   echo "::warning::no baseline file at $(san "$baseline"); this run reports but cannot fail on new findings"
 fi
@@ -76,24 +81,31 @@ def clean(v, n=300):
 def build():
     try:
         with open(path, encoding="utf-8") as f:
-            data = json.load(f)["payload"]["data"]
-        if not isinstance(data, dict):
-            raise ValueError("no data block")
+            env = json.load(f)
+        if not isinstance(env, dict) or env.get("schema") != "doctor/1" or not isinstance(env.get("data"), dict):
+            raise ValueError("not a doctor/1 envelope")
+        data = env["data"]
     except Exception:
-        data = None
+        env = data = None
 
     lines = ["<!-- sim-doctor -->", "### sim-doctor", "", "| | |", "|---|---|"]
     status, err = 0, None
     if data is None:
         status, err = 2, f"no usable envelope on stdout (exit {rc})"
-    elif rc not in (0, 1):
-        status, err = 2, f"sim-doctor exited {rc}"
     elif "error" in data:
         e = data["error"]
         status, err = 2, e.get("message", e.get("kind", "error")) if isinstance(e, dict) else e
-    elif not isinstance(data.get("diff"), dict) and (gated or rc == 1):
-        status, err = 2, "the CLI did not report a diff"
-    elif rc == 1:
+    elif rc not in (0, 1, 3):
+        status, err = 2, f"sim-doctor exited {rc}"
+    elif env.get("exit_code") != rc:
+        status, err = 2, "the envelope exit_code does not match the exit status"
+    elif gated and not isinstance(env.get("baseline"), dict):
+        status, err = 2, "the CLI did not report a baseline comparison"
+    elif gated and rc == 1:
+        status, err = 2, "exit 1 is not a baseline result"
+    elif not gated and rc == 3:
+        status, err = 2, "exit 3 without a baseline"
+    elif rc == 3:
         status = 1
 
     if status == 2:
@@ -102,7 +114,9 @@ def build():
         print(f"::error::sim-doctor tool failure: {clean(err)}")
         return status, lines
     lines.append("| Result | " + ("GATE FAILED" if status else "ok") + " |")
-    found = (data.get("findings") or {}).get("findings") or []
+    found = env.get("findings")
+    if not isinstance(found, list):
+        raise ValueError("findings is not a list")
     counts = {}
     for f in found:
         sev = clean(f.get("severity", "unknown") if isinstance(f, dict) else "unknown", 20)
@@ -110,15 +124,14 @@ def build():
     for sev, n in sorted(counts.items()):
         lines.append(f"| {sev} | {n} |")
     lines.append(f"| Findings | {len(found)} |")
-    diff = data.get("diff")
-    if isinstance(diff, dict):
-        c = diff.get("counts") or {}
-        lines.append(f"| New findings | {clean(c.get('new', '?'), 10)} |")
-        lines.append(f"| Fixed since baseline | {clean(c.get('fixed', '?'), 10)} |")
+    base = env.get("baseline")
+    if isinstance(base, dict):
+        lines.append(f"| New findings | {clean(base.get('new', '?'), 10)} |")
+        lines.append(f"| Fixed since baseline | {clean(base.get('fixed', '?'), 10)} |")
     else:
         lines.append("| NOT GATED | no baseline file, this run cannot fail on new findings |")
-    if isinstance(data.get("score"), dict) and "value" in data["score"]:
-        lines.append(f"| Score | {clean(data['score']['value'], 10)} |")
+    if isinstance(env.get("score"), dict) and "value" in env["score"]:
+        lines.append(f"| Score | {clean(env['score']['value'], 10)} |")
     return status, lines
 
 

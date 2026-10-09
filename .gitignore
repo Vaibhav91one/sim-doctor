@@ -9,8 +9,8 @@
 
 # Saved scan baselines (issue #12). A baseline is a local artifact: it names
 # the reader, the card's rule findings and the paths a walk saw, and it belongs
-# in a CI workspace rather than in a repository. Written by --baseline, read by
-# --diff. The patterns cover the common spellings because the path is whatever
+# in a CI workspace rather than in a repository. Saved with scan --json, read by
+# --baseline. The patterns cover the common spellings because the path is whatever
 # the operator typed and a baseline that gets committed is a card description
 # in the history forever.
 *.baseline.json
