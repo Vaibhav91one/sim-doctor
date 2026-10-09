@@ -458,8 +458,9 @@ sim-doctor scan --json | jq '.findings[] | select(.id == "gsma/msl-zero-allowed"
 ### EF contents, full visibility (issue #108, #102, #128)
 
 `scan --json` carries an additive `ef_contents` array: the security-relevant EFs
-([src/ef.rs](src/ef.rs): ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST, and the key files
-EF.Keys / EF.KeysPS) read with SELECT, READ BINARY and READ RECORD only, each as
+([src/ef.rs](src/ef.rs): ICCID, IMSI, MSISDN, DIR, AD, SPN, UST, EST, FPLMN, OPLMNwAcT,
+HPLMNwAcT, ACC, LOCI, PSLOCI, EPSLOCI, ADN, FDN, ISIM IMPI/IMPU/P-CSCF, MANUAREA at `3F00/0002`
+probed directly because it is outside the walk's families, and the key files EF.Keys / EF.KeysPS) read with SELECT, READ BINARY and READ RECORD only, each as
 `{path, ef, access, read, evidence, fields}`.
 **Full visibility is binding (owner decision 2026-10-08):** sim-doctor is an authorized security
 tool run on the owner's own card, so at runtime it shows full card values everywhere (table,

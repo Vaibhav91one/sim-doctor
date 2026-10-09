@@ -481,6 +481,66 @@ fn identity_evidence(subject: &Subject<'_>) -> bool {
     })
 }
 
+/// The ID of the risky-service rule.
+pub const RISKY_SERVICE_RULE: &str = "exposure/risky-service-available";
+
+/// The EF.UST services whose presence widens what a remote party can ask of the
+/// card or what the card can ask of the terminal, as (service number, why).
+///
+/// Numbers and names are TS 31.102 clause 4.2.8 (cross-checked against pySim's
+/// `EF_UST_map`): n°28 "Data download via SMS-PP" is the over-the-air entry
+/// point the TAR audit probes, and n°32 "RUN AT COMMAND command" lets a card
+/// application have the terminal execute AT commands. **The set is deliberately
+/// two services**: a service being available is capability, not a defect, so
+/// only these two, which hand a remote or on-card party control, are listed.
+/// FDN and BDN are restrictions (their presence is not a weakness), and EF.EST
+/// is decoded but not judged for the same reason.
+const RISKY_SERVICES: [(u16, &str); 2] = [
+    (
+        28,
+        "the card accepts remote command packets over SMS-PP, so it is an OTA target whose protection depends on its MSL and TAR configuration",
+    ),
+    (
+        32,
+        "a card application can have the terminal run AT commands, which a malicious applet can abuse",
+    ),
+];
+
+/// Risky services marked available in a decoded EF.UST (TS 31.102 clause 4.2.8).
+fn risky_services(subject: &Subject<'_>) -> Vec<rules::Finding> {
+    ef::entries(subject.tree)
+        .into_iter()
+        .filter_map(|e| match e.outcome {
+            ef::Outcome::Decoded(ef::Decoded::Services(s)) if s.table == ef::Table::Ust => {
+                Some((e.path, s))
+            }
+            _ => None,
+        })
+        .flat_map(|(path, s)| {
+            RISKY_SERVICES
+                .iter()
+                .filter(|(n, _)| s.enabled.contains(n))
+                .map(|(n, why)| {
+                    let name = ef::service_name(ef::Table::Ust, *n).unwrap_or("service");
+                    rules::Finding::new(
+                        rules::RuleId::new(RISKY_SERVICE_RULE).expect("a validated constant"),
+                        rules::Severity::Low,
+                        format!("EF.UST marks service {n} ({name}) available: {why}"),
+                        rules::Location::selected_file(path.to_string()),
+                        rules::Evidence::text(format!("EF.UST service {n} ({name}) = available")),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn risky_service_evidence(subject: &Subject<'_>) -> bool {
+    ef::entries(subject.tree).iter().any(|e| {
+        matches!(&e.outcome, ef::Outcome::Decoded(ef::Decoded::Services(s)) if s.table == ef::Table::Ust)
+    })
+}
+
 /// The ID of the sensitive-EF access rule.
 pub const SENSITIVE_EF_RULE: &str = "filesystem/sensitive-ef-always";
 
@@ -707,6 +767,20 @@ fn rules<'a>() -> rules::Registry<Subject<'a>> {
             identity_evidence,
         )
         .expect("the identity rule ID is unique in this registry");
+    registry
+        .register(
+            rules::RuleSpec::new(
+                rules::RuleId::new(RISKY_SERVICE_RULE).expect("a validated constant"),
+                rules::Severity::Low,
+                "EF.UST marks SMS-PP data download (service 28) or RUN AT COMMAND (service 32) available (TS 31.102 clause 4.2.8)",
+            )
+            .with_remediation(
+                "if the operator does not use the service, clear its bit in EF.UST; for service 28 keep the card at a non-zero MSL with a TAR allow-list (run `scan --tar`), then re-scan",
+            ),
+            risky_services,
+            risky_service_evidence,
+        )
+        .expect("the risky-service rule ID is unique in this registry");
     registry
 }
 
@@ -3113,7 +3187,7 @@ mod tests {
         assert_eq!(id.rule(), "msl-zero-allowed");
 
         let registry = rules();
-        assert_eq!(registry.len(), 5, "five rules are registered over a card");
+        assert_eq!(registry.len(), 6, "six rules are registered over a card");
         let rule = registry.get(&id).expect("the rule is registered");
         assert_eq!(rule.severity(), rules::Severity::Critical);
         assert!(
@@ -3160,7 +3234,7 @@ mod tests {
         // rules_run is 1 because a rule really ran, so the 100 it sits beside
         // is a score over an audit rather than an absence of one. That is the
         // whole difference NO_RULES_WARNING was written to make visible.
-        assert_eq!(rules_run(), 5);
+        assert_eq!(rules_run(), 6);
 
         let mut card = sample_card();
         let tree = walk_sample(&mut card, Limits::default());
@@ -3184,7 +3258,7 @@ mod tests {
             .tar_audit(audit);
         let block = verdict.fields();
         let score = &block["score"];
-        assert_eq!(score["rules_run"], serde_json::json!(5));
+        assert_eq!(score["rules_run"], serde_json::json!(6));
         assert_eq!(score["value"], serde_json::json!(rules::SCORE_MAX));
         assert_eq!(
             score["warning"],
