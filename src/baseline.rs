@@ -92,6 +92,8 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -113,7 +115,7 @@ pub const VERSION: u32 = 1;
 /// is here so that a hostile or accidental file cannot make the process read
 /// its way to the end of the disk. Read through a [`Read::take`], never with
 /// `fs::read`, so the ceiling is enforced while reading rather than after.
-pub const MAX_BASELINE_BYTES: usize = 1024 * 1024;
+pub const MAX_BASELINE_BYTES: usize = 8 * 1024 * 1024;
 
 /// The most findings one baseline may carry, and the most items in any one
 /// array inside it.
@@ -151,7 +153,7 @@ pub const MAX_TEXT_CHARS: usize = 1024;
 ////! report already prints (`tar:00000000`, `file:3F00/6F07 selected 9804`) and so
 ////! is one string a person can read in the refusal when two runs disagree.
 fn matching_key(finding: &rules::Finding) -> String {
-    format!("{} at {}", finding.rule(), finding.location())
+    crate::sarif::fingerprint(finding)
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +177,7 @@ pub struct RunFacts {
     reader: String,
     dialect: String,
     candidates: String,
+    #[serde(alias = "severity_threshold")]
     severity: Option<rules::Severity>,
     tar_selection: String,
     complete: bool,
@@ -352,19 +355,67 @@ impl RunFacts {
 // The file
 // ---------------------------------------------------------------------------
 
-/// A saved run: when it happened, what it did, and what it found.
+/// What a baseline keeps of one finding: its rule, its fingerprint and its
+/// severity, and nothing else.
 ///
-/// **The finding objects are the same ones the report carries**, not a
-/// projection of them, which is what makes the round trip lossless and keeps
-////! one definition of what a finding is. The bounds on the way back in are in
-////! [`Baseline::parse`], not here, because a value that arrived from a file was
-////! never constructed through [`rules::Finding::new`].
+/// **A baseline holds no card data.** Under full visibility a finding's
+/// message, evidence and location may name an IMSI, an ICCID or a file path, and
+/// the comparison needs none of them: findings match by fingerprint, and the
+/// rule and severity are enough to report what was fixed. So these three fields
+/// are all that is read from a baseline file, whether it is a full `scan --json`
+/// envelope or the reduced one the Action commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineFinding {
+    id: rules::RuleId,
+    fingerprint: String,
+    severity: rules::Severity,
+}
+
+impl BaselineFinding {
+    /// The record of a finding of this run.
+    #[must_use]
+    pub fn of(finding: &rules::Finding) -> Self {
+        Self {
+            id: finding.rule().clone(),
+            fingerprint: crate::sarif::fingerprint(finding),
+            severity: finding.severity(),
+        }
+    }
+
+    /// The rule that raised it.
+    pub const fn rule(&self) -> &rules::RuleId {
+        &self.id
+    }
+
+    /// Its fingerprint: 16 lowercase hex digits.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Its severity.
+    pub const fn severity(&self) -> rules::Severity {
+        self.severity
+    }
+}
+
+impl fmt::Display for BaselineFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {} ({})", self.severity, self.id, self.fingerprint)
+    }
+}
+
+/// A saved run: what it did, and the identity of what it found.
+///
+/// Findings are kept as [`BaselineFinding`] records, never as the finding
+/// objects of the report, so a baseline cannot carry card data. The bounds on
+/// the way back in are in [`Baseline::parse`], because a value that arrived
+/// from a file was never constructed through [`rules::Finding::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Baseline {
     sim_doctor_baseline: u32,
     created: String,
     run: RunFacts,
-    findings: Vec<rules::Finding>,
+    findings: Vec<BaselineFinding>,
 }
 
 impl Baseline {
@@ -388,7 +439,7 @@ impl Baseline {
             sim_doctor_baseline: VERSION,
             created: timestamp(),
             run,
-            findings: findings.to_vec(),
+            findings: findings.iter().map(BaselineFinding::of).collect(),
         }
     }
 
@@ -403,7 +454,7 @@ impl Baseline {
     }
 
     /// What that run found, after any severity filter.
-    pub fn findings(&self) -> &[rules::Finding] {
+    pub fn findings(&self) -> &[BaselineFinding] {
         &self.findings
     }
 
@@ -413,7 +464,7 @@ impl Baseline {
         json!({
             // Doubles as the version marker and as the answer to "is this
             // file a sim-doctor baseline at all": a random JSON document
-            // handed to --diff is refused on this key rather than failing
+            // handed to --baseline is refused on this key rather than failing
             // somewhere less legible.
             "sim_doctor_baseline": self.sim_doctor_baseline,
             "created": self.created,
@@ -471,6 +522,18 @@ impl Baseline {
                 expected: VERSION,
             });
         }
+        for finding in &baseline.findings {
+            let fp = &finding.fingerprint;
+            if fp.len() != 16
+                || !fp
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(Error::Malformed(format!(
+                    "a finding's fingerprint must be 16 lowercase hex digits, found {fp:?}"
+                )));
+            }
+        }
         if baseline.findings.len() > MAX_RECORDS {
             return Err(Error::TooManyRecords {
                 found: baseline.findings.len(),
@@ -478,6 +541,64 @@ impl Baseline {
             });
         }
         Ok(baseline)
+    }
+
+    /// Reads a baseline out of a doctor/1 envelope: the file `scan --json`
+    /// writes, or the reduced one the Action commits.
+    ///
+    /// **Only what the comparison needs is read**: `schema`, `data.run` and, for
+    /// each top-level finding, `id`, `fingerprint` and `severity`. Everything
+    /// else in the file (the ATR, `ef_contents`, messages, evidence, locations)
+    /// is ignored, so a reduced envelope loads exactly like a full one and
+    /// nothing a baseline needs is card data. The values are then re-validated
+    /// and bounded by [`Baseline::parse`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`], [`Error::Malformed`] when the text is not a
+    /// doctor/1 envelope of a scan that finished (a failed run has no
+    /// `data.run`), and everything [`Baseline::parse`] returns.
+    pub fn from_envelope(text: &str) -> Result<Self, Error> {
+        if text.len() > MAX_BASELINE_BYTES {
+            return Err(Error::TooLarge {
+                size: text.len(),
+                limit: MAX_BASELINE_BYTES,
+            });
+        }
+        let value: Value =
+            serde_json::from_str(text).map_err(|error| Error::Malformed(error.to_string()))?;
+        if value["schema"] != "doctor/1" {
+            return Err(Error::Malformed(
+                "the file is not a doctor/1 envelope; save one with `sim-doctor scan --json`"
+                    .to_owned(),
+            ));
+        }
+        let run = &value["data"]["run"];
+        let Some(found) = value["findings"].as_array() else {
+            return Err(Error::Malformed(
+                "the envelope carries no findings array".to_owned(),
+            ));
+        };
+        if run.is_null() {
+            return Err(Error::Malformed(
+                "the envelope carries no data.run; was it saved from a scan that finished?"
+                    .to_owned(),
+            ));
+        }
+        let findings: Vec<Value> = found
+            .iter()
+            .map(|f| json!({"id": f["id"], "fingerprint": f["fingerprint"], "severity": f["severity"]}))
+            .collect();
+        Self::parse(
+            &json!({
+                "sim_doctor_baseline": VERSION,
+                // A doctor/1 envelope carries no clock.
+                "created": "unknown",
+                "run": run,
+                "findings": findings,
+            })
+            .to_string(),
+        )
     }
 
     /// Reads a baseline from a path, refusing a file over [`MAX_BASELINE_BYTES`].
@@ -508,75 +629,8 @@ impl Baseline {
                 limit: MAX_BASELINE_BYTES,
             });
         }
-        Self::parse(&text)
+        Self::from_envelope(&text)
     }
-
-    /// Writes this baseline to a path, atomically.
-    ///
-    /// **Through a temporary file and a rename**, because the failure this
-    /// avoids is a baseline half-written by a machine that lost power between
-    /// the write and the rename. That file would parse, or would not, and
-    ////! whichever it did it would be a baseline no run chose. The rename is
-    ////! atomic on the platforms this crate runs on - it talks to PC/SC - so a
-    ////! reader either sees the old baseline or the new one.
-    ///
-    /// **Refuses rather than truncating a long message.** Every string this
-    /// writes is bounded by [`MAX_TEXT_CHARS`] so that what goes in is what
-    /// [`Baseline::parse`] will accept; a finding over the limit is a refusal
-    /// naming the rule, because a baseline holding a shortened message would
-    /// compare against text the file does not contain.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::MessageTooLong`] when a finding cannot be recorded within the
-    /// limits, [`Error::Unwritable`] when the file cannot be created or
-    /// renamed, and [`Error::Render`] when the document cannot be serialised,
-    /// which in practice cannot happen.
-    pub fn save(&self, path: &Path) -> Result<(), Error> {
-        for finding in &self.findings {
-            let length = finding.message().chars().count();
-            if length > MAX_TEXT_CHARS {
-                return Err(Error::MessageTooLong {
-                    rule: finding.rule().to_string(),
-                    length,
-                    limit: MAX_TEXT_CHARS,
-                });
-            }
-        }
-
-        let text = serde_json::to_string_pretty(&self.to_json())
-            .map_err(|error| Error::Render(error.to_string()))?;
-
-        // The temporary name carries this process id so that two runs writing
-        // the same baseline path concurrently cannot share a scratch file and
-        // rename each other's half-written document over each other.
-        let temporary = temporary_path(path);
-        let write = || -> std::io::Result<()> {
-            fs::write(&temporary, text.as_bytes())?;
-            fs::rename(&temporary, path)
-        };
-        if let Err(error) = write() {
-            // Best effort: the scratch file is not the operator's document and
-            // leaving one behind on every failure would be its own litter.
-            let _ = fs::remove_file(&temporary);
-            return Err(Error::Unwritable(format!("{}: {error}", path.display())));
-        }
-        Ok(())
-    }
-}
-
-/// The scratch path a save writes through, beside the real one.
-///
-/// Beside rather than in the system temporary directory because a rename
-/// across filesystems is not atomic, and the atomicity is the whole point of
-/// the two-step write.
-fn temporary_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path
-        .file_name()
-        .map_or_else(|| "baseline".as_ref(), std::ffi::OsStr::new)
-        .to_os_string();
-    name.push(format!(".tmp-{}", std::process::id()));
-    path.with_file_name(name)
 }
 
 /// Refuses a document holding a value over this module's limits.
@@ -815,7 +869,7 @@ impl Incomparable {
 pub struct RuleDrift {
     id: rules::RuleId,
     direction: Direction,
-    findings: Vec<rules::Finding>,
+    findings: Vec<BaselineFinding>,
 }
 
 /// Which run knew about the rule.
@@ -850,7 +904,7 @@ impl RuleDrift {
     }
 
     /// The findings it carried, so nothing is silently dropped.
-    pub fn findings(&self) -> &[rules::Finding] {
+    pub fn findings(&self) -> &[BaselineFinding] {
         &self.findings
     }
 
@@ -884,7 +938,7 @@ pub struct Diff {
     current_findings: usize,
     threshold: Option<rules::Severity>,
     new: Vec<rules::Finding>,
-    fixed: Vec<rules::Finding>,
+    fixed: Vec<BaselineFinding>,
     persisting: Vec<rules::Finding>,
     rules: Vec<RuleDrift>,
 }
@@ -966,7 +1020,12 @@ impl Diff {
         let drift = rule_drift(baseline, this_run);
         let withheld: Vec<&rules::RuleId> = drift.iter().map(|d| &d.id).collect();
 
-        let was = index(baseline.findings());
+        let mut was: BTreeMap<String, Vec<BaselineFinding>> = BTreeMap::new();
+        for finding in baseline.findings() {
+            was.entry(finding.fingerprint.clone())
+                .or_default()
+                .push(finding.clone());
+        }
         let now = index(current);
         let mut new = Vec::new();
         let mut fixed = Vec::new();
@@ -991,14 +1050,12 @@ impl Diff {
         {
             let then = was.get(key).map(Vec::as_slice).unwrap_or(&[]);
             let here = now.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            if let Some(rule) = then
+            let rule = then
                 .first()
-                .or_else(|| here.first())
-                .map(rules::Finding::rule)
-            {
-                if withheld.contains(&rule) {
-                    continue;
-                }
+                .map(BaselineFinding::rule)
+                .or_else(|| here.first().map(rules::Finding::rule));
+            if rule.is_some_and(|rule| withheld.contains(&rule)) {
+                continue;
             }
 
             let pairs = then.len().min(here.len());
@@ -1006,6 +1063,13 @@ impl Diff {
             new.extend(here[pairs..].iter().cloned());
             fixed.extend(then[pairs..].iter().cloned());
         }
+
+        // Matched by fingerprint, listed by rule and location: the key decides
+        // WHAT is the same finding, the readable order decides how it prints.
+        let order = |f: &rules::Finding| format!("{} at {}", f.rule(), f.location());
+        new.sort_by_key(order);
+        fixed.sort_by_key(|f| (f.id.to_string(), f.fingerprint.clone()));
+        persisting.sort_by_key(order);
 
         Self {
             baseline_created: baseline.created().to_owned(),
@@ -1044,7 +1108,7 @@ impl Diff {
     }
 
     /// Findings the baseline had that this run does not.
-    pub fn fixed(&self) -> &[rules::Finding] {
+    pub fn fixed(&self) -> &[BaselineFinding] {
         &self.fixed
     }
 
@@ -1231,7 +1295,7 @@ fn rule_drift(baseline: &Baseline, this_run: &RunFacts) -> Vec<RuleDrift> {
 }
 
 /// Every finding a saved run holds under one rule, in report order.
-fn findings_of(findings: &[rules::Finding], id: &rules::RuleId) -> Vec<rules::Finding> {
+fn findings_of(findings: &[BaselineFinding], id: &rules::RuleId) -> Vec<BaselineFinding> {
     findings
         .iter()
         .filter(|finding| finding.rule() == id)
@@ -1293,25 +1357,6 @@ pub enum Error {
         /// The ceiling.
         limit: usize,
     },
-
-    /// A finding is too long to be recorded within the limits.
-    #[error("finding {rule} carries a {length}-character message and the ceiling is {limit}; abaseline that cannot be reloaded is not a baseline, and shortening the message herewould make the diff compare text the file does not contain")]
-    MessageTooLong {
-        /// The rule that produced it.
-        rule: String,
-        /// How many characters the message had.
-        length: usize,
-        /// The ceiling.
-        limit: usize,
-    },
-
-    /// The file could not be created or renamed into place.
-    #[error("the baseline could not be written: {0}")]
-    Unwritable(String),
-
-    /// The document could not be serialised.
-    #[error("the baseline could not be rendered: {0}")]
-    Render(String),
 }
 
 impl Error {
@@ -1324,9 +1369,6 @@ impl Error {
             Self::Version { .. } => "baseline-version",
             Self::TextTooLong { .. } => "baseline-text-too-long",
             Self::TooManyRecords { .. } => "baseline-too-many-records",
-            Self::MessageTooLong { .. } => "finding-message-too-long",
-            Self::Unwritable(_) => "baseline-unwritable",
-            Self::Render(_) => "baseline-render-failed",
         }
     }
 }
@@ -1346,6 +1388,10 @@ mod tests {
 
     fn rule(text: &str) -> rules::RuleId {
         rules::RuleId::new(text).expect("a validated constant")
+    }
+
+    fn recs(findings: &[rules::Finding]) -> Vec<BaselineFinding> {
+        findings.iter().map(BaselineFinding::of).collect()
     }
 
     fn msl_zero() -> rules::Finding {
@@ -1431,7 +1477,7 @@ mod tests {
         let text = serde_json::to_string_pretty(&original.to_json()).expect("renderable");
         let reloaded = Baseline::parse(&text).expect("this build wrote it");
 
-        assert_eq!(reloaded.findings(), found.as_slice());
+        assert_eq!(reloaded.findings(), recs(&found).as_slice());
         assert_eq!(reloaded.run(), original.run());
         assert_eq!(reloaded.created(), original.created());
         assert_eq!(reloaded, original);
@@ -1485,7 +1531,7 @@ mod tests {
         let diff = Diff::compare(&then, &good(true), &now).expect("two comparable runs");
 
         assert_eq!(diff.persisting(), &[one, three][..]);
-        assert_eq!(diff.fixed(), &[two][..]);
+        assert_eq!(diff.fixed(), &recs(&[two])[..]);
         assert_eq!(
             diff.new_findings(),
             &[msl_zero()][..],
@@ -1513,7 +1559,7 @@ mod tests {
         let then = saved(good(true), &[one.clone(), msl_zero()]);
         let diff = Diff::compare(&then, &good(true), &[msl_zero()]).expect("comparable");
 
-        assert_eq!(diff.fixed(), &[one][..]);
+        assert_eq!(diff.fixed(), &recs(&[one])[..]);
         assert!(diff.new_findings().is_empty());
         assert!(!diff.regressed(), "a fix is not a regression");
         assert_eq!(diff.to_json()["regressed"], serde_json::json!(false));
@@ -1648,7 +1694,7 @@ mod tests {
         assert_eq!(drift.len(), 2);
         assert_eq!(drift[0].id(), &rule(TAR_RULE));
         assert_eq!(drift[0].direction(), Direction::Retired);
-        assert_eq!(drift[0].findings(), &[msl_zero()][..]);
+        assert_eq!(drift[0].findings(), &recs(&[msl_zero()])[..]);
         assert_eq!(drift[1].id(), &rule(RENAMED_RULE));
         assert_eq!(drift[1].direction(), Direction::Added);
 
@@ -1978,57 +2024,55 @@ mod tests {
     /// next year without anyone editing this function.
     #[test]
     fn a_hostile_baseline_cannot_produce_unbounded_output() {
-        let huge = "x".repeat(MAX_TEXT_CHARS + 1);
-        let template = |message: &str| {
+        let template = |reader: &str, truncated_by: &str| {
             format!(
-                r#"{{"sim_doctor_baseline":1,"created":"2026-01-01T00:00:00Z",
-                "run":{{"reader":"fake","dialect":"swicc",
+                r#"{{"sim_doctor_baseline":1,"created":"unknown",
+                "run":{{"reader":"{reader}","dialect":"swicc",
                 "candidates":"sim-families","severity_threshold":null,
-                "tar_selection":"focused@00","complete":true,"truncated_by":null,
+                "tar_selection":"focused@00","complete":true,"truncated_by":"{truncated_by}",
                 "limits_hit":[],"rules_run":1,
                 "rules":[{{"id":"{TAR_RULE}","evidence":true}}]}},
-                "findings":[{{"rule":"{TAR_RULE}","severity":"critical",
-                "severity_rank":4,"message":"{message}",
-                "location":{{"kind":"tar","tar":0}},
-                "evidence":{{"kind":"none"}},
-                "coverage":{{"status":"complete"}}}}]}}"#
+                "findings":[{{"id":"{TAR_RULE}","fingerprint":"0123456789abcdef",
+                "severity":"critical"}}]}}"#
             )
         };
 
-        // Inside the limit: read, so the refusal above is about the bound and
+        // Inside the limit: read, so the refusal below is about the bound and
         // not about the shape.
-        assert!(Baseline::parse(&template(&"x".repeat(MAX_TEXT_CHARS))).is_ok());
+        assert!(Baseline::parse(&template(&"x".repeat(MAX_TEXT_CHARS), "")).is_ok());
 
-        let error = Baseline::parse(&template(&huge)).expect_err("a megabyte of message");
-        assert_eq!(error.kind(), "baseline-text-too-long");
-        assert!(
-            error.to_string().contains(&MAX_TEXT_CHARS.to_string()),
-            "{error}"
-        );
+        for (what, text) in [
+            ("reader", template(&"x".repeat(MAX_TEXT_CHARS + 1), "")),
+            (
+                "truncated_by",
+                template("r", &"A".repeat(MAX_TEXT_CHARS + 1)),
+            ),
+        ] {
+            let error = Baseline::parse(&text).expect_err(what);
+            assert_eq!(error.kind(), "baseline-text-too-long", "{what}");
+        }
+    }
 
-        // And the same bound applies to a location path, which is a different
-        // field with the same risk.
-        let long_path = "A".repeat(MAX_TEXT_CHARS + 1);
-        let text = format!(
-            r#"{{"sim_doctor_baseline":1,"created":"2026-01-01T00:00:00Z",
-            "run":{{"reader":"fake","dialect":"swicc",
-            "candidates":"sim-families","severity_threshold":null,
-            "tar_selection":"focused@00","complete":true,"truncated_by":null,
-            "limits_hit":[],"rules_run":1,
-            "rules":[{{"id":"{TAR_RULE}","evidence":true}}]}},
-            "findings":[{{"rule":"filesystem/unreadable-ef","severity":"high",
-            "severity_rank":3,"message":"short",
-            "location":{{"kind":"file","path":"{long_path}","access":"forbidden",
-            "status":"9804"}},
-            "evidence":{{"kind":"none"}},
-            "coverage":{{"status":"complete"}}}}]}}"#
-        );
-        assert_eq!(
-            Baseline::parse(&text)
-                .expect_err("a megabyte of path")
-                .kind(),
-            "baseline-text-too-long"
-        );
+    /// A fingerprint that is not 16 lowercase hex digits is refused, whatever
+    /// else the file says.
+    #[test]
+    fn a_malformed_fingerprint_is_refused() {
+        let envelope = |fp: &str| {
+            json!({"schema": "doctor/1",
+                "findings": [{"id": TAR_RULE, "fingerprint": fp, "severity": "high"}],
+                "data": {"run": good(true).to_json()}})
+            .to_string()
+        };
+        assert!(Baseline::from_envelope(&envelope("0123456789abcdef")).is_ok());
+        for bad in [
+            "",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "zzzzzzzzzzzzzzzz",
+        ] {
+            let error = Baseline::from_envelope(&envelope(bad)).expect_err(bad);
+            assert_eq!(error.kind(), "baseline-malformed", "{bad:?}");
+        }
     }
 
     /// Too many findings, and too many of anything, are refused.
@@ -2041,13 +2085,9 @@ mod tests {
         let many: Vec<serde_json::Value> = (0..=MAX_RECORDS)
             .map(|i| {
                 json!({
-                    "rule": "filesystem/unreadable-ef",
+                    "id": "filesystem/unreadable-ef",
+                    "fingerprint": format!("{i:016x}"),
                     "severity": "high",
-                    "severity_rank": 3,
-                    "message": format!("EF {i} could not be selected"),
-                    "location": { "kind": "tar", "tar": i },
-                    "evidence": { "kind": "none" },
-                    "coverage": { "status": "complete" },
                 })
             })
             .collect();
@@ -2091,98 +2131,124 @@ mod tests {
         assert_eq!(error.kind(), "baseline-too-large");
     }
 
-    /// A finding too long to record is refused on the way OUT, not truncated.
+    /// A doctor/1 envelope is a baseline, and a REDUCED one loads and gates
+    /// exactly like the full one.
     ///
-    /// A baseline holding a shortened message would be compared against text
-    /// the file does not contain, and the next run would diff against a
-    /// sentence that was never written. Failing loudly, naming the rule, is the
-    /// honest answer.
+    /// The full envelope carries card data (messages, evidence, locations, the
+    /// ATR); the reduced one the Action commits carries only `schema`, per
+    /// finding `id`, `fingerprint` and `severity`, and `data.run`. Both give the
+    /// same baseline, hence the same comparison.
     #[test]
-    fn saving_refuses_a_message_it_could_not_read_back() {
-        let long = rules::Finding::new(
-            rule(TAR_RULE),
-            rules::Severity::Critical,
-            "x".repeat(MAX_TEXT_CHARS + 1),
-            rules::Location::tar(0),
-            rules::Evidence::None,
-        );
-        let path = std::env::temp_dir().join("sim-doctor-long-message-baseline.json");
-        let error = saved(good(true), &[long])
-            .save(&path)
-            .expect_err("that message would not survive the round trip");
-        assert!(
-            !path.exists(),
-            "a save that refused must not have created the file"
-        );
-        assert_eq!(error.kind(), "finding-message-too-long");
-        assert!(error.to_string().contains(TAR_RULE), "{error}");
-    }
-
-    /// A save leaves the real file untouched when it fails.
-    ///
-    /// The write goes through a temporary file and a rename precisely so that a
-    /// machine which dies between the two cannot leave a half-written baseline
-    /// that the next diff reads as though somebody chose it. This is the
-    /// in-process version of the same property.
-    #[test]
-    fn a_failed_save_leaves_the_previous_baseline_intact() {
-        let directory = std::env::temp_dir().join("sim-doctor-baseline-atomicity");
-        std::fs::create_dir_all(&directory).expect("a scratch directory");
-        let path = directory.join("baseline.json");
-
-        let good_one = saved(good(true), &[msl_zero()]);
-        good_one.save(&path).expect("the first save works");
-        let before = std::fs::read(&path).expect("the first save landed");
-
-        let too_long = rules::Finding::new(
-            rule(TAR_RULE),
-            rules::Severity::Critical,
-            "x".repeat(MAX_TEXT_CHARS + 1),
-            rules::Location::tar(0),
-            rules::Evidence::None,
-        );
-        assert!(saved(good(true), &[too_long]).save(&path).is_err());
-
-        assert_eq!(
-            std::fs::read(&path).expect("still there"),
-            before,
-            "a refused save must not have touched the file an operator already had"
-        );
-        // And no scratch file is left lying beside it.
-        let leftovers: Vec<String> = std::fs::read_dir(&directory)
-            .expect("readable")
-            .filter_map(|entry| {
-                entry
-                    .ok()
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            })
-            .filter(|name| name.contains(".tmp-"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
-
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// A saved baseline reloads from the path it was written to.
-    ///
-    /// The end-to-end half: `save` then `load`, across a real filesystem,
-    /// which is the only way to prove the temporary-file-and-rename dance did
-    /// not lose anything on the way.
-    #[test]
-    fn a_saved_baseline_reloads_from_the_path_it_was_written_to() {
-        let directory = std::env::temp_dir().join("sim-doctor-baseline-roundtrip");
-        std::fs::create_dir_all(&directory).expect("a scratch directory");
-        let path = directory.join("baseline.json");
-
+    fn a_reduced_envelope_loads_and_gates_like_the_full_one() {
         let found = vec![msl_zero(), unreadable("3F00/2F00/6F07")];
         let original = saved(good(true), &found);
-        original.save(&path).expect("saved");
+        let full = json!({
+            "schema": "doctor/1",
+            "findings": found.iter().map(|f| json!({
+                "id": f.rule().as_str(),
+                "fingerprint": crate::sarif::fingerprint(f),
+                "severity": f.severity().id(),
+                "message": "IMSI 001010123456789",
+                "evidence": [{"ref": "text", "value": "ICCID 8988211000000123456"}],
+                "location": {"kind": "card-path", "ref": "3F00/2F00/6F07"},
+                "location_detail": f.to_json()["location"],
+            })).collect::<Vec<_>>(),
+            "data": {
+                "atr": "3b9f96801fc78031a073be21136743200718000001a5",
+                "ef_contents": [{"ef": "IMSI", "fields": {"imsi": "001010123456789"}}],
+                "run": original.run().to_json(),
+            },
+        });
+        let reduced = json!({
+            "schema": "doctor/1", "tool": "sim-doctor", "version": "0.3.0",
+            "findings": found.iter().map(|f| json!({
+                "id": f.rule().as_str(),
+                "fingerprint": crate::sarif::fingerprint(f),
+                "severity": f.severity().id(),
+            })).collect::<Vec<_>>(),
+            "data": {"run": original.run().to_json()},
+        });
+        let from_full = Baseline::from_envelope(&full.to_string()).expect("a full envelope");
+        let from_reduced =
+            Baseline::from_envelope(&reduced.to_string()).expect("a reduced envelope");
+        assert_eq!(from_full.findings(), recs(&found).as_slice());
+        assert_eq!(from_full.run(), original.run());
+        assert_eq!(from_full.findings(), from_reduced.findings());
+        assert_eq!(from_full.run(), from_reduced.run());
 
-        let reloaded = Baseline::load(&path).expect("read back");
-        assert_eq!(reloaded.findings(), found.as_slice());
-        assert_eq!(reloaded.run(), original.run());
+        // The same comparison against a run with one finding fixed and one new.
+        let now = vec![unreadable("3F00/2F00/6F07"), unreadable("3F00/6F3A")];
+        let counts = |b: &Baseline| {
+            let d = Diff::compare(b, &good(true), &now).expect("comparable");
+            (
+                d.new_findings().len(),
+                d.persisting().len(),
+                d.fixed().len(),
+                d.regressed(),
+            )
+        };
+        assert_eq!(counts(&from_full), counts(&from_reduced));
+        assert_eq!(counts(&from_full), (1, 1, 1, true));
 
-        let _ = std::fs::remove_dir_all(&directory);
+        for (what, text) in [
+            ("another schema", json!({"schema": "doctor/2", "data": {}})),
+            (
+                "a failed run",
+                json!({"schema": "doctor/1", "findings": [], "data": {"error": {}}}),
+            ),
+            ("an lpac envelope", json!({"type": "scan", "payload": {}})),
+        ] {
+            let error = Baseline::from_envelope(&text.to_string()).expect_err(what);
+            assert_eq!(error.kind(), "baseline-malformed", "{what}");
+        }
+    }
+
+    /// `data.run` holds comparability facts and no card data: no ATR, ICCID,
+    /// IMSI, EF contents or key material (the reader name is the PC/SC driver's,
+    /// not the card's). The key set is asserted so a field cannot be added by
+    /// accident.
+    #[test]
+    fn the_run_record_holds_no_card_data() {
+        let mut keys: Vec<String> = good(true)
+            .to_json()
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "candidates",
+                "complete",
+                "dialect",
+                "limits_hit",
+                "reader",
+                "rules",
+                "rules_run",
+                "severity_threshold",
+                "tar_selection",
+                "truncated_by"
+            ]
+        );
+    }
+
+    /// A run's severity filter survives the round trip, so a baseline taken at
+    /// `--severity high` is compared as one.
+    #[test]
+    fn the_severity_threshold_survives_the_round_trip() {
+        let facts = facts_with(
+            "r",
+            "swicc",
+            "c",
+            Some(rules::Severity::High),
+            "t",
+            true,
+            true,
+        );
+        let back: RunFacts = serde_json::from_value(facts.to_json()).expect("reads its own json");
+        assert_eq!(back.severity(), Some(rules::Severity::High));
     }
 
     /// The threshold in force is carried beside the verdict.

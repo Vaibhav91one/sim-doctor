@@ -63,9 +63,10 @@ tests live behind the gate:
 |---|---|
 | `drives_a_real_card_through_the_pcsc_transport` | the transport round trip: SELECT MF, GET RESPONSE, READ BINARY (issue #4) |
 | `walks_the_file_system_of_a_real_card` | the DF-tree walk against real capabilities templates (issue #7) |
-| `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one envelope, exit 0 (issue #6) |
+| `scans_a_real_card_end_to_end` | `sim-doctor scan --json` as the **built binary**: one doctor/1 envelope, exit 0 (issue #6) |
 | `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula, and the difference between an earned 100 and an unearned one on real stdout (issue #14, rewritten by #24) |
-| `a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused` | `--baseline` writes a file a later run reads back, that file records what the run did, and `--diff` against a baseline whose walk stopped at a bound is refused with `baseline-truncated` and exits 1, because this fixture's walk is always truncated (issue #12) |
+| `a_saved_envelope_is_a_baseline_and_a_truncated_one_is_refused` | the saved `scan --json` envelope records what the run did (`data.run`), and `--baseline` against one whose walk stopped at a bound is refused with `baseline-truncated` and exits 2, because this fixture's walk is always truncated (issue #12, doctor/1) |
+| `scan_json_conforms_to_doctor_1_against_a_real_card` | contract section 9 on real stdout: keys, finding fields, 16-hex fingerprints, `exit_code` equals the status, two runs identical outside `data` |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
 executable. The argument parsing, the reader choice, the envelope, the stdout
@@ -185,118 +186,104 @@ committed. If it cannot be created the scan fails with error kind
 This is the most important design surface. It mirrors React Doctor's CLI model, which is
 the reference implementation for agent-friendly terminal UX.
 
-### Exit codes
+### doctor/1: the shared output contract for `scan` (decided 2026-10-09)
+
+**`sim-doctor scan` speaks the cross-tool `doctor/1` contract**, shared with luasec,
+pcap-doctor, android-doctor and ble-doctor so one parser reads all five. The contract text is
+[docs/doctor-contract.md](docs/doctor-contract.md) (identical in every repo; change it in all five
+or none). It **supersedes the old scan output** (the lpac envelope around `data.findings`, exit 0
+for any finding, `--baseline` as a writer, `--diff`). The decision and its reasons are in
+[CONTEXT.md](CONTEXT.md) section 3. Everything below that is not about scan's output shape or
+exit codes (rule IDs, TAR scanning, EF full visibility, the score formula) is unchanged.
+
+`scan --json` prints one JSON object:
+
+```json
+{
+  "schema": "doctor/1", "tool": "sim-doctor", "version": "0.3.0", "exit_code": 1,
+  "score": { "value": 61, "label": "needs work", "model": "sim/1", "coverage_gaps": 0 },
+  "findings": [ { "id": "gsma/msl-zero-allowed", "fingerprint": "f405c45b121ae11d",
+                  "severity": "critical", "category": "gsma", "message": "...",
+                  "location": { "kind": "card-path", "ref": "3F00/2F00/6F07" },
+                  "evidence": [ { "ref": "octets", "value": "a4000a" } ],
+                  "remedy": "..." } ],
+  "data": { }
+}
+```
+
+What lives where:
+
+- **`findings`** (top level, sorted critical first, then `id`, then `fingerprint`): the failed
+  checks only. `id` is the rule id. `category` is the part of the id before the first `/`.
+  `remedy` is the rule's `remediation` text, or `null`. `location` is `card-path` with the file
+  path, or `card-path` with `tar:..`/`apdu:..`/`kind:value` for the other location variants, or
+  `none`/`card` for a whole-card finding. Extra keys, which the contract allows: `severity_rank`,
+  `coverage` (`complete` or `partial` with a reason; **read it before treating the list as
+  exhaustive**), and `location_detail` (the old `Location` body: `access` and `status`
+  survive here, so absent, forbidden and refused stay distinguishable).
+- **`fingerprint`**: 16 lowercase hex, FNV-1a over rule id, location and the message with digit
+  runs masked ([src/sarif.rs](src/sarif.rs) `fingerprint`). The same value is
+  `partialFingerprints["doctorFinding/v1"]` in the SARIF.
+- **`score`**: `{value, label, model: "sim/1", coverage_gaps}`. `value` is the formula under
+  [Severity and score](#severity-and-score). `label` is `good` (>= 90), `needs work` (>= 60),
+  `critical`, and `incomplete` instead of `good` when `coverage_gaps > 0`.
+  **`coverage_gaps` counts**: one per walk bound hit (at least one when the walk is incomplete
+  for any reason), one when the TAR scan did not finish, one when no rule ran, and one per rule
+  that ran with nothing to look at (`gsma/msl-zero-allowed` under `--tar off`, so a default scan
+  is `incomplete` and never `good`). The old detail block is `data.score_detail` (`max`,
+  `penalty`, `scored_findings`, `rules_run`, `formula`, `penalties`, `warning`).
+- **`data`**: everything else the old report carried, unchanged: `reader`, `atr`, `dialect`,
+  `addressing`, `candidates`, `limits`, `complete`, `truncated`, `truncated_by`, `limits_hit`,
+  `files`, `absent`, `forbidden`, `refused`, `ef_contents`, `tar`, and `diff` under a baseline.
+  Plus `findings_detail` (the old findings block: `count`, `exhaustive`, `coverage`,
+  `severity_threshold`, and the findings in their old shape), `score_detail`, and `run` (the
+  record a later `--baseline` compares: dialect, candidates, TAR selection, bounds, rules and
+  whether each had evidence).
+- A scan that **could not run** (no reader, no card, an unusable baseline, an incomparable one)
+  is also a `doctor/1` envelope: exit 2, `findings: []`, score 0 with one coverage gap, and the
+  reason in `data.error` (`kind`, `message`) with `data.scanned: false` and
+  `data.card_touched: false`. An **interrupted** run is exit 130 with `data: {}`. Neither is a
+  verdict on a card.
+
+#### Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Success, no findings above threshold |
-| 1 | Findings present (or checks failed) |
+| 0 | Ran; no finding at or above `--fail-on` |
+| 1 | Ran; at least one finding at or above `--fail-on` |
+| 2 | Usage error, bad input (including a bad `--baseline`), or the scan could not run |
+| 3 | `--baseline` given; at least one **new** finding at or above `--fail-on` (takes precedence over 1) |
 | 130 | Interrupted by user (SIGINT or SIGTERM; SIGTERM exits 130 too, not 143) |
-| 129 | Invalid usage / bad arguments |
 
-Every one of the four is proved by a test that spawns the built binary and reads its
-real exit status, not by asserting the enum: [tests/process_contract.rs](tests/process_contract.rs).
+`--fail-on {critical,high,medium,low,info}` **defaults to `critical`**. Before doctor/1 a scan
+with findings exited 0, so the closest default that fits the contract's enum is the one that
+fails only on the worst finding: swSIM, the CI fixture, can produce no critical finding (no MSL),
+so the card-fixture job still exits 0. Pass `--fail-on info` to fail on any finding. `--severity`
+is a different thing: it REMOVES findings from the report before the gate and the score are
+computed, so `--severity high --fail-on low` can never fail on a low finding. Under `--baseline`
+only new findings count: 3 or 0, never 1.
 
-#### A scan that PRODUCES findings exits 0, and that is a decision [V]
+**What changed from the old table.** The old `129` (invalid usage) is gone **for `scan`**: a
+usage error there is exit 2, as is a failed run (it was 1). The lpa-envelope commands (`modules`,
+`rules`, `why`, `fix`, `gp`, `ts48`, `fuzz`, `trace`, `ci`, `install`, `completions`, `mcp`) keep
+their lpac envelope `{type, payload:{code,message,data}}` and the old codes 0/1/129/130 (1 means
+the run could not deliver). `scan`'s exit-0-for-findings decision, issues #14/#24/#12 and
+reasons 1 to 3, is superseded; its history stays in CONTEXT.md.
 
-**The table above permits exit 1 for findings. `scan` does not use it, and says so
-in the output instead.** The second half - "or checks failed" - is what a scan
-currently returns 1 for: no reader, no card, a walk that could not run, a
-deferred flag. A scan that ran to the end and found something to report exits
-**0** whatever it found.
+Every code is proved by a test that spawns the built binary and reads its real exit status, not
+by asserting the enum: [tests/process_contract.rs](tests/process_contract.rs). Exit 3 needs a
+completed scan, so it is proved in `scan::tests` (the mapping) and the card-fixture suite.
 
-Three reasons were recorded when this was first decided, in the order they
-carried weight. **Issue #24 withdrew the first one, because issue #24 shipped a
-rule; the other two are unchanged and were re-checked against a scan that can
-actually produce a finding.**
-
-1. ~~**No rule runs yet.**~~ **WITHDRAWN by issue #24.** Issue #13 shipped
-   the vocabulary a rule needs - the ID, the severity, the registry - and no
-   rule, because a rule that guessed would manufacture findings this
-   repository cannot justify. Issue #24 registers the first one,
-   `gsma/msl-zero-allowed`, so the question is observable for the first time. A
-   reason that has stopped being true must stop being written down, or the
-   next reader inherits it as a live argument.
-2. **`payload.code` already means something else.** Still true, and
-   independent of the first: it is 0 whenever the walk *finished*, including a
-   walk that was cut short, and `scan --help` has said
-   `GATE ON data.complete, NOT ON payload.code` since issue #6. Spending code
-   1 on "the card is dirty" without rewording that sentence would make the help
-   wrong.
-3. **The two meanings have two different documents.** **This is the decisive
-   one, and it was not written down before.** Exit 1 is reachable from six
-   conditions today - no reader, unknown reader, reader unavailable, walk
-   failed, rule misattribution, a deferred flag - plus an unwritable stdout.
-   Every one of them emits a *refusal* document: `data.error` and
-   `data.card_touched`, and **no `data.findings` key at all**. A scan that found
-   something emits the opposite shape: `data.findings` and `data.score`, and
-   **no `data.error` key at all**. Flipping the switch therefore does not add a
-   meaning to an exit code; it gives one code two mutually exclusive document
-   schemas, and an agent branching on the status has to read the body to pick
-   one. For a tool whose whole promise is that an agent can branch on the
-   status, that is the wrong trade to make in the same release that first
-   produces a finding.
-
-**What to gate on instead, and it is already in the document.** A CI gate reads
-`data.complete` (was the whole card read?) and `data.score.value` (is it under
-the threshold?). Both are per-field, neither collides with the exit code, and
-neither can be mistaken for the other.
-
-**The revisit condition has been met, and issue #12 answered it. The answer is yes for a
-DIFF and no for a PLAIN SCAN, and those are two different decisions.**
-
-The condition this section set was: "when #9 lands `--baseline` and `--diff`, both of which are
-already designed to exit 1, a gate has a *threshold* to fail against rather than a bare
-'something is wrong'." That is exactly what `--diff` plus `--severity` is - a number the operator
-chose, evaluated against a baseline these two runs have already been checked as entitled to be
-compared on. **So `--diff` regressing exits 1**, and `FINDINGS_FAIL_A_SCAN` stays `false`.
-
-#### Is a regressed diff a SEVENTH meaning smearing across the exit code? No, and here is the test
-
-Reason 3 above was never "code 1 is shared" - the table says so in so many words, deliberately,
-because a gate cares whether the card passed and not why it did not. Reason 3 was that sharing it
-would give one code two **mutually exclusive document schemas**, so an agent branching on the
-status would have to read the body to pick one. **A regressed diff is not a second schema.** The
-three documents are mutually exclusive:
-
-- a **refusal** carries `data.error` and **no** `data.diff`,
-- a **regressed diff** carries `data.diff` and **no** `data.error`,
-- a **clean scan** carries neither and exits 0.
-
-So `data.error` remains the refusal marker - the field AGENTS.md tells an agent to read - and
-code 1 keeps meaning **the thing you asked for was not delivered**, which is what it already
-meant for "a check failed". A diff that reports a regression did not deliver what was asked for.
-Every refusal this issue adds - an unreadable baseline, an incomparable pair - lands on the
-refusal side of that line, so the rule reason 3 was defending survives intact.
-
-**The honest cost, stated rather than hidden.** An agent that reads `data.error.message` on
-code 1 without checking the key first now has to check. That is one extra key read against a
-contract that was going to need one the moment a gate existed at all, and it is the price of a
-gate that is a gate. An agent branching on the status *alone* still fails the build, which is
-the correct answer in both cases.
-
-**What a diff does NOT exit 1 for, and the reasons.** A **fix** never fails a build: a card that
-improved is not a regression and a gate that punishes improvement is a gate nobody turns on.
-**Saving a baseline without `--diff` never fails a build either** - a baseline has to be
-takeable from a dirty card, which is the entire point of having taken one.
-
-**Reasons 2 and 3 still hold for a plain scan**, and nothing here gives code 1 a meaning to an
-operator who did not ask for a comparison. `--score` remains the per-field threshold a CI gate
-reads. The primitive for the other decision is still written and tested:
-[
-`Findings::reaches`](src/rules.rs) over the rendered set, at the `Ok(())` arm of
-`run_scan`. The switch is the single constant `FINDINGS_FAIL_A_SCAN` in
-[src/main.rs](src/main.rs). **Flipping IT is still a contract change and is still not a one-line
-edit**: the table above, the `GATE ON data.complete` sentence in `scan --help`, and the
-`scans_a_real_card_end_to_end` assertion in [tests/card_fixture.rs](tests/card_fixture.rs) which
-currently expects exit 0 against a live swSIM card all have to move in the same commit. Full
-reasoning in [CONTEXT.md](CONTEXT.md) section 3.
+**Gate on `data.complete` / `score.coverage_gaps` as well as the exit code.** The exit code
+follows findings, not whether the walk finished: a walk cut short at a bound exits 0 when its
+findings are below `--fail-on`. Read `data.complete` (or require `coverage_gaps == 0`) before
+trusting a clean result.
 
 **SIGINT and SIGTERM are handled, not inherited.** The handler sets one atomic flag and returns;
 ordinary code notices at a checkpoint and exits 130 itself, so a handled interrupt
 reports `code() == Some(130)` and never `signal() == Some(SIGINT)`. An interrupted run
 still emits **one** envelope carrying code 130 and an empty `data` - never a partial
-result - so `payload.code` keeps meaning the value the process exits with. Checkpoints
+result - so the envelope's exit code keeps meaning the value the process exits with. Checkpoints
 go before output and never after: a run that has already written its envelope has
 finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 
@@ -305,24 +292,37 @@ finished. Full reasoning in [CONTEXT.md](CONTEXT.md) section 3.
 | Flag | State | |
 |---|---|---|
 | `--json` | implemented | structured output on stdout, nothing else on stdout |
-| `--score` | implemented | single numeric quality score for CI gating, with its formula beside it |
+| `--score` | implemented | adds the score and its formula to the human report; the JSON always carries `score` |
+| `--fail-on <level>` | implemented | gate threshold, default `critical`; see Exit codes |
 | `--severity <level>` | implemented | remove findings below a minimum severity |
 | `--tar <selection>` | implemented | which TARs to probe for MSL 0: `off`, `focused`, `full`, `range:FIRST-LAST`, `regex:PATTERN`; capped at 4096 probes |
-| `--terminal-profile` | implemented | with `--tar` other than `off` (else exit 129): send TERMINAL PROFILE `80 10 00 00 01 13` before the TAR audit; see [TERMINAL PROFILE and a generic-error baseline](#terminal-profile-and-a-generic-error-baseline) |
-| `--baseline <file>` | implemented | save this run, so a later scan can be compared against it |
-| `--diff` | implemented | compare this run against `--baseline`; **exits 1 when the diff regresses** |
+| `--terminal-profile` | implemented | with `--tar` other than `off` (else exit 2): send TERMINAL PROFILE `80 10 00 00 01 13` before the TAR audit; see [TERMINAL PROFILE and a generic-error baseline](#terminal-profile-and-a-generic-error-baseline) |
+| `--baseline <file>` | implemented | compare this run against a previous `scan --json` envelope; new findings at or above `--fail-on` exit 3 |
+| `--sarif <file>` | implemented | also write SARIF 2.1.0 (`doctorFinding/v1` fingerprints, `properties.score`) |
+
+`--diff` is removed (doctor/1 has none: `--baseline` alone gates). To take a baseline, save the
+envelope, reduced (see "What a baseline reads"): `sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json`.
 
 No flag on the surface is deferred any more. The rule that a flag must exist from day one and
 refuse honestly until it is built is unchanged and is kept here because the pattern was right
-for `--score`, `--severity`, `--baseline` and `--diff`, but the refusal shape it produced -
+for `--score`, `--severity` and `--baseline`, but the refusal shape it produced -
 one envelope carrying `"implemented": false`, `"scanned": false` and `"card_touched": false` -
 is now reached from nothing on the command surface, and what replaced it is described below.
 The scoring and severity contract is [Severity and score](#severity-and-score).
 
-### Baseline and diff
+### Baseline
 
-`--baseline <file>` writes the findings the report carries, after `--severity`, plus **a record
-of what the run did**. `--diff` reads that file back before a reader is opened and compares.
+`--baseline <file>` reads a previous `scan --json` envelope **before a reader is opened** and
+compares this run with it. The file's `data.run` (a record of what that run did) and the
+fingerprints of its top-level findings are what the comparison reads; a file that is not a `doctor/1`
+envelope of a scan that finished (an lpac envelope, an error envelope) is refused with
+`baseline-malformed`. Matching is by `fingerprint` (a multiset: the surplus on either side is new
+or fixed). Each finding of the new run carries `baseline_state` (`new` or `unchanged`), the
+envelope carries `baseline: {new, unchanged, fixed}`, and `data.diff` carries the lists.
+Exit 3 when a new finding is at or above `--fail-on`, else 0. A finding from a rule only one of
+the two runs knows is labelled `new` (or counted as fixed) but, as before, **does not gate**:
+it is listed under `data.diff.rules` with the rename warning below. Saving is not a gate, since
+saving is just `scan --json`.
 
 #### What a baseline records, and why refusing is the whole design
 
@@ -345,40 +345,58 @@ baseline it cannot honestly compare with:
 baseline found and this run does not have would otherwise read as fixed, which tells an operator
 a card got better when the walk never got there.
 
-Every one of these is a **refusal**, not a warning: `data.error` with its own `error.kind`, exit 1,
-and no `data.findings` and no `data.diff`. Same shape as "no reader attached", for the same
+Every one of these is a **refusal**, not a warning: `data.error` with its own `error.kind`, exit 2,
+no findings and no `data.diff`. Same shape as "no reader attached", for the same
 reason - a comparison this tool cannot make honestly is a check that could not run.
 
 #### A rule ID is the address, and a rename reads as a rename
 
-Findings are matched across runs by rule ID **plus location**, because a rule may fire once per
-TAR or once per file and the ID alone is not a finding. An ID in exactly one of the two runs is
-**counted as neither new nor fixed**: it appears under `data.diff.rules` with the findings it
+Findings are matched across runs by **fingerprint** (rule ID, location and the digit-masked
+message), because a rule may fire once per TAR or once per file and the ID alone is not a
+finding. An ID in exactly one of the two runs is **not counted by the gate**: it appears under `data.diff.rules` with the findings it
 carried and a `warning` saying an ID that leaves and one that arrives together is what a **rename**
 looks like - and also what a withdrawn rule plus an unrelated new one looks like, which two files
 cannot tell apart. That is where AGENTS.md's "an ID must never be renamed casually" gets
 enforced, because a baseline outlives the release that wrote it.
 
-#### Evidence is bounded on the way IN as well as out
+#### What a baseline reads, and why it holds no card data
 
-A baseline file is **untrusted input**. A finding's `message` is an unbounded `String` in the wire
-type, so a hand-edited file could otherwise put a megabyte of prose into a CI log. `parse` walks
-the whole parsed document and refuses any string over **1024 characters** or any array over
-**4096 items**, before the typed parse; the file is read through a `take` with a **1 MiB** ceiling
-rather than `fs::read`, so the ceiling holds while reading. `RuleId` re-validates itself on the way
-in, which is issue #13's deliberate choice and the reason reading one back is safe at all.
+A baseline loader reads **only** `schema`, `data.run` and, per top-level finding, `id`,
+`fingerprint` and `severity` (`baseline::BaselineFinding`). The ATR, `ef_contents`, messages,
+evidence and locations are never read, so any envelope with those fields loads: the full
+`scan --json` output for local use, or the **reduced** form
+`{schema, tool, version, findings:[{id, fingerprint, severity}], data:{run}}`. Both give the
+same baseline and the same comparison and exit code (`baseline::tests::a_reduced_envelope_loads_and_gates_like_the_full_one`).
 
-A finding too long to record is **refused on the way out** rather than truncated: a baseline that
-cannot be reloaded is not a baseline, and a shortened message would be compared against text the
-file does not contain. Saves go through a temporary file and a rename, so a machine that dies
-mid-write cannot leave a half-written baseline the next `--diff` reads as though somebody chose it.
+`data.run` is comparability facts only: `reader` (the PC/SC reader name, not the card),
+`dialect`, `candidates`, `severity_threshold`, `tar_selection`, `complete`, `truncated_by`,
+`limits_hit`, `rules_run` and `rules` (rule id plus whether it had evidence). No ATR, ICCID,
+IMSI, EF contents or key material; a test asserts the key set. The old pre-contract baseline
+record was the reference.
 
-#### What a baseline does not contain
+**The GitHub Action writes the reduced form for you** (`$OUT/baseline.json`, the `baseline`
+output; it uses `jq -f scripts/reduce-baseline.jq`), and that is the file to commit. For a manual
+baseline use the same filter:
 
-Findings and comparability facts. **Not the ATR, not the file tree, not the notes, not the APDU
-log** - a baseline is a local artifact that lands in a CI workspace, and the narrower it is the
-less of the card it carries around. A test asserts the key set. `*.baseline.json`, `baseline.json`,
-`baseline-*.json`, `*-baseline.json` and `.baselines/` are all in `.gitignore`.
+```sh
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > .sim-doctor/baseline.json
+```
+
+A plain `scan --json > baseline.json` also works as a baseline but is a full envelope, which
+carries the ATR and EF contents under full visibility: **do not commit it**. (A reduced file
+could still be committed unreduced by mistake; the Action and the filter above are how to avoid
+that.)
+
+#### Evidence is bounded on the way IN
+
+A baseline file is **untrusted input**. The file is read through a `take` with an **8 MiB**
+ceiling rather than `fs::read`, so the ceiling holds while reading. A reduced baseline is a few
+kilobytes, but the full envelope (which carries the whole file tree) must still load for local
+use, so the ceiling stays at 8 MiB instead of returning to 1 MiB. From the envelope only the
+fields above are used, and `parse` refuses any string over **1024 characters**, any array over
+**4096 items**, and any fingerprint that is not 16 lowercase hex digits, before the typed parse.
+`RuleId` re-validates itself on the way in, which is issue #13's deliberate choice and the reason
+reading one back is safe at all.
 
 ### Rule IDs
 
@@ -388,9 +406,10 @@ addressable by agents, so an ID must never be renamed casually.
 
 ### Findings
 
-One thing a rule found. The body below is fixed by [src/rules.rs](src/rules.rs) and
-pinned byte for byte by a test; **the envelope around it does not change to accommodate
-it**, because a finding is serialized *into* `payload.data`, not wrapped by it.
+One thing a rule found. `scan --json` reports it in the doctor/1 shape above. The body below
+is the **internal** shape fixed by [src/rules.rs](src/rules.rs) and pinned byte for byte by a
+test; it is what lpa-style commands still embed in their envelopes and what `scan` keeps under
+`data.findings_detail.findings` (a baseline reads it back from there).
 
 ```json
 {
@@ -433,7 +452,7 @@ exists because getting it wrong breaks somebody downstream:
   stdout with a 64 KB elementary file.
 
 ```
-sim-doctor scan --json | jq '.data.findings[] | select(.rule == "gsma/msl-zero-allowed")'
+sim-doctor scan --json | jq '.findings[] | select(.id == "gsma/msl-zero-allowed")'
 ```
 
 ### EF contents, full visibility (issue #108, #102, #128)
@@ -599,23 +618,24 @@ says "not sent") and is reported.
 
 ### Severity and score
 
-`--severity <level>` and `--score <flag>` are implemented (issue #14) and both land in
-`payload.data`. The order they are applied in is part of the contract: **the filter runs
+`--severity <level>` and `--score` are implemented (issue #14). The score is always in the
+envelope's top-level `score` (shared shape, model `sim/1`); the detail below is
+`data.score_detail`. The order they are applied in is part of the contract: **the filter runs
 first, and the score is taken from what is reported.** `scan --severity high --score`
 scores the high and critical findings and nothing else, and says so in
-`data.score.scored_findings`. That ordering is the whole of "a score must not hide a
+`data.score_detail.scored_findings`. That ordering is the whole of "a score must not hide a
 finding" - the number in the report is a function of the `findings` array beside it, so the
 two can never disagree about what was found.
 
 #### The filter is a filter, not a mask
 
 A finding below the level is **removed**, not marked: no entry, no contribution to
-`data.findings.count`, and **no rule ID anywhere in the document**. Not a zeroed entry, not
+`data.findings_detail.count`, and **no rule ID anywhere in the document**. Not a zeroed entry, not
 an empty placeholder, not a `"suppressed": true` flag carrying the ID. A consumer that counts
 and a consumer that greps for `gsma/msl-zero-allowed` both see the same set, and a set that
 one of them can still see in the document is a set the other is counting wrong.
 
-The level in force is reported as `data.findings.severity_threshold`, because a short list
+The level in force is reported as `data.findings_detail.severity_threshold`, because a short list
 is otherwise indistinguishable from a quiet card. `null` means nothing was filtered, which is
 different from `"info"` - the first is every finding, the second is every finding the ladder
 can spell. Coverage is **recomputed from the survivors** rather than carried over, because
@@ -659,7 +679,7 @@ a decision to record in CONTEXT.md, not a tune.
 
 #### The number a reader can rebuild from the document alone
 
-`--score` does not print a bare number. `payload.data.score` carries:
+The detail block `data.score_detail` does not hold a bare number. It carries:
 
 | Field | |
 |---|---|
@@ -699,21 +719,39 @@ established.
 
 #### Proving the three copies still agree
 
-The formula lives in three places: `rules::SCORE_FORMULA`, the `score` block of every
+The formula lives in three places: `rules::SCORE_FORMULA`, the `score_detail` block of every
 JSON report, and this section. A test reads this file and asserts the other two still say the
 same thing, so a reworded constant cannot leave a reader holding a formula that computes
 something else.
 
 ### JSON envelope
 
-The best existing model is `lpac`, which returns a single envelope for everything:
+`scan` uses the doctor/1 envelope described at the top of this section. Every other command
+returns a single `lpac`-style envelope for everything:
 
 ```json
 { "type": "lpa", "payload": { "code": 0, "message": "ok", "data": {} } }
 ```
 
-Adopt this shape. `type` identifies the response, `payload.code` a machine-checkable
-status, `payload.data` the body.
+`type` identifies the response, `payload.code` a machine-checkable status, `payload.data` the
+body. Those commands keep it for lpa compatibility; they are not findings commands.
+
+### MCP
+
+`sim-doctor mcp` serves MCP over stdio with three tools, `scan`, `rules_list` and `rules_explain`.
+`scan` runs this binary as `scan --json ...` and returns the doctor/1 envelope **byte for byte**
+(exit 0, 1 and 3 are results; anything else is an error carrying stderr). It accepts every scan
+flag as an argument **except** `tui`, `json` (always forced), `help` and `version`; `baseline`,
+`fail-on` and `sarif` are passed through, as the contract requires.
+
+### Sanitization
+
+Text that came from a card is untrusted. Every human renderer strips control characters (so ESC),
+bidi controls, zero-width characters and line/paragraph separators through **one helper**,
+`contract::sanitize` ([src/contract.rs](src/contract.rs)): the scan table
+(`scan::to_human`), the TUI, the fix prompt and `why`. JSON and SARIF leave values as they are and
+rely on the serializer. Tests: `scan::tests::card_text_cannot_drive_the_terminal` and
+`contract::tests::sanitize_strips_escape_bidi_zero_width_and_separators`.
 
 ---
 

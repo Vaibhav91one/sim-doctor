@@ -456,13 +456,16 @@ fn invalid_usage() -> Run {
     run_piped(&["modules", "--no-such-flag"])
 }
 
-/// The headline test: AGENTS.md section 3's four numbers, each one observed as a
-/// real process exit status.
+/// The headline test: AGENTS.md section 3's numbers, each one observed as a
+/// real process exit status. 3 (a new finding against `--baseline`) needs a
+/// completed scan, so it is observed in the card-fixture suite and in
+/// `scan::tests::a_baseline_gates_on_new_findings_only`, not here.
 #[test]
-fn all_four_exit_codes_are_reachable_from_a_real_process() {
+fn every_exit_code_that_needs_no_card_is_reachable_from_a_real_process() {
     let mut observed = vec![
         success().code(),
         undeliverable().code(),
+        run_piped(&["scan", "--no-such-flag"]).code(),
         invalid_usage().code(),
     ];
 
@@ -472,10 +475,14 @@ fn all_four_exit_codes_are_reachable_from_a_real_process() {
 
     observed.sort_unstable();
     observed.dedup();
+    let expected: Vec<i32> = contract::ExitCode::ALL
+        .into_iter()
+        .filter(|code| *code != contract::ExitCode::NewFindings)
+        .map(|code| i32::from(code.process_code()))
+        .collect();
     assert_eq!(
-        observed,
-        contract::ExitCode::ALL.map(|code| i32::from(code.process_code())),
-        "the exit codes a caller can actually observe are not the four AGENTS.md section 3 promises"
+        observed, expected,
+        "the exit codes a caller can observe without a card are not the ones AGENTS.md section 3 promises"
     );
 }
 
@@ -652,18 +659,18 @@ fn asking_for_help_is_not_a_failure() {
 const SHELLS: [&str; 5] = ["bash", "elvish", "fish", "powershell", "zsh"];
 
 /// Issue #6's first acceptance criterion, on the command surface itself: a
-/// flag this tool does not understand is exit 129, and `scan` is no exception
-/// to the rule `modules` already follows.
+/// flag this tool does not understand is a usage error, and for `scan` (a
+/// doctor/1 findings command) that is exit 2, where the lpa-style commands keep
+/// 129.
 ///
 /// Both an unknown flag and a value outside a flag's own vocabulary are tested.
-/// The second is the one that is easy to regress: --severity has to reject
-/// "NOPE" with 129 rather than accepting any string and deferring it, because
-/// an agent that typos a severity deserves to find out at parse time rather
-/// than after a walk.
+/// The second is the one that is easy to regress: --severity and --fail-on have
+/// to reject "NOPE" at parse time rather than accepting any string and deferring
+/// it, because an agent that typos a severity deserves to find out before a walk.
 #[test]
-fn an_unparsable_scan_command_line_exits_129() {
+fn an_unparsable_scan_command_line_exits_2() {
     let unknown_flag = run_piped(&["scan", "--no-such-flag"]);
-    assert_eq!(unknown_flag.code(), 129);
+    assert_eq!(unknown_flag.code(), 2);
     assert_eq!(
         unknown_flag.stdout, "",
         "clap's usage error must not land on stdout under --json semantics"
@@ -673,37 +680,33 @@ fn an_unparsable_scan_command_line_exits_129() {
         "a bad flag that reports nothing is a bad flag nobody can debug"
     );
 
-    let bad_value = run_piped(&["scan", "--severity", "NOPE"]);
-    assert_eq!(
-        bad_value.code(),
-        129,
-        "a value outside the severity ladder is bad usage, not a deferred flag"
-    );
-    assert_eq!(bad_value.stdout, "");
+    for flag in ["--severity", "--fail-on"] {
+        let bad_value = run_piped(&["scan", flag, "NOPE"]);
+        assert_eq!(
+            bad_value.code(),
+            2,
+            "{flag}: a value outside the ladder is bad usage"
+        );
+        assert_eq!(bad_value.stdout, "");
+    }
 
-    // --diff without --baseline cannot mean anything, and saying so at parse
-    // time is better than deferring a request that could never be met.
-    let orphan_diff = run_piped(&["scan", "--diff"]);
-    assert_eq!(orphan_diff.code(), 129);
-    assert_eq!(orphan_diff.stdout, "");
-    assert!(
-        orphan_diff.stderr.contains("baseline"),
-        "{:?}",
-        orphan_diff.stderr
-    );
+    // `--diff` is gone: --baseline alone gates (doctor/1).
+    let diff = run_piped(&["scan", "--diff"]);
+    assert_eq!(diff.code(), 2);
+    assert_eq!(diff.stdout, "");
 }
 
 /// `--terminal-profile` changes the card's CAT state, so it is only accepted together with a
 /// TAR audit that will use it: without `--tar` (default off) or with `--tar off` it is refused
-/// with 129, before any reader is opened and with nothing on stdout.
+/// with 2, before any reader is opened and with nothing on stdout.
 #[test]
-fn terminal_profile_without_a_tar_audit_exits_129() {
+fn terminal_profile_without_a_tar_audit_exits_2() {
     for args in [
         &["scan", "--terminal-profile", "--json"][..],
         &["scan", "--tar", "off", "--terminal-profile", "--json"][..],
     ] {
         let run = run_piped(args);
-        assert_eq!(run.code(), 129, "{args:?}: {:?}", run.stderr);
+        assert_eq!(run.code(), 2, "{args:?}: {:?}", run.stderr);
         assert_eq!(run.stdout, "", "{args:?}");
         assert!(
             run.stderr.contains("--terminal-profile"),
@@ -731,95 +734,97 @@ fn scan_help_documents_the_terminal_profile() {
     }
 }
 
-/// --baseline and --diff are implemented, and the process says so.
+/// --baseline is implemented, and the process says so.
 ///
-/// **They were the last two.** AGENTS.md section 3 required `--score`,
-/// `--severity`, `--baseline` and `--diff` to exist on the surface from day
-/// one, and each refused honestly until it was built. Issue #12 built the last
-/// two, so the `"implemented": false` document is now reachable from
-/// **nothing** on the command surface.
-///
-/// What is pinned is the KIND of document, not the exit code. On a cardless
-/// machine `--baseline` still exits 1, but as a *failed scan* at
-/// `Pcsc::readers`: `card_touched: false` and an `error.kind`, which is a
-/// different document from a refusal. Under `--diff` it refuses at the file,
-/// with an `error.kind` of its own, and does so BEFORE a reader is opened.
-///
-/// The failure mode these rules out is the one the pattern started with: a
-/// `--baseline` that returned 0 because the comparison is unwritten would be
-/// indistinguishable from a clean card.
+/// On a cardless machine `--baseline` with a readable envelope exits 2 as a
+/// *failed scan* at `Pcsc::readers` (`card_touched: false` and an `error.kind`),
+/// which is a different document from a refusal; an unreadable one refuses on
+/// the file, before a reader is opened. Either way it is a doctor/1 envelope
+/// with no findings and an `exit_code` that matches the process.
 #[test]
-fn the_baseline_flags_no_longer_refuse_as_unimplemented() {
-    for args in [
-        &["scan", "--baseline", "saved.json", "--json"][..],
-        &["scan", "--baseline", "saved.json", "--diff", "--json"][..],
-    ] {
-        let run = run_piped(args);
-        let envelope = assert_exactly_one_envelope_for(args, &run.stdout);
-        let data = envelope.payload().data();
+fn the_baseline_flag_no_longer_refuses_as_unimplemented() {
+    let args = &["scan", "--baseline", "saved.json", "--json"][..];
+    let run = run_piped(args);
+    let envelope = assert_exactly_one_doctor_for(args, &run);
+    let data = &envelope["data"];
 
-        assert!(
-            data.get("implemented").is_none(),
-            "{args:?} is refusing, so the flag went back to deferred: {data}"
-        );
-        assert_eq!(
-            data["scanned"],
-            serde_json::Value::Bool(false),
-            "{args:?}: no card was scanned"
-        );
-        assert_eq!(
-            data["card_touched"],
-            serde_json::Value::Bool(false),
-            "{args:?} claimed it contacted a card"
-        );
-        // A refusal and a failed scan are different documents, and the `error`
-        // key is what tells them apart. That is the discriminator the exit-
-        // code table leans on and the one issue #12 relies on for its own exits.
-        assert!(
-            data.get("error").is_some(),
-            "{args:?} neither refused nor failed: {data}"
-        );
-        assert_eq!(
-            envelope.payload().code().process_code(),
-            u8::try_from(run.code()).expect("an exit code fits in a byte"),
-            "{args:?}: payload.code must stay the number the process exits with"
-        );
-    }
+    assert!(
+        data.get("implemented").is_none(),
+        "{args:?} is refusing, so the flag went back to deferred: {data}"
+    );
+    assert_eq!(data["scanned"], serde_json::Value::Bool(false));
+    assert_eq!(data["card_touched"], serde_json::Value::Bool(false));
+    assert!(
+        data.get("error").is_some(),
+        "{args:?} neither refused nor failed: {data}"
+    );
+    assert_eq!(envelope["findings"], serde_json::json!([]));
+    assert_eq!(run.code(), 2);
 }
 
-/// A `--diff` against a file that is not there refuses on the FILE, before a
-/// reader is ever opened.
+/// A `--baseline` that is not there refuses on the FILE, before a reader is
+/// ever opened.
 ///
-/// **This is the property that makes `--diff` safe to script.** The baseline is
-/// read at the top of `run_scan`, before `Pcsc::readers`, so an agent whose
+/// **This is the property that makes `--baseline` safe to script.** The baseline
+/// is read at the top of `run_scan`, before `Pcsc::readers`, so an agent whose
 /// baseline path is wrong - a stale checkout, a job that never downloaded the
-/// artifact - finds out in milliseconds instead of after a walk of a card it was
-/// never going to compare against. `error.kind` names which refusal it is, so
-/// the agent does not have to parse the sentence.
+/// artifact - finds out in milliseconds instead of after a walk. `error.kind`
+/// names which refusal it is, so the agent does not have to parse the sentence.
 #[test]
-fn a_diff_against_a_missing_baseline_refuses_on_the_file_and_says_which() {
+fn a_missing_baseline_refuses_on_the_file_and_says_which() {
     let missing = std::env::temp_dir().join("sim-doctor-no-such-baseline.json");
     let _ = std::fs::remove_file(&missing);
     let path = missing.display().to_string();
 
-    let run = run_piped(&["scan", "--diff", "--json", "--baseline", &path]);
+    let args = ["scan", "--json", "--baseline", &path];
+    let run = run_piped(&args);
 
-    assert_eq!(run.code(), 1);
-    let envelope = assert_exactly_one_envelope_for(&["scan", "--diff"], &run.stdout);
-    let data = envelope.payload().data();
+    assert_eq!(run.code(), 2);
+    let envelope = assert_exactly_one_doctor_for(&args, &run);
     assert_eq!(
-        data["error"]["kind"],
+        envelope["data"]["error"]["kind"],
         serde_json::json!("baseline-unreadable")
     );
-    // A refusal is a refusal: no findings, and no diff that could be read as
-    // one.
-    assert!(data.get("findings").is_none(), "{data}");
-    assert!(data.get("diff").is_none(), "{data}");
+    // A refusal is a refusal: no findings, and no diff that could be read as one.
+    assert_eq!(envelope["findings"], serde_json::json!([]));
+    assert!(envelope["data"].get("diff").is_none(), "{envelope}");
+    assert!(envelope.get("baseline").is_none(), "{envelope}");
     assert!(
         run.stderr.contains("baseline"),
         "the sentence has to name what went wrong: {:?}",
         run.stderr
     );
+}
+
+/// A file that is not a doctor/1 envelope of a finished scan is refused on the
+/// file too, with its own `error.kind`.
+#[test]
+fn a_baseline_that_is_not_a_doctor_envelope_is_refused() {
+    let dir = std::env::temp_dir().join(format!("sim-doctor-bad-baseline-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, body) in [
+        (
+            "lpac.json",
+            r#"{"type":"scan","payload":{"code":0,"message":"ok","data":{}}}"#,
+        ),
+        (
+            "failed.json",
+            r#"{"schema":"doctor/1","findings":[],"data":{"error":{}}}"#,
+        ),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let path = path.display().to_string();
+        let args = ["scan", "--json", "--baseline", &path];
+        let run = run_piped(&args);
+        assert_eq!(run.code(), 2, "{name}");
+        let envelope = assert_exactly_one_doctor_for(&args, &run);
+        assert_eq!(
+            envelope["data"]["error"]["kind"], "baseline-malformed",
+            "{name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The same refusal in the human mode writes nothing at all to stdout.
@@ -830,12 +835,9 @@ fn a_diff_against_a_missing_baseline_refuses_on_the_file_and_says_which() {
 /// being a half-written result on stdout.
 #[test]
 fn a_refusal_without_json_writes_nothing_to_stdout() {
-    // --diff, not --baseline alone: the file is only READ when a comparison
-    // was asked for, so a bare --baseline goes on to look for a card and fails
-    // there. Both are refusals; this one is about the one that happens first.
-    let run = run_piped(&["scan", "--diff", "--baseline", "/no/such/dir/baseline.json"]);
+    let run = run_piped(&["scan", "--baseline", "/no/such/dir/baseline.json"]);
 
-    assert_eq!(run.code(), 1);
+    assert_eq!(run.code(), 2);
     assert_eq!(run.stdout, "", "{:?}", run.stdout);
     assert!(run.stderr.contains("baseline"), "{:?}", run.stderr);
 }
@@ -858,11 +860,19 @@ fn implemented_flags_are_no_longer_deferred() {
     for args in [
         &["scan", "--score", "--json"][..],
         &["scan", "--severity", "high", "--json"][..],
-        &["scan", "--severity", "info", "--score", "--json"][..],
+        &[
+            "scan",
+            "--severity",
+            "info",
+            "--score",
+            "--fail-on",
+            "low",
+            "--json",
+        ][..],
     ] {
         let run = run_piped(args);
-        let envelope = assert_exactly_one_envelope_for(args, &run.stdout);
-        let data = envelope.payload().data();
+        let envelope = assert_exactly_one_doctor_for(args, &run);
+        let data = &envelope["data"];
 
         assert!(
             data.get("implemented").is_none(),
@@ -873,36 +883,26 @@ fn implemented_flags_are_no_longer_deferred() {
             serde_json::Value::Bool(false),
             "{args:?} claimed it contacted a card"
         );
-        assert_eq!(
-            envelope.payload().code().process_code(),
-            u8::try_from(run.code()).expect("an exit code fits in a byte"),
-            "{args:?}: payload.code must stay the number the process exits with"
-        );
     }
 }
 
-/// Asserts one envelope on stdout and returns it, without pinning the code.
-///
-/// The purity half of [`assert_exactly_one_envelope`] on its own, for the
-/// tests whose point is WHICH envelope rather than that there is exactly one.
-fn assert_exactly_one_envelope_for(args: &[&str], raw: &str) -> contract::Envelope {
+/// Asserts one doctor/1 envelope on stdout (`scan --json`, docs/doctor-contract.md
+/// section 1) and returns it: one line, schema `doctor/1`, the tool's name, and
+/// an `exit_code` equal to the real process exit status.
+fn assert_exactly_one_doctor_for(args: &[&str], run: &Run) -> serde_json::Value {
+    let raw = &run.stdout;
     assert!(
-        raw.ends_with('\n'),
-        "{args:?}: stdout must end with the one newline that terminates the envelope: {raw:?}"
+        raw.ends_with('\n') && raw.matches('\n').count() == 1,
+        "{args:?}: stdout is not exactly one line: {raw:?}"
     );
+    let envelope: serde_json::Value = serde_json::from_str(raw.trim_end())
+        .unwrap_or_else(|e| panic!("{args:?}: stdout is not one JSON envelope: {e}\n{raw:?}"));
+    assert_eq!(envelope["schema"], "doctor/1", "{args:?}");
+    assert_eq!(envelope["tool"], "sim-doctor", "{args:?}");
     assert_eq!(
-        raw.matches('\n').count(),
-        1,
-        "{args:?}: stdout is not a single line, so it is not a single envelope: {raw:?}"
-    );
-
-    let body = raw.strip_suffix('\n').expect("checked above");
-    let envelope: contract::Envelope = serde_json::from_str(body)
-        .unwrap_or_else(|e| panic!("{args:?}: stdout is not one JSON envelope: {e}\n{body:?}"));
-    assert_eq!(
-        envelope.to_json().unwrap(),
-        body,
-        "{args:?}: the envelope does not re-serialise to the bytes that are on stdout"
+        envelope["exit_code"].as_i64(),
+        Some(i64::from(run.code())),
+        "{args:?}: exit_code must stay the number the process exits with"
     );
     envelope
 }
@@ -928,12 +928,12 @@ fn interrupting_a_scan_exits_130_and_emits_no_partial_tree() {
     );
     assert_eq!(run.code(), 130);
 
-    let envelope = assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
-    assert_eq!(envelope.kind(), sim_doctor::scan::KIND);
-    assert_eq!(envelope.payload().message(), contract::INTERRUPTED_MESSAGE);
+    let envelope = assert_exactly_one_doctor_for(&["scan", "--json"], &run);
+    assert_eq!(envelope["exit_code"], 130);
+    assert_eq!(envelope["findings"], serde_json::json!([]));
     assert_eq!(
-        envelope.payload().data(),
-        &contract::interrupted_data(),
+        envelope["data"],
+        contract::interrupted_data(),
         "an interrupted scan must not carry a partial tree, a count, or the \
          reader it had found"
     );
@@ -959,7 +959,7 @@ fn a_scan_wedged_in_an_exchange_still_exits_130_within_seconds() {
     );
     assert_eq!(run.status.signal(), None, "{:?}", run.status);
     assert_eq!(run.code(), 130);
-    assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
+    assert_exactly_one_doctor_for(&["scan", "--json"], &run);
 }
 
 /// Issue #59: SIGTERM is treated like SIGINT by a scan: checkpoint, exit 130.
@@ -969,7 +969,7 @@ fn sigterm_on_a_scan_exits_130_like_sigint() {
     let run = interrupt_with(&["scan", "--json"], libc::SIGTERM);
     assert_eq!(run.status.signal(), None, "{:?}", run.status);
     assert_eq!(run.code(), 130);
-    assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Interrupted);
+    assert_exactly_one_doctor_for(&["scan", "--json"], &run);
 }
 
 /// Issue #6's third acceptance criterion: generated completions build cleanly.
@@ -1014,7 +1014,8 @@ fn completions_build_for_every_shell_and_name_the_whole_flag_surface() {
         "--score",
         "--severity",
         "--baseline",
-        "--diff",
+        "--fail-on",
+        "--sarif",
     ] {
         assert!(
             zsh.stdout.contains(flag),
@@ -1092,10 +1093,11 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
     assert!(run.stdout.contains("limits_hit"), "{}", run.stdout);
     assert!(
         run.stdout
-            .contains("GATE ON data.complete, NOT ON payload.code"),
-        "the help must say which field an agent gates on: {}",
+            .contains("READ data.complete BEFORE TRUSTING A CLEAN RESULT"),
+        "the help must say which field an agent reads before trusting a clean result: {}",
         run.stdout
     );
+    assert!(run.stdout.contains("doctor/1"), "{}", run.stdout);
 
     // The candidate-set under-report, in the flag that governs it.
     assert!(
@@ -1119,12 +1121,19 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
     );
 
     // Every flag is on the surface, whatever its state.
-    for flag in ["--score", "--severity", "--baseline", "--diff"] {
+    for flag in [
+        "--score",
+        "--severity",
+        "--baseline",
+        "--fail-on",
+        "--sarif",
+    ] {
         assert!(run.stdout.contains(flag), "{flag} is missing from --help");
     }
 
-    // **None.** --score and --severity shipped in issue #14 and --baseline and
-    // --diff in issue #12, so every flag AGENTS.md section 3 requires is built.
+    // **None.** --score and --severity shipped in issue #14, --baseline in
+    // issue #12 and --fail-on with doctor/1, so every flag AGENTS.md section 3
+    // requires is built.
     // Zero is a stronger assertion than a count: a flag quietly going back to
     // refusing puts a number back here, and a NEW unimplemented flag is only
     // reachable by also adding a flag, which the loop above catches.
@@ -1139,15 +1148,15 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
     // they publish the refusals they can make, because a gate is useless
     // without knowing when it will refuse.
     for phrase in [
-        "SAVING IS NOT A GATE",
-        "EXIT 1 WHEN THE DIFF REGRESSES",
-        "THE DIFF REFUSES RATHER THAN GUESSES",
+        "UNDER A BASELINE ONLY NEW FINDINGS GATE",
+        "THE COMPARISON REFUSES RATHER THAN GUESSES",
         "A RENAMED RULE READS AS A RENAME",
-        "A HAND-EDITED OR HOSTILE BASELINE IS REFUSED",
+        "THE BASELINE IS A FULL ENVELOPE",
+        "The default is `critical`",
     ] {
         assert!(
             run.stdout.contains(phrase),
-            "the --baseline/--diff help must state {phrase:?}: {}",
+            "the --baseline/--fail-on help must state {phrase:?}: {}",
             run.stdout
         );
     }
@@ -1157,7 +1166,7 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
     for phrase in [
         "max(0, 100 - sum of one penalty per finding)",
         "info 1, low 3, medium 10, high 25, critical 50",
-        "data.findings.severity_threshold",
+        "data.findings_detail.severity_threshold",
     ] {
         assert!(
             run.stdout.contains(phrase),
@@ -1170,15 +1179,16 @@ fn scan_help_states_what_the_defaults_cannot_guarantee() {
 /// Issue #14 acceptance criterion 4: stdout purity holds across the flag
 /// matrix, asserted against the real binary.
 ///
-/// The rule is one sentence: under `--json`, stdout carries one envelope and
-/// not one byte else, and `payload.code` is the number the process exits with.
+/// The rule is one sentence: under `--json`, stdout carries one doctor/1
+/// envelope and not one byte else, and `exit_code` is the number the process
+/// exits with.
 /// The matrix is the whole of `scan`'s AGENTS.md section 3 flag surface,
 /// because purity is a property of the COMBINATION and not of any one flag -
 /// a score printed to stderr, or a severity echoed to stdout by a path that
 /// only runs when both are present, is exactly the regression a single-flag
 /// test cannot see.
 ///
-/// Every combination is expected to exit 1 with a reader that does not exist, and
+/// Every combination is expected to exit 2 with a reader that does not exist, and
 /// that is not asserted against: the code differs legitimately between a
 /// machine with a card, a deferred flag and a failed walk. What IS asserted
 /// is the same three things for all of them, which is what makes this a
@@ -1241,14 +1251,14 @@ fn json_stdout_is_one_envelope_across_the_whole_flag_matrix() {
             ],
             "everything at once",
         ),
-        (&["--json", "--baseline", "saved.json"], "a deferred flag"),
+        (&["--json", "--baseline", "saved.json"], "a baseline"),
         (
-            &["--json", "--baseline", "saved.json", "--diff"],
-            "both deferred flags",
+            &["--json", "--baseline", "saved.json", "--fail-on", "low"],
+            "a baseline and a gate",
         ),
         (
             &["--json", "--score", "--baseline", "saved.json"],
-            "an implemented flag beside a deferred one",
+            "a score beside a baseline",
         ),
     ];
 
@@ -1256,18 +1266,10 @@ fn json_stdout_is_one_envelope_across_the_whole_flag_matrix() {
         let mut args = vec!["scan"];
         args.extend_from_slice(flags);
         let run = run_piped(&args);
-        let envelope = assert_exactly_one_envelope_for(&args, &run.stdout);
-
-        assert_eq!(
-            envelope.kind(),
-            sim_doctor::scan::KIND,
-            "{what}: the envelope must identify itself as a scan"
-        );
-        assert_eq!(
-            envelope.payload().code().process_code(),
-            u8::try_from(run.code()).expect("an exit code fits in a byte"),
-            "{what}: payload.code must stay the number the process exits with"
-        );
+        // One doctor/1 envelope, whose exit_code is the process's.
+        let envelope = assert_exactly_one_doctor_for(&args, &run);
+        assert!(envelope["findings"].is_array(), "{what}: {envelope}");
+        assert!(envelope["score"].is_object(), "{what}: {envelope}");
     }
 }
 
@@ -1291,7 +1293,7 @@ fn the_human_modes_of_the_same_matrix_print_no_report_when_the_scan_cannot_run()
         args.extend_from_slice(flags);
         let run = run_piped(&args);
 
-        assert_eq!(run.code(), 1, "{args:?}");
+        assert_eq!(run.code(), 2, "{args:?}");
         assert_eq!(run.stdout, "", "{args:?} wrote a report: {:?}", run.stdout);
         assert!(
             !run.stderr.is_empty(),
@@ -1357,7 +1359,7 @@ mod rule_catalog {
     fn why_a_saved_envelope_explains_the_rules_in_its_findings() {
         let path = saved_envelope(
             "why-ok",
-            r#"{"type":"scan","payload":{"code":0,"message":"ok","data":{"findings":{"findings":[{"rule":"gsma/msl-zero-allowed","severity":"high","message":"TAR 000000 accepted"}]}}}}"#,
+            r#"{"schema":"doctor/1","tool":"sim-doctor","findings":[{"id":"gsma/msl-zero-allowed","severity":"high","message":"TAR 000000 accepted"}]}"#,
         );
         let run = run_piped(&["why", path.to_str().unwrap()]);
         let _ = std::fs::remove_file(&path);
@@ -1376,8 +1378,8 @@ mod rule_catalog {
     }
 
     fn saved_with_rule(name: &str, rule: &str) -> std::path::PathBuf {
-        let body = serde_json::json!({"type":"scan","payload":{"code":0,"message":"ok","data":{
-            "findings":{"findings":[{"rule":rule,"severity":"high","message":"m"}]}}}});
+        let body = serde_json::json!({"schema":"doctor/1","findings":[
+            {"id":rule,"severity":"high","message":"m"}]});
         saved_envelope(name, &body.to_string())
     }
 
@@ -1452,8 +1454,8 @@ mod fix_handoff {
     const RULE: &str = "gsma/msl-zero-allowed";
 
     fn saved(name: &str, rule: &str) -> std::path::PathBuf {
-        let body = serde_json::json!({"type":"scan","payload":{"code":0,"message":"ok","data":{
-            "findings":{"findings":[{"rule":rule,"severity":"high","message":"TAR 000000 accepted"}]}}}});
+        let body = serde_json::json!({"schema":"doctor/1","findings":[
+            {"id":rule,"severity":"high","message":"TAR 000000 accepted"}]});
         let path =
             std::env::temp_dir().join(format!("sim-doctor-{name}-{}.json", std::process::id()));
         std::fs::write(&path, body.to_string()).expect("write the temp file");
@@ -1731,10 +1733,9 @@ mod fix_handoff {
     #[test]
     fn a_hundred_findings_list_twenty() {
         let findings: Vec<_> = (0..100)
-            .map(|i| serde_json::json!({"rule":RULE,"severity":"low","message":format!("m{i}")}))
+            .map(|i| serde_json::json!({"id":RULE,"severity":"low","message":format!("m{i}")}))
             .collect();
-        let body = serde_json::json!({"type":"scan","payload":{"code":0,"message":"ok","data":{
-            "findings":{"findings":findings}}}});
+        let body = serde_json::json!({"schema":"doctor/1","findings":findings});
         let path =
             std::env::temp_dir().join(format!("sim-doctor-fix-100-{}.json", std::process::id()));
         std::fs::write(&path, body.to_string()).unwrap();
@@ -1795,10 +1796,19 @@ mod mcp_server {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["scan", "rules_list", "rules_explain"]);
         let props = tools[0]["inputSchema"]["properties"].as_object().unwrap();
-        for hidden in ["baseline", "diff", "sarif", "json"] {
+        for hidden in ["tui", "json", "diff"] {
             assert!(!props.contains_key(hidden), "{hidden} exposed");
         }
-        for shown in ["reader", "max-depth", "score", "severity", "dialect"] {
+        for shown in [
+            "reader",
+            "max-depth",
+            "score",
+            "severity",
+            "dialect",
+            "baseline",
+            "fail-on",
+            "sarif",
+        ] {
             assert!(props.contains_key(shown), "{shown} missing");
         }
 
@@ -1834,7 +1844,7 @@ mod mcp_server {
     }
 
     #[test]
-    fn the_real_server_refuses_file_flags_without_starting_a_scan() {
+    fn the_real_server_refuses_flags_it_does_not_expose_without_starting_a_scan() {
         let call = |args: &str| {
             format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"scan\",\"arguments\":{args}}}}}\n"
@@ -1842,7 +1852,7 @@ mod mcp_server {
         };
         let input = format!(
             "{}{}{}",
-            call(r#"{"baseline":"x.json"}"#),
+            call(r#"{"tui":true}"#),
             call(r#"{"reader":"--baseline=x"}"#),
             "\u{ff}not json\n"
         );
@@ -1853,7 +1863,7 @@ mod mcp_server {
             // A started scan would have said something about a reader or a card.
             let text = l["result"]["content"][0]["text"].as_str().unwrap();
             assert!(
-                text.contains("baseline") || text.contains("start with"),
+                text.contains("tui") || text.contains("start with"),
                 "{text}"
             );
         }
@@ -1932,7 +1942,7 @@ mod mcp_server {
 }
 
 /// `scan --tui` is on the surface, and it is a view, not a second output
-/// format: it refuses to be combined with `--json` as bad usage (129) with
+/// format: it refuses to be combined with `--json` as bad usage (2) with
 /// nothing on stdout. A real terminal run is NOT tested here.
 #[test]
 fn scan_tui_is_listed_and_conflicts_with_json() {
@@ -1941,7 +1951,7 @@ fn scan_tui_is_listed_and_conflicts_with_json() {
     assert!(help.stdout.contains("--tui"), "{:?}", help.stdout);
 
     let both = run_piped(&["scan", "--tui", "--json"]);
-    assert_eq!(both.code(), 129, "{:?}", both.stderr);
+    assert_eq!(both.code(), 2, "{:?}", both.stderr);
     assert_eq!(both.stdout, "");
 }
 
@@ -2034,7 +2044,7 @@ mod ci_install {
             run.stdout
         );
         assert!(
-            run.stderr.contains("sim-doctor scan --baseline ci/b.json"),
+            run.stderr.contains("reduce-baseline.jq > ci/b.json"),
             "{}",
             run.stderr
         );

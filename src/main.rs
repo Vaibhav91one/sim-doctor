@@ -140,10 +140,9 @@ enum Command {
     /// the choice is yours rather than this tool's. See --dialect and the note
     /// under --max-children.
     ///
-    /// Exit codes. 0 when the walk finished, 1 when it could not run (no
-    /// reader, no card, a card that would not select its master file, or a flag
-    /// whose behaviour is not built yet), 129 for a command line this tool
-    /// cannot parse, 130 if you interrupt it.
+    /// Exit codes (doctor/1): 0 no finding at or above --fail-on, 1 at least
+    /// one, 2 usage error or the scan could not run, 3 a new finding against
+    /// --baseline, 130 if you interrupt it.
     #[command(long_about = SCAN_LONG_ABOUT)]
     Scan(ScanArgs),
 
@@ -354,11 +353,18 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "    one actually used is named in both output modes.\n",
     "  * The default candidate set can MISS a file. See --max-children.\n",
     "  * A default TAR scan does NOT prove MSL != 0. See TAR AND MSL 0.\n\n",
-    "GATE ON data.complete, NOT ON payload.code\n",
-    "  payload.code is 0 whenever the walk FINISHED, including a walk that was\n",
-    "  cut short: a card that describes an unbounded tree is a card we read part\n",
-    "  of, and that is not a failed check. An agent gating a build should\n",
-    "  require payload.data.complete to be true.\n\n",
+    "OUTPUT: doctor/1\n",
+    "  --json prints the shared doctor/1 envelope (docs/doctor-contract.md):\n",
+    "  schema, tool, version, exit_code, score, findings and data. Findings are\n",
+    "  top-level (id, fingerprint, severity, category, message, location,\n",
+    "  evidence, remedy); the walk, the TAR audit and everything else this report\n",
+    "  carries are under data.\n\n",
+    "READ data.complete BEFORE TRUSTING A CLEAN RESULT\n",
+    "  The exit code is decided by findings, not by whether the walk finished: a\n",
+    "  walk cut short at a bound exits 0 when its findings are below --fail-on.\n",
+    "  An agent gating a build should also require data.complete to be true, or\n",
+    "  score.coverage_gaps to be 0 (the score label is `incomplete`, not `good`,\n",
+    "  while there is a gap).\n\n",
     "TAR AND MSL 0\n",
     "  A TAR is a three-octet value a network uses to route an SMS payload to one\n",
     "  application on a card. A card running at MSL 0 accepts ANY command under\n",
@@ -387,14 +393,16 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "  --severity <level> REMOVES findings below that level from the report.\n",
     "  Not marked, not counted, absent from the JSON entirely, so a count or a\n",
     "  grep sees only what survived. The level in force is reported as\n",
-    "  data.findings.severity_threshold. It does not filter the walk:\n",
+    "  data.findings_detail.severity_threshold. It does not filter the walk:\n",
     "  complete, truncated and limits_hit are unaffected by it.\n",
-    "  --score adds data.score, an INTEGER 0-100 computed as\n",
+    "  The top-level score is an INTEGER 0-100 (model sim/1), always present;\n",
+    "  --score adds it to the human report. It is computed as\n",
     "    max(0, 100 - sum of one penalty per finding)\n",
     "  with a penalty of info 1, low 3, medium 10, high 25, critical 50. The\n",
     "  block carries the formula, that penalty table, the penalty total and\n",
     "  the number of findings scored, so the number can be recomputed from\n",
-    "  the report. It scores the findings this report carries, so --severity\n",
+    "  the report (data.score_detail). It scores the findings this report\n",
+    "  carries, so --severity\n",
     "  and --score compose rather than contradict each other.\n",
     "  A rules_run OF 0 means no rule was evaluated, and the block then carries\n",
     "  a warning beside the 100 saying so in words. A rules_run above 0 with a\n",
@@ -402,12 +410,12 @@ const SCAN_LONG_ABOUT: &str = concat!(
     "  The two are different numbers wearing the same digits, and warning is\n",
     "  what tells them apart.\n\n",
     "EXIT CODES\n",
-    "  0  the walk finished. A FINDING DOES NOT CHANGE THIS, deliberately: exit\n",
-    "     1 already means a check could not run, and the document reporting that\n",
-    "     carries data.error and no data.findings, so one code would carry two\n",
-    "     document schemas. Gate on data.complete and data.score instead.\n",
-    "  1  the walk could not run, or a requested flag is not implemented yet\n",
-    "  129  the command line could not be parsed\n",
+    "  0  ran; no finding at or above --fail-on (default critical)\n",
+    "  1  ran; at least one finding at or above --fail-on\n",
+    "  2  usage error, bad input (including an unusable --baseline), or the\n",
+    "     scan could not run (no reader, no card, a failed walk)\n",
+    "  3  --baseline given; at least one NEW finding at or above --fail-on.\n",
+    "     Under --baseline only new findings count: 3 or 0, never 1\n",
     "  130  interrupted\n",
 );
 /// Everything `sim-doctor ts48` takes.
@@ -568,7 +576,9 @@ struct ScanArgs {
     ///
     /// It scores what this report carries, so --severity and --score compose:
     /// `--severity high --score` scores the high and critical findings and
-    /// nothing else, and `data.score.scored_findings` says how many that was.
+    /// nothing else, and `data.score_detail.scored_findings` says how many that was.
+    /// The top-level `score` of the JSON envelope is always present; this flag
+    /// only adds the score to the human report.
     ///
     /// WHILE NO RULE IS IMPLEMENTED the score is 100 with `rules_run` 0 and a
     /// warning beside it. A 100 that means "nothing was checked" is not a
@@ -580,17 +590,17 @@ struct ScanArgs {
     /// Drop findings below this severity.
     ///
     /// Implemented. Accepted and validated as one of info, low, medium, high,
-    /// critical, so a typo is still exit 129 rather than being silently
-    /// ignored.
+    /// critical, so a typo is still a usage error (exit 2) rather than being
+    /// silently ignored.
     ///
     /// A finding below the level is REMOVED, not marked: it is absent from
-    /// `data.findings.findings`, absent from `data.findings.count`, and its
+    /// the top-level `findings`, absent from `data.findings_detail.count`, and its
     /// rule ID appears nowhere in the document. An agent counting findings
     /// therefore gets the count that survived the filter, and an agent
     /// grepping for a dropped rule finds nothing rather than an empty shell
     /// carrying the ID.
     ///
-    /// The level in force is reported as `data.findings.severity_threshold`,
+    /// The level in force is reported as `data.findings_detail.severity_threshold`,
     /// because a short list is otherwise indistinguishable from a quiet card.
     ///
     /// It does not filter the WALK. `complete`, `truncated`, `truncated_by`
@@ -599,88 +609,63 @@ struct ScanArgs {
     #[arg(long, value_name = "LEVEL")]
     severity: Option<rules::Severity>,
 
-    /// Save this run to <file>, so a later scan can be compared against it.
+    /// Compare this run against a previous `scan --json` envelope (doctor/1).
     ///
-    /// Implemented (issue #12). The file holds the findings the report carries,
-    /// after --severity because that is the set this run actually said, plus a
-    /// record of what the run DID: whether the walk finished and which bounds
-    /// fired, the FCP dialect and the identifier set it used, the --severity
-    /// level, the whole --tar selection, and every rule that ran together with
-    /// whether that rule had anything to look at.
+    /// The file is a saved envelope: `sim-doctor scan --json > baseline.json`.
+    /// Findings are matched by `fingerprint` only. Every finding in the report
+    /// gets a `baseline_state` (`new` or `unchanged`), the envelope gets a
+    /// top-level `baseline` block with `new`, `unchanged` and `fixed` counts,
+    /// and `data.diff` carries the lists.
     ///
-    /// It does NOT hold the ATR, the file tree or any key material. A baseline
-    /// is a local artifact that lands in a CI workspace, and the narrower it is
-    /// the less of the card it carries around.
+    /// UNDER A BASELINE ONLY NEW FINDINGS GATE. The exit code is 3 when at least
+    /// one new finding is at or above --fail-on, else 0; the findings the
+    /// baseline already had never fail the run.
     ///
-    /// SAVING IS NOT A GATE: --baseline on its own exits 0 whatever it found,
-    /// because a baseline has to be takeable from a dirty card - that is the
-    /// whole point of having taken one. Add --diff to make the run a gate.
+    /// THE COMPARISON REFUSES RATHER THAN GUESSES (exit 2, `data.error`, no
+    /// findings). A baseline written by a truncated scan, by a scan that ran
+    /// fewer rules, at a different --severity, --dialect or --tar, or by a scan
+    /// in which a rule had no evidence, cannot be honestly compared with this
+    /// run. `--tar off` is the default, so the usual baseline never checked
+    /// MSL 0 and the first `--tar focused` scan cannot be read as a regression
+    /// against it. A file that is not a doctor/1 envelope of a finished scan is
+    /// refused too, as is a hand-edited or hostile one (strings and arrays are
+    /// bounded before parsing).
     ///
-    /// A baseline that cannot be written is a REFUSAL, not a warning: exit 1,
-    /// `data.error`, and no `data.findings`. A save that failed must not be
-    /// reported as a scan result, or an agent reads a document that says the
-    /// card is clean and nothing about the file that is missing.
+    /// A RENAMED RULE READS AS A RENAME. An ID in exactly one of the two runs is
+    /// listed under `data.diff.rules` with a warning; the gate does not count
+    /// it, though its findings carry `baseline_state: new`.
     ///
-    /// The write goes through a temporary file and a rename, so a machine that
-    /// dies mid-write cannot leave a half-written baseline that the next --diff
-    /// reads as though somebody chose it.
+    /// THE BASELINE IS A FULL ENVELOPE. It carries the ATR and the decoded EF
+    /// contents (`data.ef_contents`, key files included) that the report
+    /// carries. Treat it as sensitive; do not commit one taken from a card with
+    /// real keys.
     #[arg(long, value_name = "FILE")]
     baseline: Option<std::path::PathBuf>,
+
+    /// Exit 1 (3 under --baseline) when a finding is at or above this severity.
+    ///
+    /// One of info, low, medium, high, critical. The default is `critical`:
+    /// before doctor/1 a scan with findings exited 0, so the default fails only
+    /// on the worst finding rather than on every report. Use `--fail-on info`
+    /// to fail on any finding, `--fail-on high` for a stricter CI gate. This is
+    /// the gate only; --severity is what REMOVES findings from the report.
+    #[arg(long, value_name = "LEVEL", default_value = "critical")]
+    fail_on: rules::Severity,
 
     /// Also write the findings to FILE as SARIF 2.1.0.
     ///
     /// A card has no files on disk, so each result carries a logical location
     /// (the card path) and never a physical one. Partial coverage is stated in
     /// the run's properties. Written after the normal output, so a failure to
-    /// write it (exit 1, a message on stderr) never costs you the report. The
+    /// write it (exit 2, a message on stderr) never costs you the report. Each
+    /// result carries `partialFingerprints["doctorFinding/v1"]`, the same value
+    /// as the finding's JSON `fingerprint`, and the run carries `properties.score`. The
     /// file is written only after a completed scan: a refused or interrupted
     /// scan leaves any existing file untouched. It must not be the --baseline path.
     /// stdout is unchanged. Whether GitHub code scanning accepts the file is
     /// not verified.
     #[arg(long, value_name = "FILE")]
     sarif: Option<std::path::PathBuf>,
-
-    /// Compare this run against --baseline and report what changed.
-    ///
-    /// Implemented (issue #12). Adds `data.diff` to the report, carrying the
-    /// findings this run has that the baseline did not (new), the ones the
-    /// baseline had and this run does not (fixed), the ones both have
-    /// (persisting), and any rule ID only one of the two runs knows. Findings
-    /// are matched on rule ID plus location, because a rule may fire once per
-    /// TAR or once per file and the ID alone is not a finding.
-    ///
-    /// EXIT 1 WHEN THE DIFF REGRESSES, and 0 otherwise. That is a decision and
-    /// not an accident - see FINDINGS, BASELINES AND WHAT EXIT 1 MEANS in the
-    /// long help. A fix never fails a build, and a clean diff never does either.
-    /// The threshold is --severity, which already filtered the list the diff
-    /// compares: `--severity high --diff` fails on any new high or critical
-    /// finding and ignores the rest.
-    ///
-    /// THE DIFF REFUSES RATHER THAN GUESSES. A baseline written by a truncated
-    /// scan, by a scan that ran fewer rules, at a different --severity, --dialect
-    /// or --tar, or by a scan in which a rule had no evidence, cannot be
-    /// honestly compared with this one, and the two lists it would produce are
-    /// both wrong. Those are refusals: exit 1, `data.error`, no `data.findings`
-    /// and no `data.diff`. `--tar off` is the default, so the usual baseline
-    /// never checked MSL 0 and the first `--tar focused` scan cannot be read as
-    /// a regression against it.
-    ///
-    /// A RENAMED RULE READS AS A RENAME. An ID in exactly one of the two runs
-    /// is counted as neither new nor fixed; it appears under `data.diff.rules`
-    /// with its findings attached and a warning saying so. Reporting it as a fix
-    /// plus a new finding would be the failure AGENTS.md section 3 forbids when
-    /// it says a rule ID must never be renamed casually.
-    ///
-    /// A HAND-EDITED OR HOSTILE BASELINE IS REFUSED, not believed. Every string
-    /// in the file is bounded before it is parsed, the whole file is size-capped
-    /// while it is read, and every rule ID re-validates on the way in, so a
-    /// file cannot produce unbounded output or name a rule no registry could
-    /// have produced.
-    ///
-    /// Requires --baseline, so --diff on its own is exit 129 rather than a
-    /// silent no-op.
-    #[arg(long, requires = "baseline")]
-    diff: bool,
 
     /// Which TARs to probe for MSL 0, and how many.
     ///
@@ -708,7 +693,7 @@ struct ScanArgs {
     /// Send a TERMINAL PROFILE to the card before the TAR audit.
     ///
     /// Only meaningful with --tar other than `off`; without it the command
-    /// line is refused (exit 129).
+    /// line is refused (exit 2).
     ///
     /// WHAT IS SENT: `80 10 00 00 01 13` (TS 102 221 clause 11.2.1), a
     /// one-octet profile with three bits set, all in byte 1 (TS 102 223 /
@@ -728,72 +713,6 @@ struct ScanArgs {
     #[arg(long)]
     terminal_profile: bool,
 }
-
-/// Whether a scan that produced findings exits 1.
-///
-/// **No. It does not, and after issue #24 that is a decision rather than an
-/// accident: a rule now runs, and the reason it deferred is gone.**
-///
-/// AGENTS.md section 3 lists exit 1 as "findings present (or checks failed)"
-/// and issue #13 left this half-taken with three reasons. They are not all
-/// still standing, and saying so is the point:
-///
-/// 1. ~~**No rule runs yet.**~~ **WITHDRAWN by issue #24.** The vocabulary
-///    arrived with #13 and the first rule arrived with #24, so a scan can
-///    produce a finding and this question is observable for the first time.
-/// 2. **`payload.code` already means something else.** Still true and still
-///    independent of the first: it is 0 whenever the walk *finished*, including
-///    a walk that was cut short, and `scan --help` has said `GATE ON
-///    data.complete, NOT ON payload.code` since issue #6.
-/// 3. **The two meanings have two different documents.** Exit 1 is reachable
-///    from seven conditions today, and every one of them emits a *refusal*
-///    document: `data.error` and `data.card_touched`, and **no `data.findings`
-///    key at all**. A scan that found something emits the opposite shape.
-///
-/// # What issue #12 changed, and what it did not
-///
-/// **The revisit condition AGENTS.md section 3 set for this decision has been
-/// met, and the answer is: yes for a diff, no for a plain scan.** Those are
-/// different decisions and the difference is the whole argument, so it is
-/// written out rather than left as a constant somebody flips.
-///
-/// **A regressed `--diff` exits 1.** The section said the moment to revisit is
-/// "when a gate has a *threshold* to fail against rather than a bare 'something
-/// is wrong'", and that is exactly what `--diff` plus `--severity` is: a
-/// number the operator chose, evaluated against a baseline this tool has
-/// already checked the two runs are entitled to be compared on.
-///
-/// **Is that a seventh meaning smeared across the exit code? No, and here is
-/// the test that says so.** Reason 3's objection was never that code 1 is
-/// shared: AGENTS.md says in so many words that it is, deliberately, because a
-/// gate cares whether the card passed and not why it did not. The objection was
-/// that sharing it would give one code two *mutually exclusive document
-/// schemas*, so an agent branching on the status would have to read the body to
-/// pick one. A regressed diff is not a second schema, and the three documents
-/// are mutually exclusive:
-///
-/// - a **refusal** carries `data.error` and no `data.diff`,
-/// - a **regressed diff** carries `data.diff` and no `data.error`,
-/// - a **clean scan** carries neither and exits 0.
-///
-/// So `data.error` stays the refusal marker, which is the field AGENTS.md
-/// tells an agent to read, and code 1 keeps meaning "the thing you asked for
-/// was not delivered", which is what it already meant for a check that failed.
-/// A diff that reports a regression did not deliver what was asked for. The
-/// honest cost, stated rather than hidden: an agent that reads
-/// `data.error.message` on code 1 without checking the key first now has to
-/// check. That is one extra key read against a contract that was going to need
-/// one the moment a gate existed at all.
-///
-/// **A plain scan with findings still exits 0, and reasons 2 and 3 still hold
-/// for it.** Nothing here gives code 1 a meaning to an operator who did not ask
-/// for a comparison, and `--score` remains the per-field threshold the section
-/// points a CI gate at. Flipping this constant is still a contract change and
-/// still not a one-line edit: the table above, the `GATE ON data.complete`
-/// sentence in `scan --help`, and `scans_a_real_card_end_to_end` in
-/// `tests/card_fixture.rs` all have to move in the same commit. Full reasoning
-/// in CONTEXT.md section 3.
-const FINDINGS_FAIL_A_SCAN: bool = false;
 
 /// Everything `sim-doctor rules` takes.
 #[derive(Args)]
@@ -1133,13 +1052,24 @@ fn report_interrupted(kind: &str, json: bool) -> contract::ExitCode {
         return contract::ExitCode::Interrupted;
     }
     if json {
-        let envelope = contract::Envelope::new(
-            kind,
-            contract::ExitCode::Interrupted,
-            contract::INTERRUPTED_MESSAGE,
-            contract::interrupted_data(),
-        );
-        match envelope.to_json() {
+        // `scan` speaks doctor/1; every other command keeps the lpa envelope.
+        let line = if kind == scan::KIND {
+            serde_json::to_string(&contract::doctor_failure(
+                contract::ExitCode::Interrupted,
+                contract::interrupted_data(),
+            ))
+            .map_err(|err| err.to_string())
+        } else {
+            contract::Envelope::new(
+                kind,
+                contract::ExitCode::Interrupted,
+                contract::INTERRUPTED_MESSAGE,
+                contract::interrupted_data(),
+            )
+            .to_json()
+            .map_err(|err| err.to_string())
+        };
+        match line {
             Ok(line) => {
                 // A failure here does not change the exit code. The operator
                 // asked to stop and stopping is what happened; reporting 130
@@ -1305,7 +1235,7 @@ fn run_ci(args: CiArgs) -> contract::ExitCode {
         Ok(ci::InstallOutcome::Wrote(path)) => {
             println!("wrote {}", path.display());
             eprintln!(
-                "next: commit a baseline first (`sim-doctor scan --baseline {}`), because require-baseline fails the first run without one.",
+                "next: commit a baseline first (`sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > {}`), because require-baseline fails the first run without one.",
                 options.baseline
             );
             eprintln!("next: the pinned ref {ref_} only exists once that release is tagged.");
@@ -1374,14 +1304,16 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 /// There is no third checkpoint, and that is deliberate: a run that has already
 /// written its envelope has finished. Retroactively converting a complete,
 /// correct answer into "interrupted" would need a second envelope on stdout or
-/// would break the promise that `payload.code` is the value the process exits
+/// would break the promise that `exit_code` is the value the process exits
 /// with. See [`report_interrupted`] and CONTEXT.md section 3.
 ///
-/// **A `--diff` run reads its baseline before it opens a reader**, so a file
+/// **A `--baseline` run reads its baseline before it opens a reader**, so a file
 /// this build cannot read is refused in milliseconds rather than after a walk
 /// it was never going to need. See the comment at the top of the body.
 ///
-/// `--score`, `--severity`, `--baseline` and `--diff` are all implemented. There
+/// The JSON is the doctor/1 envelope, and its `exit_code` is decided here (see
+/// [`scan::Verdict::exit_code`]) before it is rendered. `--score`, `--severity`,
+/// `--baseline` and `--fail-on` are all implemented. There
 /// is no flag left on the surface whose behaviour is deferred, and the
 /// refusal that used to stand in for them is now reached only by real failures
 /// - no card, an unreadable baseline, an incomparable pair.
@@ -1390,31 +1322,31 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // A flag's own shape is refused before a reader is opened, as clap would.
     if args.terminal_profile && matches!(args.tar.mode, tar::Mode::Off) {
         eprintln!("sim-doctor: --terminal-profile is only meaningful with --tar other than off");
-        return contract::ExitCode::InvalidUsage;
+        return contract::ExitCode::Error;
     }
     // Read the baseline before a reader is opened, and refuse before one is.
-    // A --baseline naming a file that is not there, is not JSON, or was written
-    // by another format version has an answer before a card exists, and an
-    // agent scripting against this tool deserves it in milliseconds rather
-    // than after a walk it was never going to need. The rules that depend on
-    // BOTH runs necessarily wait, because they cannot be known until there is
-    // something to compare against.
-    //
-    // Only under --diff. With --baseline alone the path is OVERWRITTEN, and
-    // reading it first would be work for nothing.
-    let saved = match (&args.baseline, args.diff) {
-        (Some(path), true) => match baseline::Baseline::load(path) {
+    // A --baseline naming a file that is not there, is not a doctor/1 envelope,
+    // or is over a bound has an answer before a card exists, and an agent
+    // scripting against this tool deserves it in milliseconds rather than after
+    // a walk it was never going to need. The rules that depend on BOTH runs
+    // necessarily wait, because they cannot be known until there is something to
+    // compare against.
+    let saved = match &args.baseline {
+        Some(path) => match baseline::Baseline::load(path) {
             Ok(saved) => Some(saved),
             Err(err) => {
-                return report_failure(&scan::Failure::new(err.kind(), err.to_string()), args.json)
+                return report_scan_failure(
+                    &scan::Failure::new(err.kind(), err.to_string()),
+                    args.json,
+                )
             }
         },
-        _ => None,
+        None => None,
     };
 
     if let (Some(a), Some(b)) = (&args.sarif, &args.baseline) {
         if a == b {
-            return report_failure(
+            return report_scan_failure(
                 &scan::Failure::new(
                     "sarif-baseline-same-path",
                     format!(
@@ -1434,7 +1366,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     let readers = match Pcsc::readers() {
         Ok(readers) => readers,
         Err(err) => {
-            return report_failure(
+            return report_scan_failure(
                 &scan::Failure::new("context-unavailable", err.to_string()),
                 args.json,
             )
@@ -1443,7 +1375,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
 
     let reader = match pick_reader(&readers, args.reader.as_deref()) {
         Ok(reader) => reader,
-        Err(failure) => return report_failure(&failure, args.json),
+        Err(failure) => return report_scan_failure(&failure, args.json),
     };
 
     let session = match PcscSession::open(reader) {
@@ -1453,7 +1385,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
                 TransportError::NoCard { .. } => "no-card",
                 _ => "reader-unavailable",
             };
-            return report_failure(&scan::Failure::new(kind, err.to_string()), args.json);
+            return report_scan_failure(&scan::Failure::new(kind, err.to_string()), args.json);
         }
     };
 
@@ -1470,7 +1402,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         Some(path) => match record_log_file(&path) {
             Ok(file) => Box::new(replay::Record::new(session, file)),
             Err(err) => {
-                return report_failure(
+                return report_scan_failure(
                     &scan::Failure::new(
                         "record-log-unwritable",
                         format!("SIM_DOCTOR_RECORD {}: {err}", path.to_string_lossy()),
@@ -1497,7 +1429,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     let mut tree = match walk::walk(&mut *session, &args.dialect.tag_set(), &options) {
         Ok(tree) => tree,
         Err(err) => {
-            return report_failure(
+            return report_scan_failure(
                 &scan::Failure::new("walk-failed", err.to_string()),
                 args.json,
             )
@@ -1507,7 +1439,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // EF.ARR, read-only (SELECT and READ RECORD), so that the access rules the
     // FCPs only reference can be decoded by the rules.
     if let Err(err) = access::resolve(&mut *session, &mut tree, &session::Policy::default()) {
-        return report_failure(
+        return report_scan_failure(
             &scan::Failure::new("access-rules-failed", err.to_string()),
             args.json,
         );
@@ -1516,7 +1448,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // The security-relevant EFs' contents, read-only (SELECT, READ BINARY, READ
     // RECORD), decoded later and shown in full (key files included).
     if let Err(err) = ef::read(&mut *session, &mut tree, &session::Policy::default()) {
-        return report_failure(
+        return report_scan_failure(
             &scan::Failure::new("ef-read-failed", err.to_string()),
             args.json,
         );
@@ -1545,7 +1477,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     ) {
         Ok(audit) => audit,
         Err(err) => {
-            return report_failure(
+            return report_scan_failure(
                 &scan::Failure::new("tar-audit-failed", err.to_string()),
                 args.json,
             )
@@ -1569,7 +1501,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     }) {
         Ok(found) => found,
         Err(err) => {
-            return report_failure(
+            return report_scan_failure(
                 &scan::Failure::new("rule-misattribution", err.to_string()),
                 args.json,
             )
@@ -1597,28 +1529,14 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     // did not happen.
     let facts = scan::run_facts(&tree, &context, &verdict);
 
-    // Saved before diffed. Writing a baseline is NOT a gate - a baseline has
-    // to be takeable from a dirty card, which is the whole point of having
-    // taken one - so a failed save is reported as what it is, a refusal, and
-    // never as a scan result. An agent must not read a clean document and
-    // never learn the file is missing.
-    if let Some(path) = &args.baseline {
-        let to_save = baseline::Baseline::new(facts.clone(), verdict.findings().as_slice());
-        if let Err(err) = to_save.save(path) {
-            return report_failure(&scan::Failure::new(err.kind(), err.to_string()), args.json);
-        }
-        eprintln!("sim-doctor: wrote a baseline to {}", path.display());
-    }
-
     // Compared last, and REFUSED rather than reported when the two runs cannot
     // honestly be compared. Every refusal here is the same shape as "no
-    // reader": data.error, exit 1, no data.findings and no data.diff.
+    // reader": data.error, exit 2, no findings and no data.diff.
     if let Some(saved) = saved {
         match baseline::Diff::compare(&saved, &facts, verdict.findings().as_slice()) {
             Ok(diff) => {
                 eprintln!(
-                    "sim-doctor: compared against the baseline taken {}: {} new, {} fixed, {} persisting",
-                    saved.created(),
+                    "sim-doctor: compared against the baseline: {} new, {} fixed, {} persisting",
                     diff.new_findings().len(),
                     diff.fixed().len(),
                     diff.persisting().len(),
@@ -1629,7 +1547,7 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
                 verdict = verdict.compared_against(diff);
             }
             Err(incomparable) => {
-                return report_failure(
+                return report_scan_failure(
                     &scan::Failure::new(incomparable.kind(), incomparable.explain(&saved, &facts)),
                     args.json,
                 );
@@ -1637,28 +1555,40 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         }
     }
 
+    // SARIF first, because the envelope carries the exit code and a failed
+    // SARIF write is a run error (exit 2). The report is still printed below:
+    // a SARIF failure never costs the caller the report.
+    let mut exit_code = verdict.exit_code(args.fail_on);
+    if let Some(path) = &args.sarif {
+        let score = scan::doctor_score(&tree, &context, &verdict, &facts);
+        let doc = sarif::to_sarif(verdict.findings().as_slice(), &scan::specs(), &score);
+        if let Err(error) = sarif::write(path, &doc) {
+            // stderr only: stdout stays one envelope.
+            eprintln!(
+                "sim-doctor: sarif-unwritable: could not write SARIF to {}: {error}",
+                path.display()
+            );
+            exit_code = contract::ExitCode::Error;
+        }
+    }
+
     // Assembled, then written once, so a failure halfway through cannot put
     // half an envelope on stdout. See emit_stdout.
     let mut shown_in_tui = false;
     let rendered = if args.json {
-        let envelope = contract::Envelope::new(
-            scan::KIND,
-            contract::ExitCode::Success,
-            contract::OK_MESSAGE,
-            scan::to_json(&tree, &context, &verdict),
-        );
-        match envelope.to_json() {
+        let document = scan::doctor_json(&tree, &context, &verdict, &facts, exit_code);
+        match serde_json::to_string(&document) {
             Ok(line) => line,
             Err(err) => {
                 eprintln!("sim-doctor: {err}");
-                return contract::ExitCode::Findings;
+                return contract::ExitCode::Error;
             }
         }
     } else if args.tui && io::stdin().is_terminal() && io::stdout().is_terminal() {
         // The view is the output: nothing goes to stdout but the terminal UI.
         let data = scan::to_json(&tree, &context, &verdict);
-        // A failed view must not skip the SARIF file or the stderr warnings
-        // below, and must not change the exit status: say so and carry on.
+        // A failed view must not skip the stderr warnings below, and must not
+        // change the exit status: say so and carry on.
         if let Err(err) = sim_doctor::tui::run(&data) {
             eprintln!("sim-doctor: tui: {err}");
         }
@@ -1714,41 +1644,11 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         emit_stdout(rendered.trim_end_matches('\n'), what)
     };
 
-    // After the report, so a SARIF failure never costs the caller the report.
-    // Nothing about the file goes to stdout: that stays one envelope.
-    if let Some(path) = &args.sarif {
-        let doc = sarif::to_sarif(verdict.findings().as_slice(), &scan::specs());
-        if let Err(error) = sarif::write(path, &doc) {
-            // stderr only: the scan envelope is already on stdout, and a
-            // second one would make stdout two documents.
-            eprintln!(
-                "sim-doctor: sarif-unwritable: could not write SARIF to {}: {error}",
-                path.display()
-            );
-            return contract::ExitCode::Findings;
-        }
-    }
-
     match emitted {
-        // FINDINGS_FAIL_A_SCAN is still false and still deliberately so: a
-        // plain scan that produced findings exits 0, and the reasons are on the
-        // constant. See it for why a diff did not change that answer.
-        //
-        // A REGRESSED DIFF exits 1. That is the one new meaning code 1 gained
-        // in issue #12, and it is distinguishable from every other one without
-        // reading the body: a refusal carries data.error and no data.diff, and a
-        // regressed diff carries data.diff and no data.error. An agent that has
-        // been branching on `code == 1 and data.error` since issue #6 keeps
-        // working, and one that branches on the status alone still fails the
-        // build, which is the correct answer either way.
-        Ok(()) if verdict.regressed() => contract::ExitCode::Findings,
-        Ok(()) if FINDINGS_FAIL_A_SCAN && verdict.findings().reaches(rules::Severity::MIN) => {
-            contract::ExitCode::Findings
-        }
-        Ok(()) => contract::ExitCode::Success,
+        Ok(()) => exit_code,
         Err(message) => {
             eprintln!("sim-doctor: {message}");
-            contract::ExitCode::Findings
+            contract::ExitCode::Error
         }
     }
 }
@@ -2345,17 +2245,10 @@ const RULES_KIND: &str = "rules";
 /// The largest saved envelope `why` will read: 16 MiB.
 const MAX_WHY_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Escapes control characters so untrusted file text cannot drive the terminal.
+/// Strips control and invisible characters so untrusted file text cannot drive
+/// the terminal: the shared [`contract::sanitize`].
 fn printable(text: &str) -> String {
-    text.chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
+    contract::sanitize(text)
 }
 
 /// One rule's page, as JSON.
@@ -2499,7 +2392,7 @@ fn run_why_rule(id: &str, json: bool) -> contract::ExitCode {
 
 /// Reads a saved `scan --json` envelope: a file, within the size limit, UTF-8, an envelope.
 /// Shared by `why` and `fix`; the error is the refusal sentence.
-fn read_saved_envelope(target: &str) -> Result<contract::Envelope, String> {
+fn read_saved_envelope(target: &str) -> Result<serde_json::Value, String> {
     let path = std::path::Path::new(target);
     let meta = std::fs::metadata(path).map_err(|err| format!("cannot read {target}: {err}"))?;
     if !meta.is_file() {
@@ -2513,8 +2406,14 @@ fn read_saved_envelope(target: &str) -> Result<contract::Envelope, String> {
     }
     let raw =
         std::fs::read_to_string(path).map_err(|err| format!("cannot read {target}: {err}"))?;
-    serde_json::from_str(&raw)
-        .map_err(|err| format!("{target} is not a saved sim-doctor envelope: {err}"))
+    let envelope: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("{target} is not a saved sim-doctor envelope: {err}"))?;
+    if envelope["schema"] != contract::DOCTOR_SCHEMA {
+        return Err(format!(
+            "{target} is not a doctor/1 envelope; was it saved from `scan --json`?"
+        ));
+    }
+    Ok(envelope)
 }
 
 /// Explains a rule id, or every rule in a saved scan envelope.
@@ -2536,16 +2435,16 @@ fn run_why(target: &str, json: bool) -> contract::ExitCode {
         Ok(envelope) => envelope,
         Err(message) => return refuse(message),
     };
-    let Some(findings) = envelope.payload().data()["findings"]["findings"].as_array() else {
+    let Some(findings) = envelope["findings"].as_array() else {
         return refuse(format!(
-            "{target} carries no data.findings.findings; was it saved from `scan --json`?"
+            "{target} carries no findings array; was it saved from `scan --json`?"
         ));
     };
 
     // (rule id, severity, count), in first-seen order.
     let mut seen: Vec<(String, String, usize)> = Vec::new();
     for finding in findings {
-        let rule = finding["rule"].as_str().unwrap_or("(unnamed)");
+        let rule = finding["id"].as_str().unwrap_or("(unnamed)");
         match seen.iter_mut().find(|(id, _, _)| id == rule) {
             Some(entry) => entry.2 += 1,
             None => seen.push((
@@ -2600,15 +2499,15 @@ fn run_fix(args: &FixArgs) -> contract::ExitCode {
         Ok(envelope) => envelope,
         Err(message) => return refuse(message),
     };
-    let Some(all) = envelope.payload().data()["findings"]["findings"].as_array() else {
+    let Some(all) = envelope["findings"].as_array() else {
         return refuse(format!(
-            "{} carries no data.findings.findings; was it saved from `scan --json`?",
+            "{} carries no findings array; was it saved from `scan --json`?",
             args.from
         ));
     };
     let findings: Vec<(String, String)> = all
         .iter()
-        .filter(|f| f["rule"].as_str() == Some(spec.id().as_str()))
+        .filter(|f| f["id"].as_str() == Some(spec.id().as_str()))
         // Cap before collecting: a 16 MiB file of matches must not allocate per finding.
         .take(fix::MAX_FINDINGS)
         .map(|f| {
@@ -2695,7 +2594,9 @@ fn run_fix(args: &FixArgs) -> contract::ExitCode {
     }
 }
 
-/// Reports a scan that could not run, and returns exit code 1.
+/// Reports a refusal of a lpa-style command that shares `scan`'s failure shape
+/// (the fuzz commands), and returns exit code 1. `scan` itself uses
+/// [`report_scan_failure`] and exits 2.
 ///
 /// The same shape as every other refusal: AGENTS.md
 /// section 3 shares code 1 between "findings present" and "a check failed", and
@@ -2722,8 +2623,10 @@ fn report_refusal(
     eprintln!("sim-doctor: {message}");
 
     if json {
-        let envelope = contract::Envelope::new(kind, contract::ExitCode::Findings, message, data);
-        match envelope.to_json() {
+        let line = contract::Envelope::new(kind, contract::ExitCode::Findings, message, data)
+            .to_json()
+            .map_err(|e| e.to_string());
+        match line {
             Ok(line) => {
                 // A write failure does not change the exit code, for the same
                 // reason it does not in report_interrupted: the run genuinely
@@ -2740,6 +2643,26 @@ fn report_refusal(
     contract::ExitCode::Findings
 }
 
+/// Reports a `scan` that could not run: a doctor/1 envelope with no findings and
+/// the reason in `data`, exit 2. (Other commands keep the lpa refusal and exit 1.)
+fn report_scan_failure(failure: &scan::Failure, json: bool) -> contract::ExitCode {
+    eprintln!("sim-doctor: {}", failure.message);
+    if json {
+        let envelope = contract::doctor_failure(contract::ExitCode::Error, failure.data());
+        // A write failure does not change the exit code: the run genuinely
+        // failed, and "could not report the failure" is not a different answer.
+        match serde_json::to_string(&envelope) {
+            Ok(line) => {
+                if let Err(err) = emit_stdout(&line, "the failure envelope") {
+                    eprintln!("sim-doctor: {err}");
+                }
+            }
+            Err(err) => eprintln!("sim-doctor: {err}"),
+        }
+    }
+    contract::ExitCode::Error
+}
+
 /// Turns a clap failure into one of the four contract exit codes.
 ///
 /// clap exits with 2 by default. That number is not in AGENTS.md section 3,
@@ -2750,6 +2673,15 @@ fn exit_with_clap_error(err: clap::Error) -> process::ExitCode {
         ErrorKind::DisplayHelp
         | ErrorKind::DisplayVersion
         | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => contract::ExitCode::Success,
+        // `scan` is a doctor/1 findings command: a usage error is 2 there.
+        _ if std::env::args()
+            .skip(1)
+            .find(|a| !a.starts_with('-'))
+            .as_deref()
+            == Some("scan") =>
+        {
+            contract::ExitCode::Error
+        }
         _ => contract::ExitCode::InvalidUsage,
     };
     // clap already routes help to stdout and errors to stderr; do not print
@@ -2766,75 +2698,23 @@ fn exit(code: contract::ExitCode) -> process::ExitCode {
 mod tests {
     use super::*;
 
-    /// The decision `run_scan`'s success arm is built on, pinned.
-    ///
-    /// Still false after issue #12, and that is the point of the test: the
-    /// issue gave `--diff` a threshold to fail against and attached exit 1 to
-    /// *that*, without giving exit 1 a meaning to a plain scan. The card
-    /// fixture's `scans_a_real_card_end_to_end` asserts exit 0 against a live
-    /// card and would go red on the day this flips, which is the intended
-    /// signal and not a surprise.
+    /// `--fail-on` defaults to `critical`: the choice that keeps a scan with
+    /// only lower findings at exit 0, as it was before doctor/1. Documented in
+    /// `scan --help`, the README and AGENTS.md section 3.
     #[test]
-    fn a_plain_scan_with_findings_still_exits_0() {
-        // Bound to a local first, on purpose. clippy is right that the
-        // condition is a constant: that is the whole point of this test, and
-        // the failure it produces is the message below rather than a line
-        // number. A `const { assert! }` block would say the same thing at
-        // compile time, but it would also stop the binary building at all, and
-        // a contract decision is not worth taking the tool away over.
-        let findings_fail_a_scan: bool = FINDINGS_FAIL_A_SCAN;
-        assert!(
-            !findings_fail_a_scan,
-            concat!(
-                "a plain scan that produced findings now exits 1. That IS a contract ",
-                "change, and issue #12 decided NOT to make it: AGENTS.md section 3 ",
-                "allows it but reasons 2 and 3 still hold for an operator who did not ",
-                "ask for a comparison. If this is the day, the scan --help sentence ",
-                "GATE ON data.complete must be reworded, the exit-code table updated, ",
-                "and tests/card_fixture.rs moved deliberately rather than quietly, in ",
-                "the same commit as this constant."
-            )
-        );
+    fn fail_on_defaults_to_critical() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sim-doctor", "scan"]).expect("parses");
+        let Command::Scan(args) = cli.command else {
+            panic!("not a scan")
+        };
+        assert_eq!(args.fail_on, rules::Severity::Critical);
     }
 
-    /// No flag on `scan` refuses as unimplemented any more.
-    ///
-    /// `--score` and `--severity` shipped with issue #14; `--baseline` and
-    /// `--diff` shipped with issue #12. `scan::Deferred` and the refusal shape
-    /// it built are gone, so the "implemented: false" document is reachable
-    /// from nothing on the command surface - which is a stronger statement than
-    /// the count of flags that refuse, and is the property worth pinning.
+    /// `scan` no longer has `--diff`: `--baseline` alone gates (doctor/1).
     #[test]
-    fn no_scan_flag_refuses_as_unimplemented() {
-        let args = ScanArgs {
-            json: false,
-            tui: false,
-            dialect: scan::Dialect::Ts102221,
-            reader: None,
-            walk_limits: WalkLimitArgs {
-                max_depth: None,
-                max_children: None,
-                max_nodes: None,
-                max_directories: None,
-            },
-            score: true,
-            severity: Some(rules::Severity::High),
-            baseline: Some(std::path::PathBuf::from("saved.json")),
-            sarif: None,
-            diff: true,
-            tar: tar::Selection::default(),
-            terminal_profile: false,
-        };
-
-        // The whole surface is on and nothing refuses before a card is asked
-        // for. A run reaches `Pcsc::readers` and fails there, which is a
-        // different document with an `error` in it.
-        assert_eq!(
-            args.baseline.as_deref(),
-            Some(std::path::Path::new("saved.json"))
-        );
-        assert!(args.diff);
-        assert!(args.score);
-        assert_eq!(args.severity, Some(rules::Severity::High));
+    fn scan_has_no_diff_flag() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["sim-doctor", "scan", "--diff"]).is_err());
     }
 }

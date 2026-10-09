@@ -28,8 +28,6 @@
 
 #![cfg(feature = "card-fixture")]
 
-use std::path::Path;
-
 use sim_doctor::apdu::StatusWord;
 use sim_doctor::transport::{pcsc::Pcsc, pcsc::PcscSession, CardSession, ReaderProvider};
 
@@ -1209,25 +1207,10 @@ fn scans_a_real_card_end_to_end() {
     // 7. And the binary itself, which is the actual acceptance criterion.
     //    `CARGO_BIN_EXE_sim-doctor` is resolved by cargo at compile time, so
     //    this is the binary cargo built rather than a path guessed at run time.
-    //    **The exit-0 assertion below is a STATED contract decision, and issue
-    //    #24 re-took it with a rule in place.** Issue #14 decided it while no
-    //    rule ran, so the question was not yet observable; issue #24 is the
-    //    first issue where a scan can produce a finding at all, which withdrew
-    //    reason 1 of the three AGENTS.md records and left reasons 2 and 3
-    //    standing. It decided no again, for a reason that did not exist
-    //    before: exit 1 is reachable from six conditions already (no reader,
-    //    unknown reader, reader unavailable, walk failed, rule misattribution,
-    //    a deferred flag) and every one of them emits a *refusal* document
-    //    carrying `data.error` and NO `data.findings` key. A scan that found
-    //    something emits the opposite shape. Giving one code two mutually
-    //    exclusive document schemas is the wrong trade for a tool whose whole
-    //    promise is that an agent can branch on the status.
-    //
-    //    So it stays asserting success, and the finding it would have covered
-    //    is covered by `data.score` and `data.complete` instead. If somebody
-    //    flips FINDINGS_FAIL_A_SCAN in src/main.rs, this assertion goes red on
-    //    purpose; the message on it names the other three places that have to
-    //    move with it.
+    //    **Exit 0 is asserted because of `--fail-on`'s default.** Since doctor/1
+    //    a scan exits 1 for a finding at or above `--fail-on`, and the default is
+    //    `critical`; swSIM implements no MSL, so the only critical rule
+    //    (`gsma/msl-zero-allowed`) cannot fire on it and the fixture stays at 0.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
         .args(["scan", "--json", "--reader", reader.as_str()])
         .output()
@@ -1235,11 +1218,8 @@ fn scans_a_real_card_end_to_end() {
     assert!(
         output.status.success(),
         concat!(
-            "sim-doctor scan --json exited {:?}. That is the assertion AGENTS.md ",
-            "section 3 names as moving IF a scan that produces findings is ever made ",
-            "to exit 1: change FINDINGS_FAIL_A_SCAN in src/main.rs, the exit code ",
-            "table, the GATE ON data.complete sentence in SCAN_LONG_ABOUT and this ",
-            "line together, or the tool will say two different things. ",
+            "sim-doctor scan --json exited {:?}; the default --fail-on is critical ",
+            "and swSIM cannot produce a critical finding. ",
             "stderr: {}\nstdout: {}"
         ),
         output.status,
@@ -1259,15 +1239,15 @@ fn scans_a_real_card_end_to_end() {
     );
     let envelope: serde_json::Value =
         serde_json::from_str(stdout.trim_end_matches('\n')).expect("stdout is one envelope");
-    assert_eq!(envelope["type"], serde_json::json!("scan"));
-    assert_eq!(envelope["payload"]["code"], serde_json::json!(0));
+    assert_eq!(envelope["schema"], serde_json::json!("doctor/1"));
+    assert_eq!(envelope["exit_code"], serde_json::json!(0));
     assert_eq!(
-        envelope["payload"]["data"]["dialect"]["name"],
+        envelope["data"]["dialect"]["name"],
         serde_json::json!(sim_doctor::fcp::TagSet::ts_102_221().name()),
         "the binary ran under the default dialect, ETSI TS 102 221"
     );
     assert_eq!(
-        envelope["payload"]["data"]["truncated"],
+        envelope["data"]["truncated"],
         serde_json::Value::Bool(true),
         "the binary reported the same truncation the library run did"
     );
@@ -1352,7 +1332,11 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
         );
         let envelope: serde_json::Value =
             serde_json::from_str(stdout.trim_end_matches('\n')).expect("one envelope");
-        assert_eq!(envelope["type"], serde_json::json!("scan"), "{args:?}");
+        assert_eq!(
+            envelope["schema"],
+            serde_json::json!("doctor/1"),
+            "{args:?}"
+        );
         (
             output
                 .status
@@ -1365,24 +1349,36 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
 
     let base = ["scan", "--json", "--reader", reader.as_str()];
 
-    // A bare run carries a findings block and no score: the score is a
-    // deliberate act, not something every report carries.
+    // A bare run carries the findings array and the doctor/1 score (always
+    // present), and the old findings block under data.findings_detail.
     let (code, _, bare) = scan(&base);
     println!("severity/score: scanning with {reader}");
     assert_eq!(code, 0, "{bare:#}");
-    println!("severity/score: a bare run carries a findings block and no score");
+    println!("severity/score: a bare run carries the findings and the shared score");
     assert!(
-        bare["payload"]["data"]["findings"].is_object(),
-        "every scan carries a findings block: {bare:#}"
+        bare["findings"].is_array() && bare["data"]["findings_detail"].is_object(),
+        "every scan carries a findings array: {bare:#}"
     );
     assert_eq!(
-        bare["payload"]["data"]["findings"]["severity_threshold"],
+        bare["data"]["findings_detail"]["severity_threshold"],
         serde_json::Value::Null,
         "no --severity means no threshold, which is not the same as \"info\""
     );
+    assert_eq!(
+        bare["score"]["model"],
+        serde_json::json!("sim/1"),
+        "{bare:#}"
+    );
     assert!(
-        bare["payload"]["data"].get("score").is_none(),
-        "--score was not asked for, so there is no score: {bare:#}"
+        bare["score"]["coverage_gaps"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "the default scan truncates the walk and runs MSL 0 without evidence: {bare:#}"
+    );
+    assert_ne!(
+        bare["score"]["label"],
+        serde_json::json!("good"),
+        "a score with coverage gaps is never good: {bare:#}"
     );
 
     // --severity on its own: the threshold is reported, and it is reported
@@ -1394,12 +1390,12 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     assert_eq!(code, 0, "{high:#}");
     println!("severity/score: --severity high reported the threshold it applied");
     assert_eq!(
-        high["payload"]["data"]["findings"]["severity_threshold"],
+        high["data"]["findings_detail"]["severity_threshold"],
         serde_json::json!("high")
     );
     assert_eq!(
-        high["payload"]["data"]["findings"]["count"],
-        high["payload"]["data"]["findings"]["findings"]
+        high["data"]["findings_detail"]["count"],
+        high["findings"]
             .as_array()
             .expect("findings is an array")
             .len() as u64,
@@ -1411,7 +1407,7 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     scored.extend_from_slice(&["--score"]);
     let (code, _, with_score) = scan(&scored);
     assert_eq!(code, 0, "{with_score:#}");
-    let block = &with_score["payload"]["data"]["score"];
+    let block = &with_score["data"]["score_detail"];
     assert_eq!(
         block["formula"],
         serde_json::json!(sim_doctor::rules::SCORE_FORMULA)
@@ -1433,9 +1429,13 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     // attributes this repository did not choose, so the number of findings is
     // not asserted here. What is asserted is that the score is the formula
     // applied to the findings beside it, whatever they are.
-    let reported = with_score["payload"]["data"]["findings"]["findings"]
+    let reported = with_score["data"]["findings_detail"]["findings"]
         .as_array()
         .expect("findings is an array");
+    assert_eq!(
+        with_score["score"]["value"], block["value"],
+        "the shared score is the same number as the detailed one"
+    );
     assert_eq!(
         block["scored_findings"],
         serde_json::json!(reported.len()),
@@ -1500,12 +1500,11 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     let (code, _, both) = scan(&both);
     assert_eq!(code, 0, "{both:#}");
     assert_eq!(
-        both["payload"]["data"]["score"]["scored_findings"],
-        both["payload"]["data"]["findings"]["count"],
+        both["data"]["score_detail"]["scored_findings"], both["data"]["findings_detail"]["count"],
         "the score counts what the report shows, not what the scan found"
     );
     assert_eq!(
-        both["payload"]["data"]["findings"]["severity_threshold"],
+        both["data"]["findings_detail"]["severity_threshold"],
         serde_json::json!("critical")
     );
 
@@ -1535,27 +1534,22 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
     println!("severity/score: the human report printed the formula and no no-rules warning");
 }
 
-/// `--baseline` and `--diff` reach the envelope against a live card, and the
-/// exit status a gate branches on comes out of the real process.
+/// `--baseline` reaches the envelope against a live card, and the exit status a
+/// gate branches on comes out of the real process.
 ///
-/// **What this proves and what it cannot.** It proves that saving a run writes
-/// a file a later run reads back, that the file records what the run did, and
-/// that `--diff` against a baseline whose walk did not finish is REFUSED with
-/// `baseline-truncated`, exit 1 and the card untouched. The swSIM walk stops at
-/// a bound (a truncated report is this fixture's normal shape), so a clean
-/// same-card diff is not reachable here: a truncated walk did not see the whole
-/// card, and diffing it would call almost every finding new. It cannot prove a
-/// clean diff or a regression; the new/fixed/persisting classification and the
-/// clean path are proved in `src/baseline.rs` against synthesised finding sets,
-/// which is the only place they can be proved without a card that completes.
-///
-/// **The exit status is the point of putting it here.** A refused `--diff`
-/// exiting 1 is a decision recorded in AGENTS.md section 3 and in CONTEXT.md,
-/// and like every other claim about a process it can only be proved by spawning
-/// the process.
+/// **What this proves and what it cannot.** It proves that a saved `scan --json`
+/// envelope carries what a later run reads back (`data.run`, the old findings
+/// under `data.findings_detail`), and that `--baseline` against one whose walk
+/// did not finish is REFUSED with `baseline-truncated`, exit 2 and the card
+/// untouched. The swSIM walk stops at a bound (a truncated report is this
+/// fixture's normal shape), so a clean same-card comparison is not reachable
+/// here: a truncated walk did not see the whole card, and comparing it would
+/// call almost every finding new. The new/unchanged/fixed classification, exit
+/// 3 and the clean path are proved in `src/baseline.rs` and `src/scan.rs`
+/// against synthesised finding sets.
 #[test]
 #[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
-fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
+fn a_saved_envelope_is_a_baseline_and_a_truncated_one_is_refused() {
     let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
     let reader = readers
         .iter()
@@ -1567,7 +1561,7 @@ fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
             )
         });
 
-    fn scan(args: &[&str]) -> (i32, serde_json::Value) {
+    fn scan(args: &[&str]) -> (i32, String, serde_json::Value) {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
             .args(args)
             .stdin(std::process::Stdio::null())
@@ -1585,29 +1579,21 @@ fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
         );
         let envelope: serde_json::Value =
             serde_json::from_str(stdout.trim_end_matches('\n')).expect("one envelope");
-        assert_eq!(envelope["type"], serde_json::json!("scan"), "{args:?}");
         assert_eq!(
-            envelope["payload"]["code"]
-                .as_u64()
-                .expect("a numeric code"),
-            u64::from(
-                u8::try_from(
-                    output
-                        .status
-                        .code()
-                        .expect("the process chose an exit code")
-                )
-                .expect("an exit code fits in a byte")
-            ),
-            "{args:?}: payload.code must stay the number the process exits with"
+            envelope["schema"],
+            serde_json::json!("doctor/1"),
+            "{args:?}"
         );
-        (
-            output
-                .status
-                .code()
-                .expect("the process chose an exit code"),
-            envelope,
-        )
+        let code = output
+            .status
+            .code()
+            .expect("the process chose an exit code");
+        assert_eq!(
+            envelope["exit_code"].as_i64(),
+            Some(i64::from(code)),
+            "{args:?}: exit_code must stay the number the process exits with"
+        );
+        (code, stdout, envelope)
     }
 
     let directory = std::env::temp_dir().join("sim-doctor-card-baseline");
@@ -1616,88 +1602,150 @@ fn a_baseline_saves_and_a_diff_against_a_truncated_one_is_refused() {
     let _ = std::fs::remove_file(&path);
     let path = path.display().to_string();
 
-    let mut save = vec!["scan", "--json", "--reader", reader.as_str()];
-    save.extend_from_slice(&["--baseline", &path]);
-    let (code, saved) = scan(&save);
-    println!("baseline/diff: saved a baseline to {path}");
-    assert_eq!(code, 0, "saving is not a gate: {saved:#}");
+    // Saving a baseline is `scan --json > file`.
+    let (code, text, saved) = scan(&["scan", "--json", "--reader", reader.as_str()]);
+    std::fs::write(&path, &text).expect("write the baseline");
+    println!("baseline: saved an envelope to {path}");
+    assert_eq!(code, 0, "{saved:#}");
     assert!(
-        saved["payload"]["data"].get("diff").is_none(),
-        "a scan with no --diff carries no diff key at all, not an empty one: {saved:#}"
-    );
-    assert!(
-        Path::new(&path).exists(),
-        "--baseline said it wrote a file and the file is not there"
-    );
-
-    // What the file records about the run that wrote it, read back and
-    // checked against the report beside it. Every one of these is a field the
-    // diff refuses on, so a baseline that got one wrong would refuse every
-    // later comparison.
-    let document: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("readable")).expect("JSON");
-    assert_eq!(document["sim_doctor_baseline"], serde_json::json!(1));
-    assert_eq!(
-        document["run"]["reader"], saved["payload"]["data"]["reader"],
-        "the baseline must name the reader the report names"
-    );
-    assert_eq!(
-        document["run"]["dialect"], saved["payload"]["data"]["dialect"]["id"],
-        "the baseline records the dialect as its id string"
-    );
-    assert_eq!(
-        document["run"]["complete"],
-        saved["payload"]["data"]["complete"],
-        "a baseline claiming completeness the report does not claim would refuse          every later comparison, or worse would not"
+        saved.get("baseline").is_none(),
+        "a scan with no --baseline carries no baseline block: {saved:#}"
     );
     assert!(
-        document["run"]["rules"].is_array(),
-        "which rules ran is recorded: {document}"
+        saved["data"].get("diff").is_none(),
+        "a scan with no --baseline carries no diff key at all, not an empty one: {saved:#}"
+    );
+
+    // What the envelope records about the run, checked against the report
+    // beside it. Every one of these is a field the comparison refuses on.
+    let run = &saved["data"]["run"];
+    assert_eq!(run["reader"], saved["data"]["reader"]);
+    assert_eq!(run["dialect"], saved["data"]["dialect"]["id"]);
+    assert_eq!(run["complete"], saved["data"]["complete"]);
+    assert!(
+        run["rules"].is_array(),
+        "which rules ran is recorded: {saved:#}"
     );
     assert_eq!(
-        document["findings"].as_array().expect("an array").len() as u64,
-        saved["payload"]["data"]["findings"]["count"]
-            .as_u64()
-            .expect("a count"),
-        "the baseline holds the findings the report showed, not a different set"
+        saved["data"]["findings_detail"]["findings"]
+            .as_array()
+            .expect("an array")
+            .len(),
+        saved["findings"].as_array().expect("an array").len(),
+        "the old-shape findings are the same set as the top-level ones"
     );
 
-    // And it carries nothing it should not: the ATR and the file tree are in
-    // the report and must not be in the file.
-    let text = std::fs::read_to_string(&path).expect("readable");
-    for forbidden in ["\"atr\"", "\"files\"", "\"notes\"", "\"probes\""] {
-        assert!(
-            !text.contains(forbidden),
-            "a baseline must not carry {forbidden}"
-        );
-    }
-
-    // The second run, same card, same flags, with --diff. This card's walk
-    // stops at a bound, so the baseline it just wrote is truncated and the diff
-    // must refuse rather than call almost every finding new.
-    let mut diff = vec!["scan", "--json", "--reader", reader.as_str()];
-    diff.extend_from_slice(&["--baseline", &path, "--diff"]);
-    let (code, compared) = scan(&diff);
-    println!("baseline/diff: diffed a second run against the truncated baseline");
-    assert_eq!(code, 1, "a refused diff is a failed run: {compared:#}");
-    let data = &compared["payload"]["data"];
+    // The second run, same card, same flags, with --baseline. This card's walk
+    // stops at a bound, so the baseline it just wrote is truncated and the
+    // comparison must refuse rather than call almost every finding new.
+    let (code, _, compared) = scan(&[
+        "scan",
+        "--json",
+        "--reader",
+        reader.as_str(),
+        "--baseline",
+        &path,
+    ]);
+    println!("baseline: compared a second run against the truncated baseline");
+    assert_eq!(
+        code, 2,
+        "a refused comparison is a failed run: {compared:#}"
+    );
+    let data = &compared["data"];
     assert_eq!(
         data["error"]["kind"],
         serde_json::json!("baseline-truncated"),
-        "a baseline whose walk did not finish cannot be diffed against: {compared:#}"
+        "a baseline whose walk did not finish cannot be compared against: {compared:#}"
     );
     assert_eq!(data["scanned"], serde_json::json!(false), "{compared:#}");
-    assert_eq!(
-        data["card_touched"],
-        serde_json::json!(false),
-        "the refusal comes before the card is read: {compared:#}"
-    );
     assert!(
         data.get("diff").is_none(),
         "a refusal carries no diff block at all: {compared:#}"
     );
+    assert_eq!(compared["findings"], serde_json::json!([]));
 
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Contract section 9 against a live card: `scan --json` run twice gives the
+/// same document apart from `data`, with the required keys, enum values and a
+/// 16-hex fingerprint on every finding.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn scan_json_conforms_to_doctor_1_against_a_real_card() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+    let run = || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+            .args(["scan", "--json", "--reader", reader.as_str()])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary should run");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout is one envelope");
+        (output.status.code().expect("an exit code"), envelope)
+    };
+    let (code, first) = run();
+    let (_, second) = run();
+
+    let mut keys: Vec<&str> = first
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "data",
+            "exit_code",
+            "findings",
+            "schema",
+            "score",
+            "tool",
+            "version"
+        ]
+    );
+    assert_eq!(first["schema"], "doctor/1");
+    assert_eq!(first["tool"], "sim-doctor");
+    assert_eq!(first["exit_code"].as_i64(), Some(i64::from(code)));
+    for finding in first["findings"].as_array().expect("an array") {
+        for key in [
+            "id",
+            "fingerprint",
+            "severity",
+            "category",
+            "message",
+            "location",
+            "remedy",
+        ] {
+            assert!(finding.get(key).is_some(), "{key} missing: {finding}");
+        }
+        let fingerprint = finding["fingerprint"].as_str().expect("a string");
+        assert!(
+            fingerprint.len() == 16
+                && fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{fingerprint}"
+        );
+        assert!(["critical", "high", "medium", "low", "info"]
+            .contains(&finding["severity"].as_str().expect("a string")));
+    }
+    let strip = |mut v: serde_json::Value| {
+        v.as_object_mut().expect("an object").remove("data");
+        v
+    };
+    assert_eq!(strip(first), strip(second), "two runs differ outside data");
 }
 
 /// `ts48 compare` against the swSIM card: the walk runs, the envelope is one

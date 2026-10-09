@@ -39,7 +39,7 @@ const fn security_severity(severity: Severity) -> &'static str {
 /// which finding this is: findings differing only in digits share a
 /// fingerprint by design. Fields are length-prefixed so no separator inside
 /// one of them can be mistaken for a boundary.
-fn fingerprint(finding: &Finding) -> String {
+pub fn fingerprint(finding: &Finding) -> String {
     let mut masked = String::new();
     let mut in_digits = false;
     for c in finding.message().chars() {
@@ -83,7 +83,10 @@ pub fn write(path: &std::path::Path, doc: &Value) -> std::io::Result<()> {
 }
 
 /// The findings as a SARIF 2.1.0 document, with one rule per spec.
-pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec]) -> Value {
+///
+/// `score` is the doctor/1 score object (contract section 5); the fingerprint
+/// under `doctorFinding/v1` is the same value as the finding's JSON `fingerprint`.
+pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec], score: &Value) -> Value {
     let mut rules: Vec<Value> = specs
         .iter()
         .map(|spec| {
@@ -133,7 +136,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec]) -> Value {
                 "name": finding.location().to_string(),
                 "kind": "resource",
             }]}],
-            "partialFingerprints": {"simDoctorFinding/v1": fingerprint(finding)},
+            "partialFingerprints": {"doctorFinding/v1": fingerprint(finding)},
             "properties": properties,
         }));
     }
@@ -157,6 +160,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec]) -> Value {
             "properties": {
                 "coverage": if reasons.is_empty() { "complete" } else { "partial" },
                 "coverageReasons": reasons,
+                "score": score,
             },
         }],
     })
@@ -181,9 +185,13 @@ mod tests {
         crate::scan::specs()
     }
 
+    fn score() -> Value {
+        crate::contract::doctor_score(100, "sim/1", 0)
+    }
+
     #[test]
     fn document_shape() {
-        let doc = to_sarif(&[], &specs());
+        let doc = to_sarif(&[], &specs(), &score());
         assert_eq!(doc["version"], "2.1.0");
         assert_eq!(doc["runs"].as_array().unwrap().len(), 1);
         assert_eq!(doc["runs"][0]["tool"]["driver"]["name"], "sim-doctor");
@@ -191,7 +199,7 @@ mod tests {
 
     #[test]
     fn empty_findings_is_well_formed() {
-        let doc = to_sarif(&[], &specs());
+        let doc = to_sarif(&[], &specs(), &score());
         assert_eq!(doc["runs"][0]["results"], json!([]));
         assert_eq!(doc["runs"][0]["properties"]["coverage"], "complete");
         assert_eq!(doc["runs"][0]["properties"]["coverageReasons"], json!([]));
@@ -204,7 +212,7 @@ mod tests {
     #[test]
     fn every_severity_maps_to_a_level() {
         let all: Vec<Finding> = Severity::LADDER.iter().map(|s| finding(*s, "m")).collect();
-        let doc = to_sarif(&all, &specs());
+        let doc = to_sarif(&all, &specs(), &score());
         let levels: Vec<&str> = doc["runs"][0]["results"]
             .as_array()
             .unwrap()
@@ -228,7 +236,7 @@ mod tests {
         ] {
             assert_eq!(security_severity(s), want);
         }
-        let doc = to_sarif(&[], &specs());
+        let doc = to_sarif(&[], &specs(), &score());
         for rule in doc["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .unwrap()
@@ -239,7 +247,7 @@ mod tests {
 
     #[test]
     fn logical_locations_and_no_physical_location() {
-        let doc = to_sarif(&[finding(Severity::High, "m")], &specs());
+        let doc = to_sarif(&[finding(Severity::High, "m")], &specs(), &score());
         let loc = &doc["runs"][0]["results"][0]["locations"][0]["logicalLocations"][0];
         assert_eq!(loc["kind"], "resource");
         assert!(loc["name"].as_str().unwrap().contains("3F00/2F00/6F07"));
@@ -257,6 +265,7 @@ mod tests {
                 finding(Severity::High, "c").partial("walk bound reached"),
             ],
             &specs(),
+            &score(),
         );
         let props = &doc["runs"][0]["properties"];
         assert_eq!(props["coverage"], "partial");
@@ -270,7 +279,7 @@ mod tests {
             "walk bound reached"
         );
 
-        let all_complete = to_sarif(&[finding(Severity::High, "a")], &specs());
+        let all_complete = to_sarif(&[finding(Severity::High, "a")], &specs(), &score());
         assert_eq!(
             all_complete["runs"][0]["properties"]["coverage"],
             "complete"
@@ -278,8 +287,8 @@ mod tests {
     }
 
     fn fp(f: &Finding) -> String {
-        to_sarif(std::slice::from_ref(f), &specs())["runs"][0]["results"][0]["partialFingerprints"]
-            ["simDoctorFinding/v1"]
+        to_sarif(std::slice::from_ref(f), &specs(), &score())["runs"][0]["results"][0]
+            ["partialFingerprints"]["doctorFinding/v1"]
             .as_str()
             .unwrap()
             .to_owned()
@@ -307,8 +316,14 @@ mod tests {
     }
 
     #[test]
+    fn the_run_carries_the_score_object() {
+        let doc = to_sarif(&[], &specs(), &score());
+        assert_eq!(doc["runs"][0]["properties"]["score"], score());
+    }
+
+    #[test]
     fn rule_index_points_at_the_same_id() {
-        let doc = to_sarif(&[finding(Severity::High, "m")], &specs());
+        let doc = to_sarif(&[finding(Severity::High, "m")], &specs(), &score());
         let rules = doc["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .unwrap();
@@ -320,7 +335,7 @@ mod tests {
 
     #[test]
     fn a_rule_missing_from_specs_still_gets_an_entry() {
-        let doc = to_sarif(&[finding(Severity::High, "m")], &[]);
+        let doc = to_sarif(&[finding(Severity::High, "m")], &[], &score());
         let rules = doc["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .unwrap();

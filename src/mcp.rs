@@ -24,12 +24,11 @@ use serde_json::{json, Map, Value};
 /// This module's name in [`crate::MODULES`].
 pub const NAME: &str = "mcp";
 
-/// `scan` flags an agent must never reach: `baseline`, `diff` and `sarif` read
-/// or write files (an agent could overwrite one), `tui` is interactive, and
-/// `json` is always forced on.
-const EXCLUDED: &[&str] = &[
-    "baseline", "diff", "sarif", "tui", "json", "help", "version",
-];
+/// `scan` flags an agent cannot reach: `tui` is interactive, `json` is always
+/// forced on, and `help` and `version` make no sense over MCP. `baseline`,
+/// `fail-on` and `sarif` ARE exposed (doctor/1 section 7); `baseline` and
+/// `sarif` take a path the agent chooses, as the CLI does.
+const EXCLUDED: &[&str] = &["tui", "json", "help", "version"];
 
 /// A call's default wall-clock limit; `SIM_DOCTOR_MCP_TIMEOUT_SECONDS` overrides it.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -167,15 +166,16 @@ fn build_argv(scan: &Command, name: &str, args: &Value) -> Result<Vec<String>, S
     }
 }
 
-/// Map a child's outcome to an MCP tool result. 0 and 1 (findings, regressed)
-/// carry the envelope; everything else is an error with the child's stderr.
+/// Map a child's outcome to an MCP tool result. 0, 1 (findings) and 3 (new
+/// findings against a baseline) carry the envelope unchanged; everything else
+/// is an error with the child's stderr.
 fn tool_result(out: ToolOutcome) -> Value {
     if out.truncated {
         let text = format!("{}\n[output truncated at {OUTPUT_CAP} bytes]", out.stdout);
         return json!({ "content": [{ "type": "text", "text": text }], "isError": true });
     }
     let (text, is_error) = match out.code {
-        Some(0) | Some(1) => (out.stdout, false),
+        Some(0) | Some(1) | Some(3) => (out.stdout, false),
         Some(c) => (error_text(&format!("exit code {c}"), &out.stderr), true),
         None => (
             error_text("the process did not exit normally", &out.stderr),
@@ -404,8 +404,9 @@ mod tests {
                     .help("A score."),
             )
             .arg(Arg::new("baseline").long("baseline"))
+            .arg(Arg::new("fail-on").long("fail-on"))
             .arg(Arg::new("sarif").long("sarif"))
-            .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue))
+            .arg(Arg::new("tui").long("tui").action(ArgAction::SetTrue))
     }
 
     fn call(name: &str, args: Value, code: i32) -> (Value, Option<Vec<String>>) {
@@ -460,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_schema_is_generated_and_hides_file_flags() {
+    fn scan_schema_is_generated_and_exposes_the_contract_flags() {
         let scan = fake_scan();
         let list = tool_list(&scan);
         let props = list["tools"][0]["inputSchema"]["properties"]
@@ -473,6 +474,12 @@ mod tests {
             } else {
                 assert!(props.contains_key(id), "{id} missing from the scan schema");
             }
+        }
+        for flag in ["baseline", "fail-on", "sarif"] {
+            assert!(
+                props.contains_key(flag),
+                "{flag} must be exposed (doctor/1 section 7)"
+            );
         }
         assert_eq!(props["max-depth"]["type"], "integer");
         assert_eq!(props["score"]["type"], "boolean");
@@ -614,8 +621,7 @@ mod tests {
     fn bad_calls_are_errors_and_never_spawn() {
         let cases = [
             ("nope", json!({})),
-            ("scan", json!({"baseline": "x.json"})),
-            ("scan", json!({"sarif": "out.sarif"})),
+            ("scan", json!({"tui": true})),
             ("scan", json!({"json": true})),
             ("scan", json!({"reader": "--sarif"})),
             ("scan", json!({"max-depth": "3"})),
@@ -658,7 +664,7 @@ mod tests {
 
     #[test]
     fn exit_codes_map_to_is_error() {
-        for code in [0, 1] {
+        for code in [0, 1, 3] {
             let (r, _) = call("rules_list", json!({}), code);
             assert_eq!(r["isError"], false);
             assert_eq!(r["content"][0]["text"], "ENVELOPE");

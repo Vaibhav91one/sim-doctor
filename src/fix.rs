@@ -60,27 +60,11 @@ pub fn clean(text: &str) -> String {
 
 /// [`clean`] with a caller-chosen length cap.
 pub fn clean_with_limit(text: &str, limit: usize) -> String {
-    text.chars()
-        .map(|c| match c {
-            '`' => '\'',
-            c if c.is_control() || is_invisible(c) => ' ',
-            c => c,
-        })
+    crate::contract::sanitize(text)
+        .chars()
+        .map(|c| if c == '`' { '\'' } else { c })
         .take(limit)
         .collect()
-}
-
-/// Format (Cf), line/paragraph separator, private-use and default-ignorable characters.
-///
-/// std has no general-category lookup and no new crate is allowed, so this is an
-/// explicit table. Unassigned code points (Cn) are NOT covered beyond the ranges below.
-fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
-        | '\u{180b}'..='\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
-        | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}'
-        | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}'
-        | '\u{e0100}'..='\u{e01ef}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{10ffff}')
 }
 
 /// The prompt for one rule. `findings` are `(severity, message)` pairs from a saved scan.

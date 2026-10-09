@@ -10,7 +10,7 @@ inputs:
     description: 'Build the pinned swSIM + swicc-pcsc and start pcscd so the runner has a software card ("true"). When "false" the runner must already have a PC/SC reader.'
     default: "false"
   baseline:
-    description: Path of the committed baseline file written by `sim-doctor scan --baseline`. If it does not exist there is no gate, only a report.
+    description: 'Path of the committed baseline file: a doctor/1 envelope; commit the reduced one this action writes (output `baseline`). If it does not exist there is no gate, only a report.'
     default: .sim-doctor/baseline.json
   require-baseline:
     description: 'When "true" (default) a missing baseline file fails the job: the baseline is part of the contract of a gating action. When "false" the scan reports without gating, with a warning.'
@@ -20,6 +20,9 @@ inputs:
     default: ""
   severity:
     description: Passed to `sim-doctor scan --severity` (info, low, medium, high, critical). Optional.
+    default: ""
+  fail-on:
+    description: Passed to `sim-doctor scan --fail-on` (info, low, medium, high, critical). Under a baseline only NEW findings at or above it fail the job. Optional; the CLI default is critical.
     default: ""
   comment:
     description: Post or update one summary comment on the pull request (needs pull-requests write).
@@ -32,6 +35,9 @@ outputs:
   summary:
     description: Path of the markdown summary.
     value: ${{ steps.run.outputs.summary }}
+  baseline:
+    description: Path of the REDUCED baseline of this run (rule ids, fingerprints, severities and the run record; no card data), ready to commit as the baseline file. Empty when the run failed or jq is missing.
+    value: ${{ steps.run.outputs.baseline }}
 
 runs:
   using: composite
@@ -134,6 +140,7 @@ runs:
         BASELINE: ${{ inputs.baseline }}
         REQUIRE_BASELINE: ${{ inputs.require-baseline == 'false' && 'false' || 'true' }}
         SEVERITY: ${{ inputs.severity }}
+        FAIL_ON: ${{ inputs.fail-on }}
         READER: ${{ inputs.reader }} # always set, so a runner-level READER variable cannot leak into --reader
         OUT: ${{ runner.temp }}/sim-doctor
         SIM_DOCTOR: ${{ runner.temp }}/sim-doctor-target/release/sim-doctor

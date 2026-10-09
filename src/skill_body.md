@@ -7,10 +7,11 @@ meaningful exit code. Run it; do not guess what a card holds.
 ## Run a scan
 
 ```sh
-sim-doctor scan --json              # one JSON envelope on stdout, nothing else
-sim-doctor scan --json --score      # adds data.score (integer 0-100)
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
 sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
 sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
 sim-doctor scan --help              # the full contract, including what it cannot do
 ```
 
@@ -19,29 +20,32 @@ stdout carries the envelope and nothing else; diagnostics go to stderr.
 ## Read the envelope
 
 ```json
-{ "type": "scan", "payload": { "code": 0, "message": "...", "data": { } } }
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
 ```
 
-- `payload.code` is **0 whenever the walk finished**, including a truncated walk and a
-  walk that produced findings. It is not a verdict on the card.
-- **Gate on `payload.data.complete`, not on `payload.code`.** `complete: false` means a
-  bound was hit (`truncated_by`, `limits_hit`) and you read only part of the card.
-- `payload.data.findings.findings[]` holds the findings. Each has `rule`
-  (`namespace/name`), `severity`, `message`, `location`, bounded `evidence`, and a
-  `coverage` of `complete` or `partial`. A `partial` finding came from a scan that did not
-  finish: the list may be short.
-- `payload.data.score` (with `--score`) is `100 - sum of penalties`, floored at 0. Read
-  `rules_run` beside it: **a score of 100 with `rules_run` 0 means nothing was checked,
-  not that the card is clean.**
-- On failure `payload.data.error.kind` names why (`no-reader`, ...) and `scanned` is false.
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | the walk finished (findings do not change this) |
-| 1 | the scan could not run: no reader, no card, or a flag not implemented yet |
-| 129 | bad command line |
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
 | 130 | interrupted |
 
 ## What it does not tell you

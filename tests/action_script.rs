@@ -99,6 +99,7 @@ exit "$FAKE_RC"
             .env("REQUIRE_BASELINE", "false")
             .env_remove("READER")
             .env_remove("SEVERITY")
+            .env_remove("FAIL_ON")
             .env("OUT", &out)
             .env("GITHUB_OUTPUT", dir.join("gh_output"))
             .env("GITHUB_STEP_SUMMARY", dir.join("gh_summary"))
@@ -125,12 +126,12 @@ exit "$FAKE_RC"
     }
 }
 
-const CLEAN: &str = r#"{"type":"scan","payload":{"code":0,"message":"ok","data":{"findings":{"count":2,"findings":[{"severity":"high"},{"severity":"low"}]},"score":{"value":89}}}}"#;
-const DIFF: &str = r#"{"type":"scan","payload":{"code":1,"message":"regressed","data":{"findings":{"count":3,"findings":[{"severity":"high"},{"severity":"high"},{"severity":"low"}]},"diff":{"regressed":true,"counts":{"new":2,"fixed":0,"persisting":1}}}}}"#;
-const DIFF_OK: &str = r#"{"type":"scan","payload":{"code":0,"message":"ok","data":{"findings":{"count":1,"findings":[{"severity":"low"}]},"diff":{"regressed":false,"counts":{"new":0,"fixed":1,"persisting":1}}}}}"#;
+const CLEAN: &str = r#"{"schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":0,"score":{"value":89,"label":"needs work","model":"sim/1","coverage_gaps":0},"findings":[{"severity":"high"},{"severity":"low"}],"data":{}}"#;
+const NEW: &str = r#"{"schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":3,"score":{"value":40,"label":"critical","model":"sim/1","coverage_gaps":0},"findings":[{"severity":"high","baseline_state":"new"},{"severity":"high","baseline_state":"new"},{"severity":"low","baseline_state":"unchanged"}],"baseline":{"new":2,"unchanged":1,"fixed":0},"data":{}}"#;
+const NEW_OK: &str = r#"{"schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":0,"score":{"value":97,"label":"good","model":"sim/1","coverage_gaps":0},"findings":[{"severity":"low","baseline_state":"unchanged"}],"baseline":{"new":0,"unchanged":1,"fixed":1},"data":{}}"#;
 
 fn error_body(msg: &str) -> String {
-    serde_json::json!({"type":"scan","payload":{"code":1,"message":"x","data":{"error":{"kind":"no-reader","message":msg}}}}).to_string()
+    serde_json::json!({"schema":"doctor/1","tool":"sim-doctor","exit_code":2,"score":{"value":0},"findings":[],"data":{"error":{"kind":"no-reader","message":msg}}}).to_string()
 }
 
 fn has_row(r: &Run, row: &str) -> bool {
@@ -154,25 +155,41 @@ fn exit_0_is_ok_and_the_summary_carries_the_marker_table_and_score() {
 }
 
 #[test]
-fn a_regressed_diff_fails_the_gate_and_names_the_new_count() {
-    let r = case("gate", 1, DIFF).baseline().run();
+fn a_new_finding_against_the_baseline_fails_the_gate_and_names_the_new_count() {
+    let r = case("gate", 3, NEW).baseline().run();
     assert_eq!(r.code, 1, "{}", r.stdout);
     assert!(has_row(&r, "| Result | GATE FAILED |"), "{}", r.summary);
     assert!(has_row(&r, "| New findings | 2 |"), "{}", r.summary);
 }
 
 #[test]
-fn a_gated_exit_0_with_a_diff_is_ok() {
-    let r = case("gated-ok", 0, DIFF_OK).baseline().run();
+fn a_gated_exit_0_with_a_baseline_block_is_ok() {
+    let r = case("gated-ok", 0, NEW_OK).baseline().run();
     assert_eq!(r.code, 0, "{}", r.stdout);
     assert!(has_row(&r, "| New findings | 0 |"), "{}", r.summary);
 }
 
 #[test]
-fn a_gated_exit_0_without_a_diff_is_a_tool_failure_not_ok() {
+fn a_gated_exit_0_without_a_baseline_block_is_a_tool_failure_not_ok() {
     let r = case("failopen", 0, CLEAN).baseline().run();
     assert_eq!(r.code, 2, "{}", r.stdout);
-    assert!(r.summary.contains("did not report a diff"), "{}", r.summary);
+    assert!(
+        r.summary.contains("did not report a baseline comparison"),
+        "{}",
+        r.summary
+    );
+}
+
+#[test]
+fn an_ungated_exit_1_is_reported_not_failed() {
+    let body = CLEAN.replace(r#""exit_code":0"#, r#""exit_code":1"#);
+    let r = case("ungated1", 1, body).run();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(
+        r.summary.contains("NOT GATED"),
+        "findings above --fail-on without a baseline are shown, not failed: {}",
+        r.summary
+    );
 }
 
 #[test]
@@ -187,20 +204,25 @@ fn exit_0_with_data_error_is_a_tool_failure() {
 
 #[test]
 fn a_refusal_with_data_error_is_a_tool_failure_exit_2() {
-    let r = case("refusal", 1, error_body("no reader")).run();
+    let r = case("refusal", 2, error_body("no reader")).run();
     assert_eq!(r.code, 2, "{}", r.stdout);
     assert!(r.summary.contains("TOOL FAILURE"), "{}", r.summary);
     assert!(r.summary.contains("no reader"), "{}", r.summary);
 }
 
 #[test]
-fn exit_129_130_and_unknown_exits_are_tool_failures() {
+fn exit_2_129_130_and_unknown_exits_are_tool_failures() {
+    assert_eq!(case("e2", 2, "").run().code, 2);
     assert_eq!(case("e129", 129, "").run().code, 2);
     assert_eq!(case("e130", 130, "").run().code, 2);
     assert_eq!(case("e130b", 130, CLEAN).run().code, 2);
     assert_eq!(case("e7", 7, CLEAN).run().code, 2);
-    // exit 1 with an envelope that is neither a diff nor an error is not a gate
-    assert_eq!(case("e1bare", 1, CLEAN).run().code, 2);
+    // exit 1 under a baseline is not a baseline result (it would be 3 or 0)
+    assert_eq!(case("e1gated", 1, CLEAN).baseline().run().code, 2);
+    // exit 3 without a baseline cannot happen
+    assert_eq!(case("e3bare", 3, CLEAN).run().code, 2);
+    // an envelope whose exit_code disagrees with the status is not trusted
+    assert_eq!(case("e0lie", 3, CLEAN).baseline().run().code, 2);
 }
 
 #[test]
@@ -212,11 +234,11 @@ fn an_unparsable_or_unexpected_envelope_is_a_tool_failure_with_a_summary() {
         ("two", two.into_bytes()),
         (
             "findstr",
-            br#"{"payload":{"data":{"findings":"oops"}}}"#.to_vec(),
+            br#"{"schema":"doctor/1","exit_code":0,"data":{},"findings":"oops"}"#.to_vec(),
         ),
         (
-            "findlist",
-            br#"{"payload":{"data":{"findings":["x"]}}}"#.to_vec(),
+            "lpac",
+            br#"{"type":"scan","payload":{"code":0,"message":"ok","data":{}}}"#.to_vec(),
         ),
         ("notobj", br#"[1,2]"#.to_vec()),
     ];
@@ -235,21 +257,17 @@ fn an_unparsable_or_unexpected_envelope_is_a_tool_failure_with_a_summary() {
 }
 
 #[test]
-fn no_baseline_file_means_no_baseline_or_diff_flag() {
+fn no_baseline_file_means_no_baseline_flag() {
     let r = case("nobase", 0, CLEAN).run();
-    assert!(
-        !r.argv.contains("--baseline") && !r.argv.contains("--diff"),
-        "{}",
-        r.argv
-    );
+    assert!(!r.argv.contains("--baseline"), "{}", r.argv);
     assert!(r.argv.contains("--json"), "{}", r.argv);
 }
 
 #[test]
-fn a_baseline_file_means_both_flags() {
-    let r = case("base", 0, DIFF_OK).baseline().run();
+fn a_baseline_file_means_the_baseline_flag_and_no_diff_flag() {
+    let r = case("base", 0, NEW_OK).baseline().run();
     assert!(r.argv.contains("--baseline\n"), "{}", r.argv);
-    assert!(r.argv.contains("--diff\n"), "{}", r.argv);
+    assert!(!r.argv.contains("--diff"), "{}", r.argv);
 }
 
 #[test]
@@ -378,12 +396,12 @@ fn hostile_error_text_never_appears_raw() {
 }
 
 #[test]
-fn hostile_severity_and_diff_counts_never_appear_raw() {
-    let body = serde_json::json!({"payload":{"code":1,"data":{
-        "findings":{"findings":[{"severity":"<img src=x>\n@octocat [x](http://evil)"}]},
-        "diff":{"counts":{"new":"`id`\n::add-mask::z|@octocat","fixed":"[x](http://evil)"}}}}})
+fn hostile_severity_and_baseline_counts_never_appear_raw() {
+    let body = serde_json::json!({"schema":"doctor/1","exit_code":3,"data":{},
+        "findings":[{"severity":"<img src=x>\n@octocat [x](http://evil)"}],
+        "baseline":{"new":"`id`\n::add-mask::z|@octocat","fixed":"[x](http://evil)"}})
     .to_string();
-    let r = case("hostile2", 1, body).baseline().run();
+    let r = case("hostile2", 3, body).baseline().run();
     assert_eq!(r.code, 1, "{}", r.stdout);
     assert_clean(&r.summary);
     assert_clean(&r.stdout);
@@ -398,4 +416,69 @@ fn a_hostile_baseline_path_is_not_shown_raw() {
     assert_eq!(r.code, 2);
     assert_clean(&r.summary);
     assert_clean(&r.stdout);
+}
+
+/// The baseline the Action offers for committing is REDUCED: rule ids,
+/// fingerprints, severities and the run record. No ATR, ICCID, IMSI, EF contents
+/// or key bytes, wherever they sit in the envelope.
+#[test]
+fn the_baseline_the_action_writes_holds_no_card_data() {
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("jq is not installed; skipping");
+        return;
+    }
+    const SECRETS: [&str; 5] = [
+        "3b9f96801fc78031a073be21136743200718000001a5",
+        "8988211000000123456",
+        "001010123456789",
+        "00112233445566778899aabbccddeeff",
+        "secret-message-text",
+    ];
+    let body = serde_json::json!({
+        "schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":1,
+        "score":{"value":75,"label":"needs work","model":"sim/1","coverage_gaps":0},
+        "findings":[{"id":"filesystem/sensitive-ef-always","fingerprint":"0123456789abcdef","severity":"high",
+            "message":"secret-message-text IMSI 001010123456789","category":"filesystem",
+            "location":{"kind":"card-path","ref":"3F00/7F20/6F07"},
+            "location_detail":{"kind":"file","path":"3F00/7F20/6F07"},
+            "evidence":[{"ref":"text","value":"ICCID 8988211000000123456"}],"remedy":null}],
+        "data":{
+            "atr":SECRETS[0],
+            "ef_contents":[{"ef":"EF.Keys","fields":{"ki":SECRETS[3],"iccid":SECRETS[1]}}],
+            "run":{"reader":"fake reader","dialect":"ts-102-221","candidates":"sim-families",
+                   "severity_threshold":null,"tar_selection":"off","complete":true,
+                   "truncated_by":null,"limits_hit":[],"rules_run":1,
+                   "rules":[{"id":"filesystem/sensitive-ef-always","evidence":true}]}}
+    })
+    .to_string();
+    let r = case("reduced", 1, body.clone()).run();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    let reduced = fs::read_to_string(r.out.join("baseline.json")).expect("a reduced baseline");
+    for secret in SECRETS {
+        assert!(body.contains(secret), "the fixture must hold {secret}");
+        assert!(
+            !reduced.contains(secret),
+            "{secret} leaked into the baseline: {reduced}"
+        );
+    }
+    let v: serde_json::Value = serde_json::from_str(&reduced).unwrap();
+    assert_eq!(v["schema"], "doctor/1");
+    assert_eq!(
+        v["findings"],
+        serde_json::json!([{"id":"filesystem/sensitive-ef-always","fingerprint":"0123456789abcdef","severity":"high"}])
+    );
+    assert_eq!(v["data"]["run"]["rules_run"], 1);
+    assert_eq!(
+        v["data"].as_object().unwrap().len(),
+        1,
+        "only data.run survives"
+    );
+    assert!(r.outputs.contains("baseline="), "{}", r.outputs);
+}
+
+#[test]
+fn a_failed_run_writes_no_baseline() {
+    let r = case("nobl", 2, error_body("no reader")).run();
+    assert_eq!(r.code, 2);
+    assert!(!r.out.join("baseline.json").exists());
 }
