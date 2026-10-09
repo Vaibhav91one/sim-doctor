@@ -1892,3 +1892,151 @@ fn fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card() {
         );
     }
 }
+
+/// The security rules of issue #40/#110 against the swSIM card: every rule is registered, and
+/// each rule's findings are exactly what the card's own decoded `ef_contents` say they must be.
+///
+/// swSIM's profile is generated at CI time and this crate does not control it, so the test
+/// cannot force a true positive (a card with a null-scheme EF.SUCI_Calc_Info, say). It asserts
+/// the stronger-than-nothing property instead: whatever the card holds, the findings and the
+/// card's reported access conditions and service table agree, rule by rule. The true-positive
+/// and true-negative cases are in `tests/corpus.rs`, on generated cards.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn security_rules_agree_with_what_a_real_card_reports() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args(["scan", "--json", "--reader", reader.as_str()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one envelope");
+    let data = &envelope["data"];
+    // Every finding the card produced names a rule this crate declares.
+    let known: Vec<String> = sim_doctor::scan::all_specs()
+        .iter()
+        .map(|spec| spec.id().as_str().to_owned())
+        .collect();
+    for finding in envelope["findings"].as_array().expect("findings") {
+        let id = finding["id"].as_str().expect("an id").to_owned();
+        assert!(known.contains(&id), "{id} is not a declared rule");
+    }
+
+    let refs = |rule: &str| -> Vec<String> {
+        let mut found: Vec<String> = envelope["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter(|f| f["id"] == rule)
+            .map(|f| f["location"]["ref"].as_str().expect("a path").to_owned())
+            .collect();
+        found.sort();
+        found
+    };
+    let contents = data["ef_contents"].as_array().expect("ef_contents");
+    let paths_where = |names: &[&str], pick: &dyn Fn(&serde_json::Value) -> bool| -> Vec<String> {
+        let mut paths: Vec<String> = contents
+            .iter()
+            .filter(|e| names.contains(&e["ef"].as_str().unwrap_or("")) && pick(e))
+            .map(|e| e["path"].as_str().expect("a path").to_owned())
+            .collect();
+        paths.sort();
+        paths
+    };
+    let check = |rule: &str, expected: Vec<String>| {
+        println!(
+            "security-rules: {rule} expected {} finding(s), reported {}",
+            expected.len(),
+            refs(rule).len()
+        );
+        assert_eq!(refs(rule), expected, "{rule}: {envelope}");
+    };
+
+    // Access-condition rules: decided from the access each EF reports.
+    check(
+        "filesystem/config-ef-updatable-always",
+        paths_where(
+            &[
+                "EF.UST",
+                "EF.EST",
+                "EF.SUCI_Calc_Info",
+                "EF.AD",
+                "EF.ACC",
+                "EF.SPN",
+                "EF.OPLMNwAcT",
+                "EF.Routing_Indicator",
+            ],
+            &|e| e["access"]["update"] == "ALW",
+        ),
+    );
+    check(
+        "identity/readable-without-pin",
+        paths_where(&["EF.MSISDN", "EF.ADN", "EF.FDN"], &|e| {
+            e["access"]["read"] == "ALW"
+        }),
+    );
+    let aggregate = refs("filesystem/ef-updatable-always");
+    println!(
+        "security-rules: filesystem/ef-updatable-always reported {} finding(s)",
+        aggregate.len()
+    );
+    assert!(
+        aggregate.len() <= 1,
+        "one aggregate finding per scan: {envelope}"
+    );
+
+    // SUCI rules: decided from EF.UST and EF.SUCI_Calc_Info.
+    let services: Vec<u64> = contents
+        .iter()
+        .find(|e| e["ef"] == "EF.UST" && e["read"] == "decoded")
+        .map(|e| {
+            e["fields"]["enabled"]
+                .as_array()
+                .expect("enabled")
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .collect()
+        })
+        .unwrap_or_default();
+    let ust_path = contents
+        .iter()
+        .find(|e| e["ef"] == "EF.UST" && e["read"] == "decoded")
+        .map(|e| e["path"].as_str().expect("a path").to_owned());
+    let five_g = services.iter().any(|n| matches!(n, 122 | 123));
+    check(
+        "privacy/suci-not-provisioned",
+        match (&ust_path, five_g && !services.contains(&124)) {
+            (Some(path), true) => vec![path.clone()],
+            _ => vec![],
+        },
+    );
+    let terminal_calculates = services.contains(&124) && !services.contains(&125);
+    check(
+        "privacy/suci-null-scheme",
+        if terminal_calculates {
+            paths_where(&["EF.SUCI_Calc_Info"], &|e| {
+                e["read"] == "decoded" && e["fields"]["conceals"] == false
+            })
+        } else {
+            vec![]
+        },
+    );
+    println!(
+        "security-rules: UST decoded={}, 5GS services={five_g}, DF.5GS files seen={}",
+        ust_path.is_some(),
+        contents
+            .iter()
+            .filter(|e| e["ef"] == "EF.SUCI_Calc_Info" || e["ef"] == "EF.Routing_Indicator")
+            .count()
+    );
+}

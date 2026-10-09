@@ -1649,6 +1649,8 @@ pub struct RuleSpec {
     severity: Severity,
     summary: String,
     remediation: Option<String>,
+    cwe: Option<&'static str>,
+    reference: Option<&'static str>,
 }
 
 impl RuleSpec {
@@ -1664,7 +1666,34 @@ impl RuleSpec {
             severity,
             summary: summary.into(),
             remediation: None,
+            cwe: None,
+            reference: None,
         }
+    }
+
+    /// The weakness class, as a `CWE-<n>` identifier. Left unset for a rule
+    /// that reports a difference rather than a weakness (the TS.48 rules).
+    #[must_use]
+    pub const fn with_cwe(mut self, cwe: &'static str) -> Self {
+        self.cwe = Some(cwe);
+        self
+    }
+
+    /// The specification clauses the rule is decided from.
+    #[must_use]
+    pub const fn with_reference(mut self, reference: &'static str) -> Self {
+        self.reference = Some(reference);
+        self
+    }
+
+    /// The CWE identifier, when the rule reports a weakness.
+    pub const fn cwe(&self) -> Option<&'static str> {
+        self.cwe
+    }
+
+    /// The specification clauses, when the rule cites any.
+    pub const fn reference(&self) -> Option<&'static str> {
+        self.reference
     }
 
     /// Adds what to do about it.

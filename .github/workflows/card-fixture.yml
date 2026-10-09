@@ -372,8 +372,9 @@ jobs:
           # than only names because `--ignored` against a deleted test still
           # exits 0; the names pin the set and the count is what fails when a
           # fifth test is added and not wired up here (6 with issue #25's ts48
-          # compare, 7 with issue #16's fuzz apdu --quick, 8 with the doctor/1 conformance test).
-          grep -q '8 passed' "$log"
+          # compare, 7 with issue #16's fuzz apdu --quick, 8 with the doctor/1 conformance test,
+          # 9 with issue #40's security-rule agreement test).
+          grep -q '9 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
           grep -q 'scans_a_real_card_end_to_end' "$log"
@@ -382,6 +383,7 @@ jobs:
           grep -q 'scan_json_conforms_to_doctor_1_against_a_real_card' "$log"
           grep -q 'ts48_compare_accounts_for_every_profile_file_against_a_real_card' "$log"
           grep -q 'fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card' "$log"
+          grep -q 'security_rules_agree_with_what_a_real_card_reports' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job
@@ -421,6 +423,13 @@ jobs:
           # lines it prints on the way, so a green job means both ran.
           grep -q 'baseline: saved an envelope to' "$log"
           grep -q 'baseline: compared a second run against the truncated baseline' "$log"
+
+          # Issue #40/#110's rules: each reported its finding count beside the count the
+          # card's own ef_contents imply, and the test asserted they are equal.
+          grep -q 'security-rules: filesystem/config-ef-updatable-always expected' "$log"
+          grep -q 'security-rules: identity/readable-without-pin expected' "$log"
+          grep -q 'security-rules: privacy/suci-not-provisioned expected' "$log"
+          grep -q 'security-rules: privacy/suci-null-scheme expected' "$log"
 
           # Issue #4's test got as far as the SELECT MF and READ BINARY round
           # trips.

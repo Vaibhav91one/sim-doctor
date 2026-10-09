@@ -67,6 +67,7 @@ tests live behind the gate:
 | `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula, and the difference between an earned 100 and an unearned one on real stdout (issue #14, rewritten by #24) |
 | `a_saved_envelope_is_a_baseline_and_a_truncated_one_is_refused` | the saved `scan --json` envelope records what the run did (`data.run`), and `--baseline` against one whose walk stopped at a bound is refused with `baseline-truncated` and exits 2, because this fixture's walk is always truncated (issue #12, doctor/1) |
 | `scan_json_conforms_to_doctor_1_against_a_real_card` | contract section 9 on real stdout: keys, finding fields, 16-hex fingerprints, `exit_code` equals the status, two runs identical outside `data` |
+| `security_rules_agree_with_what_a_real_card_reports` | each access-condition and SUCI rule's findings equal what the card's own `ef_contents` (access, UST, SUCI_Calc_Info) imply; it cannot force a true positive on swSIM's generated profile, so TP/TN cases live in `tests/corpus.rs` (issue #40, #110) |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
 executable. The argument parsing, the reader choice, the envelope, the stdout
@@ -401,7 +402,15 @@ reading one back is safe at all.
 ### Rule IDs
 
 Use the `plugin/rule` namespaced form, e.g. `filesystem/unreadable-ef`,
-`auth/scp03-missing-mac`, `gsma/msl-zero-allowed`. Stable and greppable. Rules are
+`auth/scp03-missing-mac`, `gsma/msl-zero-allowed`. Stable and greppable. The rules a scan runs
+(issue #40/#110): `gsma/msl-zero-allowed`, `auth/scp03-missing-mac` (no scan path records SCP03),
+`auth/pin1-disabled`, `filesystem/sensitive-ef-always`, `filesystem/config-ef-updatable-always`,
+`filesystem/ef-updatable-always`, `identity/readable-without-pin`, `exposure/risky-service-available`,
+`privacy/suci-null-scheme`, `privacy/suci-not-provisioned`. Every rule declares a CWE (none for
+`ts48/*`, which compare against a test profile) and a specification reference in its `RuleSpec`;
+`docs/rule_docs/` is generated from those declarations and gated by `tests/rule_docs.rs`, so edit
+the declaration, never the JSON. A rule that cannot be decided from a read-only scan stays out:
+COMP128/Milenage (needs AUTHENTICATE, #105) and anything needing PIN, ADM or SCP keys. Rules are
 addressable by agents, so an ID must never be renamed casually.
 
 ### Findings
@@ -468,7 +477,7 @@ tool run on the owner's own card, so at runtime it shows full card values everyw
 card allows the read, and full PIN/key/cryptogram hex in `trace`. Nothing is masked, truncated
 or redacted. A read the card refuses is reported (`refused` + status word), never retried;
 sim-doctor still never sends VERIFY/UPDATE. `identity/readable-without-pin` fires
-from the access rule alone and covers the MSISDN only (low); the IMSI stays with
+from the access rule alone and covers the MSISDN, EF.ADN and EF.FDN (low); the IMSI stays with
 `filesystem/sensitive-ef-always`, so one fact is never scored twice. `read` is `decoded`, `refused` (with the status word),
 `malformed` or `not-read`.
 

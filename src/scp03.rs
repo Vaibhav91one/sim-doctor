@@ -348,6 +348,10 @@ pub fn missing_mac_spec() -> rules::RuleSpec {
         "require C-MAC (security level 01 or higher) on EXTERNAL AUTHENTICATE and on every \
          command after it, and configure the security domain to refuse a command without one",
     )
+    .with_cwe("CWE-345")
+    .with_reference(
+        "GlobalPlatform Card Specification Amendment D (SCP03), security level and C-MAC",
+    )
 }
 
 /// Raises one finding per probe the card answered `90 00`.

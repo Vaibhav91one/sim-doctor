@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-319",
+  "description": "EF.SUCI_Calc_Info puts the null scheme first or lists no scheme with a provisioned home network public key, so the IMSI is sent in the clear on 5G",
+  "id": "privacy/suci-null-scheme",
+  "reference": "3GPP TS 31.102 clauses 4.2.8, 4.4.11.8, 5.3.47; TS 33.501 clause 6.12; TS 23.003 clause 2.2B",
+  "remediation": "provision a Profile A or B protection scheme first in EF.SUCI_Calc_Info with its home network public key (or enable SUCI calculation by the USIM, service 125), then re-scan",
+  "severity": "high"
+}

@@ -18,8 +18,9 @@ CLI-first SIM/UICC/eUICC security testing tool.
 
 `sim-doctor` examines a card over PC/SC and reports what it found through both a
 terminal table and one stable JSON envelope with a meaningful exit code, so the same
-binary serves an operator and an automated agent. **Its rule set is still small: see
-[Status](#status) before you trust a clean result.**
+binary serves an operator and an automated agent. **Its rules cover access conditions, PIN state, risky services and 5G
+SUCI privacy, and not yet crypto or eUICC weaknesses: see [Status](#status) before you trust a
+clean result.**
 
 ```sh
 npx sim-doctor scan --json
@@ -91,8 +92,9 @@ sim-doctor scan --json --score --tar focused
 ```
 
 `--tar focused` probes 592 TARs for MSL 0 (`gsma/msl-zero-allowed`). Without it the scan
-still checks PIN1 status (`auth/pin1-disabled`) and sensitive EFs under ALWays
-(`filesystem/sensitive-ef-always`) from the FCPs and EF.ARR, read-only. The JSON always carries `score` (an integer 0-100, `data.score_detail.rules_run` beside it); `--score` adds it to the human report. A 100 with `rules_run` 0 means
+still checks PIN1 status, EF access conditions and the 5G SUCI configuration from the FCPs, EF.ARR and
+EF contents, read-only (`sim-doctor rules list`; each rule is documented in
+[docs/rule_docs](docs/rule_docs)). The JSON always carries `score` (an integer 0-100, `data.score_detail.rules_run` beside it); `--score` adds it to the human report. A 100 with `rules_run` 0 means
 nothing was checked, and the report says so in words.
 
 ### 4. Hand it to an agent
@@ -291,16 +293,27 @@ about 2 minutes with nothing truncated.
 (IMSI, ICCID, file and key-file contents) with no runtime masking. It never commits real card data to
 a repo; test fixtures are synthetic.
 
-Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always`,
-`identity/readable-without-pin`, `exposure/risky-service-available` (EF.UST services 28, SMS-PP data
-download, and 32, RUN AT COMMAND; low) and `gsma/msl-zero-allowed` (behind `--tar`). `scan` also decodes the
+Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always` (now including the
+5GS key and context files), `filesystem/config-ef-updatable-always` (EF.UST, EST, AD, ACC, SPN,
+OPLMNwAcT, SUCI_Calc_Info, Routing_Indicator with UPDATE ALWays), `filesystem/ef-updatable-always`
+(any other EF with UPDATE ALWays, one finding per scan), `identity/readable-without-pin` (MSISDN,
+ADN, FDN), `exposure/risky-service-available` (EF.UST services 28, SMS-PP data download, and 32,
+RUN AT COMMAND; low), `privacy/suci-null-scheme` (high: the card's EF.SUCI_Calc_Info leaves the IMSI
+in the clear on 5G), `privacy/suci-not-provisioned` (medium: 5GS services without service 124) and
+`gsma/msl-zero-allowed` (behind `--tar`). Ten ordinary violations score below 30 (the formula is
+unchanged, `sim/1`); `low` advisories alone do not. `scan` also decodes the
 security-relevant EFs and reads key files where the card allows: ICCID, IMSI, MSISDN, EF.DIR, AD, SPN,
 UST/EST, FPLMN, OPLMNwAcT, HPLMNwAcT, ACC, LOCI, PSLOCI, EPSLOCI, ADN, FDN, the ISIM IMPI/IMPU/P-CSCF,
 and EF.MANUAREA (`3F00/0002`, shown as hex: not a 3GPP/ETSI file, so it is probed directly and
 simply absent on most cards). Every rule is gated by the corpus precision/recall test
 (`tests/corpus.rs`). `auth/scp03-missing-mac` is registered, but no scan path records SCP03, so it
-has no evidence on a real card. Still missing ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)):
-crypto rules (COMP128/Milenage, weak keys) and eUICC/SGP.22 rules. The MSL 0 check runs on a real
+has no evidence on a real card. Not validated on a real card yet: the new
+rules are gated on generated cards and cross-checked against swSIM in CI, which does not reproduce a
+real card's access conditions ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)). Not
+possible from a read-only scan: COMP128 v1/v2 and Milenage configuration (the algorithm and the
+key material are not in any readable EF; telling them apart needs AUTHENTICATE, issue #105), and
+anything that needs PIN, ADM or SCP keys. eUICC/SGP.22 rules need the eUICC read path, which is
+separate work. The MSL 0 check runs on a real
 card, but a card that answers every ENVELOPE with `6F00` gives an inconclusive result
 ([#98](https://github.com/Vaibhav91one/sim-doctor/issues/98)). The eUICC stack (SCP03t, BPP, ES10x,
 ES9+) is library code with no card or network path yet.

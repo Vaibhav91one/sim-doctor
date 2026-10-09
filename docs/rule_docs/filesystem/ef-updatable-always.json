@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-732",
+  "description": "elementary files not judged by a more specific rule can be updated under ALWays, where the standards give PIN, ADM or NEVer",
+  "id": "filesystem/ef-updatable-always",
+  "reference": "ETSI TS 102 221 clause 9.2 (access rules); 3GPP TS 31.102 clause 4",
+  "remediation": "set each listed file's UPDATE access rule (its EF.ARR record) to PIN or ADM as the standard or the operator profile requires; confirm a proprietary file is meant to be world-writable, then re-scan",
+  "severity": "medium"
+}

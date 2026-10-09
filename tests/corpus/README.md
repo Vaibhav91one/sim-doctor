@@ -15,5 +15,7 @@ warning on stderr, not a failure.
 2. If the card needs a behaviour `Card` cannot express, extend `Card::transmit`; only reach
    for a swSIM image (card-fixture workflow) if it truly cannot be scripted.
 3. Run `cargo test --test corpus -- --nocapture` to see the table.
-4. Lowering a threshold: add the rule to `THRESHOLDS` with a reason in the PR. Do not lower
+4. `docs/rule_docs/` is generated from the rule declarations; a new rule needs
+   `UPDATE_RULE_DOCS=1 cargo test --test rule_docs`.
+5. Lowering a threshold: add the rule to `THRESHOLDS` with a reason in the PR. Do not lower
    it to make a regression pass.

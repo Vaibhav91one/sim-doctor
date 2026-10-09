@@ -152,6 +152,14 @@ impl Card {
         self
     }
 
+    /// A transparent EF (`path`) holding `bytes`, with extra FCP atoms (its security attributes).
+    fn secured(mut self, path: &str, bytes: &[u8], extra: &[u8]) -> Self {
+        let size = u16::try_from(bytes.len()).unwrap();
+        self = self.described(path, Fcp::Ts102221, Some(size), &[0x01, 0x21], extra);
+        self.binary.insert(path_bytes(path), bytes.to_vec());
+        self
+    }
+
     /// A linear fixed EF (`path`) holding `records`, all of one length.
     fn linear(mut self, path: &str, records: &[Vec<u8>]) -> Self {
         let (count, len) = (u8::try_from(records.len()).unwrap(), records[0].len());
@@ -268,6 +276,11 @@ struct Case {
 const BASIC_PROBE: &[&str] = &["2F01", "2FE2", "6F07", "7F20"];
 const USIM_IDENTITY_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F07", "6F40"];
 const UST_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F38"];
+const FIVEG_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "5FC0", "6F38", "4F07", "4F0A"];
+const CONFIG_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F38", "6FAD", "6F78", "6F46"];
+const OTHER_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F3C", "6F42", "6F43"];
+const PHONEBOOK_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "5F3A", "4F3A", "6F3B", "6F40"];
+const GS5_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "5FC0", "4F05", "4F07"];
 const USIM_PROBE: &[&str] = &[
     "2F06", "6F06", "7FFF", "5F3B", "5F3C", "4F20", "6F07", "6F08", "6F73", "6F7E",
 ];
@@ -333,6 +346,42 @@ fn msl0_finding() -> (&'static str, String) {
     (scan::MSL_ZERO_RULE, Location::tar(tar::TAR_MIN).to_string())
 }
 
+/// EF.UST of 16 octets with services 122, 123 (5GS) and `extra` in octet 16 (service 124 is
+/// `0x08`, 125 is `0x10`) and `low` in octet 4 (service 28 is `0x08`, 32 is `0x80`).
+fn ust_5g(extra: u8, low: u8) -> Vec<u8> {
+    let mut ust = vec![0; 16];
+    ust[3] = low;
+    ust[15] = 0x06 | extra;
+    ust
+}
+
+/// A home network public key list (tag `A1`) holding `keys` keys of 32 octets.
+fn suci_info(schemes: &[(u8, u8)], keys: u8) -> Vec<u8> {
+    let mut out = atom(
+        0xA0,
+        &schemes
+            .iter()
+            .flat_map(|(a, b)| [*a, *b])
+            .collect::<Vec<_>>(),
+    );
+    let list: Vec<u8> = (1..=keys)
+        .flat_map(|i| [atom(0x80, &[i]), atom(0x81, &[0x5A; 32])].concat())
+        .collect();
+    out.extend(atom(0xA1, &list));
+    out
+}
+
+/// A USIM with EF.UST `ust`, an application directory DF.5GS, and EF.SUCI_Calc_Info `suci`.
+fn fiveg(ust: &[u8], suci: Option<&[u8]>) -> Card {
+    let card = usim(pin_status(true, false), &[], &[ARR_ALWAYS], &[ARR_ALWAYS])
+        .transparent("3F00/7FFF/6F38", ust)
+        .file("3F00/7FFF/5FC0", Fcp::Ts102221, None);
+    match suci {
+        Some(suci) => card.transparent("3F00/7FFF/5FC0/4F07", suci),
+        None => card,
+    }
+}
+
 fn corpus() -> Vec<Case> {
     let case = |name, card, dialect, limits, expected, complete, nodes| Case {
         name,
@@ -359,6 +408,10 @@ fn corpus() -> Vec<Case> {
         complete: true,
         nodes,
         probe: USIM_PROBE,
+    };
+    let suci_case = |name, card, expected| Case {
+        probe: FIVEG_PROBE,
+        ..usim_case(name, card, expected, 22)
     };
     let ust_case = |name, ust: &[u8], findings: usize| Case {
         probe: UST_PROBE,
@@ -475,6 +528,8 @@ fn corpus() -> Vec<Case> {
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F08")),
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/6F7E")),
                 (scan::SENSITIVE_EF_RULE, file("3F00/7FFF/5F3B/4F20")),
+                // 4F20 below 5F3C is not the sensitive EF.Kc, so it is judged as any other EF.
+                (scan::EF_UPDATABLE_RULE, file("3F00/7FFF/5F3C/4F20")),
             ],
             41,
         ),
@@ -539,6 +594,189 @@ fn corpus() -> Vec<Case> {
         ust_case("usim-ust-sms-pp-only", &[0x00, 0x00, 0x00, 0x08], 1),
         // Typical UST without either (services 2-5, 8, 9, 11-13, 17): silent.
         ust_case("usim-ust-benign", &[0x9E, 0x1D, 0x01, 0x00], 0),
+        // Issue #110: SUCI privacy. UST 124 without 125 means the terminal calculates the SUCI
+        // from EF.SUCI_Calc_Info; the null scheme first (or no usable key) leaves the IMSI clear.
+        suci_case(
+            "5g-suci-null-scheme-first",
+            fiveg(&ust_5g(0x08, 0), Some(&suci_info(&[(0, 0), (1, 1)], 1))),
+            vec![(scan::SUCI_NULL_RULE, file("3F00/7FFF/5FC0/4F07"))],
+        ),
+        suci_case(
+            "5g-suci-profile-a-with-key",
+            fiveg(&ust_5g(0x08, 0), Some(&suci_info(&[(1, 1), (0, 0)], 1))),
+            vec![],
+        ),
+        suci_case(
+            "5g-suci-scheme-without-key",
+            fiveg(&ust_5g(0x08, 0), Some(&suci_info(&[(2, 1)], 0))),
+            vec![(scan::SUCI_NULL_RULE, file("3F00/7FFF/5FC0/4F07"))],
+        ),
+        suci_case(
+            "5g-suci-key-index-past-the-list",
+            fiveg(&ust_5g(0x08, 0), Some(&suci_info(&[(1, 2)], 1))),
+            vec![(scan::SUCI_NULL_RULE, file("3F00/7FFF/5FC0/4F07"))],
+        ),
+        // Service 125: the USIM calculates it, the file is not used and the scheme is unreadable.
+        suci_case(
+            "5g-suci-by-the-usim",
+            fiveg(&ust_5g(0x18, 0), Some(&suci_info(&[(0, 0)], 0))),
+            vec![],
+        ),
+        // Not a TLV the clause gives: reported as malformed, never as clean or as a finding.
+        suci_case(
+            "5g-suci-malformed",
+            fiveg(&ust_5g(0x08, 0), Some(&[0xA0, 0x03, 0x01, 0x01, 0x01])),
+            vec![],
+        ),
+        suci_case(
+            "5g-no-service-124",
+            fiveg(&ust_5g(0x00, 0), None),
+            vec![(scan::SUCI_NOT_PROVISIONED_RULE, file("3F00/7FFF/6F38"))],
+        ),
+        // A 4G-only card has no 5GS service, so lacking 124 is not a finding.
+        suci_case(
+            "4g-only-card",
+            fiveg(&[0x9E, 0x1D, 0x01, 0x00], None),
+            vec![],
+        ),
+        // Access conditions of the configuration EFs (issue #40).
+        Case {
+            probe: CONFIG_PROBE,
+            ..usim_case(
+                "usim-config-efs-open",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/6F38", arr_ref([0x6F, 0x06], 1)),
+                        ("3F00/7FFF/6FAD", arr_ref([0x6F, 0x06], 1)),
+                        ("3F00/7FFF/6F78", arr_ref([0x6F, 0x06], 2)),
+                        ("3F00/7FFF/6F46", arr_ref([0x6F, 0x06], 2)),
+                    ],
+                    &[ARR_ALWAYS],
+                    &[ARR_ALWAYS, ARR_READ_OPEN],
+                ),
+                vec![
+                    (scan::CONFIG_EF_RULE, file("3F00/7FFF/6F38")),
+                    (scan::CONFIG_EF_RULE, file("3F00/7FFF/6FAD")),
+                ],
+                15,
+            )
+        },
+        Case {
+            probe: CONFIG_PROBE,
+            ..usim_case(
+                "usim-config-efs-protected",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/6F38", arr_ref([0x6F, 0x06], 2)),
+                        ("3F00/7FFF/6FAD", arr_ref([0x6F, 0x06], 2)),
+                        ("3F00/7FFF/6F78", arr_ref([0x6F, 0x06], 2)),
+                        ("3F00/7FFF/6F46", arr_ref([0x6F, 0x06], 2)),
+                    ],
+                    &[ARR_ALWAYS],
+                    &[ARR_ALWAYS, ARR_READ_OPEN],
+                ),
+                vec![],
+                15,
+            )
+        },
+        // Any other EF with UPDATE ALW is one aggregated finding; a protected one is silent.
+        Case {
+            probe: OTHER_PROBE,
+            ..usim_case(
+                "usim-other-efs-open",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/6F3C", arr_ref([0x6F, 0x06], 1)),
+                        ("3F00/7FFF/6F42", arr_ref([0x6F, 0x06], 1)),
+                        ("3F00/7FFF/6F43", arr_ref([0x6F, 0x06], 2)),
+                    ],
+                    &[ARR_ALWAYS],
+                    &[ARR_ALWAYS, ARR_READ_OPEN],
+                ),
+                vec![(scan::EF_UPDATABLE_RULE, file("3F00/7FFF/6F3C"))],
+                13,
+            )
+        },
+        Case {
+            probe: OTHER_PROBE,
+            ..usim_case(
+                "usim-other-efs-protected",
+                usim(
+                    pin_status(true, false),
+                    &[("3F00/7FFF/6F3C", arr_ref([0x6F, 0x06], 2))],
+                    &[ARR_ALWAYS],
+                    &[ARR_ALWAYS, ARR_READ_OPEN],
+                ),
+                vec![],
+                13,
+            )
+        },
+        // Phonebook numbers (EF.ADN, EF.FDN) readable without a PIN, as EF.MSISDN is.
+        Case {
+            probe: PHONEBOOK_PROBE,
+            ..usim_case(
+                "usim-phonebook-readable",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/5F3A/4F3A", arr_ref([0x6F, 0x06], 2)),
+                        ("3F00/7FFF/6F3B", arr_ref([0x6F, 0x06], 2)),
+                    ],
+                    &[ARR_ALWAYS],
+                    &[ARR_ALWAYS, ARR_READ_OPEN],
+                )
+                .file("3F00/7FFF/5F3A", Fcp::Ts102221, None),
+                vec![
+                    (scan::IDENTITY_READABLE_RULE, file("3F00/7FFF/5F3A/4F3A")),
+                    (scan::IDENTITY_READABLE_RULE, file("3F00/7FFF/6F3B")),
+                ],
+                22,
+            )
+        },
+        Case {
+            probe: PHONEBOOK_PROBE,
+            ..usim_case(
+                "usim-phonebook-protected",
+                usim(
+                    pin_status(true, false),
+                    &[
+                        ("3F00/7FFF/5F3A/4F3A", atom(0xAB, ARR_PIN_ADM)),
+                        ("3F00/7FFF/6F3B", atom(0xAB, ARR_PIN_ADM)),
+                    ],
+                    &[ARR_ALWAYS],
+                    &[ARR_ALWAYS, ARR_READ_OPEN],
+                )
+                .file("3F00/7FFF/5F3A", Fcp::Ts102221, None),
+                vec![],
+                22,
+            )
+        },
+        // The 5GS key and context files hold PIN conditions in TS 31.102 clause 4.4.11.
+        Case {
+            probe: GS5_PROBE,
+            ..usim_case(
+                "usim-5gs-keys-open",
+                usim(pin_status(true, false), &[], &[ARR_ALWAYS], &[ARR_ALWAYS])
+                    .file("3F00/7FFF/5FC0", Fcp::Ts102221, None)
+                    .secured("3F00/7FFF/5FC0/4F05", &[0xFF; 9], &arr_ref([0x6F, 0x06], 1)),
+                vec![(scan::SENSITIVE_EF_RULE, file("3F00/7FFF/5FC0/4F05"))],
+                19,
+            )
+        },
+        Case {
+            probe: GS5_PROBE,
+            ..usim_case(
+                "usim-5gs-keys-protected",
+                usim(pin_status(true, false), &[], &[ARR_ALWAYS], &[ARR_PIN_ADM])
+                    .file("3F00/7FFF/5FC0", Fcp::Ts102221, None)
+                    .secured("3F00/7FFF/5FC0/4F05", &[0xFF; 9], &arr_ref([0x6F, 0x06], 1)),
+                vec![],
+                19,
+            )
+        },
         usim_case(
             "usim-pin1-off-universal-in-use",
             usim(pin_status(false, true), &[], &[ARR_ALWAYS], &[ARR_ALWAYS]),
@@ -633,27 +871,24 @@ fn report(counts: &BTreeMap<String, Counts>) -> (String, bool) {
 }
 
 /// Runs one case; returns (expected, actual, shape problems).
-fn run(mut case: Case) -> (Vec<Found>, Vec<Found>, Vec<String>) {
-    let mut problems = Vec::new();
+/// The walk -> access -> EF contents -> TAR audit -> rules pipeline of `sim-doctor scan`.
+fn scan_card(
+    card: &mut Card,
+    dialect: Dialect,
+    limits: Limits,
+    probe: &[&str],
+) -> (walk::Tree, sim_doctor::rules::Findings) {
     let options = walk::Options {
-        candidates: Candidates::List(
-            case.probe
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect::<Vec<_>>(),
-        ),
-        limits: case.limits,
+        candidates: Candidates::List(probe.iter().map(|s| s.parse().unwrap()).collect::<Vec<_>>()),
+        limits,
         ..walk::Options::default()
     };
-    let mut tree = walk::walk(&mut case.card, &case.dialect.tag_set(), &options).expect("walk");
-    access::resolve(&mut case.card, &mut tree, &Policy::default()).expect("access rules");
-    ef::read(&mut case.card, &mut tree, &Policy::default()).expect("ef contents");
-    let audit = tar::audit(
-        &mut case.card,
-        &Selection::focused(),
-        &Policy::default(),
-        &mut || false,
-    )
+    let mut tree = walk::walk(card, &dialect.tag_set(), &options).expect("walk");
+    access::resolve(card, &mut tree, &Policy::default()).expect("access rules");
+    ef::read(card, &mut tree, &Policy::default()).expect("ef contents");
+    let audit = tar::audit(card, &Selection::focused(), &Policy::default(), &mut || {
+        false
+    })
     .expect("tar audit");
     let found = scan::findings(&Subject {
         tree: &tree,
@@ -661,6 +896,12 @@ fn run(mut case: Case) -> (Vec<Found>, Vec<Found>, Vec<String>) {
         scp03: None,
     })
     .expect("rules");
+    (tree, found)
+}
+
+fn run(mut case: Case) -> (Vec<Found>, Vec<Found>, Vec<String>) {
+    let mut problems = Vec::new();
+    let (tree, found) = scan_card(&mut case.card, case.dialect, case.limits, case.probe);
 
     if tree.is_complete() != case.complete {
         problems.push(format!(
@@ -897,4 +1138,53 @@ fn a_short_iccid_is_shown_in_full_by_the_scan_json() {
     assert!(text.contains("ICCID 89123456"), "{text}");
     // No 3F00/0002 on this card: no EF.MANUAREA entry, and the scan went on.
     assert!(!text.contains("EF.MANUAREA"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// The score (issue #40 acceptance: ten violations score below 30)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_card_with_many_violations_scores_under_30_through_the_whole_pipeline() {
+    let open = |n| arr_ref([0x6F, 0x06], n);
+    let services = ust_5g(0x08, 0x88);
+    let mut card = usim(
+        pin_status(false, false),
+        &[
+            ("3F00/7FFF/6F07", open(1)),
+            ("3F00/7FFF/6F08", open(1)),
+            ("3F00/7FFF/6F7E", open(1)),
+            ("3F00/7FFF/6F40", open(2)),
+            ("3F00/7FFF/6FAD", open(1)),
+            ("3F00/7FFF/6F3C", open(1)),
+        ],
+        &[ARR_ALWAYS],
+        &[ARR_ALWAYS, ARR_READ_OPEN],
+    )
+    .secured("3F00/7FFF/6F38", &services, &open(1))
+    .file("3F00/7FFF/5FC0", Fcp::Ts102221, None)
+    .transparent("3F00/7FFF/5FC0/4F07", &suci_info(&[(0, 0)], 0));
+    let probe = &[
+        "2F06", "6F06", "7FFF", "5FC0", "4F07", "6F38", "6F07", "6F08", "6F7E", "6F40", "6FAD",
+        "6F3C",
+    ];
+    let (_, found) = scan_card(&mut card, Dialect::Ts102221, Limits::default(), probe);
+    let rules_hit: BTreeSet<&str> = found.iter().map(|f| f.rule().as_str()).collect();
+    assert!(found.len() >= 10, "{} findings: {rules_hit:?}", found.len());
+    for rule in [
+        scan::PIN1_DISABLED_RULE,
+        scan::SENSITIVE_EF_RULE,
+        scan::IDENTITY_READABLE_RULE,
+        scan::RISKY_SERVICE_RULE,
+        scan::CONFIG_EF_RULE,
+        scan::EF_UPDATABLE_RULE,
+        scan::SUCI_NULL_RULE,
+    ] {
+        assert!(
+            rules_hit.contains(rule),
+            "{rule} did not fire: {rules_hit:?}"
+        );
+    }
+    let score = sim_doctor::rules::Score::of(&found);
+    assert!(score.value() < 30, "{score}");
 }

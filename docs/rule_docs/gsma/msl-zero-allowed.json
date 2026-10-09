@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-306",
+  "description": "the card accepted TAR 000000, so it runs at MSL 0",
+  "id": "gsma/msl-zero-allowed",
+  "reference": "ETSI TS 102 225 (minimum security level, TAR); ETSI TS 102 226",
+  "remediation": "raise MSL and load the card's TAR allow-list, then re-scan; a card at MSL 0 accepts any command under any TAR with no cryptographic verification",
+  "severity": "critical"
+}

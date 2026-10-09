@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-345",
+  "description": "the card accepted an SCP03 command that carried no valid C-MAC",
+  "id": "auth/scp03-missing-mac",
+  "reference": "GlobalPlatform Card Specification Amendment D (SCP03), security level and C-MAC",
+  "remediation": "require C-MAC (security level 01 or higher) on EXTERNAL AUTHENTICATE and on every command after it, and configure the security domain to refuse a command without one",
+  "severity": "high"
+}

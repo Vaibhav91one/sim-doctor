@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-732",
+  "description": "a configuration file (EF.UST, EF.EST, EF.SUCI_Calc_Info, EF.AD, EF.ACC, EF.SPN, EF.OPLMNwAcT, EF.Routing_Indicator) can be updated under ALWays (TS 31.102 gives them ADM)",
+  "id": "filesystem/config-ef-updatable-always",
+  "reference": "3GPP TS 31.102 clauses 4.2.8, 4.2.12, 4.2.15, 4.2.18, 4.2.47, 4.2.53, 4.4.11.8, 4.4.11.11",
+  "remediation": "set the file's UPDATE access rule (its EF.ARR record) back to ADM (PIN2 for EF.EST), then re-scan",
+  "severity": "high"
+}

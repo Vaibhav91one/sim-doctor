@@ -1,0 +1,8 @@
+{
+  "cwe": null,
+  "description": "the card holds a file the TS.48 test profile does not define",
+  "id": "ts48/file-extra",
+  "reference": "GSMA TS.48 generic test profile",
+  "remediation": "expected for an operator SIM, which is not a TS.48 card; matching TS.48 is not GCF or PTCRB conformance",
+  "severity": "info"
+}

@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-319",
+  "description": "EF.UST marks 5GS services available but not service 124 (Subscription identifier privacy support), so the card offers no SUCI configuration",
+  "id": "privacy/suci-not-provisioned",
+  "reference": "3GPP TS 31.102 clauses 4.2.8, 5.3.47; TS 33.501 clause 6.12",
+  "remediation": "if the operator uses SUPI concealment, set service 124 in EF.UST and provision EF.SUCI_Calc_Info (or set 125 for USIM calculation); otherwise confirm the terminal is configured to conceal the SUPI, then re-scan",
+  "severity": "medium"
+}
