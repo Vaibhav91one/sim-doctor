@@ -12,15 +12,32 @@
 //! `gp ara` ([`ara`]) and `gp status` ([`status`]) add SELECT of the ARA-M and GET
 //! STATUS (INS F2), both unauthenticated; a refusal is data.
 //!
-//! **Does not own, and never sends.** INITIALIZE UPDATE, EXTERNAL AUTHENTICATE,
-//! STORE DATA, INSTALL, LOAD, DELETE, PUT KEY, SET STATUS, MANAGE CHANNEL (that
-//! one is [`session::open_channel`], used by nothing here). The only
-//! instructions [`info`], [`ara`] and [`status`] send are SELECT, GET DATA and GET STATUS (plus the GET RESPONSE
-//! that [`session::send`] adds for a `61 xx`). A `91 xx` is deliberately NOT
-//! followed (no FETCH), and a refusal is recorded once, never retried.
-//! The INSTALL / LOAD builders return [`Command`]s and nothing calls
-//! `session::send` with them: sending, DAP signing, PUT KEY and DELETE belong
-//! to issue #115, and validating a KCV against a card needs keys for that card.
+//! **Authenticated reads (issues #112, #19).** `gp status` can open one SCP03
+//! secure channel to the ISD with user-supplied keys ([`Keys`], [`Auth`]) and
+//! list the registry over it; [`select`] is `gp select --aid`. The channel is the
+//! one in [`crate::scp03`] (C-MAC only); nothing here builds a second one.
+//!
+//! **Lockout safety.** A failed EXTERNAL AUTHENTICATE counts toward locking the
+//! ISD for good, so a run makes at most ONE attempt and never retries or tries a
+//! second key. Before EXTERNAL AUTHENTICATE the card cryptogram from INITIALIZE
+//! UPDATE is checked locally (Amendment D 6.2.2: the off-card entity verifies the
+//! card cryptogram); on a mismatch the run stops with `keys-do-not-match` and
+//! EXTERNAL AUTHENTICATE is never sent. Keys are read from a file or an
+//! environment variable by the caller, never the command line, and appear in no
+//! output: [`Keys`] has a redacting `Debug`, parse errors never quote input, and
+//! the trace holds wire bytes only (cryptograms and MACs, no key or session key).
+//! This is the one exception to the full-visibility rule in AGENTS.md.
+//!
+//! **Does not own, and never sends.** STORE DATA, INSTALL, LOAD, DELETE, PUT
+//! KEY, SET STATUS, MANAGE CHANNEL (that one is [`session::open_channel`], used
+//! by nothing here). The only instructions [`info`], [`ara`], [`status`] and
+//! [`select`] send are SELECT, GET DATA and GET STATUS, plus, only when keys are
+//! supplied, one INITIALIZE UPDATE and at most one EXTERNAL AUTHENTICATE (and the
+//! GET RESPONSE that [`session::send`] adds for a `61 xx`). A `91 xx` is
+//! deliberately NOT followed (no FETCH), and a refusal is recorded once, never
+//! retried. The INSTALL / LOAD builders return [`Command`]s and nothing calls
+//! `session::send` with them: sending, DAP signing, PUT KEY and DELETE belong to
+//! issue #115.
 
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "gp";
@@ -29,6 +46,7 @@ use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use serde_json::{json, Value};
 
 use crate::apdu::{Command, CorrectedLength, Header, Le, CLA_GET_RESPONSE_ISO};
+use crate::scp03;
 use crate::session::{self, PendingFollowUp, Policy};
 use crate::transport::CardSession;
 
@@ -462,6 +480,25 @@ pub const ARA_M_AID: [u8; 9] = [0xA0, 0x00, 0x00, 0x01, 0x51, 0x41, 0x43, 0x4C, 
 /// kept as the ISO 7816-4 "security status not satisfied" meaning.
 const AUTH_REQUIRED: [&str; 2] = ["6982", "6985"];
 
+/// The policy of every GP read: the ARA-M and the ISD are GP applets, so a `61 xx`
+/// is answered with the ISO class (00) GET RESPONSE, not the GSM class (A0) that
+/// [`Policy`] defaults to, and a pending proactive command is ignored.
+fn read_policy() -> Policy {
+    Policy {
+        proactive_command: PendingFollowUp::Ignore,
+        get_response_class: CLA_GET_RESPONSE_ISO,
+        ..Policy::default()
+    }
+}
+
+fn push_steps(steps: &mut Vec<Value>, label: &str, ex: &session::Exchange) {
+    for s in ex.steps() {
+        steps.push(
+            json!({"step": label, "command": hex_of(s.command()), "response": hex_of(s.response())}),
+        );
+    }
+}
+
 /// Sends `build(le)` and, on `6C xx`, the same command once with the Le the
 /// card named. Nothing else is retried. Records every APDU in `steps`.
 fn read_once<S: CardSession + ?Sized>(
@@ -470,25 +507,13 @@ fn read_once<S: CardSession + ?Sized>(
     label: &str,
     build: impl Fn(Le) -> Command,
 ) -> Result<session::Exchange, session::Error> {
-    // The ARA-M and the ISD are GP applets: a 61 xx is answered with the ISO
-    // class (00) GET RESPONSE, not the GSM class (A0) that Policy defaults to.
-    let policy = Policy {
-        proactive_command: PendingFollowUp::Ignore,
-        get_response_class: CLA_GET_RESPONSE_ISO,
-        ..Policy::default()
-    };
+    let policy = read_policy();
     let mut ex = session::send(session, &build(Le::Short(0)), &policy)?;
     if let Some(CorrectedLength::Accepts(le)) = ex.status().and_then(|s| s.corrected_length()) {
-        for s in ex.steps() {
-            steps.push(json!({"step": label, "command": hex_of(s.command()), "response": hex_of(s.response())}));
-        }
+        push_steps(steps, label, &ex);
         ex = session::send(session, &build(Le::Short(le)), &policy)?;
     }
-    for s in ex.steps() {
-        steps.push(
-            json!({"step": label, "command": hex_of(s.command()), "response": hex_of(s.response())}),
-        );
-    }
+    push_steps(steps, label, &ex);
     Ok(ex)
 }
 
@@ -792,12 +817,436 @@ pub fn decode_registry(scope: &str, data: &[u8]) -> Result<Value, String> {
     Ok(Value::Array(out))
 }
 
-/// `gp status`: SELECT the ISD, GET DATA tag 66 (Card Recognition Data), then
-/// GET STATUS (`80 F2 <scope> 02`, TLV format) for the ISD, applications,
-/// executable load files and load files with modules. Read-only and
-/// unauthenticated: a card that wants a secure channel answers `6982`/`6985`
-/// and the scope is reported as `requires_authentication`. `63 10` is followed
-/// with GET STATUS "next" up to [`STATUS_MAX_PAGES`] pages.
+// ---------------------------------------------------------------------------
+// Keys and the one SCP03 authentication attempt
+// ---------------------------------------------------------------------------
+
+/// Where the key text comes from. Never the command line (shell history).
+#[derive(Debug, Clone, Copy)]
+pub enum KeySource<'a> {
+    /// A file, read up to [`KEY_TEXT_MAX`] bytes.
+    File(&'a std::path::Path),
+    /// An environment variable.
+    Env(&'a str),
+}
+
+/// Largest key text read. Three keys with KCVs are about 120 bytes.
+pub const KEY_TEXT_MAX: u64 = 4096;
+
+/// Why keys could not be loaded. Messages name the source and the key's
+/// position (1 = ENC, 2 = MAC, 3 = DEK) and never quote the key text.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum KeyError {
+    /// The file or variable could not be read.
+    #[error("cannot read the keys from {0}")]
+    Unreadable(String),
+    /// More than [`KEY_TEXT_MAX`] bytes.
+    #[error("the key text is longer than {KEY_TEXT_MAX} bytes")]
+    TooLong,
+    /// Not one to three keys.
+    #[error("expected 1 to 3 keys (ENC [MAC [DEK]]), found {0}")]
+    Count(usize),
+    /// A token is not 32 hex digits, optionally `/` and 6 hex digits of KCV.
+    #[error("key {0} is not 32 hex digits (AES-128), optionally followed by /KCV of 6 hex digits")]
+    Format(usize),
+    /// The stated KCV is not the KCV of the key.
+    #[error(
+        "key {index}: its key check value is {computed} but {stated} was stated, so the key or \
+         the KCV is mistyped; nothing was sent to the card"
+    )]
+    Kcv {
+        /// 1 = ENC, 2 = MAC, 3 = DEK.
+        index: usize,
+        /// The KCV of the key as given (a KCV is public, 24 bits).
+        computed: String,
+        /// The KCV the text stated.
+        stated: String,
+    },
+}
+
+/// The static AES-128 keys of the ISD's SCP03 key set. The DEK, if given, is
+/// checked and dropped: no command here uses it.
+///
+/// `Debug` is redacted. Not `Clone`, not `Serialize`.
+pub struct Keys {
+    enc: [u8; 16],
+    mac: [u8; 16],
+    stated: [bool; 2],
+}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keys { .. }")
+    }
+}
+
+impl Keys {
+    /// Parses `ENC [MAC [DEK]]`, separated by whitespace or commas; `#` lines are
+    /// skipped. One key means ENC = MAC (GlobalPlatformPro's `--key`). A token
+    /// may be `KEY/KCV` (KCV: first 3 bytes of AES-ECB of 16 bytes of 0x01,
+    /// Amendment D 4.1.2); a stated KCV that is wrong is an error, which catches
+    /// a typo before the card is touched.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError`], whose text never contains the input.
+    pub fn parse(text: &str) -> Result<Self, KeyError> {
+        let tokens: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .flat_map(|l| l.split(|c: char| c.is_whitespace() || c == ','))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() || tokens.len() > 3 {
+            return Err(KeyError::Count(tokens.len()));
+        }
+        let mut keys = Vec::new();
+        let mut stated = [false; 2];
+        for (i, token) in tokens.iter().enumerate() {
+            let n = i + 1;
+            let (key_hex, kcv_hex) = match token.split_once('/') {
+                Some((k, c)) => (k, Some(c)),
+                None => (*token, None),
+            };
+            let key = hex::decode(key_hex)
+                .ok()
+                .and_then(|v| <[u8; 16]>::try_from(v).ok())
+                .ok_or(KeyError::Format(n))?;
+            if let Some(kcv_hex) = kcv_hex {
+                let want = hex::decode(kcv_hex)
+                    .ok()
+                    .and_then(|v| <[u8; 3]>::try_from(v).ok())
+                    .ok_or(KeyError::Format(n))?;
+                let got = aes_kcv(&key).expect("16-byte key");
+                if got != want {
+                    return Err(KeyError::Kcv {
+                        index: n,
+                        computed: hex::encode_upper(got),
+                        stated: hex::encode_upper(want),
+                    });
+                }
+                if n <= 2 {
+                    stated[i] = true;
+                }
+            }
+            keys.push(key);
+        }
+        if tokens.len() == 1 {
+            stated[1] = stated[0];
+        }
+        Ok(Self {
+            enc: keys[0],
+            mac: keys.get(1).copied().unwrap_or(keys[0]),
+            stated,
+        })
+    }
+
+    /// Reads and parses the key text from `source`.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError`].
+    pub fn load(source: KeySource<'_>) -> Result<Self, KeyError> {
+        use std::io::Read;
+        let text = match source {
+            KeySource::Env(name) => std::env::var(name)
+                .map_err(|_| KeyError::Unreadable(format!("environment variable {name}")))?,
+            KeySource::File(path) => {
+                let mut text = String::new();
+                std::fs::File::open(path)
+                    .and_then(|f| f.take(KEY_TEXT_MAX + 1).read_to_string(&mut text))
+                    .map_err(|_| KeyError::Unreadable(format!("file {}", path.display())))?;
+                text
+            }
+        };
+        if text.len() as u64 > KEY_TEXT_MAX {
+            return Err(KeyError::TooLong);
+        }
+        Self::parse(&text)
+    }
+}
+
+/// What `gp status` needs to authenticate once.
+pub struct Auth<'a> {
+    /// The static keys.
+    pub keys: &'a Keys,
+    /// Key version number for INITIALIZE UPDATE P1; 0 lets the card choose.
+    pub key_version: u8,
+    /// The 8 random bytes of the host challenge. Fresh per run.
+    pub host_challenge: [u8; scp03::CHALLENGE_LEN],
+}
+
+/// Why the run stopped before a secure channel existed.
+struct Stop {
+    kind: &'static str,
+    message: String,
+    key_version: Option<u8>,
+}
+
+struct Established {
+    channel: scp03::Channel,
+    iur: scp03::InitializeUpdateResponse,
+}
+
+/// The ONE authentication attempt: INITIALIZE UPDATE, the local check of the
+/// card cryptogram, then EXTERNAL AUTHENTICATE (security level C-MAC, `01`).
+///
+/// Commands and cryptograms follow GlobalPlatform Card Specification Amendment D
+/// (SCP03) v1.2: INITIALIZE UPDATE `80 50 <kvn> 00 08 <host challenge> 00`
+/// (7.1.1.2), the 3-byte key information, challenge and cryptogram response
+/// (7.1.1.6, Table 7-3), the card cryptogram under S-MAC with derivation
+/// constant 00 (6.2.2.2), the host cryptogram with constant 01 (6.2.2.3),
+/// EXTERNAL AUTHENTICATE `84 82 <level> 00 10 <host cryptogram> <C-MAC>` with a
+/// zero MAC chaining value (7.1.2, 6.2.3). Cross-checked against pySim
+/// `pySim/global_platform/scp.py` (`SCP03.parse_init_update_resp`,
+/// `gen_ext_auth_apdu`) and GlobalPlatformPro `SCP03Wrapper`. Not done: for a
+/// pseudo-random card challenge (`i` bit 0x10) the challenge is not recomputed
+/// from the sequence counter (6.2.2.1); the cryptogram check covers the keys.
+fn authenticate<S: CardSession + ?Sized>(
+    session: &mut S,
+    steps: &mut Vec<Value>,
+    auth: &Auth<'_>,
+) -> Result<Result<Established, Stop>, session::Error> {
+    let policy = read_policy();
+    let stop = |kind, message, key_version| {
+        Ok(Err(Stop {
+            kind,
+            message,
+            key_version,
+        }))
+    };
+    let sw = |ex: &session::Exchange| sw_hex(ex).unwrap_or_else(|| "none".into());
+
+    let init = scp03::initialize_update(auth.key_version, &auth.host_challenge);
+    let ex = session::send(session, &init, &policy)?;
+    push_steps(steps, "initialize_update", &ex);
+    if !ex.is_normal_processing() {
+        return stop(
+            "initialize-update-refused",
+            format!(
+                "INITIALIZE UPDATE answered {}; nothing else was sent",
+                sw(&ex)
+            ),
+            None,
+        );
+    }
+    // SCP02 answers 28 bytes with 02 at offset 11; name it rather than "bad length".
+    if let Some(&scp) = ex.data().get(11).filter(|b| **b != 0x03) {
+        return stop(
+            "not-scp03",
+            format!("the card answered with SCP {scp:02X}; only SCP03 is implemented"),
+            None,
+        );
+    }
+    let iur = match scp03::InitializeUpdateResponse::parse(ex.data()) {
+        Ok(iur) => iur,
+        Err(e) => return stop("initialize-update-unreadable", e.to_string(), None),
+    };
+    let kvn = Some(iur.key_version);
+    let session_keys = scp03::derive_session_keys(
+        &auth.keys.enc,
+        &auth.keys.mac,
+        &auth.host_challenge,
+        &iur.card_challenge,
+    );
+    if !scp03::verify_card_cryptogram(
+        &session_keys,
+        &auth.host_challenge,
+        &iur.card_challenge,
+        &iur.card_cryptogram,
+    ) {
+        return stop(
+            "keys-do-not-match",
+            "keys do not match this card: the card cryptogram does not verify with the supplied \
+             keys. EXTERNAL AUTHENTICATE was not sent, so no authentication attempt was counted"
+                .into(),
+            kvn,
+        );
+    }
+    let host_cryptogram = scp03::cryptogram(
+        &session_keys.mac,
+        scp03::Side::Host,
+        &auth.host_challenge,
+        &iur.card_challenge,
+    );
+    let mut channel = scp03::Channel::new(&session_keys);
+    let external =
+        match scp03::external_authenticate(&mut channel, scp03::LEVEL_C_MAC, &host_cryptogram) {
+            Ok(command) => command,
+            Err(e) => return stop("external-authenticate-unbuildable", e.to_string(), kvn),
+        };
+    let ex = session::send(session, &external, &policy)?;
+    push_steps(steps, "external_authenticate", &ex);
+    if !ex.is_normal_processing() {
+        return stop(
+            "external-authenticate-refused",
+            format!(
+                "EXTERNAL AUTHENTICATE answered {}. It was not retried; the card counts this as \
+                 one failed authentication",
+                sw(&ex)
+            ),
+            kvn,
+        );
+    }
+    Ok(Ok(Established { channel, iur }))
+}
+
+/// Sends `plain` MAC'd on `channel` (once, in send order: the chaining value
+/// advances per command sent). No `6C` correction, because a re-send would need a
+/// new MAC and the card's chain state after a `6C` is not specified.
+fn send_secure<S: CardSession + ?Sized>(
+    session: &mut S,
+    steps: &mut Vec<Value>,
+    channel: &mut scp03::Channel,
+    label: &str,
+    plain: &Command,
+) -> Result<session::Exchange, session::Error> {
+    // GET STATUS data is the 2-byte search criterion, so data plus MAC always fits.
+    let wrapped = channel
+        .wrap(plain)
+        .expect("2 data bytes plus the C-MAC fit a short APDU");
+    let ex = session::send(session, &wrapped, &read_policy())?;
+    push_steps(steps, label, &ex);
+    Ok(ex)
+}
+
+/// The `secure_channel` block of an established channel. Holds the key check
+/// values of the supplied keys (public, 24 bits each) and never a key.
+fn channel_report(auth: &Auth<'_>, est: &Established, card_keys: Option<&Value>) -> Value {
+    let kvn = est.iur.key_version;
+    // The card's own entry for this key version: GET DATA E0 has id, version,
+    // type and length only; no KCV (GP 2.3.1 11.3.3.1; GlobalPlatformPro
+    // `GPKeyInfo.parseTemplate` reads no KCV either).
+    let card = card_keys.and_then(Value::as_array).and_then(|keys| {
+        keys.iter()
+            .find(|k| k["key_version"].as_u64() == Some(u64::from(kvn)))
+    });
+    let key_info = match card {
+        Some(k) => json!({
+            "found": true,
+            "card_key_type": k["key_type_name"],
+            "card_key_length": k["key_length"],
+            "matches_supplied": k["key_type"] == "88" && k["key_length"] == 16,
+        }),
+        None => json!({ "found": false }),
+    };
+    let kcv = |key: &[u8; 16], stated: bool| {
+        json!({
+            "kcv": hex::encode_upper(aes_kcv(key).expect("16-byte key")),
+            "stated_kcv": if stated { "match" } else { "not-stated" },
+        })
+    };
+    json!({
+        "protocol": "SCP03",
+        "established": true,
+        "security_level": "C-MAC (01)",
+        "key_version": kvn,
+        "i_parameter": format!("{:02X}", est.iur.i_parameter),
+        "card_cryptogram_verified": true,
+        "enc_key_exercised": false,
+        "enc_key": kcv(&auth.keys.enc, auth.keys.stated[0]),
+        "mac_key": kcv(&auth.keys.mac, auth.keys.stated[1]),
+        "card_key_info": key_info,
+        "kcv_on_card": "not exposed: GET DATA key information carries id, version, type and length only",
+    })
+}
+
+/// Findings over a `gp status` `data`, as `{id, severity, message[, aid]}`.
+/// They are entries in `data.registry_findings`, not doctor/1 findings: `gp`
+/// keeps the lpac envelope.
+///
+/// - `gp/weak-secure-channel` (medium): Card Recognition Data advertises SCP01 or SCP02.
+/// - `gp/isd-lifecycle` (medium before SECURED, low when locked or terminated).
+/// - `gp/app-locked` (low): an application in the LOCKED state.
+/// - `gp/app-excess-privilege` (medium): an application that is not a security
+///   domain holds Card Lock, Card Terminate, Card Reset, Global Delete, Global
+///   Lock or Global Registry (privilege bits as in [`PRIVILEGES`]).
+pub fn registry_findings(data: &Value) -> Vec<Value> {
+    const RISKY: [&str; 6] = [
+        "card_lock",
+        "card_terminate",
+        "card_reset",
+        "global_delete",
+        "global_lock",
+        "global_registry",
+    ];
+    let mut out = Vec::new();
+    let mut add = |id: &str, severity: &str, message: String, aid: Option<&Value>| {
+        let mut f = json!({ "id": id, "severity": severity, "message": message });
+        if let Some(aid) = aid {
+            f["aid"] = aid.clone();
+        }
+        out.push(f);
+    };
+    for n in data["card_recognition"]["weak_scp"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        add(
+            "gp/weak-secure-channel",
+            "medium",
+            format!("the card offers SCP0{n}, an old secure channel protocol; prefer SCP03"),
+            None,
+        );
+    }
+    for scope in data["registry"].as_array().into_iter().flatten() {
+        let name = scope["scope"].as_str().unwrap_or("");
+        for e in scope["entries"].as_array().into_iter().flatten() {
+            let aid = &e["aid"];
+            let life = e["lifecycle_name"].as_str().unwrap_or("unknown");
+            let privs: Vec<&str> = e["privilege_names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if name == "isd" && life != "SECURED" && life != "unknown" {
+                let (sev, tail) = match life {
+                    "CARD_LOCKED" | "TERMINATED" => ("low", ""),
+                    _ => ("medium", ": the card is not in the SECURED state"),
+                };
+                add(
+                    "gp/isd-lifecycle",
+                    sev,
+                    format!("the ISD is {life}{tail}"),
+                    Some(aid),
+                );
+            }
+            if name == "applications" {
+                if life == "LOCKED" {
+                    add(
+                        "gp/app-locked",
+                        "low",
+                        "an application is LOCKED".into(),
+                        Some(aid),
+                    );
+                }
+                if !privs.contains(&"security_domain") {
+                    let held: Vec<&str> = RISKY
+                        .iter()
+                        .copied()
+                        .filter(|r| privs.contains(r))
+                        .collect();
+                    if !held.is_empty() {
+                        add(
+                            "gp/app-excess-privilege",
+                            "medium",
+                            format!(
+                                "a non-security-domain application holds {}",
+                                held.join(", ")
+                            ),
+                            Some(aid),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `gp status` without keys; see [`status_with`].
 ///
 /// # Errors
 ///
@@ -805,6 +1254,76 @@ pub fn decode_registry(scope: &str, data: &[u8]) -> Result<Value, String> {
 pub fn status<S: CardSession + ?Sized>(
     session: &mut S,
     trace: bool,
+) -> Result<Report, session::Error> {
+    status_with(session, trace, None)
+}
+
+/// `gp status` over a secure channel opened with `auth`; see [`status_with`].
+///
+/// # Errors
+///
+/// Only transport and encoding failures. A failed authentication is data:
+/// `data.error` and `data.secure_channel`.
+pub fn status_authenticated<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+    auth: &Auth<'_>,
+) -> Result<Report, session::Error> {
+    status_with(session, trace, Some(auth))
+}
+
+/// `gp select --aid`: SELECT an arbitrary GlobalPlatform application (or any
+/// application) by AID and report the status word and the FCI. `isd_found` is
+/// whether it answered `90 00`. Changes the card's current selection only.
+///
+/// # Errors
+///
+/// Only transport and encoding failures.
+pub fn select<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    trace: bool,
+) -> Result<Report, session::Error> {
+    let mut steps = Vec::new();
+    let ex = read_once(session, &mut steps, "select", select_by_aid(aid))?;
+    let mut data = json!({
+        "card_touched": true,
+        "selected": { "aid": hex::encode_upper(aid), "status": sw_hex(&ex) },
+    });
+    if ex.is_success() {
+        data["selected"]["fci"] = hex_of(ex.data());
+        // FCI is `6F { 84 DF name, A5 proprietary ... }` (ISO/IEC 7816-4 SELECT).
+        if let Some((_, name)) = parse_tlvs(ex.data())
+            .and_then(|t| t.into_iter().find(|(tag, _)| *tag == 0x6F))
+            .and_then(|(_, body)| parse_tlvs(body))
+            .and_then(|t| t.into_iter().find(|(tag, _)| *tag == 0x84))
+        {
+            data["selected"]["df_name"] = hex_of(name);
+        }
+    }
+    if trace {
+        data["trace"] = Value::Array(steps);
+    }
+    Ok(Report {
+        isd_found: ex.is_success(),
+        data,
+    })
+}
+
+/// `gp status`: SELECT the ISD, GET DATA tag 66 (Card Recognition Data), then
+/// GET STATUS (`80 F2 <scope> 02`, TLV format) for the ISD, applications,
+/// executable load files and load files with modules. Without `auth` it is
+/// read-only and unauthenticated: a card that wants a secure channel answers
+/// `6982`/`6985` and the scope is reported as `requires_authentication`. With
+/// `auth` it also reads the key information (GET DATA E0), makes the one
+/// authentication attempt of [`authenticate`] and sends GET STATUS MAC'd on the
+/// channel; a failed authentication returns early with `data.error` set and no
+/// registry. `63 10` is followed with GET STATUS "next" up to
+/// [`STATUS_MAX_PAGES`] pages.
+fn status_with<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+    auth: Option<&Auth<'_>>,
 ) -> Result<Report, session::Error> {
     let mut steps = Vec::new();
     let mut attempts = Vec::new();
@@ -818,6 +1337,7 @@ pub fn status<S: CardSession + ?Sized>(
         }
     }
     let mut data = json!({ "card_touched": true, "isd": selected, "isd_attempts": attempts });
+    let mut channel = None;
     if selected.is_some() {
         let ex = read_once(session, &mut steps, "card_data", |le| {
             Command::case2(Header::new(0x80, 0xCA, 0x00, 0x66), le)
@@ -842,15 +1362,51 @@ pub fn status<S: CardSession + ?Sized>(
             }
         }
         data["card_recognition"] = crd;
+        if let Some(auth) = auth {
+            // Plain reads first: after EXTERNAL AUTHENTICATE every command must be MAC'd.
+            let ex = read_once(session, &mut steps, "key_information", |le| {
+                Command::case2(Header::new(0x80, 0xCA, 0x00, 0xE0), le)
+            })?;
+            let card_keys = if ex.is_success() {
+                decode_key_information(ex.data()).ok()
+            } else {
+                None
+            };
+            match authenticate(session, &mut steps, auth)? {
+                Ok(est) => {
+                    data["secure_channel"] = channel_report(auth, &est, card_keys.as_ref());
+                    channel = Some(est.channel);
+                }
+                Err(stop) => {
+                    data["secure_channel"] = json!({
+                        "protocol": "SCP03",
+                        "established": false,
+                        "stopped": stop.kind,
+                        "key_version": stop.key_version,
+                    });
+                    data["error"] = json!({ "kind": stop.kind, "message": stop.message });
+                    if trace {
+                        data["trace"] = Value::Array(steps);
+                    }
+                    return Ok(Report {
+                        isd_found: true,
+                        data,
+                    });
+                }
+            }
+        }
         let mut scopes = Vec::new();
         for (p1, name) in STATUS_SCOPES {
             let mut collected = Vec::new();
             let mut p2 = 0x02;
             let mut pages = 0;
             let (last, truncated) = loop {
-                let ex = read_once(session, &mut steps, name, |le| {
-                    Command::case4(Header::new(0x80, 0xF2, p1, p2), vec![0x4F, 0x00], le)
-                })?;
+                let build =
+                    |le| Command::case4(Header::new(0x80, 0xF2, p1, p2), vec![0x4F, 0x00], le);
+                let ex = match channel.as_mut() {
+                    Some(ch) => send_secure(session, &mut steps, ch, name, &build(Le::Short(0)))?,
+                    None => read_once(session, &mut steps, name, build)?,
+                };
                 let sw = sw_hex(&ex);
                 if ex.is_success() || sw.as_deref() == Some("6310") {
                     collected.extend_from_slice(ex.data());
@@ -884,6 +1440,7 @@ pub fn status<S: CardSession + ?Sized>(
             scopes.push(item);
         }
         data["registry"] = Value::Array(scopes);
+        data["registry_findings"] = Value::Array(registry_findings(&data));
     }
     if trace {
         data["trace"] = Value::Array(steps);
@@ -894,12 +1451,24 @@ pub fn status<S: CardSession + ?Sized>(
     })
 }
 
-/// Plain-text rendering of a `gp ara` / `gp status` `data`, one fact per line.
+/// Plain-text rendering of a `gp ara` / `gp status` / `gp select` `data`, one fact per line.
 /// Card bytes only reach it as hex or as the package name, which goes through
 /// [`crate::contract::sanitize`] (JSON output is escaped by the serialiser).
 pub fn render_text(data: &Value) -> String {
     let s = |v: &Value| crate::contract::sanitize(v.as_str().unwrap_or("-"));
     let mut out = Vec::new();
+    if let Some(sel) = data.get("selected") {
+        out.push(format!(
+            "SELECT {}: status {}",
+            s(&sel["aid"]),
+            s(&sel["status"])
+        ));
+        for (key, label) in [("df_name", "DF name"), ("fci", "FCI")] {
+            if sel.get(key).is_some() {
+                out.push(format!("  {label}: {}", s(&sel[key])));
+            }
+        }
+    }
     if let Some(rules) = data["rules"].as_array() {
         out.push(format!("ARA-M: {} rule(s)", rules.len()));
         for r in rules {
@@ -937,6 +1506,25 @@ pub fn render_text(data: &Value) -> String {
             out.push(format!("  weak secure channel offered: SCP0{}", w[0]));
         }
     }
+    if let Some(c) = data
+        .get("secure_channel")
+        .filter(|c| c["established"] == true)
+    {
+        out.push(format!(
+            "Secure channel: SCP03 {}, key version {:02X}, card cryptogram verified; ENC KCV {}, MAC KCV {}",
+            s(&c["security_level"]),
+            c["key_version"].as_u64().unwrap_or(0),
+            s(&c["enc_key"]["kcv"]),
+            s(&c["mac_key"]["kcv"]),
+        ));
+        if c["card_key_info"]["matches_supplied"] == false {
+            out.push(format!(
+                "  card key type {} length {} differs from the supplied AES-128 key",
+                s(&c["card_key_info"]["card_key_type"]),
+                c["card_key_info"]["card_key_length"]
+            ));
+        }
+    }
     for scope in data["registry"].as_array().into_iter().flatten() {
         let n = scope["entries"].as_array().map_or(0, Vec::len);
         let note = if scope["requires_authentication"] == true {
@@ -950,8 +1538,26 @@ pub fn render_text(data: &Value) -> String {
             s(&scope["status"])
         ));
         for e in scope["entries"].as_array().into_iter().flatten() {
-            out.push(format!("  {} {}", s(&e["aid"]), s(&e["lifecycle_name"])));
+            let mut line = format!("  {} {}", s(&e["aid"]), s(&e["lifecycle_name"]));
+            let privs: Vec<&str> = e["privilege_names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if !privs.is_empty() {
+                line += &format!(" [{}]", privs.join(", "));
+            }
+            out.push(line);
         }
+    }
+    for f in data["registry_findings"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "finding {} ({}): {}",
+            s(&f["id"]),
+            s(&f["severity"]),
+            s(&f["message"])
+        ));
     }
     out.join("\n")
 }
@@ -1831,5 +2437,351 @@ mod tests {
         }
         let text = serde_json::to_string(&report.data).unwrap();
         let _: Value = serde_json::from_str(&text).unwrap();
+    }
+
+    // ---- authenticated reads --------------------------------------------
+    //
+    // Test vectors: pySim tests/unittests/test_globalplatform.py class
+    // SCP03_Test_AES128_11 (osmocom/pysim, keyset 000102.. / 101112..), repeated
+    // in scp03.rs for the primitives. The flow below runs at security level 01,
+    // whose wire bytes are not in pySim; they were computed with an independent
+    // Python model (AES-CMAC from `cryptography`, written from Amendment D 4.1.5
+    // and 6.2.4) that first reproduced every pySim vector byte for byte,
+    // including the wrapped `80 F2 80 02 02 4F 00 00` GET STATUS.
+
+    const ENC_HEX: &str = "000102030405060708090A0B0C0D0E0F";
+    const MAC_HEX: &str = "101112131415161718191A1B1C1D1E1F";
+    const HOST_CHALLENGE: [u8; 8] = [0xB1, 0x3E, 0x5F, 0x93, 0x8F, 0xC1, 0x08, 0xC4];
+    const INIT_UPDATE: &str = "8050300008B13E5F938FC108C400";
+    const INIT_UPDATE_RESP: &str =
+        "000000000000000000003003703EB51047495B249F66C484C1D2EF1948000002";
+    const EXT_AUTH_01: &str = "84820100107D5F5826A993EBC8CEDC6DBB0146E4A0";
+    const GS_ISD: &str = "84F280020A4F004B3EF773D6AD4FFA00";
+    const GS_APPS: &str = "84F240020A4F0006CD27885DC7CBDD00";
+    const GS_APPS_NEXT: &str = "84F240030A4F0080F9BC578DEC364D00";
+    const GS_LF: &str = "84F220020A4F00900999D121148E2400";
+    const GS_LFM: &str = "84F210020A4F00C93E4C6C7772071000";
+    const KEY_INFO_AES: &str = "E006C00401308810";
+
+    fn keys() -> Keys {
+        Keys::parse(&format!("{ENC_HEX} {MAC_HEX}")).unwrap()
+    }
+
+    fn auth(keys: &Keys) -> Auth<'_> {
+        Auth {
+            keys,
+            key_version: 0x30,
+            host_challenge: HOST_CHALLENGE,
+        }
+    }
+
+    fn sent_ins(card: &Card, ins: &str) -> usize {
+        card.sent.iter().filter(|c| &c[2..4] == ins).count()
+    }
+
+    /// A card that accepts the vector's keys and answers the registry.
+    fn secure_card(ext_auth_answer: &str) -> Card {
+        let isd = tlv(
+            "E3",
+            &(tlv("4F", "A000000151000000") + &tlv("9F70", "0F") + &tlv("C5", "9E0000")),
+        );
+        let app1 = tlv(
+            "E3",
+            &(tlv("4F", "A0000000620001") + &tlv("9F70", "07") + &tlv("C5", "180000")),
+        );
+        let app2 = tlv(
+            "E3",
+            &(tlv("4F", "A0000000620002") + &tlv("9F70", "83") + &tlv("C5", "800000")),
+        );
+        let lfm = tlv(
+            "E3",
+            &(tlv("4F", "A0000000620003") + &tlv("9F70", "01") + &tlv("84", "A000000062000301")),
+        );
+        let crd = recognition_hex(&["0215", "0370"]) + "9000";
+        let rows = [
+            (SEL1, "9000".to_string()),
+            ("80CA006600", crd),
+            ("80CA00E000", format!("{KEY_INFO_AES}9000")),
+            (INIT_UPDATE, format!("{INIT_UPDATE_RESP}9000")),
+            (EXT_AUTH_01, ext_auth_answer.to_string()),
+            (GS_ISD, isd + "9000"),
+            (GS_APPS, app1 + "6310"),
+            (GS_APPS_NEXT, app2 + "9000"),
+            (GS_LF, "6A88".into()),
+            (GS_LFM, lfm + "9000"),
+        ];
+        let rows: Vec<(&str, &str)> = rows.iter().map(|(a, b)| (*a, b.as_str())).collect();
+        Card::new(&rows)
+    }
+
+    /// Everything a run could print, for the "no keys anywhere" checks.
+    fn everything(report: &Report, keys: &Keys) -> String {
+        format!(
+            "{}\n{}\n{keys:?}\n{:?}",
+            serde_json::to_string(&report.data).unwrap(),
+            render_text(&report.data),
+            report.data
+        )
+        .to_lowercase()
+    }
+
+    fn assert_no_key_material(out: &str) {
+        let session = scp03::derive_session_keys(
+            &<[u8; 16]>::try_from(hex::decode(ENC_HEX).unwrap()).unwrap(),
+            &<[u8; 16]>::try_from(hex::decode(MAC_HEX).unwrap()).unwrap(),
+            &HOST_CHALLENGE,
+            &[0x3E, 0xB5, 0x10, 0x47, 0x49, 0x5B, 0x24, 0x9F],
+        );
+        for secret in [
+            hex::decode(ENC_HEX).unwrap(),
+            hex::decode(MAC_HEX).unwrap(),
+            session.enc.to_vec(),
+            session.mac.to_vec(),
+            session.rmac.to_vec(),
+        ] {
+            assert!(
+                !out.contains(&hex::encode(&secret)),
+                "key material in output"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_status_lists_the_registry_over_the_channel() {
+        let keys = keys();
+        let mut card = secure_card("9000");
+        let r = status_authenticated(&mut card, true, &auth(&keys)).unwrap();
+        assert!(r.isd_found);
+        assert!(r.data.get("error").is_none());
+        // Exactly one attempt: one INITIALIZE UPDATE, one EXTERNAL AUTHENTICATE.
+        assert_eq!(sent_ins(&card, "50"), 1);
+        assert_eq!(sent_ins(&card, "82"), 1);
+        // Order: plain reads, the handshake, then only MAC'd GET STATUS.
+        let wire: Vec<&str> = card.sent.iter().map(String::as_str).collect();
+        assert_eq!(
+            wire,
+            [
+                SEL1,
+                "80CA006600",
+                "80CA00E000",
+                INIT_UPDATE,
+                EXT_AUTH_01,
+                GS_ISD,
+                GS_APPS,
+                GS_APPS_NEXT,
+                GS_LF,
+                GS_LFM
+            ]
+        );
+        let ch = &r.data["secure_channel"];
+        assert_eq!(ch["established"], true);
+        assert_eq!(ch["key_version"], 0x30);
+        assert_eq!(ch["card_cryptogram_verified"], true);
+        assert_eq!(ch["enc_key"]["kcv"], "C35280");
+        assert_eq!(ch["mac_key"]["kcv"], "013808");
+        assert_eq!(ch["enc_key"]["stated_kcv"], "not-stated");
+        assert_eq!(ch["card_key_info"]["matches_supplied"], true);
+        let reg = &r.data["registry"];
+        assert_eq!(reg[0]["entries"][0]["lifecycle_name"], "SECURED");
+        assert_eq!(reg[1]["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(reg[2]["status"], "6A88");
+        assert_eq!(reg[3]["entries"][0]["modules"][0], "A000000062000301");
+        let ids: Vec<&str> = r.data["registry_findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "gp/weak-secure-channel",
+                "gp/app-excess-privilege",
+                "gp/app-locked"
+            ]
+        );
+        assert_no_key_material(&everything(&r, &keys));
+        assert!(render_text(&r.data).contains("Secure channel: SCP03"));
+    }
+
+    #[test]
+    fn wrong_keys_stop_before_external_authenticate() {
+        // Same card, but the host holds a different MAC key.
+        let wrong = Keys::parse(&format!("{ENC_HEX} {}", "FF".repeat(16))).unwrap();
+        let mut card = secure_card("9000");
+        let r = status_authenticated(&mut card, true, &auth(&wrong)).unwrap();
+        assert_eq!(r.data["error"]["kind"], "keys-do-not-match");
+        assert!(r.data["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("keys do not match this card"));
+        assert_eq!(r.data["secure_channel"]["established"], false);
+        assert_eq!(sent_ins(&card, "50"), 1);
+        assert_eq!(
+            sent_ins(&card, "82"),
+            0,
+            "EXTERNAL AUTHENTICATE must not be sent"
+        );
+        assert_eq!(sent_ins(&card, "F2"), 0);
+        assert!(r.data.get("registry").is_none());
+        let out = everything(&r, &wrong);
+        assert!(!out.contains(&"ff".repeat(16)));
+    }
+
+    #[test]
+    fn a_refused_external_authenticate_is_never_retried() {
+        let keys = keys();
+        let mut card = secure_card("6300");
+        let r = status_authenticated(&mut card, false, &auth(&keys)).unwrap();
+        assert_eq!(r.data["error"]["kind"], "external-authenticate-refused");
+        assert!(r.data["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("6300"));
+        assert_eq!(sent_ins(&card, "50"), 1);
+        assert_eq!(sent_ins(&card, "82"), 1);
+        assert_eq!(sent_ins(&card, "F2"), 0);
+    }
+
+    #[test]
+    fn an_initialize_update_refusal_or_scp02_card_sends_no_external_authenticate() {
+        let keys = keys();
+        for (answer, kind) in [
+            ("6A88".to_string(), "initialize-update-refused"),
+            // SCP02 INITIALIZE UPDATE response: 28 bytes, 02 at offset 11.
+            (
+                format!("{}0201{}9000", "00".repeat(11), "00".repeat(14)),
+                "not-scp03",
+            ),
+        ] {
+            let mut card = Card::new(&[(SEL1, "9000"), (INIT_UPDATE, &answer)]);
+            let r = status_authenticated(&mut card, false, &auth(&keys)).unwrap();
+            assert_eq!(r.data["error"]["kind"], kind);
+            assert_eq!(sent_ins(&card, "82"), 0);
+            assert_eq!(sent_ins(&card, "50"), 1);
+        }
+    }
+
+    #[test]
+    fn key_info_of_another_type_is_reported_not_trusted() {
+        let keys = keys();
+        let mut card = secure_card("9000");
+        // The card says key version 30 is a 3DES key (type 80, 16 bytes).
+        card.table.insert(
+            "80CA00E000".into(),
+            hex::decode("E006C0040130801090 00".replace(' ', "")).unwrap(),
+        );
+        let r = status_authenticated(&mut card, false, &auth(&keys)).unwrap();
+        assert_eq!(
+            r.data["secure_channel"]["card_key_info"]["matches_supplied"],
+            false
+        );
+        assert!(render_text(&r.data).contains("differs from the supplied"));
+    }
+
+    #[test]
+    fn keys_parse_with_kcv_checks_and_never_quote_input() {
+        // Key check values: pySim SCP03_KCV_Test (AES-128 keyset 000102.. and 101112..).
+        let k = Keys::parse(&format!(
+            "{ENC_HEX}/C35280\n# comment\n{MAC_HEX}/013808 {}",
+            "20".repeat(16)
+        ))
+        .unwrap();
+        assert_eq!(k.stated, [true, true]);
+        assert_eq!(aes_kcv(&k.enc).unwrap(), [0xC3, 0x52, 0x80]);
+        assert_eq!(aes_kcv(&k.mac).unwrap(), [0x01, 0x38, 0x08]);
+        // one key is both
+        let one = Keys::parse(ENC_HEX).unwrap();
+        assert_eq!(one.enc, one.mac);
+        // a wrong KCV is a mismatch error naming the position, before any card
+        let err = Keys::parse(&format!("{ENC_HEX}/000000")).unwrap_err();
+        assert_eq!(
+            err,
+            KeyError::Kcv {
+                index: 1,
+                computed: "C35280".into(),
+                stated: "000000".into()
+            }
+        );
+        // format errors say which key, never what was typed
+        let secret = "ZZ0102030405060708090A0B0C0D0E0F";
+        for bad in [secret, "0001", &format!("{ENC_HEX}/12"), ""] {
+            let msg = Keys::parse(bad).unwrap_err().to_string();
+            assert!(!msg.contains(secret) && !msg.contains(ENC_HEX), "{msg}");
+        }
+        assert_eq!(
+            Keys::parse(&format!("{ENC_HEX} {ENC_HEX} {ENC_HEX} {ENC_HEX}")).unwrap_err(),
+            KeyError::Count(4)
+        );
+        assert_eq!(format!("{k:?}"), "Keys { .. }");
+    }
+
+    #[test]
+    fn keys_load_from_a_file_or_an_environment_variable() {
+        let dir = std::env::temp_dir().join(format!("sim-doctor-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("keys.txt");
+        std::fs::write(&file, format!("{ENC_HEX} {MAC_HEX}\n")).unwrap();
+        assert!(Keys::load(KeySource::File(&file)).is_ok());
+        std::fs::write(&file, "x".repeat(5000)).unwrap();
+        assert_eq!(
+            Keys::load(KeySource::File(&file)).unwrap_err(),
+            KeyError::TooLong
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let missing = Keys::load(KeySource::File(&dir.join("nope"))).unwrap_err();
+        assert!(matches!(missing, KeyError::Unreadable(_)));
+        let var = "SIM_DOCTOR_TEST_GP_KEYS_UNSET";
+        assert!(matches!(
+            Keys::load(KeySource::Env(var)).unwrap_err(),
+            KeyError::Unreadable(m) if m.contains(var)
+        ));
+    }
+
+    #[test]
+    fn select_by_aid_reports_status_and_fci() {
+        let fci = tlv(
+            "6F",
+            &(tlv("84", "A0000000620001") + &tlv("A5", "9F6501FF")),
+        );
+        let aid = [0xA0, 0x00, 0x00, 0x00, 0x62, 0x00, 0x01];
+        let mut card = Card::new(&[("00A4040007A000000062000100", &(fci.clone() + "9000"))]);
+        let r = select(&mut card, &aid, true).unwrap();
+        assert!(r.isd_found);
+        assert_eq!(r.data["selected"]["df_name"], "A0000000620001");
+        assert_eq!(r.data["selected"]["fci"], fci);
+        assert!(render_text(&r.data).contains("DF name: A0000000620001"));
+        let mut card = Card::new(&[("00A4040007A000000062000100", "6A82")]);
+        let r = select(&mut card, &aid, false).unwrap();
+        assert!(!r.isd_found);
+        assert_eq!(r.data["selected"]["status"], "6A82");
+    }
+
+    #[test]
+    fn registry_findings_flag_lifecycle_and_privileges() {
+        let data = json!({
+            "card_recognition": {"weak_scp": [2]},
+            "registry": [
+                {"scope": "isd", "entries": [{"aid": "A1", "lifecycle_name": "INITIALIZED"}]},
+                {"scope": "applications", "entries": [
+                    {"aid": "A2", "lifecycle_name": "SELECTABLE", "privilege_names": ["global_delete"]},
+                    {"aid": "A3", "lifecycle_name": "SELECTABLE", "privilege_names": ["security_domain", "global_delete"]},
+                    {"aid": "A4", "lifecycle_name": "LOCKED"},
+                ]},
+            ]
+        });
+        let f = registry_findings(&data);
+        let ids: Vec<&str> = f.iter().map(|f| f["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gp/weak-secure-channel",
+                "gp/isd-lifecycle",
+                "gp/app-excess-privilege",
+                "gp/app-locked"
+            ]
+        );
+        assert_eq!(f[2]["aid"], "A2");
+        assert!(registry_findings(&json!({})).is_empty());
     }
 }

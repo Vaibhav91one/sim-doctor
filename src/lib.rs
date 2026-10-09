@@ -295,8 +295,8 @@ pub const MODULES: &[ModuleInfo] = &[
     },
     ModuleInfo {
         name: gp::NAME,
-        owns: "Read-only GlobalPlatform: select the issuer security domain, GET DATA (CPLC, key information, counters, extended resources, Card Recognition Data decoders), the APDU trace, AES/3DES key check values, and INSTALL [for load] / LOAD builders that are never sent; sends no authenticating or writing command.",
-        depends_on: &[apdu::NAME, transport::NAME, session::NAME],
+        owns: "Read-only GlobalPlatform: select the issuer security domain or any application by AID, GET DATA (CPLC, key information, counters, extended resources, Card Recognition Data decoders), GET STATUS, the APDU trace, AES/3DES key check values, registry findings, the key loader and the single opt-in SCP03 authentication behind `gp status --keys-*` (one attempt, cryptogram checked before EXTERNAL AUTHENTICATE, keys never printed), and INSTALL [for load] / LOAD builders that are never sent; sends no writing command.",
+        depends_on: &[apdu::NAME, transport::NAME, session::NAME, scp03::NAME],
     },
     ModuleInfo {
         name: trace::NAME,

@@ -756,8 +756,26 @@ body. Those commands keep it for lpa compatibility; they are not findings comman
 
 ### GlobalPlatform reads (`gp`)
 
-`gp info`, `gp ara` and `gp status` send only SELECT, GET DATA (`80 CA`) and GET STATUS (`80 F2`)
-plus GET RESPONSE; `src/gp.rs` has no authenticated path. ARA-M is `A00000015141434C00`, GET DATA
+`gp info`, `gp ara`, `gp select` and `gp status` send only SELECT, GET DATA (`80 CA`) and GET STATUS (`80 F2`)
+plus GET RESPONSE, and, only for `gp status --keys-file|--keys-env`, one INITIALIZE UPDATE and at most
+one EXTERNAL AUTHENTICATE (SCP03, issue #112/#19; the code is `src/scp03.rs` reused, not a second
+implementation). **Binding rules for that path (owner decision 2026-10-10):** (1) exactly ONE
+authentication attempt per run, never a retry, never a loop over candidate keys: failed attempts count
+toward permanently locking the ISD; (2) the card cryptogram from INITIALIZE UPDATE is verified locally
+(`scp03::verify_card_cryptogram`) before EXTERNAL AUTHENTICATE, and on a mismatch EXTERNAL AUTHENTICATE
+is not sent (`keys-do-not-match`, "keys do not match this card"); (3) keys come from a file or an
+environment variable, never the command line, and **never appear in any output, log or trace**.
+Rule 3 is the one **exception to the full-visibility decision above**, the same way baselines hold no
+card data: a supplied key is the operator's secret, not card data. `gp::Keys` has a redacting `Debug`
+and no `Clone`/`Serialize`, key errors name a position and never quote the text, and the trace holds
+wire bytes only. The KCV of a supplied key (24 bits, public) is shown. A stated `KEY/KCV` that is wrong
+stops the run before a reader is opened. Do not add a key option that takes the value. Verified
+against Amendment D v1.2 (7.1.1, 7.1.2, 6.2.2-6.2.4), pySim `pySim/global_platform/scp.py` and
+`tests/unittests/test_globalplatform.py` (SCP03_Test_AES128_11), GlobalPlatformPro `SCP03Wrapper`. The
+card key information (GET DATA E0) has no KCV, so a KCV cannot be compared with the card's: the
+cryptogram check is what proves the MAC key. Findings are `data.registry_findings` entries
+(`gp/weak-secure-channel`, `gp/isd-lifecycle`, `gp/app-locked`, `gp/app-excess-privilege`), not
+doctor/1 findings. Sensitive-data encryption (#19) belongs with PUT KEY (#115). ARA-M is `A00000015141434C00`, GET DATA
 `FF40`; rules decode from `E2 { E1 {4F|C0, C1, CA}, E3 {D0, D1, DB} }` (GP Secure Element Access
 Control v1.1, GPD_SPE_013 2024 public review: FF40 is 4.1 Table 4-2, rules are chapter 6; CA and DB are AOSP extensions). A first GET DATA that holds less than FF40's declared length is continued with GET DATA [Next] `80 CA FF 60` (raw bytes, bounded 255 calls / 64 KiB); a short list is `truncated`. ARA and GET STATUS reads answer `61 xx` with the ISO-class (00) GET RESPONSE. GET STATUS uses P2 `02` (TLV)
 and `03` (next) on `63 10`, bounded at 16 pages. `6982`/`6985` is data (`requires_authentication`),

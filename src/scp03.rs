@@ -9,11 +9,13 @@
 //! identifier), and the evaluation of the missing-MAC rule over a *recorded*
 //! exchange.
 //!
-//! **Does not own.** A transport. Nothing here sends a byte to a card, and no
-//! CLI path runs SCP03: INITIALIZE UPDATE (`80 50`) and EXTERNAL AUTHENTICATE
-//! (`84 82`) are forbidden on the live operator SIM, and a wrong EXTERNAL
-//! AUTHENTICATE counts toward a card's retry limit. A future live path must be
-//! opt-in (an explicit flag) and is not part of this module.
+//! **Does not own.** A transport. Nothing here sends a byte to a card. The one
+//! live path is `gp status --keys-file/--keys-env` in [`crate::gp`], which is
+//! opt-in, makes a single attempt (a wrong EXTERNAL AUTHENTICATE counts toward a
+//! card's retry limit) and checks the card cryptogram with
+//! [`verify_card_cryptogram`] before it sends EXTERNAL AUTHENTICATE. INITIALIZE
+//! UPDATE (`80 50`) and EXTERNAL AUTHENTICATE (`84 82`) stay forbidden on the live
+//! operator SIM everywhere else.
 //!
 //! **Scope.** AES-128 keys, 8-byte challenges and 8-byte cryptograms/MACs
 //! (the "i" = 0x00/0x10 profiles). C-MAC only: C-DECRYPTION and R-MAC/R-ENC
@@ -538,6 +540,85 @@ mod tests {
         let wire = wrapped.encode().unwrap();
         assert_eq!(&wire[wire.len() - 8..], &second[..8]);
         assert_ne!(&full[..8], &second[..8]);
+    }
+
+    // Replay of pySim tests/unittests/test_globalplatform.py, class
+    // SCP03_Test_AES128_11 (osmocom/pysim): a recorded INITIALIZE UPDATE
+    // exchange, the EXTERNAL AUTHENTICATE it leads to at security level 11, and
+    // five C-MAC'd commands chained after it, including the case 4 GET STATUS
+    // `80 F2 80 02 02 4F 00 00` that `gp status` sends. Keys 000102.. / 101112...
+    #[test]
+    fn replays_pysim_scp03_session() {
+        let (enc, mac) = (
+            h::<16>("000102030405060708090a0b0c0d0e0f"),
+            h::<16>("101112131415161718191a1b1c1d1e1f"),
+        );
+        let host = h::<8>("b13e5f938fc108c4");
+        assert_eq!(
+            hex::encode(initialize_update(0x30, &host).encode().unwrap()),
+            "8050300008b13e5f938fc108c400"
+        );
+        let resp = InitializeUpdateResponse::parse(&h::<32>(
+            "000000000000000000003003703eb51047495b249f66c484c1d2ef1948000002",
+        ))
+        .unwrap();
+        assert_eq!(resp.key_version, 0x30);
+        assert_eq!(resp.i_parameter, 0x70);
+        assert_eq!(resp.sequence_counter, Some([0, 0, 2]));
+        let keys = derive_session_keys(&enc, &mac, &host, &resp.card_challenge);
+        assert!(verify_card_cryptogram(
+            &keys,
+            &host,
+            &resp.card_challenge,
+            &resp.card_cryptogram
+        ));
+        // a card holding other keys fails the check: the "wrong key" stop
+        let wrong = derive_session_keys(&enc, &[0xFF; 16], &host, &resp.card_challenge);
+        assert!(!verify_card_cryptogram(
+            &wrong,
+            &host,
+            &resp.card_challenge,
+            &resp.card_cryptogram
+        ));
+        let host_cg = cryptogram(&keys.mac, Side::Host, &host, &resp.card_challenge);
+        let mut ch = Channel::new(&keys);
+        let ea = external_authenticate(&mut ch, 0x11, &host_cg).unwrap();
+        assert_eq!(
+            hex::encode(ea.encode().unwrap()),
+            "84821100107d5f5826a993ebc89eea24957fa0b3ce"
+        );
+        let get = |hex_cmd: &str| {
+            let b = hex::decode(hex_cmd).unwrap();
+            let (header, rest) = (Header::new(b[0], b[1], b[2], b[3]), &b[4..]);
+            match rest {
+                [] => Command::case1(header),
+                [le] => Command::case2(header, Le::Short(*le)),
+                [lc, tail @ ..] if tail.len() == usize::from(*lc) => {
+                    Command::case3(header, tail.to_vec())
+                }
+                [lc, tail @ ..] => Command::case4(
+                    header,
+                    tail[..usize::from(*lc)].to_vec(),
+                    Le::Short(tail[usize::from(*lc)]),
+                ),
+            }
+        };
+        for (plain, wire) in [
+            (
+                "80E2910006BF3E035C015A00",
+                "84e291000ebf3e035c015a558d036518a2829700",
+            ),
+            ("80F22002", "84f220020863a63f8959827fb2"),
+            ("80ca006600", "84ca006608a0c6a4a74166f7ce00"),
+            (
+                "80F220020a4f0212345c054f9f70c5",
+                "84f22002124f0212345c054f9f70c52249b50272656536",
+            ),
+            ("80f28002024f0000", "84f280020a4f00e91443f6dce6b8ed00"),
+        ] {
+            let wrapped = ch.wrap(&get(plain)).unwrap();
+            assert_eq!(hex::encode(wrapped.encode().unwrap()), wire, "{plain}");
+        }
     }
 
     #[test]
