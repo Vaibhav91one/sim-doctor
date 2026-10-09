@@ -2,7 +2,8 @@
 //! layer for InitiateAuthentication, AuthenticateClient,
 //! GetBoundProfilePackage, HandleNotification and CancelSession. Library
 //! only: **nothing here opens a socket**. A caller supplies an
-//! [`Es9Transport`]; the CLI never calls this module.
+//! [`Es9Transport`] (the HTTPS one is [`crate::es9_https`]); the CLI does not
+//! call this module yet.
 //!
 //! **Owns.** SM-DP+ address validation ([`SmdpAddress`]), request bodies and
 //! headers ([`Request`]), response checking (HTTP status, redirects,
@@ -56,8 +57,7 @@
 //!
 //! # Not implemented
 //!
-//! A real HTTPS backend and the lpac `LPAC_HTTP`-style backend selection (a
-//! follow-up: no HTTP client is a dependency yet), ES11 and ES2+, the
+//! ES11 and ES2+, the
 //! `Executed-WithWarning` detail (treated as success, the warning is not
 //! surfaced), checks on response headers (`Content-Type`, `X-Admin-Protocol`),
 //! a `host:port` SM-DP+ address (the spec type is a bare FQDN), and splitting
@@ -231,6 +231,17 @@ pub trait Es9Transport {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Response, TransportError>;
+}
+
+impl<T: Es9Transport + ?Sized> Es9Transport for Box<T> {
+    fn post(
+        &mut self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Response, TransportError> {
+        (**self).post(url, headers, body)
+    }
 }
 
 // ---------------------------------------------------------------------------

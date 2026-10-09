@@ -370,7 +370,7 @@ anything that needs PIN, ADM or SCP keys. eUICC/SGP.22 rules need the eUICC read
 separate work. The MSL 0 check runs on a real
 card, but a card that answers every ENVELOPE with `6F00` gives an inconclusive result
 ([#98](https://github.com/Vaibhav91one/sim-doctor/issues/98)). The eUICC stack (SCP03t, BPP, ES10x,
-ES9+) is library code with no card or network path yet.
+ES9+) is library code with no card or network path from the CLI yet; the HTTPS transport for ES9+ exists (see Privacy and telemetry) but no command calls it.
 See [CONTEXT.md](CONTEXT.md) for the plan.
 
 `sim-doctor scan --sarif FILE` also writes the findings as SARIF 2.1.0, using logical locations
@@ -453,9 +453,21 @@ The file is written atomically (a temp file renamed over the target); a director
 
 ## Privacy and telemetry
 
-`sim-doctor` sends nothing anywhere. It talks to the PC/SC reader you point it at. The
-only network access is the npm launcher's one-time release download. Never commit card
+`sim-doctor` is offline by default and sends nothing anywhere. It talks to the PC/SC reader
+you point it at. The only network access is the npm launcher's one-time release download, and
+the ES9+ HTTPS transport in the library (`sim_doctor::es9_https`), which opens a socket only
+when a command explicitly needs an SM-DP+ (no shipped command does yet). Never commit card
 secrets (keys, KI/OPc, ADM codes).
+
+ES9+ HTTPS always verifies the server certificate; there is no insecure option. SGP.22 says an
+SM-DP+ TLS certificate chains to a GSMA CI, which lpac does not check at all (its curl backend
+disables verification). Set `SIM_DOCTOR_CA_BUNDLE=<pem file>` to trust exactly those anchors;
+without it the compiled-in Mozilla web roots are used. Redirects are never followed; a 30 s
+timeout and a 16 MiB response cap apply. Backends, after lpac's `LPAC_APDU`/`LPAC_HTTP`:
+`SIM_DOCTOR_APDU` = `pcsc` (default) or `replay` (log path in `SIM_DOCTOR_REPLAY`);
+`SIM_DOCTOR_HTTP` = `https` (default) or `stdio` (lpac's JSON-lines protocol, the host does the
+HTTP). lpac's AT/QMI/MBIM/curl/WinHTTP backends are not supported, and the CLI does not read
+`SIM_DOCTOR_APDU` yet.
 
 ## Design principles
 
