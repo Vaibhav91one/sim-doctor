@@ -229,12 +229,12 @@ enum Command {
     /// command line, 130 if interrupted.
     Fuzz(FuzzArgs),
 
-    /// eUICC queries over ES10 (lpac: chip info, profile list, notification list), and nickname.
+    /// eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the nickname, enable and disable writes.
     ///
     /// Opens a logical channel, selects the ISD-R by AID, sends STORE DATA
     /// requests, and closes the channel. info, profiles and notifications only
-    /// read. `nickname` is the one write: a dry run unless --yes. Never enables,
-    /// disables or deletes a profile and never retrieves or removes a notification. The output is the
+    /// read. `nickname`, `enable` and `disable` are the writes: dry runs unless --yes.
+    /// Never deletes a profile and never retrieves or removes a notification. The output is the
     /// lpac envelope under --json. Exit codes: 0 answered, 1 the card is not an
     /// eUICC, refused, or answered something malformed (the envelope carries
     /// `data.error.kind`), 129 for a bad command line, 130 if interrupted.
@@ -256,9 +256,30 @@ enum EuiccAction {
     Profiles(EuiccFlags),
     /// Pending notification metadata, nothing retrieved or removed (lpac `notification list`).
     Notifications(EuiccFlags),
-    /// Set a profile's nickname (lpac `profile nickname`). The only write here:
-    /// a dry run unless `--yes`, never exposed over MCP.
+    /// Set a profile's nickname (lpac `profile nickname`). A write: a dry
+    /// run unless `--yes`, never exposed over MCP.
     Nickname(NicknameArgs),
+    /// Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH).
+    /// A dry run unless `--yes`: switches the active profile and the device
+    /// loses its connection until it re-attaches. Never exposed over MCP.
+    Enable(StateArgs),
+    /// Disable a profile (lpac `profile disable`, ES10c DisableProfile with
+    /// REFRESH). A dry run unless `--yes`: disabling the only enabled profile
+    /// leaves no active profile. Never exposed over MCP.
+    Disable(StateArgs),
+}
+
+/// Everything `sim-doctor euicc enable` and `disable` take.
+#[derive(Args)]
+struct StateArgs {
+    /// ICCID (18 to 20 digits) or ISD-P AID (hex) of the profile.
+    id: String,
+    /// Send the request, then re-read the profile list and confirm. Without
+    /// it nothing is changed: the plan and its consequence are printed.
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    flags: EuiccFlags,
 }
 
 /// Everything `sim-doctor euicc nickname` takes.
@@ -1012,6 +1033,8 @@ fn main() -> process::ExitCode {
             EuiccAction::Profiles(f) => run_euicc(euicc::Query::Profiles, &f),
             EuiccAction::Notifications(f) => run_euicc(euicc::Query::Notifications, &f),
             EuiccAction::Nickname(n) => run_euicc_nickname(&n),
+            EuiccAction::Enable(a) => run_euicc_state(euicc::Action::Enable, &a),
+            EuiccAction::Disable(a) => run_euicc_state(euicc::Action::Disable, &a),
         },
         Command::Trace(args) => run_trace(&args),
         Command::Mcp => run_mcp(),
@@ -1867,6 +1890,23 @@ fn run_euicc_nickname(args: &NicknameArgs) -> contract::ExitCode {
         &args.flags,
         |session, aid| euicc::nickname(session, aid, max, &request),
         euicc::nickname_to_human,
+    )
+}
+
+/// `sim-doctor euicc <enable|disable> <iccid|aid> [--yes]`: a dry run unless
+/// `--yes`. The identifier is checked before a reader is opened.
+fn run_euicc_state(action: euicc::Action, args: &StateArgs) -> contract::ExitCode {
+    let request = match euicc::StateChange::new(action, &args.id, args.yes) {
+        Ok(request) => request,
+        Err(f) => {
+            return report_refusal(contract::DEFAULT_KIND, &f.message, f.data, args.flags.json)
+        }
+    };
+    let max = usize::from(args.flags.max_segment);
+    run_euicc_op(
+        &args.flags,
+        |session, aid| euicc::set_state(session, aid, max, &request),
+        euicc::state_to_human,
     )
 }
 

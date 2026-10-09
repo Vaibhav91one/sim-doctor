@@ -6,14 +6,17 @@
 //! `profiles` (GetProfilesInfo) and `notifications` (ListNotification,
 //! metadata only), the JSON each produces and the sanitized human table. lpac
 //! names: `chip info`, `profile list`, `notification list`. Also the one write,
-//! [`nickname`] (SetNickname, lpac `profile nickname`): a dry run by default,
-//! sent only when [`Nickname::apply`] is set, and then verified by a re-read.
+//! [`nickname`] (SetNickname, lpac `profile nickname`) and [`set_state`]
+//! (EnableProfile / DisableProfile, lpac `profile enable` / `disable`): each a
+//! dry run by default, sent only when `apply` is set, and then verified by a
+//! re-read.
 //!
-//! **Does not own, and never sends.** EnableProfile, DeleteProfile,
+//! **Does not own, and never sends.** DeleteProfile,
 //! RetrieveNotificationsList, RemoveNotificationFromList, the download
 //! functions or anything over HTTPS. The only commands on the wire are MANAGE
 //! CHANNEL (open, close), SELECT of the ISD-R, and STORE DATA carrying one of
-//! the read requests above, or SetNickname when applying. The channel is
+//! the read requests above, or SetNickname / EnableProfile / DisableProfile
+//! when applying. The channel is
 //! closed again on every path, a failure included.
 //!
 //! **Card safety.** A card that is not an eUICC refuses the ISD-R SELECT; that
@@ -306,6 +309,26 @@ fn read_query(ask: &mut Ask<'_>, query: Query) -> Result<Value, Failure> {
     Ok(data)
 }
 
+/// An ICCID (18 to 20 decimal digits) as the 10 octets EF ICCID codes: BCD
+/// with the nibbles swapped, padded with F (ETSI TS 102 221).
+fn raw_iccid(iccid: &str) -> Result<[u8; 10], Failure> {
+    if !(18..=20).contains(&iccid.len()) || !iccid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Failure::new(
+            "bad-iccid",
+            format!("the ICCID must be 18 to 20 decimal digits, got {iccid:?}"),
+            json!({}),
+        ));
+    }
+    let mut padded = iccid.as_bytes().to_vec();
+    padded.resize(20, b'F');
+    let mut raw = [0u8; 10];
+    for (out, pair) in raw.iter_mut().zip(padded.chunks(2)) {
+        let nibble = |c: u8| if c == b'F' { 0xF } else { c - b'0' };
+        *out = (nibble(pair[1]) << 4) | nibble(pair[0]);
+    }
+    Ok(raw)
+}
+
 /// A request to set one profile's nickname. Built by [`Nickname::new`], which
 /// checks the ICCID and the name before anything touches a card.
 #[derive(Debug, Clone)]
@@ -328,13 +351,7 @@ impl Nickname {
     ///
     /// A [`Failure`] of kind `bad-iccid` or `bad-nickname`.
     pub fn new(iccid: &str, name: &str, apply: bool) -> Result<Self, Failure> {
-        if !(18..=20).contains(&iccid.len()) || !iccid.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(Failure::new(
-                "bad-iccid",
-                format!("the ICCID must be 18 to 20 decimal digits, got {iccid:?}"),
-                json!({}),
-            ));
-        }
+        let raw_iccid = raw_iccid(iccid)?;
         if name.len() > es10::MAX_NICKNAME_BYTES {
             return Err(Failure::new(
                 "bad-nickname",
@@ -352,14 +369,6 @@ impl Nickname {
                 "the nickname must not contain control characters".to_owned(),
                 json!({}),
             ));
-        }
-        // BCD with the nibbles swapped, padded with F (ETSI TS 102 221 EF.ICCID).
-        let mut padded = iccid.as_bytes().to_vec();
-        padded.resize(20, b'F');
-        let mut raw_iccid = [0u8; 10];
-        for (out, pair) in raw_iccid.iter_mut().zip(padded.chunks(2)) {
-            let nibble = |c: u8| if c == b'F' { 0xF } else { c - b'0' };
-            *out = (nibble(pair[1]) << 4) | nibble(pair[0]);
         }
         Ok(Self {
             iccid: iccid.to_owned(),
@@ -446,6 +455,224 @@ pub fn nickname<S: CardSession + ?Sized>(
                     request.name
                 ),
                 json!({ "eid": data["eid"], "iccid": request.iccid, "expected": request.name, "actual": after }),
+            ));
+        }
+        data["applied"] = json!(true);
+        Ok(data)
+    })
+}
+
+/// Which ES10c state change [`set_state`] makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// EnableProfile (lpac `profile enable`).
+    Enable,
+    /// DisableProfile (lpac `profile disable`).
+    Disable,
+}
+
+/// A request to enable or disable one profile. Built by [`StateChange::new`],
+/// which checks the identifier before anything touches a card.
+#[derive(Debug, Clone)]
+pub struct StateChange {
+    action: Action,
+    /// What the operator typed (the ICCID digits, or the AID in upper-case hex).
+    target: String,
+    iccid: Option<[u8; 10]>,
+    aid: Option<Vec<u8>>,
+    /// Send the request. `false` (the default of the CLI) reads the card and
+    /// reports what would change, sending nothing that changes it.
+    pub apply: bool,
+}
+
+impl StateChange {
+    /// Validates `id`: 18 to 20 decimal digits are an ICCID, otherwise an
+    /// ISD-P AID of 5 to 16 bytes written as hex (lpac takes 32 hex digits).
+    ///
+    /// # Errors
+    ///
+    /// A [`Failure`] of kind `bad-profile-id`.
+    pub fn new(action: Action, id: &str, apply: bool) -> Result<Self, Failure> {
+        let (iccid, aid, target) = if (18..=20).contains(&id.len())
+            && id.bytes().all(|b| b.is_ascii_digit())
+        {
+            (Some(raw_iccid(id)?), None, id.to_owned())
+        } else {
+            match hex::decode(id) {
+                Ok(aid) if (5..=16).contains(&aid.len()) => {
+                    (None, Some(aid), id.to_ascii_uppercase())
+                }
+                _ => {
+                    return Err(Failure::new(
+                        "bad-profile-id",
+                        format!(
+                            "expected an ICCID (18 to 20 digits) or an ISD-P AID (10 to 32 hex digits), got {id:?}"
+                        ),
+                        json!({}),
+                    ))
+                }
+            }
+        };
+        Ok(Self {
+            action,
+            target,
+            iccid,
+            aid,
+            apply,
+        })
+    }
+
+    fn matches(&self, p: &es10::ProfileInfo) -> bool {
+        match (&self.iccid, &self.aid) {
+            (Some(iccid), _) => p.iccid.as_deref() == Some(&iccid[..]),
+            (_, Some(aid)) => p.isdp_aid.as_deref() == Some(&aid[..]),
+            _ => false,
+        }
+    }
+
+    fn identifier(&self) -> es10::ProfileIdentifier<'_> {
+        match (&self.iccid, &self.aid) {
+            (Some(iccid), _) => es10::ProfileIdentifier::Iccid(iccid),
+            (_, Some(aid)) => es10::ProfileIdentifier::IsdpAid(aid),
+            _ => unreachable!("StateChange::new sets one of iccid and aid"),
+        }
+    }
+}
+
+/// The refusal kind and wording for an ES10c result code other than ok(0)
+/// (`enableResult` / `disableResult`, [SGP.22 v2.5 §5.7.16], §5.7.17; pySim
+/// `rsp.asn`). `None` for a code neither function defines.
+fn state_refusal(action: Action, code: u8) -> Option<(&'static str, &'static str)> {
+    Some(match (code, action) {
+        (1, _) => ("profile-not-found", "iccidOrAidNotFound"),
+        (2, Action::Enable) => ("profile-not-in-disabled-state", "profileNotInDisabledState"),
+        (2, Action::Disable) => ("profile-not-in-enabled-state", "profileNotInEnabledState"),
+        (3, _) => ("disallowed-by-policy", "disallowedByPolicy"),
+        (4, Action::Enable) => ("wrong-profile-reenabling", "wrongProfileReenabling"),
+        (5, _) => ("cat-busy", "catBusy"),
+        (127, _) => ("undefined-error", "undefinedError"),
+        _ => return None,
+    })
+}
+
+/// EnableProfile or DisableProfile (lpac `profile enable` / `profile disable`),
+/// with REFRESH requested. Reads the EID and the profile list first and refuses,
+/// sending nothing, an unknown profile (`profile-not-found`), enabling an enabled
+/// profile (`already-enabled`) and disabling a disabled one (`already-disabled`).
+/// Without [`StateChange::apply`] it stops there and reports the plan and its
+/// `consequence` (`dry_run` true, `applied` false). With it, it sends the request,
+/// maps every non-ok result code to its own error kind (see [`state_refusal`]),
+/// re-reads the profile list and fails with `verify-failed` unless the profile is
+/// now in the requested state.
+///
+/// # Errors
+///
+/// A [`Failure`].
+pub fn set_state<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    request: &StateChange,
+) -> Result<Value, Failure> {
+    use es10::ProfileState::{Disabled, Enabled};
+    let (want, name) = match request.action {
+        Action::Enable => (Enabled, "EnableProfile"),
+        Action::Disable => (Disabled, "DisableProfile"),
+    };
+    in_channel(session, aid, max_segment, |ask| {
+        let eid = read_eid(ask)?;
+        let profiles = read_profiles(ask)?;
+        let Some(profile) = profiles.iter().find(|p| request.matches(p)) else {
+            return Err(Failure::new(
+                "profile-not-found",
+                format!("no profile {} on this eUICC", request.target),
+                json!({ "eid": eid, "profile": request.target,
+                    "iccids": profiles.iter().filter_map(|p| p.iccid.as_deref().map(iccid_text)).collect::<Vec<_>>() }),
+            ));
+        };
+        let current = profile.profile_state;
+        if !matches!(current, Some(Enabled | Disabled)) {
+            return Err(Failure::new(
+                "profile-state-unknown",
+                format!(
+                    "profile {} reports no usable state; refusing",
+                    request.target
+                ),
+                json!({ "eid": eid, "profile": request.target }),
+            ));
+        }
+        if current == Some(want) {
+            let (kind, word) = match want {
+                Enabled => ("already-enabled", "enabled"),
+                Disabled => ("already-disabled", "disabled"),
+                es10::ProfileState::Unknown(_) => unreachable!(),
+            };
+            return Err(Failure::new(
+                kind,
+                format!("profile {} is already {word}; nothing sent", request.target),
+                json!({ "eid": eid, "profile": request.target }),
+            ));
+        }
+        let enabled = profiles
+            .iter()
+            .filter(|p| p.profile_state == Some(Enabled))
+            .count();
+        let consequence = match request.action {
+            Action::Enable => "Enabling switches the active profile: the device loses its current connection until it re-attaches (REFRESH is requested).",
+            Action::Disable if enabled == 1 => "Disabling the only enabled profile leaves the eUICC with no active profile: the device has no subscription until one is enabled (REFRESH is requested).",
+            Action::Disable => "Disabling this profile leaves another profile enabled (REFRESH is requested).",
+        };
+        let state_text = |s: es10::ProfileState| if s == Enabled { "enabled" } else { "disabled" };
+        let mut data = json!({
+            "eid": eid,
+            "action": match request.action { Action::Enable => "enable", Action::Disable => "disable" },
+            "profile": request.target,
+            "iccid": profile.iccid.as_deref().map(iccid_text),
+            "isdp_aid": profile.isdp_aid.as_deref().map(hex::encode_upper),
+            "current_state": current.map(state_text),
+            "new_state": state_text(want),
+            "refresh": true,
+            "consequence": consequence,
+            "dry_run": !request.apply,
+            "applied": false,
+        });
+        if !request.apply {
+            return Ok(data);
+        }
+        let frame = match request.action {
+            Action::Enable => es10::enable_profile_request(request.identifier(), true),
+            Action::Disable => es10::disable_profile_request(request.identifier(), true),
+        }
+        .map_err(exchange_failed)?;
+        let response = ask(name, frame)?;
+        let code = match request.action {
+            Action::Enable => es10::decode_enable_profile(&response).map(|r| r.result.code()),
+            Action::Disable => es10::decode_disable_profile(&response).map(|r| r.code()),
+        }
+        .map_err(|e| bad(name, e))?;
+        if code != 0 {
+            let (kind, word) =
+                state_refusal(request.action, code).unwrap_or(("es10-refused", "unknown result"));
+            return Err(Failure::new(
+                kind,
+                format!("{name} returned {word} (code {code}); the profile was not changed"),
+                json!({ "function": name, "code": code, "eid": data["eid"], "profile": request.target }),
+            ));
+        }
+        let after = read_profiles(ask)?
+            .iter()
+            .find(|p| request.matches(p))
+            .and_then(|p| p.profile_state);
+        data["verified_state"] = json!(after.map(state_text));
+        if after != Some(want) {
+            return Err(Failure::new(
+                "verify-failed",
+                format!(
+                    "{name} was accepted but the profile list now shows {}, not {}",
+                    after.map_or("(profile missing)", state_text),
+                    state_text(want)
+                ),
+                json!({ "eid": data["eid"], "profile": request.target, "expected": state_text(want), "actual": after.map(state_text) }),
             ));
         }
         data["applied"] = json!(true);
@@ -649,6 +876,38 @@ pub fn nickname_to_human(data: &Value) -> String {
         "SetNickname sent; the profile list now shows the new nickname.\n"
     } else {
         "Dry run: nothing was sent. Re-run with --yes to set the nickname.\n"
+    };
+    out
+}
+
+/// The human report for [`set_state`]'s `data`.
+pub fn state_to_human(data: &Value) -> String {
+    let text = |v: &Value| match v {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => sanitize(s),
+        other => sanitize(&other.to_string()),
+    };
+    let verb = if data["action"] == "enable" {
+        "Enable"
+    } else {
+        "Disable"
+    };
+    let mut out = format!(
+        "EID: {}\nICCID: {}\nISD-P AID: {}\nState: {} -> {}\nConsequence: {}\n",
+        text(&data["eid"]),
+        text(&data["iccid"]),
+        text(&data["isdp_aid"]),
+        text(&data["current_state"]),
+        text(&data["new_state"]),
+        text(&data["consequence"]),
+    );
+    out += &if data["applied"] == true {
+        format!("{verb}Profile sent; the profile list now shows the new state.\n")
+    } else {
+        format!(
+            "Dry run: nothing was sent. Re-run with --yes to {}.\n",
+            verb.to_lowercase()
+        )
     };
     out
 }
@@ -964,6 +1223,208 @@ mod tests {
                 .raw_iccid[9],
             0xF4
         );
+    }
+
+    const AID_HEX: &str = "A0000005591010FFFFFFFF8900001000";
+    const OTHER_RAW: &str = "98001032547698103299";
+
+    /// A GetProfilesInfo response with the test profile in `state` (0 disabled,
+    /// 1 enabled) and, when `other` is set, a second profile in that state.
+    fn states_response(state: u8, other: Option<u8>) -> String {
+        let one = |raw: &str, aid: &str, st: u8| {
+            let body = format!("5A0A{raw}4F10{aid}9F7001{st:02X}");
+            format!("E3{:02X}{body}", body.len() / 2)
+        };
+        let mut list = one(ICCID_RAW, AID_HEX, state);
+        if let Some(o) = other {
+            list += &one(OTHER_RAW, "A0000005591010FFFFFFFF8900001001", o);
+        }
+        let a0 = format!("A0{:02X}{list}", list.len() / 2);
+        ok(&format!("BF2D{:02X}{a0}", a0.len() / 2))
+    }
+
+    fn change_request(action: Action) -> Vec<u8> {
+        let id = es10::ProfileIdentifier::Iccid(&h(ICCID_RAW));
+        match action {
+            Action::Enable => es10::enable_profile_request(id, true),
+            Action::Disable => es10::disable_profile_request(id, true),
+        }
+        .unwrap()
+    }
+
+    fn eid_and_profiles(state: u8, other: Option<u8>) -> Vec<(Vec<u8>, String)> {
+        vec![
+            (es10::get_eid_request(), eid_response()),
+            (profiles_request(), states_response(state, other)),
+        ]
+    }
+
+    #[test]
+    fn enable_and_disable_frames_are_the_hand_written_bytes() {
+        assert_eq!(
+            change_request(Action::Enable),
+            h(&format!("BF3111 A00C 5A0A{ICCID_RAW} 8101FF"))
+        );
+        assert_eq!(
+            change_request(Action::Disable),
+            h(&format!("BF3211 A00C 5A0A{ICCID_RAW} 8101FF"))
+        );
+    }
+
+    #[test]
+    fn dry_run_reads_and_sends_nothing_for_both_actions() {
+        for (action, from, other, needle) in [
+            (Action::Enable, 0, Some(1), "switches the active profile"),
+            (Action::Disable, 1, None, "no active profile"),
+        ] {
+            let mut card = script("9000", &eid_and_profiles(from, other));
+            let req = StateChange::new(action, ICCID, false).unwrap();
+            let data = set_state(&mut card, &ISDR_AID, 255, &req).unwrap();
+            assert_eq!(card.remaining(), 0);
+            assert_eq!(data["dry_run"], true);
+            assert_eq!(data["applied"], false);
+            assert_eq!(data["iccid"], ICCID);
+            assert_eq!(data["isdp_aid"], AID_HEX);
+            assert!(data["consequence"].as_str().unwrap().contains(needle));
+            let human = state_to_human(&data);
+            assert!(human.contains("Dry run: nothing was sent"));
+            assert!(human.contains(needle));
+        }
+        // Disabling one of two enabled profiles does not say "no active profile".
+        let mut card = script("9000", &eid_and_profiles(1, Some(1)));
+        let req = StateChange::new(Action::Disable, ICCID, false).unwrap();
+        let data = set_state(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert!(!data["consequence"].as_str().unwrap().contains("no active"));
+    }
+
+    #[test]
+    fn yes_sends_the_exact_frame_then_verifies_for_both_actions() {
+        for (action, from, to) in [(Action::Enable, 0, 1), (Action::Disable, 1, 0)] {
+            let (tag, name) = match action {
+                Action::Enable => ("BF31", "enabled"),
+                Action::Disable => ("BF32", "disabled"),
+            };
+            let mut steps = eid_and_profiles(from, None);
+            steps.push((change_request(action), ok(&format!("{tag}03 8001 00"))));
+            steps.push((profiles_request(), states_response(to, None)));
+            let mut card = script("9000", &steps);
+            let req = StateChange::new(action, ICCID, true).unwrap();
+            let data = set_state(&mut card, &ISDR_AID, 255, &req).unwrap();
+            assert_eq!(card.remaining(), 0);
+            assert_eq!(data["applied"], true);
+            assert_eq!(data["dry_run"], false);
+            assert_eq!(data["verified_state"], name);
+            assert!(state_to_human(&data).contains("Profile sent"));
+        }
+    }
+
+    #[test]
+    fn an_aid_names_the_profile_with_tag_4f() {
+        let aid = h(AID_HEX);
+        let frame =
+            es10::enable_profile_request(es10::ProfileIdentifier::IsdpAid(&aid), true).unwrap();
+        assert_eq!(frame, h(&format!("BF3117 A012 4F10{AID_HEX} 8101FF")));
+        let mut steps = eid_and_profiles(0, None);
+        steps.push((frame, ok("BF3103 8001 00")));
+        steps.push((profiles_request(), states_response(1, None)));
+        let mut card = script("9000", &steps);
+        let req = StateChange::new(Action::Enable, &AID_HEX.to_lowercase(), true).unwrap();
+        let data = set_state(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["verified_state"], "enabled");
+    }
+
+    #[test]
+    fn every_result_code_is_its_own_kind_and_is_not_verified() {
+        let cases: [(Action, &str, &str); 12] = [
+            (Action::Enable, "01", "profile-not-found"),
+            (Action::Enable, "02", "profile-not-in-disabled-state"),
+            (Action::Enable, "03", "disallowed-by-policy"),
+            (Action::Enable, "04", "wrong-profile-reenabling"),
+            (Action::Enable, "05", "cat-busy"),
+            (Action::Enable, "7F", "undefined-error"),
+            (Action::Disable, "01", "profile-not-found"),
+            (Action::Disable, "02", "profile-not-in-enabled-state"),
+            (Action::Disable, "03", "disallowed-by-policy"),
+            (Action::Disable, "05", "cat-busy"),
+            (Action::Disable, "7F", "undefined-error"),
+            (Action::Disable, "63", "es10-refused"),
+        ];
+        for (action, code, kind) in cases {
+            let (tag, from) = match action {
+                Action::Enable => ("BF31", 0),
+                Action::Disable => ("BF32", 1),
+            };
+            let mut steps = eid_and_profiles(from, None);
+            steps.push((change_request(action), ok(&format!("{tag}03 8001 {code}"))));
+            let mut card = script("9000", &steps);
+            let req = StateChange::new(action, ICCID, true).unwrap();
+            let failure = set_state(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+            assert_eq!(failure.kind, kind, "{action:?} {code}");
+            assert_eq!(failure.data["code"], i64::from_str_radix(code, 16).unwrap());
+            assert_eq!(card.remaining(), 0, "no verify read after a refusal");
+        }
+    }
+
+    #[test]
+    fn accepted_but_unchanged_is_a_verify_failure() {
+        let mut steps = eid_and_profiles(0, None);
+        steps.push((change_request(Action::Enable), ok("BF3103 8001 00")));
+        steps.push((profiles_request(), states_response(0, None)));
+        let mut card = script("9000", &steps);
+        let req = StateChange::new(Action::Enable, ICCID, true).unwrap();
+        let failure = set_state(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "verify-failed");
+        assert_eq!(failure.data["actual"], "disabled");
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn wrong_state_is_refused_with_nothing_sent() {
+        for (action, from, kind) in [
+            (Action::Enable, 1, "already-enabled"),
+            (Action::Disable, 0, "already-disabled"),
+        ] {
+            let mut card = script("9000", &eid_and_profiles(from, None));
+            let req = StateChange::new(action, ICCID, true).unwrap();
+            let failure = set_state(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+            assert_eq!(failure.kind, kind);
+            assert_eq!(card.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn an_unknown_profile_is_refused_with_nothing_sent() {
+        for id in ["89000123456789012349", "A0000005591010FFFFFFFF8900009999"] {
+            let mut card = script("9000", &eid_and_profiles(0, None));
+            let req = StateChange::new(Action::Enable, id, true).unwrap();
+            let failure = set_state(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+            assert_eq!(failure.kind, "profile-not-found");
+            assert_eq!(failure.data["iccids"], json!([ICCID]));
+            assert_eq!(card.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn state_change_validation_happens_before_any_card_contact() {
+        for bad in [
+            "",
+            "1234",
+            "8900012345678901234x",
+            "A000",
+            "ZZ00000000",
+            &"A0".repeat(17),
+        ] {
+            assert_eq!(
+                StateChange::new(Action::Enable, bad, true)
+                    .unwrap_err()
+                    .kind,
+                "bad-profile-id",
+                "{bad:?}"
+            );
+        }
+        assert!(StateChange::new(Action::Disable, AID_HEX, true).is_ok());
+        assert!(StateChange::new(Action::Disable, "89000123456789012", true).is_err());
     }
 
     #[test]
