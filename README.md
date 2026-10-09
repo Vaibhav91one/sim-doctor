@@ -233,13 +233,15 @@ a `scan` rule for the all-access ARA-M rule (scan does not select the ARA-M).
 ### `trace`
 
 Decodes a captured APDU trace offline: no card, no reader. Input is hex lines (command, then
-response, alternating; `#` comments) sim-doctor's own `gp info --json --trace` output, or a pcap/pcapng capture of GSMTAP SIM APDUs
+response, alternating; `#` comments), sim-doctor's own `gp info --json --trace` output, or a pcap/pcapng capture of GSMTAP SIM APDUs
 (UDP port 4729 over Ethernet, loopback, raw IP or Linux cooked capture, IPv4; the format is detected
 from the file's magic number), from a file or stdin. A capture is read like pySim-trace does: only the
 GSMTAP SIM sub-type `APDU` (one packet holds the whole `CLA INS P1 P2 P3 DATA SW` exchange) is used;
 ATR, PPS and the TPDU sub-types are skipped. Each exchange is named (ISO 7816-4, TS 102 221, TS 31.102 and GlobalPlatform
-commands), the status word is explained, and the selected file is tracked. PIN and PUT KEY values
-are never printed. `--json` adds `data.exchanges[]`.
+commands), the status word is explained, and the selected file is tracked. Nothing is masked or
+redacted: PIN, PUT KEY, EXTERNAL AUTHENTICATE and challenge/cryptogram values are shown in full, in
+the text and in `--json`, so treat a decoded trace like the capture itself. `--json` adds
+`data.exchanges[]`.
 
     printf 'A0A40000023F00\n9F16\n' | sim-doctor trace
 
