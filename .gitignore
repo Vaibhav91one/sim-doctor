@@ -24,6 +24,8 @@ baseline-*.json
 *.der
 *.crt
 *.pem
+# The bundled public GSMA RSP2 Root CI1 certificate (no key material), compiled in by src/es9_https.rs
+!certs/gsma-rsp2-root-ci1.pem
 *.pvk
 profile.json
 profiles.json
