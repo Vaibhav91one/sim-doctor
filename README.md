@@ -50,7 +50,7 @@ sim-doctor install
 - `scan`: a card scan; needs a card and a reader. Its arguments are generated from `scan --help`.
 - `rules_list`: the rule catalogue. No card.
 - `rules_explain`: one rule by `id`. No card.
-- `euicc_info`, `euicc_profiles`, `euicc_notifications`: the read-only `euicc` commands below, one optional `reader` argument each; they return the lpac envelope of `euicc <sub> --json` byte for byte. Need an eUICC and a reader. `euicc nickname` (the only eUICC write) is deliberately not an MCP tool.
+- `euicc_info`, `euicc_profiles`, `euicc_notifications`: the read-only `euicc` commands below, one optional `reader` argument each; they return the lpac envelope of `euicc <sub> --json` byte for byte. Need an eUICC and a reader. The eUICC writes (`nickname`, `enable`, `disable`, `delete`, `reset`, `notifications remove`) are deliberately not MCP tools.
 - `gp_info`, `gp_ara`, `gp_status`: the read-only `gp` commands below, one optional `reader` argument each; they return the envelope of `gp <sub> --json` byte for byte. Need a card and a reader.
 
 Every `scan` flag is an argument (`baseline`, `fail-on` and `sarif` included) except `tui`, `json` (always on), `help` and `version`; `baseline` and `sarif` take a file path, as on the command line. Each call runs `sim-doctor` itself as a subprocess and returns its doctor/1 envelope byte for byte as the tool text. Exit 0, 1 and 3 are normal results (isError false): findings at or above `--fail-on`, or a new finding against a baseline. 2 (the scan could not run: its envelope has `data.error`), 130 or any other exit is a tool error (isError true) carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything.
@@ -156,6 +156,9 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 | `euicc enable\|disable ICCID\|AID [--yes] [...]` | enable or disable a profile; a dry run unless `--yes`, see below |
+| `euicc delete ICCID\|AID [--yes] [...]` | delete a disabled profile permanently; a dry run unless `--yes`, see below |
+| `euicc reset [--operational] [--test] [--smdp-address] [--confirm-eid EID] [--yes] [...]` | eUICC memory reset; needs `--yes` and `--confirm-eid`, see below |
+| `euicc notifications remove SEQ [--yes] [...]` | remove a notification from the list; a dry run unless `--yes`, see below |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 
@@ -205,7 +208,7 @@ Queries to an eUICC's ISD-R (SGP.22 ES10), named after lpac's, and three writes 
 | --- | --- | --- |
 | `euicc info` | `chip info` | EID (GetEID), the configured default SM-DP+ and root SM-DS addresses (ES10a GetEuiccConfiguredAddresses), EUICCInfo1 and EUICCInfo2 (GetEuiccInfo1/2): SVN, profile version, firmware, RSP capability, CI key ids, category |
 | `euicc profiles` | `profile list` | GetProfilesInfo: ICCID, state, class, nickname, service provider, name, ISD-P AID |
-| `euicc notifications` | `notification list` | ListNotification metadata only (sequence number, operation, address, ICCID); nothing is retrieved or removed |
+| `euicc notifications` | `notification list` | ListNotification metadata only (sequence number, operation, address, ICCID); nothing is retrieved or removed (`notifications remove SEQ` below removes one) |
 
 Each command opens a logical channel, selects the ISD-R by AID (`A0000005591010FFFFFFFF8900000100`,
 `--aid HEX` overrides), sends one STORE DATA request and closes the channel again, also when it
@@ -218,7 +221,7 @@ interrupted. The swSIM fixture is not an eUICC, so these are tested against synt
 through the replay transport and still need a live-card check (tracked on #92). The online side
 (download, discovery, notification handling) needs the HTTPS transport (#20) and is not here.
 
-`euicc nickname ICCID NAME` (lpac `profile nickname`, ES10c SetNickname) is the only command here that
+`euicc nickname ICCID NAME` (lpac `profile nickname`, ES10c SetNickname) is the first command here that
 changes the card, and it is cautious by default. The ICCID (18 to 20 digits) and the name (at most 64
 bytes of UTF-8, no control characters; `""` clears it) are checked before a reader is opened.
 Without `--yes` it is a **dry run**: it reads the EID and the profile list, prints the target EID
@@ -238,6 +241,26 @@ each SGP.22 result code to its own error kind (`profile-not-found`, `profile-not
 `profile-not-in-enabled-state`, `disallowed-by-policy`, `wrong-profile-reenabling`, `cat-busy`, `undefined-error`; an
 unlisted code is `es10-refused`), re-read the profile list and exit 1 (`verify-failed`) unless the state changed.
 Neither is exposed over MCP.
+
+`euicc delete ICCID|AID`, `euicc reset` and `euicc notifications remove SEQ` (lpac `profile delete`,
+`chip purge`, `notification remove`; ES10c DeleteProfile / eUICCMemoryReset, ES10b RemoveNotificationFromList)
+erase things and follow the same rules: a **dry run** unless `--yes`, a verifying re-read (`verify-failed`),
+validation before a reader is opened, each SGP.22 result code its own error kind (an unlisted code is
+`es10-refused`), and no MCP exposure.
+
+- `delete` refuses, sending nothing, an unknown profile and an **enabled** one (`profile-enabled`: run
+  `euicc disable` first). The dry run states that the profile is erased permanently and can only come back by
+  downloading it again from the operator. Kinds: `profile-not-found`, `profile-not-in-disabled-state`,
+  `disallowed-by-policy`, `undefined-error`.
+- `reset` can erase every profile. Nothing is selected by default: pick `--operational`, `--test` (field-loaded
+  test profiles) and/or `--smdp-address` (reset the default SM-DP+ address), or it is refused
+  (`no-reset-option`). Sending needs both `--yes` and `--confirm-eid <EID>`, and the EID must match the one read
+  from the card (`confirm-eid-required`, `bad-eid`, `eid-mismatch`; nothing is sent). The dry run lists every
+  profile that would be erased (provisioning profiles are never touched). Kinds: `nothing-to-delete`,
+  `undefined-error`.
+- `notifications remove SEQ` reads the notification list first and refuses a sequence number that is not in it
+  (`notification-not-found`). The dry run states that a removed notification is never sent to the operator's
+  server. Kinds: `nothing-to-delete`, `undefined-error`.
 
 ### `gp`
 

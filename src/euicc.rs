@@ -5,18 +5,21 @@
 //! (GetEID, GetEuiccInfo1, GetEuiccInfo2, GetEuiccConfiguredAddresses),
 //! `profiles` (GetProfilesInfo) and `notifications` (ListNotification,
 //! metadata only), the JSON each produces and the sanitized human table. lpac
-//! names: `chip info`, `profile list`, `notification list`. Also the one write,
+//! names: `chip info`, `profile list`, `notification list`. Also the writes:
 //! [`nickname`] (SetNickname, lpac `profile nickname`) and [`set_state`]
 //! (EnableProfile / DisableProfile, lpac `profile enable` / `disable`): each a
 //! dry run by default, sent only when `apply` is set, and then verified by a
 //! re-read.
 //!
-//! **Does not own, and never sends.** DeleteProfile,
-//! RetrieveNotificationsList, RemoveNotificationFromList, the download
+//! The erasing writes are [`delete_profile`] (DeleteProfile, `profile delete`),
+//! [`memory_reset`] (eUICCMemoryReset, `chip purge`; needs `--confirm-eid`) and
+//! [`remove_notification`] (RemoveNotificationFromList, `notification remove`),
+//! under the same rule.
+//!
+//! **Does not own, and never sends.** RetrieveNotificationsList, the download
 //! functions or anything over HTTPS. The only commands on the wire are MANAGE
 //! CHANNEL (open, close), SELECT of the ISD-R, and STORE DATA carrying one of
-//! the read requests above, or SetNickname / EnableProfile / DisableProfile
-//! when applying. The channel is
+//! the read requests above, or a write above when applying. The channel is
 //! closed again on every path, a failure included.
 //!
 //! **Card safety.** A card that is not an eUICC refuses the ISD-R SELECT; that
@@ -259,6 +262,23 @@ fn read_eid(ask: &mut Ask<'_>) -> Result<String, Failure> {
     Ok(hex::encode_upper(eid))
 }
 
+/// ListNotification for every pending notification (metadata only).
+fn read_notifications(ask: &mut Ask<'_>) -> Result<Vec<es10::NotificationMetadata>, Failure> {
+    match es10::decode_list_notification(&ask(
+        "ListNotification",
+        es10::list_notification_request(),
+    )?)
+    .map_err(|e| bad("ListNotification", e))?
+    {
+        es10::ListNotificationResponse::Ok(list) => Ok(list),
+        es10::ListNotificationResponse::Error(code) => Err(Failure::new(
+            "es10-refused",
+            format!("ListNotification returned error code {code}"),
+            json!({ "function": "ListNotification", "code": code }),
+        )),
+    }
+}
+
 fn read_query(ask: &mut Ask<'_>, query: Query) -> Result<Value, Failure> {
     let mut data = json!({});
     match query {
@@ -287,23 +307,10 @@ fn read_query(ask: &mut Ask<'_>, query: Query) -> Result<Value, Failure> {
             data["profiles"] = read_profiles(ask)?.iter().map(profile_json).collect();
         }
         Query::Notifications => {
-            let response = es10::decode_list_notification(&ask(
-                "ListNotification",
-                es10::list_notification_request(),
-            )?)
-            .map_err(|e| bad("ListNotification", e))?;
-            match response {
-                es10::ListNotificationResponse::Ok(list) => {
-                    data["notifications"] = list.iter().map(notification_json).collect();
-                }
-                es10::ListNotificationResponse::Error(code) => {
-                    return Err(Failure::new(
-                        "es10-refused",
-                        format!("ListNotification returned error code {code}"),
-                        json!({ "function": "ListNotification", "code": code }),
-                    ));
-                }
-            }
+            data["notifications"] = read_notifications(ask)?
+                .iter()
+                .map(notification_json)
+                .collect();
         }
     }
     Ok(data)
@@ -471,28 +478,19 @@ pub enum Action {
     Disable,
 }
 
-/// A request to enable or disable one profile. Built by [`StateChange::new`],
-/// which checks the identifier before anything touches a card.
+/// A profile named by ICCID or ISD-P AID, validated before a card is touched.
 #[derive(Debug, Clone)]
-pub struct StateChange {
-    action: Action,
+struct ProfileRef {
     /// What the operator typed (the ICCID digits, or the AID in upper-case hex).
     target: String,
     iccid: Option<[u8; 10]>,
     aid: Option<Vec<u8>>,
-    /// Send the request. `false` (the default of the CLI) reads the card and
-    /// reports what would change, sending nothing that changes it.
-    pub apply: bool,
 }
 
-impl StateChange {
-    /// Validates `id`: 18 to 20 decimal digits are an ICCID, otherwise an
-    /// ISD-P AID of 5 to 16 bytes written as hex (lpac takes 32 hex digits).
-    ///
-    /// # Errors
-    ///
-    /// A [`Failure`] of kind `bad-profile-id`.
-    pub fn new(action: Action, id: &str, apply: bool) -> Result<Self, Failure> {
+impl ProfileRef {
+    /// 18 to 20 decimal digits are an ICCID, otherwise an ISD-P AID of 5 to 16
+    /// bytes written as hex (lpac takes 32 hex digits).
+    fn new(id: &str) -> Result<Self, Failure> {
         let (iccid, aid, target) = if (18..=20).contains(&id.len())
             && id.bytes().all(|b| b.is_ascii_digit())
         {
@@ -513,13 +511,7 @@ impl StateChange {
                 }
             }
         };
-        Ok(Self {
-            action,
-            target,
-            iccid,
-            aid,
-            apply,
-        })
+        Ok(Self { target, iccid, aid })
     }
 
     fn matches(&self, p: &es10::ProfileInfo) -> bool {
@@ -534,8 +526,45 @@ impl StateChange {
         match (&self.iccid, &self.aid) {
             (Some(iccid), _) => es10::ProfileIdentifier::Iccid(iccid),
             (_, Some(aid)) => es10::ProfileIdentifier::IsdpAid(aid),
-            _ => unreachable!("StateChange::new sets one of iccid and aid"),
+            _ => unreachable!("ProfileRef::new sets one of iccid and aid"),
         }
+    }
+
+    /// The profile-not-found refusal, listing the ICCIDs that do exist.
+    fn not_found(&self, eid: &str, profiles: &[es10::ProfileInfo]) -> Failure {
+        Failure::new(
+            "profile-not-found",
+            format!("no profile {} on this eUICC", self.target),
+            json!({ "eid": eid, "profile": self.target,
+                "iccids": profiles.iter().filter_map(|p| p.iccid.as_deref().map(iccid_text)).collect::<Vec<_>>() }),
+        )
+    }
+}
+
+/// A request to enable or disable one profile. Built by [`StateChange::new`],
+/// which checks the identifier before anything touches a card.
+#[derive(Debug, Clone)]
+pub struct StateChange {
+    action: Action,
+    profile: ProfileRef,
+    /// Send the request. `false` (the default of the CLI) reads the card and
+    /// reports what would change, sending nothing that changes it.
+    pub apply: bool,
+}
+
+impl StateChange {
+    /// Validates `id`: 18 to 20 decimal digits are an ICCID, otherwise an
+    /// ISD-P AID of 5 to 16 bytes written as hex (lpac takes 32 hex digits).
+    ///
+    /// # Errors
+    ///
+    /// A [`Failure`] of kind `bad-profile-id`.
+    pub fn new(action: Action, id: &str, apply: bool) -> Result<Self, Failure> {
+        Ok(Self {
+            action,
+            profile: ProfileRef::new(id)?,
+            apply,
+        })
     }
 }
 
@@ -582,13 +611,8 @@ pub fn set_state<S: CardSession + ?Sized>(
     in_channel(session, aid, max_segment, |ask| {
         let eid = read_eid(ask)?;
         let profiles = read_profiles(ask)?;
-        let Some(profile) = profiles.iter().find(|p| request.matches(p)) else {
-            return Err(Failure::new(
-                "profile-not-found",
-                format!("no profile {} on this eUICC", request.target),
-                json!({ "eid": eid, "profile": request.target,
-                    "iccids": profiles.iter().filter_map(|p| p.iccid.as_deref().map(iccid_text)).collect::<Vec<_>>() }),
-            ));
+        let Some(profile) = profiles.iter().find(|p| request.profile.matches(p)) else {
+            return Err(request.profile.not_found(&eid, &profiles));
         };
         let current = profile.profile_state;
         if !matches!(current, Some(Enabled | Disabled)) {
@@ -596,9 +620,9 @@ pub fn set_state<S: CardSession + ?Sized>(
                 "profile-state-unknown",
                 format!(
                     "profile {} reports no usable state; refusing",
-                    request.target
+                    request.profile.target
                 ),
-                json!({ "eid": eid, "profile": request.target }),
+                json!({ "eid": eid, "profile": request.profile.target }),
             ));
         }
         if current == Some(want) {
@@ -609,8 +633,11 @@ pub fn set_state<S: CardSession + ?Sized>(
             };
             return Err(Failure::new(
                 kind,
-                format!("profile {} is already {word}; nothing sent", request.target),
-                json!({ "eid": eid, "profile": request.target }),
+                format!(
+                    "profile {} is already {word}; nothing sent",
+                    request.profile.target
+                ),
+                json!({ "eid": eid, "profile": request.profile.target }),
             ));
         }
         let enabled = profiles
@@ -626,7 +653,7 @@ pub fn set_state<S: CardSession + ?Sized>(
         let mut data = json!({
             "eid": eid,
             "action": match request.action { Action::Enable => "enable", Action::Disable => "disable" },
-            "profile": request.target,
+            "profile": request.profile.target,
             "iccid": profile.iccid.as_deref().map(iccid_text),
             "isdp_aid": profile.isdp_aid.as_deref().map(hex::encode_upper),
             "current_state": current.map(state_text),
@@ -640,8 +667,8 @@ pub fn set_state<S: CardSession + ?Sized>(
             return Ok(data);
         }
         let frame = match request.action {
-            Action::Enable => es10::enable_profile_request(request.identifier(), true),
-            Action::Disable => es10::disable_profile_request(request.identifier(), true),
+            Action::Enable => es10::enable_profile_request(request.profile.identifier(), true),
+            Action::Disable => es10::disable_profile_request(request.profile.identifier(), true),
         }
         .map_err(exchange_failed)?;
         let response = ask(name, frame)?;
@@ -656,12 +683,12 @@ pub fn set_state<S: CardSession + ?Sized>(
             return Err(Failure::new(
                 kind,
                 format!("{name} returned {word} (code {code}); the profile was not changed"),
-                json!({ "function": name, "code": code, "eid": data["eid"], "profile": request.target }),
+                json!({ "function": name, "code": code, "eid": data["eid"], "profile": request.profile.target }),
             ));
         }
         let after = read_profiles(ask)?
             .iter()
-            .find(|p| request.matches(p))
+            .find(|p| request.profile.matches(p))
             .and_then(|p| p.profile_state);
         data["verified_state"] = json!(after.map(state_text));
         if after != Some(want) {
@@ -672,7 +699,386 @@ pub fn set_state<S: CardSession + ?Sized>(
                     after.map_or("(profile missing)", state_text),
                     state_text(want)
                 ),
-                json!({ "eid": data["eid"], "profile": request.target, "expected": state_text(want), "actual": after.map(state_text) }),
+                json!({ "eid": data["eid"], "profile": request.profile.target, "expected": state_text(want), "actual": after.map(state_text) }),
+            ));
+        }
+        data["applied"] = json!(true);
+        Ok(data)
+    })
+}
+
+/// The refusal for a non-ok result code of an erasing function: the kind named
+/// for its code, or `es10-refused` for a code the function does not define.
+fn erase_refusal(
+    function: &'static str,
+    code: u8,
+    names: &[(u8, &'static str, &'static str)],
+    extra: Value,
+) -> Failure {
+    let (kind, word) = names
+        .iter()
+        .find(|(c, _, _)| *c == code)
+        .map_or(("es10-refused", "unknown result"), |(_, k, w)| (*k, *w));
+    let mut data = json!({ "function": function, "code": code });
+    if let (Some(into), Some(from)) = (data.as_object_mut(), extra.as_object()) {
+        into.extend(from.clone());
+    }
+    Failure::new(
+        kind,
+        format!("{function} returned {word} (code {code}); nothing was erased"),
+        data,
+    )
+}
+
+/// A request to delete one profile. Built by [`ProfileDelete::new`], which
+/// checks the identifier before anything touches a card.
+#[derive(Debug, Clone)]
+pub struct ProfileDelete {
+    profile: ProfileRef,
+    /// Send DeleteProfile. `false` (the default of the CLI) reads the card and
+    /// reports what would be erased, sending nothing that changes it.
+    pub apply: bool,
+}
+
+impl ProfileDelete {
+    /// Validates `id` as [`StateChange::new`] does.
+    ///
+    /// # Errors
+    ///
+    /// A [`Failure`] of kind `bad-profile-id`.
+    pub fn new(id: &str, apply: bool) -> Result<Self, Failure> {
+        Ok(Self {
+            profile: ProfileRef::new(id)?,
+            apply,
+        })
+    }
+}
+
+/// DeleteProfile (lpac `profile delete`). Reads the EID and the profile list
+/// first and refuses, sending nothing, an unknown profile (`profile-not-found`)
+/// and an enabled one (`profile-enabled`: disable it first). Without
+/// [`ProfileDelete::apply`] it stops there and reports the plan and its
+/// `consequence` (`dry_run` true, `applied` false). With it, it sends
+/// DeleteProfile, maps every non-ok `deleteResult` ([SGP.22 v2.5 §5.7.18]; pySim
+/// `rsp.asn`) to its own error kind, re-reads the profile list and fails with
+/// `verify-failed` if the profile is still there.
+///
+/// # Errors
+///
+/// A [`Failure`].
+pub fn delete_profile<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    request: &ProfileDelete,
+) -> Result<Value, Failure> {
+    use es10::ProfileState::{Disabled, Enabled};
+    const CODES: [(u8, &str, &str); 4] = [
+        (1, "profile-not-found", "iccidOrAidNotFound"),
+        (
+            2,
+            "profile-not-in-disabled-state",
+            "profileNotInDisabledState",
+        ),
+        (3, "disallowed-by-policy", "disallowedByPolicy"),
+        (127, "undefined-error", "undefinedError"),
+    ];
+    in_channel(session, aid, max_segment, |ask| {
+        let eid = read_eid(ask)?;
+        let profiles = read_profiles(ask)?;
+        let Some(profile) = profiles.iter().find(|p| request.profile.matches(p)) else {
+            return Err(request.profile.not_found(&eid, &profiles));
+        };
+        let target = &request.profile.target;
+        match profile.profile_state {
+            Some(Disabled) => {}
+            Some(Enabled) => {
+                return Err(Failure::new(
+                    "profile-enabled",
+                    format!("profile {target} is enabled; disable it first (sim-doctor euicc disable {target} --yes); nothing sent"),
+                    json!({ "eid": eid, "profile": target }),
+                ))
+            }
+            _ => {
+                return Err(Failure::new(
+                    "profile-state-unknown",
+                    format!("profile {target} reports no usable state; refusing"),
+                    json!({ "eid": eid, "profile": target }),
+                ))
+            }
+        }
+        let mut data = json!({
+            "command": "delete",
+            "eid": eid,
+            "profile": target,
+            "iccid": profile.iccid.as_deref().map(iccid_text),
+            "isdp_aid": profile.isdp_aid.as_deref().map(hex::encode_upper),
+            "nickname": profile.profile_nickname,
+            "name": profile.profile_name,
+            "consequence": "The profile is erased permanently. It can only come back by downloading it again from the operator.",
+            "dry_run": !request.apply,
+            "applied": false,
+        });
+        if !request.apply {
+            return Ok(data);
+        }
+        let frame =
+            es10::delete_profile_request(request.profile.identifier()).map_err(exchange_failed)?;
+        let result = es10::decode_delete_profile(&ask("DeleteProfile", frame)?)
+            .map_err(|e| bad("DeleteProfile", e))?
+            .result;
+        if result != es10::DeleteResult::Ok {
+            return Err(erase_refusal(
+                "DeleteProfile",
+                result.code(),
+                &CODES,
+                json!({ "eid": eid, "profile": target }),
+            ));
+        }
+        let still = read_profiles(ask)?
+            .iter()
+            .any(|p| request.profile.matches(p));
+        data["profile_still_listed"] = json!(still);
+        if still {
+            return Err(Failure::new(
+                "verify-failed",
+                format!(
+                    "DeleteProfile was accepted but profile {target} is still in the profile list"
+                ),
+                json!({ "eid": eid, "profile": target }),
+            ));
+        }
+        data["applied"] = json!(true);
+        Ok(data)
+    })
+}
+
+/// A request for eUICCMemoryReset. Built by [`MemoryReset::new`], which checks
+/// the options and the confirmation before anything touches a card.
+#[derive(Debug, Clone)]
+pub struct MemoryReset {
+    options: es10::ResetOptions,
+    confirm_eid: Option<String>,
+    /// Send the reset. `false` reads the card and lists what would be erased.
+    pub apply: bool,
+}
+
+impl MemoryReset {
+    /// Validates the request: at least one option (`no-reset-option`), a
+    /// well-formed `confirm_eid` of 32 hex digits (`bad-eid`), and, when
+    /// `apply` is set, a `confirm_eid` at all (`confirm-eid-required`). Whether
+    /// it matches the card is checked in [`memory_reset`].
+    ///
+    /// # Errors
+    ///
+    /// A [`Failure`] of one of those kinds.
+    pub fn new(
+        options: es10::ResetOptions,
+        confirm_eid: Option<&str>,
+        apply: bool,
+    ) -> Result<Self, Failure> {
+        if options.is_empty() {
+            return Err(Failure::new(
+                "no-reset-option",
+                "choose what to reset: --operational, --test and/or --smdp-address; nothing is selected by default".to_owned(),
+                json!({}),
+            ));
+        }
+        let confirm_eid = match confirm_eid {
+            Some(eid) if eid.len() == 32 && eid.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Some(eid.to_ascii_uppercase())
+            }
+            Some(eid) => {
+                return Err(Failure::new(
+                    "bad-eid",
+                    format!("--confirm-eid must be the 32 hex digits of the EID, got {eid:?}"),
+                    json!({}),
+                ))
+            }
+            None => None,
+        };
+        if apply && confirm_eid.is_none() {
+            return Err(Failure::new(
+                "confirm-eid-required",
+                "an eUICC memory reset needs both --yes and --confirm-eid <EID> (the EID of the card, from `euicc info`)".to_owned(),
+                json!({}),
+            ));
+        }
+        Ok(Self {
+            options,
+            confirm_eid,
+            apply,
+        })
+    }
+
+    /// Whether the reset would erase `p`: operational profiles (a profile with
+    /// no class counts, as SGP.22 makes operational the default) and field-loaded
+    /// test profiles; provisioning profiles are never touched.
+    fn erases(&self, p: &es10::ProfileInfo) -> bool {
+        use es10::ProfileClass::{Operational, Provisioning, Test};
+        match p.profile_class {
+            Some(Test) => self.options.delete_field_loaded_test_profiles,
+            Some(Provisioning) => false,
+            Some(Operational) | None => self.options.delete_operational_profiles,
+            Some(es10::ProfileClass::Unknown(_)) => false,
+        }
+    }
+}
+
+/// eUICCMemoryReset (lpac `chip purge`, [SGP.22 v2.5 §5.7.19]). Reads the EID
+/// and the profile list first and refuses, sending nothing, an EID that is not
+/// the `--confirm-eid` one (`eid-mismatch`). Without [`MemoryReset::apply`] it
+/// stops there and lists every profile that would be erased (`profiles_to_erase`,
+/// `dry_run` true). With it, it sends the reset, maps `nothingToDelete(1)` and
+/// `undefinedError(127)` to their own kinds (any other code is `es10-refused`),
+/// re-reads the profile list and fails with `verify-failed` if an erased profile
+/// is still listed.
+///
+/// # Errors
+///
+/// A [`Failure`].
+pub fn memory_reset<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    request: &MemoryReset,
+) -> Result<Value, Failure> {
+    const CODES: [(u8, &str, &str); 2] = [
+        (1, "nothing-to-delete", "nothingToDelete"),
+        (127, "undefined-error", "undefinedError"),
+    ];
+    in_channel(session, aid, max_segment, |ask| {
+        let eid = read_eid(ask)?;
+        if let Some(want) = &request.confirm_eid {
+            if *want != eid {
+                return Err(Failure::new(
+                    "eid-mismatch",
+                    format!("--confirm-eid {want} is not this card's EID {eid}; nothing sent"),
+                    json!({ "eid": eid, "confirm_eid": want }),
+                ));
+            }
+        }
+        let profiles = read_profiles(ask)?;
+        let mut data = json!({
+            "command": "reset",
+            "eid": eid,
+            "options": {
+                "delete_operational_profiles": request.options.delete_operational_profiles,
+                "delete_field_loaded_test_profiles": request.options.delete_field_loaded_test_profiles,
+                "reset_default_smdp_address": request.options.reset_default_smdp_address,
+            },
+            "profiles_to_erase": profiles.iter().filter(|p| request.erases(p)).map(profile_json).collect::<Vec<_>>(),
+            "consequence": "Every listed profile is erased permanently, an enabled one included, and can only come back by downloading it again from the operator.",
+            "dry_run": !request.apply,
+            "applied": false,
+        });
+        if !request.apply {
+            return Ok(data);
+        }
+        let frame = es10::memory_reset_request(request.options).map_err(exchange_failed)?;
+        let result = es10::decode_memory_reset(&ask("eUICCMemoryReset", frame)?)
+            .map_err(|e| bad("eUICCMemoryReset", e))?;
+        if result != es10::ResetResult::Ok {
+            return Err(erase_refusal(
+                "eUICCMemoryReset",
+                result.code(),
+                &CODES,
+                json!({ "eid": eid }),
+            ));
+        }
+        let left: Vec<Value> = read_profiles(ask)?
+            .iter()
+            .filter(|p| request.erases(p))
+            .map(profile_json)
+            .collect();
+        data["profiles_remaining"] = json!(left);
+        if !left.is_empty() {
+            return Err(Failure::new(
+                "verify-failed",
+                format!(
+                    "eUICCMemoryReset was accepted but {} profile(s) it should have erased are still listed",
+                    left.len()
+                ),
+                json!({ "eid": eid, "profiles_remaining": left }),
+            ));
+        }
+        data["applied"] = json!(true);
+        Ok(data)
+    })
+}
+
+/// A request to remove one notification from the eUICC's list. Built by hand:
+/// the sequence number is already a number.
+#[derive(Debug, Clone, Copy)]
+pub struct NotificationRemoval {
+    /// `seqNumber` of the notification, as `euicc notifications` lists it.
+    pub seq_number: u32,
+    /// Send RemoveNotificationFromList. `false` reads and reports only.
+    pub apply: bool,
+}
+
+/// RemoveNotificationFromList (lpac `notification remove`, [SGP.22 v2.5
+/// §5.7.12]). Reads the EID and the notification list first and refuses,
+/// sending nothing, a sequence number not in the list (`notification-not-found`).
+/// Without `apply` it stops there. With it, it sends the request, maps
+/// `nothingToDelete(1)` and `undefinedError(127)` to their own kinds (any other
+/// code is `es10-refused`), re-reads the list and fails with `verify-failed` if
+/// the notification is still there.
+///
+/// # Errors
+///
+/// A [`Failure`].
+pub fn remove_notification<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    request: NotificationRemoval,
+) -> Result<Value, Failure> {
+    const CODES: [(u8, &str, &str); 2] = [
+        (1, "nothing-to-delete", "nothingToDelete"),
+        (127, "undefined-error", "undefinedError"),
+    ];
+    let seq = request.seq_number;
+    in_channel(session, aid, max_segment, |ask| {
+        let eid = read_eid(ask)?;
+        let list = read_notifications(ask)?;
+        let Some(found) = list.iter().find(|n| n.seq_number == seq) else {
+            return Err(Failure::new(
+                "notification-not-found",
+                format!("no notification with sequence number {seq} on this eUICC; nothing sent"),
+                json!({ "eid": eid, "seq_number": seq,
+                    "seq_numbers": list.iter().map(|n| n.seq_number).collect::<Vec<_>>() }),
+            ));
+        };
+        let mut data = json!({
+            "command": "notification-remove",
+            "eid": eid,
+            "notification": notification_json(found),
+            "consequence": "A removed notification is never sent to the operator's server.",
+            "dry_run": !request.apply,
+            "applied": false,
+        });
+        if !request.apply {
+            return Ok(data);
+        }
+        let frame = es10::remove_notification_request(seq);
+        let result = es10::decode_remove_notification(&ask("RemoveNotificationFromList", frame)?)
+            .map_err(|e| bad("RemoveNotificationFromList", e))?;
+        if result != es10::RemoveNotificationResult::Ok {
+            return Err(erase_refusal(
+                "RemoveNotificationFromList",
+                result.code(),
+                &CODES,
+                json!({ "eid": eid, "seq_number": seq }),
+            ));
+        }
+        let still = read_notifications(ask)?.iter().any(|n| n.seq_number == seq);
+        data["notification_still_listed"] = json!(still);
+        if still {
+            return Err(Failure::new(
+                "verify-failed",
+                format!("RemoveNotificationFromList was accepted but notification {seq} is still listed"),
+                json!({ "eid": eid, "seq_number": seq }),
             ));
         }
         data["applied"] = json!(true);
@@ -908,6 +1314,72 @@ pub fn state_to_human(data: &Value) -> String {
             "Dry run: nothing was sent. Re-run with --yes to {}.\n",
             verb.to_lowercase()
         )
+    };
+    out
+}
+
+/// The human report for [`delete_profile`], [`memory_reset`] and
+/// [`remove_notification`]: what is (or was) erased, the consequence, and
+/// whether anything was sent.
+pub fn erase_to_human(data: &Value) -> String {
+    let text = |v: &Value| match v {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => sanitize(s),
+        other => sanitize(&other.to_string()),
+    };
+    let mut out = format!("EID: {}\n", text(&data["eid"]));
+    let what = match data["command"].as_str() {
+        Some("delete") => {
+            out += &format!(
+                "ICCID: {}\nISD-P AID: {}\nNickname: {}\nName: {}\n",
+                text(&data["iccid"]),
+                text(&data["isdp_aid"]),
+                text(&data["nickname"]),
+                text(&data["name"]),
+            );
+            "delete the profile"
+        }
+        Some("reset") => {
+            out += "Profiles that would be erased:\n";
+            for p in data["profiles_to_erase"].as_array().into_iter().flatten() {
+                out += &format!(
+                    "  {}\t{}\t{}\t{}\n",
+                    text(&p["iccid"]),
+                    text(&p["state"]),
+                    text(&p["class"]),
+                    text(&p["name"]),
+                );
+            }
+            if data["options"]["reset_default_smdp_address"] == true {
+                out += "The default SM-DP+ address is reset.\n";
+            }
+            "reset the eUICC"
+        }
+        _ => {
+            let n = &data["notification"];
+            out += &format!(
+                "Notification {}: {} {} {}\n",
+                text(&n["seq_number"]),
+                n["operation"]
+                    .as_array()
+                    .map(|a| a.iter().map(&text).collect::<Vec<_>>().join("+"))
+                    .unwrap_or_default(),
+                text(&n["iccid"]),
+                text(&n["address"]),
+            );
+            "remove the notification"
+        }
+    };
+    out += &format!("Consequence: {}\n", text(&data["consequence"]));
+    out += &if data["applied"] == true {
+        "Sent and verified by a re-read.\n".to_owned()
+    } else if data["command"] == "reset" {
+        format!(
+            "Dry run: nothing was sent. Re-run with --yes --confirm-eid {} to {what}.\n",
+            text(&data["eid"])
+        )
+    } else {
+        format!("Dry run: nothing was sent. Re-run with --yes to {what}.\n")
     };
     out
 }
@@ -1586,5 +2058,366 @@ mod tests {
     fn requests_are_the_documented_frames() {
         assert_eq!(es10::get_eid_request(), h("BF3E035C015A"));
         assert_eq!(es10::list_notification_request(), h("BF2800"));
+    }
+
+    // -- delete, reset, notification remove ------------------------------
+
+    const OTHER_AID: &str = "A0000005591010FFFFFFFF8900001001";
+
+    /// A GetProfilesInfo response: `(iccid_raw, aid, state, class)` per profile.
+    fn classed(profiles: &[(&str, &str, u8, u8)]) -> String {
+        let list: String = profiles
+            .iter()
+            .map(|(raw, aid, st, class)| {
+                let body = format!("5A0A{raw}4F10{aid}9F7001{st:02X}9501{class:02X}");
+                format!("E3{:02X}{body}", body.len() / 2)
+            })
+            .collect();
+        let a0 = format!("A0{:02X}{list}", list.len() / 2);
+        ok(&format!("BF2D{:02X}{a0}", a0.len() / 2))
+    }
+
+    fn delete_request() -> Vec<u8> {
+        es10::delete_profile_request(es10::ProfileIdentifier::Iccid(&h(ICCID_RAW))).unwrap()
+    }
+
+    #[test]
+    fn delete_dry_run_sends_nothing_and_says_it_is_permanent() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), classed(&[(ICCID_RAW, AID_HEX, 0, 2)])),
+            ],
+        );
+        let req = ProfileDelete::new(ICCID, false).unwrap();
+        let data = delete_profile(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["dry_run"], true);
+        assert_eq!(data["applied"], false);
+        assert_eq!(data["iccid"], ICCID);
+        assert!(data["consequence"]
+            .as_str()
+            .unwrap()
+            .contains("erased permanently"));
+        assert!(erase_to_human(&data).contains("Dry run: nothing was sent"));
+    }
+
+    #[test]
+    fn delete_with_yes_sends_the_exact_frame_then_verifies() {
+        assert_eq!(delete_request(), h("BF33 0C 5A0A 98001032547698103214"));
+        let mut steps = vec![
+            (es10::get_eid_request(), eid_response()),
+            (profiles_request(), classed(&[(ICCID_RAW, AID_HEX, 0, 2)])),
+            (delete_request(), ok("BF3303 800100")),
+            (profiles_request(), classed(&[(OTHER_RAW, OTHER_AID, 0, 2)])),
+        ];
+        let mut card = script("9000", &steps);
+        let req = ProfileDelete::new(ICCID, true).unwrap();
+        let data = delete_profile(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["applied"], true);
+        assert_eq!(data["profile_still_listed"], false);
+        // Still listed afterwards: verify-failed.
+        steps[3].1 = classed(&[(ICCID_RAW, AID_HEX, 0, 2)]);
+        let mut card = script("9000", &steps);
+        let failure = delete_profile(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "verify-failed");
+    }
+
+    #[test]
+    fn delete_maps_every_result_code_to_its_own_kind() {
+        for (code, kind) in [
+            ("01", "profile-not-found"),
+            ("02", "profile-not-in-disabled-state"),
+            ("03", "disallowed-by-policy"),
+            ("7F", "undefined-error"),
+            ("63", "es10-refused"),
+        ] {
+            let mut card = script(
+                "9000",
+                &[
+                    (es10::get_eid_request(), eid_response()),
+                    (profiles_request(), classed(&[(ICCID_RAW, AID_HEX, 0, 2)])),
+                    (delete_request(), ok(&format!("BF3303 8001 {code}"))),
+                ],
+            );
+            let req = ProfileDelete::new(ICCID, true).unwrap();
+            let failure = delete_profile(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+            assert_eq!(failure.kind, kind, "{code}");
+            assert_eq!(failure.data["code"], i64::from_str_radix(code, 16).unwrap());
+            assert_eq!(card.remaining(), 0, "no verify read after a refusal");
+        }
+    }
+
+    #[test]
+    fn delete_refuses_an_enabled_profile_and_an_unknown_one_with_nothing_sent() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), classed(&[(ICCID_RAW, AID_HEX, 1, 2)])),
+            ],
+        );
+        let req = ProfileDelete::new(ICCID, true).unwrap();
+        let failure = delete_profile(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "profile-enabled");
+        assert!(failure.message.contains("disable it first"));
+        assert_eq!(card.remaining(), 0);
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), classed(&[(OTHER_RAW, OTHER_AID, 0, 2)])),
+            ],
+        );
+        let failure = delete_profile(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "profile-not-found");
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(
+            ProfileDelete::new("1234", true).unwrap_err().kind,
+            "bad-profile-id"
+        );
+    }
+
+    const ALL: es10::ResetOptions = es10::ResetOptions {
+        delete_operational_profiles: true,
+        delete_field_loaded_test_profiles: true,
+        reset_default_smdp_address: true,
+    };
+
+    fn three_profiles() -> String {
+        // operational (enabled), test, provisioning
+        classed(&[
+            (ICCID_RAW, AID_HEX, 1, 2),
+            (OTHER_RAW, OTHER_AID, 0, 0),
+            (
+                "98001032547698103288",
+                "A0000005591010FFFFFFFF8900001002",
+                0,
+                1,
+            ),
+        ])
+    }
+
+    #[test]
+    fn reset_validation_needs_an_option_and_for_yes_a_confirm_eid() {
+        let only_test = es10::ResetOptions {
+            delete_field_loaded_test_profiles: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            MemoryReset::new(es10::ResetOptions::default(), Some(EID), true)
+                .unwrap_err()
+                .kind,
+            "no-reset-option"
+        );
+        assert_eq!(
+            MemoryReset::new(ALL, None, true).unwrap_err().kind,
+            "confirm-eid-required"
+        );
+        assert_eq!(
+            MemoryReset::new(ALL, Some("1234"), true).unwrap_err().kind,
+            "bad-eid"
+        );
+        assert!(MemoryReset::new(only_test, None, false).is_ok());
+        assert!(MemoryReset::new(only_test, Some(&EID.to_lowercase()), true).is_ok());
+    }
+
+    #[test]
+    fn reset_dry_run_lists_what_it_would_erase_and_sends_nothing() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), three_profiles()),
+            ],
+        );
+        let only_test = es10::ResetOptions {
+            delete_field_loaded_test_profiles: true,
+            ..Default::default()
+        };
+        let req = MemoryReset::new(only_test, None, false).unwrap();
+        let data = memory_reset(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        let listed = data["profiles_to_erase"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["class"], "test");
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), three_profiles()),
+            ],
+        );
+        let req = MemoryReset::new(ALL, Some(EID), false).unwrap();
+        let data = memory_reset(&mut card, &ISDR_AID, 255, &req).unwrap();
+        // operational and test; the provisioning profile is never erased.
+        assert_eq!(data["profiles_to_erase"].as_array().unwrap().len(), 2);
+        assert_eq!(data["dry_run"], true);
+        assert!(erase_to_human(&data).contains(&format!("--confirm-eid {EID}")));
+    }
+
+    #[test]
+    fn reset_with_yes_sends_the_exact_frame_then_verifies() {
+        let frame = es10::memory_reset_request(ALL).unwrap();
+        assert_eq!(frame, h("BF34 04 82 02 05E0"));
+        let mut steps = vec![
+            (es10::get_eid_request(), eid_response()),
+            (profiles_request(), three_profiles()),
+            (frame, ok("BF3403 800100")),
+            (
+                profiles_request(),
+                classed(&[(
+                    "98001032547698103288",
+                    "A0000005591010FFFFFFFF8900001002",
+                    0,
+                    1,
+                )]),
+            ),
+        ];
+        let mut card = script("9000", &steps);
+        let req = MemoryReset::new(ALL, Some(EID), true).unwrap();
+        let data = memory_reset(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["applied"], true);
+        assert_eq!(data["profiles_remaining"], json!([]));
+        // An erased profile still listed: verify-failed.
+        steps[3].1 = three_profiles();
+        let mut card = script("9000", &steps);
+        let failure = memory_reset(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "verify-failed");
+    }
+
+    #[test]
+    fn reset_with_a_mismatched_eid_sends_nothing() {
+        let mut card = script("9000", &[(es10::get_eid_request(), eid_response())]);
+        let wrong = "89049032123451234512345678901236";
+        let req = MemoryReset::new(ALL, Some(wrong), true).unwrap();
+        let failure = memory_reset(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "eid-mismatch");
+        assert_eq!(failure.data["eid"], EID);
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn reset_maps_every_result_code_to_its_own_kind() {
+        for (code, kind) in [
+            ("01", "nothing-to-delete"),
+            ("7F", "undefined-error"),
+            ("63", "es10-refused"),
+        ] {
+            let mut card = script(
+                "9000",
+                &[
+                    (es10::get_eid_request(), eid_response()),
+                    (profiles_request(), three_profiles()),
+                    (
+                        es10::memory_reset_request(ALL).unwrap(),
+                        ok(&format!("BF3403 8001 {code}")),
+                    ),
+                ],
+            );
+            let req = MemoryReset::new(ALL, Some(EID), true).unwrap();
+            let failure = memory_reset(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+            assert_eq!(failure.kind, kind, "{code}");
+            assert_eq!(card.remaining(), 0);
+        }
+    }
+
+    fn notification_list(seqs: &[u8]) -> String {
+        let list: String = seqs
+            .iter()
+            .map(|seq| {
+                let meta =
+                    format!("8001{seq:02X}8102 0480 0C0161 5A0A{ICCID_RAW}").replace(' ', "");
+                format!("BF2F{:02X}{meta}", meta.len() / 2)
+            })
+            .collect();
+        let a0 = format!("A0{:02X}{list}", list.len() / 2);
+        ok(&format!("BF28{:02X}{a0}", a0.len() / 2))
+    }
+
+    fn remove_steps(seq: u8, list: &[u8]) -> Vec<(Vec<u8>, String)> {
+        vec![
+            (es10::get_eid_request(), eid_response()),
+            (es10::list_notification_request(), notification_list(list)),
+            (
+                es10::remove_notification_request(u32::from(seq)),
+                ok("BF3003 800100"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn notification_remove_dry_run_sends_nothing() {
+        let steps = remove_steps(5, &[4, 5]);
+        let mut card = script("9000", &steps[..2]);
+        let req = NotificationRemoval {
+            seq_number: 5,
+            apply: false,
+        };
+        let data = remove_notification(&mut card, &ISDR_AID, 255, req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["notification"]["seq_number"], 5);
+        assert_eq!(data["dry_run"], true);
+        assert!(data["consequence"]
+            .as_str()
+            .unwrap()
+            .contains("never sent to the operator"));
+    }
+
+    #[test]
+    fn notification_remove_with_yes_sends_the_exact_frame_then_verifies() {
+        assert_eq!(es10::remove_notification_request(5), h("BF30 03 80 01 05"));
+        let mut steps = remove_steps(5, &[4, 5]);
+        steps.push((es10::list_notification_request(), notification_list(&[4])));
+        let mut card = script("9000", &steps);
+        let req = NotificationRemoval {
+            seq_number: 5,
+            apply: true,
+        };
+        let data = remove_notification(&mut card, &ISDR_AID, 255, req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["applied"], true);
+        assert_eq!(data["notification_still_listed"], false);
+        steps[3].1 = notification_list(&[4, 5]);
+        let mut card = script("9000", &steps);
+        let failure = remove_notification(&mut card, &ISDR_AID, 255, req).unwrap_err();
+        assert_eq!(failure.kind, "verify-failed");
+    }
+
+    #[test]
+    fn notification_remove_maps_every_result_code_to_its_own_kind() {
+        for (code, kind) in [
+            ("01", "nothing-to-delete"),
+            ("7F", "undefined-error"),
+            ("63", "es10-refused"),
+        ] {
+            let mut steps = remove_steps(5, &[5]);
+            steps[2].1 = ok(&format!("BF3003 8001 {code}"));
+            let mut card = script("9000", &steps);
+            let req = NotificationRemoval {
+                seq_number: 5,
+                apply: true,
+            };
+            let failure = remove_notification(&mut card, &ISDR_AID, 255, req).unwrap_err();
+            assert_eq!(failure.kind, kind, "{code}");
+            assert_eq!(card.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn notification_remove_of_an_unknown_sequence_number_sends_nothing() {
+        let steps = remove_steps(9, &[4, 5]);
+        let mut card = script("9000", &steps[..2]);
+        let req = NotificationRemoval {
+            seq_number: 9,
+            apply: true,
+        };
+        let failure = remove_notification(&mut card, &ISDR_AID, 255, req).unwrap_err();
+        assert_eq!(failure.kind, "notification-not-found");
+        assert_eq!(failure.data["seq_numbers"], json!([4, 5]));
+        assert_eq!(card.remaining(), 0);
     }
 }

@@ -42,6 +42,8 @@
 //! | DisableProfile | 5.7.17 | `BF32` | `BF32` |
 //! | DeleteProfile | 5.7.18 | `BF33` | `BF33` |
 //! | SetNickname | 5.7.21 | `BF29` | `BF29` |
+//! | RemoveNotificationFromList | 5.7.12 | `BF30` | `BF30` |
+//! | eUICCMemoryReset | 5.7.19 | `BF34` | `BF34` |
 //!
 //! Where issue #18 differs from the spec: the issue says "`<=255` data bytes"
 //! under 5.7.2, but Table 47 gives Lc as "Var." and the 255-byte rule is
@@ -62,8 +64,8 @@
 //! # Not implemented
 //!
 //! The "alternative case 3" form of EnableProfile and DeleteProfile (P1 `90`,
-//! no response data, 5.7.16 and 5.7.18), and the notification,
-//! DisableProfile, eUICCMemoryReset and SetDefaultDpAddress functions. None is
+//! no response data, 5.7.16 and 5.7.18), and the RetrieveNotificationsList,
+//! HandleNotification and SetDefaultDpAddress functions. None is
 //! in issue #18. Decoders preserve tags they do not know in `unknown` fields
 //! instead of dropping them.
 
@@ -734,6 +736,17 @@ code_enum! {
     }
 }
 code_enum! {
+    /// `deleteNotificationStatus` of `NotificationSentResponse`, the answer to
+    /// RemoveNotificationFromList ([SGP.22 v2.5 §5.7.12]; pySim `rsp.asn`:
+    /// ok(0), nothingToDelete(1), undefinedError(127)).
+    RemoveNotificationResult { Ok = 0, NothingToDelete = 1, UndefinedError = 127 }
+}
+code_enum! {
+    /// `resetResult` of `EuiccMemoryResetResponse` ([SGP.22 v2.5 §5.7.19];
+    /// pySim `rsp.asn`: ok(0), nothingToDelete(1), undefinedError(127)).
+    ResetResult { Ok = 0, NothingToDelete = 1, UndefinedError = 127 }
+}
+code_enum! {
     /// `euiccCategory` ([SGP.22 v2.5 §5.7.8]).
     EuiccCategory { Other = 0, BasicEuicc = 1, MediumEuicc = 2, ContactlessEuicc = 3 }
 }
@@ -966,11 +979,91 @@ fn state_request(
 /// `DeleteProfileRequest`, `BF33` ([SGP.22 v2.5 §5.7.18]): the identifier
 /// directly, `4F` or `5A`.
 ///
+/// Checked 2026-10-10 against pySim `rsp.asn` (`DeleteProfileRequest ::= [51]
+/// CHOICE { isdpAid [APPLICATION 15] OctetTo16, iccid Iccid }`) and lpac
+/// `euicc/es10c.c` (`es10c_delete_profile` calls
+/// `es10c_enable_disable_delete_profile` with tag `0xBF33` and no refresh flag,
+/// which packs the identifier node as the only child: `BF33 { 4F|5A id }`).
+///
 /// # Errors
 ///
 /// [`EncodeError::FieldLength`] for a malformed identifier.
 pub fn delete_profile_request(profile: ProfileIdentifier<'_>) -> Result<Vec<u8>, EncodeError> {
     Ok(tlv(0xBF33, &profile.encode()?))
+}
+
+/// Which parts of the eUICC `eUICCMemoryReset` clears: the `resetOptions`
+/// BIT STRING of [SGP.22 v2.5 §5.7.19].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResetOptions {
+    /// Bit 0, `deleteOperationalProfiles`.
+    pub delete_operational_profiles: bool,
+    /// Bit 1, `deleteFieldLoadedTestProfiles`.
+    pub delete_field_loaded_test_profiles: bool,
+    /// Bit 2, `resetDefaultSmdpAddress`.
+    pub reset_default_smdp_address: bool,
+}
+
+impl ResetOptions {
+    /// Whether no option is chosen.
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// `EuiccMemoryResetRequest`, `BF34` ([SGP.22 v2.5 §5.7.19]):
+/// `82 <len> <unused> <bits>`, bit 0 the most significant. The BIT STRING is a
+/// named-bit list, so DER drops trailing zero bits: the unused-bit count is the
+/// number of trailing zeros of the octet.
+///
+/// Checked 2026-10-10 against pySim `rsp.asn` (`EuiccMemoryResetRequest ::=
+/// [52] SEQUENCE { resetOptions [2] BIT STRING { deleteOperationalProfiles(0),
+/// deleteFieldLoadedTestProfiles(1), resetDefaultSmdpAddress(2) } }`) and lpac
+/// `euicc/es10c.c` (`es10c_euicc_memory_reset` sends `BF34 { 82 02 05 E0 }`,
+/// all three bits, which this produces for all three options).
+///
+/// # Errors
+///
+/// [`EncodeError::FieldLength`] when no option is chosen.
+pub fn memory_reset_request(options: ResetOptions) -> Result<Vec<u8>, EncodeError> {
+    let bits = [
+        options.delete_operational_profiles,
+        options.delete_field_loaded_test_profiles,
+        options.reset_default_smdp_address,
+    ]
+    .iter()
+    .enumerate()
+    .fold(0u8, |acc, (i, on)| acc | (u8::from(*on) << (7 - i)));
+    if bits == 0 {
+        return Err(EncodeError::FieldLength {
+            field: "resetOptions",
+            min: 1,
+            max: 3,
+            got: 0,
+        });
+    }
+    let body = tlv(0x82, &[bits.trailing_zeros() as u8, bits]);
+    Ok(tlv(0xBF34, &body))
+}
+
+/// `NotificationSentRequest`, `BF30` ([SGP.22 v2.5 §5.7.12], the request of
+/// RemoveNotificationFromList): `80 <seqNumber>` with `seqNumber` the shortest
+/// two's-complement INTEGER.
+///
+/// Checked 2026-10-10 against pySim `rsp.asn` (`NotificationSentRequest ::=
+/// [48] SEQUENCE { seqNumber [0] INTEGER }`) and lpac `euicc/es10b.c`
+/// (`es10b_remove_notification_from_list` sends `BF30 { 80 <long2bin> }`).
+pub fn remove_notification_request(seq_number: u32) -> Vec<u8> {
+    let mut int: Vec<u8> = seq_number
+        .to_be_bytes()
+        .iter()
+        .copied()
+        .skip_while(|b| *b == 0)
+        .collect();
+    if int.first().is_none_or(|b| b & 0x80 != 0) {
+        int.insert(0, 0);
+    }
+    tlv(0xBF30, &tlv(0x80, &int))
 }
 
 /// The `searchCriteria` of GetProfilesInfo ([SGP.22 v2.5 §5.7.15]).
@@ -1954,6 +2047,27 @@ pub fn decode_delete_profile(data: &[u8]) -> Result<DeleteProfileResponse, Decod
     })
 }
 
+/// Decodes the response data of eUICCMemoryReset (`BF34`): `resetResult`
+/// ([SGP.22 v2.5 §5.7.19]).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed or incomplete structure.
+pub fn decode_memory_reset(data: &[u8]) -> Result<ResetResult, DecodeError> {
+    result_code(data, 0xBF34, "resetResult").map(|(code, _)| ResetResult::from_code(code))
+}
+
+/// Decodes the response data of RemoveNotificationFromList (`BF30`):
+/// `deleteNotificationStatus` ([SGP.22 v2.5 §5.7.12]).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed or incomplete structure.
+pub fn decode_remove_notification(data: &[u8]) -> Result<RemoveNotificationResult, DecodeError> {
+    result_code(data, 0xBF30, "deleteNotificationStatus")
+        .map(|(code, _)| RemoveNotificationResult::from_code(code))
+}
+
 fn result_code(
     data: &[u8],
     tag: u32,
@@ -2890,6 +3004,49 @@ mod tests {
         }
         assert!(decode_disable_profile(&h("BF32 00")).is_err());
         assert!(decode_disable_profile(&h("BF31 03 80 01 00")).is_err());
+    }
+
+    #[test]
+    fn delete_reset_and_remove_notification_frames_and_results() {
+        // Hand-written from pySim rsp.asn + lpac es10b.c / es10c.c.
+        assert_eq!(remove_notification_request(5), h("BF30 03 80 01 05"));
+        assert_eq!(remove_notification_request(0x80), h("BF30 04 80 02 0080"));
+        assert_eq!(remove_notification_request(0x1234), h("BF30 04 80 02 1234"));
+        assert_eq!(remove_notification_request(0), h("BF30 03 80 01 00"));
+        let opts = |a, b, c| ResetOptions {
+            delete_operational_profiles: a,
+            delete_field_loaded_test_profiles: b,
+            reset_default_smdp_address: c,
+        };
+        for (o, want) in [
+            (opts(true, true, true), "BF34 04 82 02 05E0"),
+            (opts(true, false, false), "BF34 04 82 02 0780"),
+            (opts(false, true, false), "BF34 04 82 02 0640"),
+            (opts(false, false, true), "BF34 04 82 02 0520"),
+            (opts(true, false, true), "BF34 04 82 02 05A0"),
+            (opts(true, true, false), "BF34 04 82 02 06C0"),
+        ] {
+            assert_eq!(memory_reset_request(o).unwrap(), h(want));
+        }
+        assert!(memory_reset_request(ResetOptions::default()).is_err());
+        assert!(ResetOptions::default().is_empty());
+        for (code, want) in [
+            ("00", ResetResult::Ok),
+            ("01", ResetResult::NothingToDelete),
+            ("7F", ResetResult::UndefinedError),
+            ("63", ResetResult::Unknown(0x63)),
+        ] {
+            assert_eq!(
+                decode_memory_reset(&h(&format!("BF34 03 80 01 {code}"))).unwrap(),
+                want
+            );
+        }
+        assert_eq!(
+            decode_remove_notification(&h("BF30 03 80 01 01")).unwrap(),
+            RemoveNotificationResult::NothingToDelete
+        );
+        assert!(decode_memory_reset(&h("BF34 00")).is_err());
+        assert!(decode_remove_notification(&h("BF34 03 80 01 00")).is_err());
     }
 
     #[test]

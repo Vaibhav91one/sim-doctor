@@ -2278,3 +2278,51 @@ fn euicc_enable_and_disable_validate_before_touching_a_reader() {
         assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
     }
 }
+
+#[test]
+fn euicc_delete_reset_and_remove_validate_before_touching_a_reader() {
+    // Issue #117. Bad input is refused with no reader named at all.
+    let eid = "89049032123451234512345678901235";
+    let cases: [(&[&str], &str); 5] = [
+        (&["euicc", "delete", "1234", "--yes"], "bad-profile-id"),
+        (
+            &["euicc", "reset", "--yes", "--confirm-eid", eid],
+            "no-reset-option",
+        ),
+        (
+            &["euicc", "reset", "--operational", "--yes"],
+            "confirm-eid-required",
+        ),
+        (
+            &["euicc", "reset", "--operational", "--confirm-eid", "12"],
+            "bad-eid",
+        ),
+        (
+            &["euicc", "reset", "--test", "--smdp-address", "--yes"],
+            "confirm-eid-required",
+        ),
+    ];
+    for (args, kind) in cases {
+        let mut full = args.to_vec();
+        full.push("--json");
+        let run = run_piped(&full);
+        assert_eq!(run.code(), 1, "{}", run.stderr);
+        assert_eq!(
+            assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings)
+                .payload()
+                .data()["error"]["kind"],
+            kind
+        );
+    }
+    for args in [
+        &["euicc", "delete", "89000123456789012341"][..],
+        &["euicc", "reset", "--test"],
+        &["euicc", "notifications", "remove", "5"],
+    ] {
+        let mut full = args.to_vec();
+        full.extend(["--json", "--reader", NO_SUCH_READER]);
+        let run = run_piped(&full);
+        assert_eq!(run.code(), 1, "{}", run.stderr);
+        assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+    }
+}
