@@ -289,9 +289,9 @@ struct EuiccFlags {
     /// ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100).
     #[arg(long, value_name = "HEX")]
     aid: Option<String>,
-    /// Most data bytes in one STORE DATA block, 1 to 255 (default 255, the
-    /// SGP.22 maximum). Lower it for a reader that mishandles long blocks.
-    #[arg(long, value_name = "BYTES", default_value_t = 255, value_parser = clap::value_parser!(u16).range(1..=255))]
+    /// Most data bytes in one STORE DATA block, 1 to 255 (default 120, as
+    /// lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks.
+    #[arg(long, value_name = "BYTES", default_value_t = 120, value_parser = clap::value_parser!(u16).range(1..=255))]
     max_segment: u16,
 }
 

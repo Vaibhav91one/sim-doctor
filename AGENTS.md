@@ -960,7 +960,7 @@ sim-doctor's subset (issues #116, #132, #117), lpac name in brackets: `euicc inf
 `euicc profiles` [`profile list`], `euicc notifications` [`notification list`]. Each opens a logical
 channel (MANAGE CHANNEL), SELECTs the ISD-R (`A0000005591010FFFFFFFF8900000100`, `--aid` overrides),
 sends one ES10 STORE DATA request ([src/euicc.rs](src/euicc.rs) over [src/es10.rs](src/es10.rs)) and
-closes the channel on every path. `euicc info` also reads ES10a GetEuiccConfiguredAddresses (default SM-DP+, root SM-DS); `--max-segment` (1-255) lowers the STORE DATA block size. They speak the lpac envelope (`type` `lpa`), human table without
+closes the channel on every path. `euicc info` also reads ES10a GetEuiccConfiguredAddresses (default SM-DP+, root SM-DS); `--max-segment` (1-255, default 120 as lpac) sets the STORE DATA block size. They speak the lpac envelope (`type` `lpa`), human table without
 `--json`. Exit 0 answered; 1 not an eUICC (`data.error.kind` `not-an-euicc`), no channel, ISD-R
 refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Never sent:
 EnableProfile, DeleteProfile, RetrieveNotificationsList, RemoveNotification (the rest of #117, #119).

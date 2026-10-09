@@ -40,8 +40,9 @@ pub const ISDR_AID: [u8; 16] = [
 /// and nothing here shows it.
 const PROFILE_TAGS: [u16; 7] = [0x5A, 0x4F, 0x9F70, 0x90, 0x91, 0x92, 0x95];
 
-/// STORE DATA data bytes per block unless `--max-segment` lowers it.
-pub const DEFAULT_MAX_SEGMENT: usize = es10::MAX_BLOCK_DATA;
+/// STORE DATA data bytes per block unless `--max-segment` changes it: lpac's
+/// default, since some eUICCs reject full 255-byte blocks.
+pub const DEFAULT_MAX_SEGMENT: usize = 120;
 
 /// Which read-only query to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +421,13 @@ pub fn nickname<S: CardSession + ?Sized>(
             .map_err(exchange_failed)?;
         let result = es10::decode_set_nickname(&ask("SetNickname", frame)?)
             .map_err(|e| bad("SetNickname", e))?;
+        if result == es10::SetNicknameResult::IccidNotFound {
+            return Err(Failure::new(
+                "iccid-not-found",
+                format!("the ISD-R reports no profile with ICCID {}", request.iccid),
+                json!({ "eid": data["eid"], "iccid": request.iccid }),
+            ));
+        }
         if result != es10::SetNicknameResult::Ok {
             return Err(Failure::new(
                 "es10-refused",
@@ -834,7 +842,7 @@ mod tests {
 
     #[test]
     fn nickname_with_yes_sends_set_nickname_then_verifies() {
-        // Exact SetNickname frame, hand-written: BF29 12 5A0A <iccid> 9003 'n' 'e' 'w'.
+        // Exact SetNickname frame, hand-written: BF29 11 5A0A <iccid> 9003 'n' 'e' 'w'.
         assert_eq!(
             set_request("new"),
             h(&format!("BF2911 5A0A{ICCID_RAW} 9003 6E6577"))
@@ -882,13 +890,31 @@ mod tests {
             &[
                 (es10::get_eid_request(), eid_response()),
                 (profiles_request(), profile_response("old")),
-                (set_request("new"), ok("BF2903 8001 01")),
+                (set_request("new"), ok("BF2903 8001 7F")),
             ],
         );
         let req = Nickname::new(ICCID, "new", true).unwrap();
         let failure = nickname(&mut card, &ISDR_AID, 255, &req).unwrap_err();
         assert_eq!(failure.kind, "es10-refused");
-        assert_eq!(failure.data["code"], 1);
+        assert_eq!(failure.data["code"], 127);
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn set_nickname_result_1_is_iccid_not_found() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), profile_response("old")),
+                (set_request("new"), ok("BF2903800101")),
+            ],
+        );
+        let req = Nickname::new(ICCID, "new", true).unwrap();
+        let failure = nickname(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "iccid-not-found");
+        assert_eq!(failure.data["iccid"], ICCID);
+        assert_eq!(failure.data["eid"], EID);
         assert_eq!(card.remaining(), 0);
     }
 

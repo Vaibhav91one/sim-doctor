@@ -206,7 +206,7 @@ Queries to an eUICC's ISD-R (SGP.22 ES10), named after lpac's, and one write (`n
 
 Each command opens a logical channel, selects the ISD-R by AID (`A0000005591010FFFFFFFF8900000100`,
 `--aid HEX` overrides), sends one STORE DATA request and closes the channel again, also when it
-fails. `--max-segment BYTES` (1 to 255, default 255) caps the data bytes in one STORE DATA block, for a reader that mishandles long blocks. `info`, `profiles` and `notifications` change nothing. `--json` prints the lpac envelope
+fails. `--max-segment BYTES` (1 to 255, default 120 as in lpac; 255 is the short-APDU Lc limit) caps the data bytes in one STORE DATA block, because some eUICCs reject full 255-byte blocks. `info`, `profiles` and `notifications` change nothing. `--json` prints the lpac envelope
 (`{"type":"lpa","payload":{"code","message","data"}}`); without it you get a table with
 card-supplied text sanitized. Exit codes: `0` answered; `1` the card is not an eUICC (the ISD-R
 SELECT was refused: `data.error.kind` is `not-an-euicc`), the card refused a logical channel or an
