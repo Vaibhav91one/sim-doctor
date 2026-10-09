@@ -746,9 +746,18 @@ returns a single `lpac`-style envelope for everything:
 `type` identifies the response, `payload.code` a machine-checkable status, `payload.data` the
 body. Those commands keep it for lpa compatibility; they are not findings commands.
 
+### GlobalPlatform reads (`gp`)
+
+`gp info`, `gp ara` and `gp status` send only SELECT, GET DATA (`80 CA`) and GET STATUS (`80 F2`)
+plus GET RESPONSE; `src/gp.rs` has no authenticated path. ARA-M is `A00000015141434C00`, GET DATA
+`FF40`; rules decode from `E2 { E1 {4F|C0, C1, CA}, E3 {D0, D1, DB} }` (GP Secure Element Access
+Control v1.1, GPD_SPE_013 2024 public review: FF40 is 4.1 Table 4-2, rules are chapter 6; CA and DB are AOSP extensions). A first GET DATA that holds less than FF40's declared length is continued with GET DATA [Next] `80 CA FF 60` (raw bytes, bounded 255 calls / 64 KiB); a short list is `truncated`. ARA and GET STATUS reads answer `61 xx` with the ISO-class (00) GET RESPONSE. GET STATUS uses P2 `02` (TLV)
+and `03` (next) on `63 10`, bounded at 16 pages. `6982`/`6985` is data (`requires_authentication`),
+`6A88` is an empty scope. Replay tests only; no live ARA-M card was available.
+
 ### MCP
 
-`sim-doctor mcp` serves MCP over stdio with six tools: `scan`, `rules_list`, `rules_explain` and the read-only eUICC queries `euicc_info`, `euicc_profiles` and `euicc_notifications` (each takes an optional `reader`; they return the `euicc ... --json` lpac envelope unchanged).
+`sim-doctor mcp` serves MCP over stdio with nine tools: `scan`, `rules_list`, `rules_explain`, the read-only eUICC queries `euicc_info`, `euicc_profiles` and `euicc_notifications`, and the read-only GlobalPlatform reads `gp_info`, `gp_ara` and `gp_status` (each takes an optional `reader`; they return the `euicc ... --json` / `gp ... --json` envelope unchanged).
 `scan` runs this binary as `scan --json ...` and returns the doctor/1 envelope **byte for byte**
 (exit 0, 1 and 3 are results; anything else is an error carrying stderr). It accepts every scan
 flag as an argument **except** `tui`, `json` (always forced), `help` and `version`; `baseline`,
