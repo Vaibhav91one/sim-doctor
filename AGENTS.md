@@ -486,6 +486,14 @@ bytes in the repo, tests, fixtures, docs, issues or PRs. Test fixtures are synth
 (e.g. IMSI `001010...`). That is version-control hygiene, not runtime behaviour. Keep any real
 capture under `/tmp/sim-doctor-<n>/`.
 
+**`trace` input formats (#109).** Hex lines, our own `--trace` JSON, or a pcap/pcapng capture of
+GSMTAP SIM APDUs (UDP 4729, type SIM 0x04, sub-type APDU 0x00; SIMtrace2, pySim-trace), detected by
+magic number in `trace::parse_bytes`. The reader is hand-written in `src/trace/pcap.rs` (no pcap
+crate): IPv4 only, unfragmented, link types Ethernet/loopback/raw/Linux cooked. As in pySim-trace one
+APDU packet carries the whole exchange; it is split by INS (`CMD_DATA_INS`, pySim does it per command
+class). ATR, PPS and TPDU sub-types are skipped. Malformed input is an error, never a panic. Test
+captures are built in the tests from synthetic bytes; never commit a real capture.
+
 ### TAR scanning and MSL=0
 
 A TAR is a three-octet value a network uses to route an SMS payload to one
