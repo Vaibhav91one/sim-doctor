@@ -36,9 +36,11 @@
 //! | GetEUICCInfo (EUICCInfo1, EUICCInfo2) | 5.7.8 | `BF20`, `BF22` | `BF20`, `BF22` |
 //! | AuthenticateServer | 5.7.13 | `BF38` | `BF38` |
 //! | CancelSession | 5.7.14 | `BF41` | `BF41` |
+//! | GetEuiccConfiguredAddresses (ES10a) | 5.7.3 | `BF3C` | `BF3C` |
 //! | GetProfilesInfo | 5.7.15 | `BF2D` | `BF2D` |
 //! | EnableProfile | 5.7.16 | `BF31` | `BF31` |
 //! | DeleteProfile | 5.7.18 | `BF33` | `BF33` |
+//! | SetNickname | 5.7.21 | `BF29` | `BF29` |
 //!
 //! Where issue #18 differs from the spec: the issue says "`<=255` data bytes"
 //! under 5.7.2, but Table 47 gives Lc as "Var." and the 255-byte rule is
@@ -59,8 +61,8 @@
 //! # Not implemented
 //!
 //! The "alternative case 3" form of EnableProfile and DeleteProfile (P1 `90`,
-//! no response data, 5.7.16 and 5.7.18), and the ES10a, notification,
-//! DisableProfile, eUICCMemoryReset, GetEID and SetNickname functions. None is
+//! no response data, 5.7.16 and 5.7.18), and the notification,
+//! DisableProfile, eUICCMemoryReset and SetDefaultDpAddress functions. None is
 //! in issue #18. Decoders preserve tags they do not know in `unknown` fields
 //! instead of dropping them.
 
@@ -217,13 +219,34 @@ pub enum DecodeError {
 /// [`EncodeError::BadClass`], [`EncodeError::EmptyData`], and
 /// [`EncodeError::TooManyBlocks`] above 256 blocks (65280 bytes).
 pub fn blocks(cla: u8, data: &[u8]) -> Result<Vec<Command>, EncodeError> {
+    blocks_sized(cla, data, MAX_BLOCK_DATA)
+}
+
+/// [`blocks`] with a smaller data field per block, for a reader or card that
+/// cannot take 255 bytes at once (lpac's `--apdu-max`-style segment size).
+/// `max` is the most data bytes in one block; the spec's own limit stays the
+/// ceiling ([`MAX_BLOCK_DATA`]).
+///
+/// # Errors
+///
+/// [`EncodeError::FieldLength`] when `max` is 0 or above 255, otherwise as
+/// [`blocks`] (a small `max` reaches the 256-block limit sooner).
+pub fn blocks_sized(cla: u8, data: &[u8], max: usize) -> Result<Vec<Command>, EncodeError> {
+    if !(1..=MAX_BLOCK_DATA).contains(&max) {
+        return Err(EncodeError::FieldLength {
+            field: "maxBlockData",
+            min: 1,
+            max: MAX_BLOCK_DATA,
+            got: max,
+        });
+    }
     if !is_valid_class(cla) {
         return Err(EncodeError::BadClass(cla));
     }
     if data.is_empty() {
         return Err(EncodeError::EmptyData);
     }
-    let count = data.len().div_ceil(MAX_BLOCK_DATA);
+    let count = data.len().div_ceil(max);
     if count > 256 {
         return Err(EncodeError::TooManyBlocks {
             bytes: data.len(),
@@ -231,7 +254,7 @@ pub fn blocks(cla: u8, data: &[u8]) -> Result<Vec<Command>, EncodeError> {
         });
     }
     Ok(data
-        .chunks(MAX_BLOCK_DATA)
+        .chunks(max)
         .enumerate()
         .map(|(index, chunk)| {
             let p1 = if index + 1 == count {
@@ -305,6 +328,21 @@ pub fn store_data<S: CardSession + ?Sized>(
     policy: &Policy,
 ) -> Result<Sent, Error> {
     send_blocks(session, blocks(cla, data)?, policy)
+}
+
+/// [`store_data`] with at most `max` data bytes per block ([`blocks_sized`]).
+///
+/// # Errors
+///
+/// As [`store_data`], plus [`blocks_sized`]'s `max` check.
+pub fn store_data_sized<S: CardSession + ?Sized>(
+    session: &mut S,
+    cla: u8,
+    data: &[u8],
+    max: usize,
+    policy: &Policy,
+) -> Result<Sent, Error> {
+    send_blocks(session, blocks_sized(cla, data, max)?, policy)
 }
 
 /// Sends a Bound Profile Package segment by segment ([`bpp_blocks`]) and
@@ -673,6 +711,10 @@ code_enum! {
     }
 }
 code_enum! {
+    /// `setNicknameResult` ([SGP.22 v2.5 §5.7.21]).
+    SetNicknameResult { Ok = 0, IccidNotFound = 1, UndefinedError = 127 }
+}
+code_enum! {
     /// `deleteResult` ([SGP.22 v2.5 §5.7.18]).
     DeleteResult {
         Ok = 0, IccidOrAidNotFound = 1, ProfileNotInDisabledState = 2,
@@ -720,6 +762,36 @@ pub fn get_euicc_info2_request() -> Vec<u8> {
 /// ([SGP.22 v2.5 §5.7.20], the frame pySim sends).
 pub fn get_eid_request() -> Vec<u8> {
     tlv(0xBF3E, &tlv(0x5C, &[0x5A]))
+}
+
+/// `GetEuiccConfiguredAddressesRequest`, `BF 3C 00` (ES10a,
+/// [SGP.22 v2.5 §5.7.3]): the default SM-DP+ and root SM-DS addresses.
+pub fn get_euicc_configured_addresses_request() -> Vec<u8> {
+    tlv(0xBF3C, &[])
+}
+
+/// Longest `profileNickname`, in bytes ([SGP.22 v2.5 §5.7.21]:
+/// `UTF8String (SIZE(0..64))`; counted in bytes, the stricter reading).
+pub const MAX_NICKNAME_BYTES: usize = 64;
+
+/// `SetNicknameRequest`, `BF29` ([SGP.22 v2.5 §5.7.21]): the 10-octet ICCID
+/// (tag `5A`) and the nickname (tag `90`, 0 to 64 bytes; empty clears it).
+///
+/// # Errors
+///
+/// [`EncodeError::FieldLength`] for an ICCID that is not 10 bytes or a
+/// nickname over [`MAX_NICKNAME_BYTES`].
+pub fn set_nickname_request(iccid: &[u8], nickname: &str) -> Result<Vec<u8>, EncodeError> {
+    check(iccid, "iccid", 10, 10)?;
+    check(
+        nickname.as_bytes(),
+        "profileNickname",
+        0,
+        MAX_NICKNAME_BYTES,
+    )?;
+    let mut body = tlv(0x5A, iccid);
+    push_tlv(&mut body, 0x90, nickname.as_bytes());
+    Ok(tlv(0xBF29, &body))
 }
 
 /// `ListNotificationRequest` with no filter, `BF28 00`: every pending
@@ -1191,6 +1263,53 @@ pub fn decode_get_eid(data: &[u8]) -> Result<[u8; 16], DecodeError> {
         }
     }
     require(eid, "eidValue")
+}
+
+/// `EuiccConfiguredAddresses` ([SGP.22 v2.5 §5.7.3]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredAddresses {
+    /// `defaultDpAddress`, tag `80`; absent when none is configured.
+    pub default_dp_address: Option<String>,
+    /// `rootDsAddress`, tag `81`. The spec makes it mandatory; a card that
+    /// leaves it out still gets its other address shown, so this is optional.
+    pub root_ds_address: Option<String>,
+    /// Tags this decoder does not know.
+    pub unknown: Vec<Unknown>,
+}
+
+/// Decodes the response data of GetEuiccConfiguredAddresses (`BF3C`).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed structure or a non-UTF-8 address.
+pub fn decode_configured_addresses(data: &[u8]) -> Result<ConfiguredAddresses, DecodeError> {
+    let (mut default_dp, mut root_ds) = (None, None);
+    let mut unknown = Vec::new();
+    for node in only(data, 0xBF3C)? {
+        match node.tag {
+            0x80 if default_dp.is_none() => {
+                default_dp = Some(utf8(node.value, "defaultDpAddress")?)
+            }
+            0x81 if root_ds.is_none() => root_ds = Some(utf8(node.value, "rootDsAddress")?),
+            _ => keep(&mut unknown, node),
+        }
+    }
+    Ok(ConfiguredAddresses {
+        default_dp_address: default_dp,
+        root_ds_address: root_ds,
+        unknown,
+    })
+}
+
+/// Decodes the response data of SetNickname (`BF29`) into its
+/// `setNicknameResult` ([SGP.22 v2.5 §5.7.21]).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed or incomplete structure.
+pub fn decode_set_nickname(data: &[u8]) -> Result<SetNicknameResult, DecodeError> {
+    result_code(data, 0xBF29, "setNicknameResult")
+        .map(|(code, _)| SetNicknameResult::from_code(code))
 }
 
 /// One `NotificationMetadata` (`BF2F`) of a ListNotification response
@@ -2656,5 +2775,66 @@ mod tests {
             Err(DecodeError::Truncated { .. })
         ));
         assert_eq!(tlv(0xBF2D, &[0u8; 200])[..4], [0xBF, 0x2D, 0x81, 200]);
+    }
+
+    #[test]
+    fn set_nickname_request_and_response() {
+        let iccid = h("98 00 10 32 54 76 98 10 32 14");
+        assert_eq!(
+            set_nickname_request(&iccid, "nick").unwrap(),
+            h("BF29 12 5A0A 98001032547698103214 9004 6E69636B")
+        );
+        // An empty nickname clears it.
+        assert_eq!(
+            set_nickname_request(&iccid, "").unwrap(),
+            h("BF29 0E 5A0A 98001032547698103214 9000")
+        );
+        assert!(set_nickname_request(&iccid[..9], "x").is_err());
+        assert!(set_nickname_request(&iccid, &"a".repeat(65)).is_err());
+        assert!(set_nickname_request(&iccid, &"a".repeat(64)).is_ok());
+        assert_eq!(
+            decode_set_nickname(&h("BF29 03 80 01 00")).unwrap(),
+            SetNicknameResult::Ok
+        );
+        assert_eq!(
+            decode_set_nickname(&h("BF29 03 80 01 01")).unwrap(),
+            SetNicknameResult::IccidNotFound
+        );
+        assert!(decode_set_nickname(&h("BF29 00")).is_err());
+    }
+
+    #[test]
+    fn configured_addresses_request_and_response() {
+        assert_eq!(get_euicc_configured_addresses_request(), h("BF3C 00"));
+        let both = decode_configured_addresses(&h(
+            "BF3C 1B 80 07 64702E6578616D 81 10 64732E6578616D706C652E6F7267",
+        ));
+        // 0x1B is a deliberate miscount: the decoder checks lengths.
+        assert!(both.is_err());
+        let ok = decode_configured_addresses(&h(
+            "BF3C 19 80 07 64702E6578616D 81 0E 64732E6578616D706C652E6F7267",
+        ))
+        .unwrap();
+        assert_eq!(ok.default_dp_address.as_deref(), Some("dp.exam"));
+        assert_eq!(ok.root_ds_address.as_deref(), Some("ds.example.org"));
+        let root_only =
+            decode_configured_addresses(&h("BF3C 10 81 0E 64732E6578616D706C652E6F7267")).unwrap();
+        assert_eq!(root_only.default_dp_address, None);
+    }
+
+    #[test]
+    fn sized_blocks_cut_at_the_chosen_size() {
+        let cmds = blocks_sized(0x81, &[7u8; 100], 40).unwrap();
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0].encode().unwrap()[..5], [0x81, 0xE2, 0x11, 0x00, 40]);
+        assert_eq!(cmds[2].encode().unwrap()[..5], [0x81, 0xE2, 0x91, 0x02, 20]);
+        assert_eq!(blocks_sized(0x81, &[7u8; 100], 255).unwrap().len(), 1);
+        assert!(blocks_sized(0x81, &[7u8; 10], 0).is_err());
+        assert!(blocks_sized(0x81, &[7u8; 10], 256).is_err());
+        // 300 bytes at 1 per block is more than P2 can number.
+        assert!(matches!(
+            blocks_sized(0x81, &[7u8; 300], 1),
+            Err(EncodeError::TooManyBlocks { .. })
+        ));
     }
 }

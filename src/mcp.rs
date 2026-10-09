@@ -3,7 +3,7 @@
 //! `sim-doctor mcp` lets a coding agent call the scan and the rule catalogue as
 //! tools instead of shelling out: `scan`, `rules_list`, `rules_explain` and the
 //! three read-only eUICC queries `euicc_info`, `euicc_profiles` and
-//! `euicc_notifications`.
+//! `euicc_notifications`. The `euicc nickname` write is deliberately not a tool.
 //!
 //! Each call runs this same binary as a subprocess (`scan --json ...`), so the
 //! envelope an agent receives is byte for byte the one the CLI prints, and no

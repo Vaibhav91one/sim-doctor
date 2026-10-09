@@ -50,7 +50,7 @@ sim-doctor install
 - `scan`: a card scan; needs a card and a reader. Its arguments are generated from `scan --help`.
 - `rules_list`: the rule catalogue. No card.
 - `rules_explain`: one rule by `id`. No card.
-- `euicc_info`, `euicc_profiles`, `euicc_notifications`: the read-only `euicc` commands below, one optional `reader` argument each; they return the lpac envelope of `euicc <sub> --json` byte for byte. Need an eUICC and a reader.
+- `euicc_info`, `euicc_profiles`, `euicc_notifications`: the read-only `euicc` commands below, one optional `reader` argument each; they return the lpac envelope of `euicc <sub> --json` byte for byte. Need an eUICC and a reader. `euicc nickname` (the only eUICC write) is deliberately not an MCP tool.
 - `gp_info`, `gp_ara`, `gp_status`: the read-only `gp` commands below, one optional `reader` argument each; they return the envelope of `gp <sub> --json` byte for byte. Need a card and a reader.
 
 Every `scan` flag is an argument (`baseline`, `fail-on` and `sarif` included) except `tui`, `json` (always on), `help` and `version`; `baseline` and `sarif` take a file path, as on the command line. Each call runs `sim-doctor` itself as a subprocess and returns its doctor/1 envelope byte for byte as the tool text. Exit 0, 1 and 3 are normal results (isError false): findings at or above `--fail-on`, or a new finding against a baseline. 2 (the scan could not run: its envelope has `data.error`), 130 or any other exit is a tool error (isError true) carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything.
@@ -153,7 +153,8 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
 | `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; `fix` strips zero-width joiners (U+200C/U+200D), the combining grapheme joiner and variation selectors from agent-bound text, so emoji ZWJ sequences and Persian/Indic shaping marks are removed; unassigned code points and some other Cf characters (e.g. U+0600-0605, U+06DD) are NOT stripped. card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent; `SIM_DOCTOR_HANDOFF_SKIP_APPROVALS=1` is the same as `--skip-approvals`; an agent that is not installed exits 1, and one killed by a signal exits 128+signal. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
 | `gp info\|ara\|status [--json] [--reader NAME] [--trace]` | read-only GlobalPlatform reads, see below |
-| `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX]` | read-only eUICC queries over ES10, see below |
+| `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
+| `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 
@@ -197,17 +198,17 @@ profile's `7FD0` and ISIM (`A0000000871004`) to `7FC0`.
 
 ### `euicc`
 
-Read-only queries to an eUICC's ISD-R (SGP.22 ES10), named after lpac's:
+Queries to an eUICC's ISD-R (SGP.22 ES10), named after lpac's, and one write (`nickname`):
 
 | sim-doctor | lpac | Asks the card for |
 | --- | --- | --- |
-| `euicc info` | `chip info` | EID (GetEID), EUICCInfo1 and EUICCInfo2 (GetEuiccInfo1/2): SVN, profile version, firmware, RSP capability, CI key ids, category |
+| `euicc info` | `chip info` | EID (GetEID), the configured default SM-DP+ and root SM-DS addresses (ES10a GetEuiccConfiguredAddresses), EUICCInfo1 and EUICCInfo2 (GetEuiccInfo1/2): SVN, profile version, firmware, RSP capability, CI key ids, category |
 | `euicc profiles` | `profile list` | GetProfilesInfo: ICCID, state, class, nickname, service provider, name, ISD-P AID |
 | `euicc notifications` | `notification list` | ListNotification metadata only (sequence number, operation, address, ICCID); nothing is retrieved or removed |
 
 Each command opens a logical channel, selects the ISD-R by AID (`A0000005591010FFFFFFFF8900000100`,
 `--aid HEX` overrides), sends one STORE DATA request and closes the channel again, also when it
-fails. Nothing here changes a profile or a notification. `--json` prints the lpac envelope
+fails. `--max-segment BYTES` (1 to 255, default 120 as in lpac; 255 is the short-APDU Lc limit) caps the data bytes in one STORE DATA block, because some eUICCs reject full 255-byte blocks. `info`, `profiles` and `notifications` change nothing. `--json` prints the lpac envelope
 (`{"type":"lpa","payload":{"code","message","data"}}`); without it you get a table with
 card-supplied text sanitized. Exit codes: `0` answered; `1` the card is not an eUICC (the ISD-R
 SELECT was refused: `data.error.kind` is `not-an-euicc`), the card refused a logical channel or an
@@ -215,6 +216,15 @@ ES10 request, the response was malformed, or no reader or card; `129` bad comman
 interrupted. The swSIM fixture is not an eUICC, so these are tested against synthetic responses
 through the replay transport and still need a live-card check (tracked on #92). The online side
 (download, discovery, notification handling) needs the HTTPS transport (#20) and is not here.
+
+`euicc nickname ICCID NAME` (lpac `profile nickname`, ES10c SetNickname) is the only command here that
+changes the card, and it is cautious by default. The ICCID (18 to 20 digits) and the name (at most 64
+bytes of UTF-8, no control characters; `""` clears it) are checked before a reader is opened.
+Without `--yes` it is a **dry run**: it reads the EID and the profile list, prints the target EID
+and ICCID and the current and the new nickname, and exits 0 without sending SetNickname. With `--yes`
+it sends SetNickname, re-reads the profile list and exits 1 (`verify-failed`) unless the nickname
+changed. An ICCID the eUICC does not hold is `iccid-not-found`, and nothing is written. The nickname
+write is **not exposed over MCP**: the MCP server offers the three read-only `euicc_*` tools only.
 
 ### `gp`
 
