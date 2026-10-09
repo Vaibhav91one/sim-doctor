@@ -409,7 +409,7 @@ jobs:
           # ran rather than the process having exited at reader discovery -
           # which is exactly what a cardless run does.
           grep -q 'severity/score: scanning with' "$log"
-          grep -q 'severity/score: a bare run carries a findings block and no score' "$log"
+          grep -q 'severity/score: a bare run carries the findings and the shared score' "$log"
           grep -q 'severity/score: --severity high reported the threshold it applied' "$log"
           grep -q 'severity/score: --score emitted value .* penalty .* rules_run' "$log"
           grep -q 'severity/score: rules_run is 1 but the audit probed nothing' "$log"
