@@ -30,7 +30,7 @@
 //! layer 1  euicc      eUICC queries (ISD-R, ES10) and the nickname, enable and disable writes behind `sim-doctor euicc`
 //! layer 1  es9         ES9+: the JSON-over-HTTPS messages to an SM-DP+, behind a transport trait
 //! layer 1  es9_https   the verified HTTPS (and lpac stdio) ES9+ transport; the only socket in the crate
-//! layer 1  backend     SIM_DOCTOR_APDU / SIM_DOCTOR_HTTP backend selection, after lpac
+//! layer 1  backend     SIM_DOCTOR_HTTP / SIM_DOCTOR_CA_BUNDLE selection, after lpac
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report

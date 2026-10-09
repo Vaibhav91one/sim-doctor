@@ -9,28 +9,40 @@
 //! * SGP.22 v2.2.2 §5.6 ("the LPA SHALL verify the received CERT.DP.TLS
 //!   according to section 4.5.2.2") and §3.1.2 step 5 (verify CERT.XX.TLS or
 //!   stop) require the check; §4.5.2.2 says a certificate is "Signed by a
-//!   GSMA CI, or a trusted chain up to a GSMA CI". So the specified trust
-//!   anchor of an SM-DP+ TLS certificate is a GSMA CI, **not** the web PKI.
-//!   §3.1.2 also notes the LPAd may retry when several CIs exist.
+//!   GSMA CI, or a trusted chain up to a GSMA CI". The anchor of an SM-DP+ TLS
+//!   certificate is a GSMA CI, not the web PKI.
+//! * Observed 2026-10-09 with a plain `openssl s_client` handshake (no ES9+
+//!   request): `smdp.io` and `rsp.truphone.com` (1GLOBAL SM-DP+) present a
+//!   leaf issued **directly** by `GSM Association - RSP2 Root CI1` (AKI
+//!   `81370f51...ebfb`), which no web root signs, so web roots would reject
+//!   it. Google's `prod.smdp-plus.rsp.goog` chains to a Symantec RSP *test*
+//!   root, also not a web root.
 //! * lpac (estkme-group/lpac, `driver/http/curl.c`, commit 82ada9e) sets
 //!   `CURLOPT_SSL_VERIFYPEER` and `CURLOPT_SSL_VERIFYHOST` to 0: it verifies
 //!   **nothing** (its WinHTTP backend sets `SECURITY_FLAG_IGNORE_UNKNOWN_CA`).
-//!   Its `LPAC_HTTP=stdio` backend delegates the whole exchange to the host.
 //!   That is not copied here.
 //!
-//! So: [`HttpsConfig::ca_bundle`] is a PEM file of trust anchors (the GSMA CI
-//! certificate(s) a deployment trusts, or any private CA) and, when set,
-//! **replaces** the default roots entirely; the CLI reads it from
-//! `SIM_DOCTOR_CA_BUNDLE`. Without a bundle the default is the compiled-in
-//! Mozilla web roots (`webpki-roots`), because SM-DP+ operators commonly
-//! present public-CA TLS certificates in practice. That default is a
-//! convenience and a deviation from the §4.5.2.2 text; a deployment that wants
-//! the spec's trust model supplies the GSMA CI bundle. Revocation (CRL) is not
-//! checked, and the §2.6.6 cipher-suite rules are those of rustls, which
-//! offers only TLS 1.2+ AEAD ECDHE suites (the §2.6.6 CBC suite is not
-//! offered, the GCM one is).
+//! [`Trust`] therefore defaults to [`Trust::GsmaCi`]: the bundled
+//! `certs/gsma-rsp2-root-ci1.pem`. Its SHA-256 is
+//! [`GSMA_RSP2_ROOT_CI1_SHA256`], pinned by a test. Provenance: the PEM comes
+//! from the Osmocom eUICC manual's CI bundle
+//! (<https://euicc-manual.osmocom.org/docs/pki/ci/bundle.pem>, entry
+//! "GSMA RSP2 Root CI1", Key ID 81370f51...ebfb, valid to 2052-02-21).
+//! gsma.com refuses automated downloads (HTTP 403), so no GSMA-hosted copy was
+//! compared; instead the key was checked against production: the live
+//! `smdp.io` leaf verifies against this certificate with OpenSSL. Compare the
+//! fingerprint with the file on GSMA's "Root Certificate Issuer for Remote SIM
+//! Provisioning" page before relying on it.
 //!
-//! # Wire behaviour
+//! Other live CIs (for example OISTE GSMA CI G1, Key ID 4c27967a...222f) are
+//! not bundled: supply them with [`Trust::Bundle`] (CLI/env
+//! `SIM_DOCTOR_CA_BUNDLE=<pem>`), which **replaces** the default. The Mozilla
+//! web roots are only used when asked for explicitly ([`Trust::Webpki`], env
+//! value `webpki`), for test servers and public-CA hosts. Revocation (CRL) is
+//! not checked, and the §2.6.6 cipher-suite rules are those of rustls, which
+//! offers only TLS 1.2+ AEAD ECDHE suites.
+//!
+//! //! # Wire behaviour
 //!
 //! POST only, `https://` only, redirects never followed (a `3xx` is returned
 //! as is and [`crate::es9`] refuses it), any status returned as a [`Response`]
@@ -62,12 +74,42 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default response cap: 16 MiB. A BoundProfilePackage is far smaller.
 pub const DEFAULT_MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 
+/// SHA-256 of the DER of the bundled GSMA RSP2 Root CI1 certificate.
+pub const GSMA_RSP2_ROOT_CI1_SHA256: &str =
+    "5E3E91FD454327C3AF5D32A7A73BBC59FE43AA7D85FD32D5DB44423F80A56BB3";
+/// The bundled certificate, PEM.
+const GSMA_RSP2_ROOT_CI1_PEM: &str = include_str!("../certs/gsma-rsp2-root-ci1.pem");
+
+/// Which certificates the server must chain to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Trust {
+    /// The bundled GSMA RSP2 Root CI1 (SGP.22 §4.5.2.2). The default.
+    #[default]
+    GsmaCi,
+    /// These PEM trust anchors instead of the default.
+    Bundle(PathBuf),
+    /// The Mozilla web roots. Never implied; asked for by name.
+    Webpki,
+}
+
+impl Trust {
+    /// Reads the value of `SIM_DOCTOR_CA_BUNDLE`: unset is the default, the
+    /// word `webpki` is [`Trust::Webpki`], anything else a PEM path.
+    pub fn from_env_value(value: Option<std::ffi::OsString>) -> Self {
+        match value {
+            None => Self::GsmaCi,
+            Some(v) if v == "webpki" => Self::Webpki,
+            Some(v) => Self::Bundle(PathBuf::from(v)),
+        }
+    }
+}
+
 /// Settings of [`HttpsTransport`]. There is deliberately no way to turn
 /// certificate verification off.
 #[derive(Debug, Clone)]
 pub struct HttpsConfig {
-    /// PEM file of trust anchors that replaces the default web roots.
-    pub ca_bundle: Option<PathBuf>,
+    /// The trust anchors.
+    pub trust: Trust,
     /// Whole-request timeout (connect, send and receive together).
     pub timeout: Duration,
     /// Largest response body accepted, in bytes.
@@ -77,7 +119,7 @@ pub struct HttpsConfig {
 impl Default for HttpsConfig {
     fn default() -> Self {
         Self {
-            ca_bundle: None,
+            trust: Trust::default(),
             timeout: DEFAULT_TIMEOUT,
             max_response: DEFAULT_MAX_RESPONSE,
         }
@@ -96,29 +138,16 @@ impl HttpsTransport {
     ///
     /// # Errors
     ///
-    /// [`TransportError`] when `ca_bundle` cannot be read or holds no
+    /// [`TransportError`] when a [`Trust::Bundle`] cannot be read or holds no
     /// certificate (an empty bundle would otherwise trust nothing, silently).
     pub fn new(config: &HttpsConfig) -> Result<Self, TransportError> {
-        let roots = match &config.ca_bundle {
-            None => RootCerts::WebPki,
-            Some(path) => {
+        let roots = match &config.trust {
+            Trust::Webpki => RootCerts::WebPki,
+            Trust::GsmaCi => roots_from_pem(GSMA_RSP2_ROOT_CI1_PEM.as_bytes(), "bundled GSMA CI")?,
+            Trust::Bundle(path) => {
                 let pem = std::fs::read(path)
                     .map_err(|e| TransportError(format!("CA bundle {}: {e}", path.display())))?;
-                let mut certs = Vec::new();
-                for item in ureq::tls::parse_pem(&pem) {
-                    if let ureq::tls::PemItem::Certificate(cert) =
-                        item.map_err(|e| TransportError(format!("CA bundle: {e}")))?
-                    {
-                        certs.push(cert);
-                    }
-                }
-                if certs.is_empty() {
-                    return Err(TransportError(format!(
-                        "CA bundle {} contains no certificate",
-                        path.display()
-                    )));
-                }
-                RootCerts::Specific(Arc::new(certs))
+                roots_from_pem(&pem, &format!("CA bundle {}", path.display()))?
             }
         };
         let agent = ureq::Agent::config_builder()
@@ -134,6 +163,22 @@ impl HttpsTransport {
             max_response: config.max_response,
         })
     }
+}
+
+/// Trust anchors from PEM text; an empty set is an error, never "trust nothing".
+fn roots_from_pem(pem: &[u8], what: &str) -> Result<RootCerts, TransportError> {
+    let mut certs = Vec::new();
+    for item in ureq::tls::parse_pem(pem) {
+        if let ureq::tls::PemItem::Certificate(cert) =
+            item.map_err(|e| TransportError(format!("{what}: {e}")))?
+        {
+            certs.push(cert);
+        }
+    }
+    if certs.is_empty() {
+        return Err(TransportError(format!("{what} contains no certificate")));
+    }
+    Ok(RootCerts::Specific(Arc::new(certs)))
 }
 
 impl Es9Transport for HttpsTransport {
@@ -241,6 +286,29 @@ impl<R: BufRead, W: Write> Es9Transport for StdioTransport<R, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn bundled_gsma_ci_matches_its_recorded_fingerprint() {
+        let RootCerts::Specific(certs) =
+            roots_from_pem(GSMA_RSP2_ROOT_CI1_PEM.as_bytes(), "bundled").unwrap()
+        else {
+            panic!("expected specific roots");
+        };
+        assert_eq!(certs.len(), 1);
+        let digest = Sha256::digest(certs[0].der());
+        assert_eq!(hex::encode_upper(digest), GSMA_RSP2_ROOT_CI1_SHA256);
+    }
+
+    #[test]
+    fn trust_env_value() {
+        assert_eq!(Trust::from_env_value(None), Trust::GsmaCi);
+        assert_eq!(Trust::from_env_value(Some("webpki".into())), Trust::Webpki);
+        assert_eq!(
+            Trust::from_env_value(Some("/x/ca.pem".into())),
+            Trust::Bundle("/x/ca.pem".into())
+        );
+    }
 
     #[test]
     fn stdio_round_trip_matches_lpac_framing() {

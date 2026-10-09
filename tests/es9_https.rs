@@ -10,7 +10,7 @@ use std::time::Duration;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sim_doctor::es9::{self, Es9Client, Es9Transport, Request, SmdpAddress};
-use sim_doctor::es9_https::{HttpsConfig, HttpsTransport};
+use sim_doctor::es9_https::{HttpsConfig, HttpsTransport, Trust};
 
 struct Ca {
     cert: rcgen::Certificate,
@@ -131,7 +131,7 @@ fn http(status: &str, extra: &str, body: &[u8]) -> Vec<u8> {
 
 fn transport(bundle: &Path) -> HttpsTransport {
     HttpsTransport::new(&HttpsConfig {
-        ca_bundle: Some(bundle.to_path_buf()),
+        trust: Trust::Bundle(bundle.to_path_buf()),
         timeout: Duration::from_secs(5),
         max_response: 1000,
     })
@@ -184,10 +184,23 @@ fn wrong_ca_is_rejected() {
 }
 
 #[test]
-fn default_web_roots_reject_a_private_ca() {
+fn default_anchor_is_gsma_ci_and_rejects_a_private_ca() {
+    assert_eq!(HttpsConfig::default().trust, Trust::GsmaCi);
     let ca = make_ca();
     let (port, _seen) = serve(&ca, 1, |_| http("200 OK", "", b"{}"));
     let mut t = HttpsTransport::new(&HttpsConfig::default()).unwrap();
+    assert!(t.post(&url(port), &Request::headers(), b"{}").is_err());
+}
+
+#[test]
+fn explicit_webpki_also_rejects_a_private_ca() {
+    let ca = make_ca();
+    let (port, _seen) = serve(&ca, 1, |_| http("200 OK", "", b"{}"));
+    let mut t = HttpsTransport::new(&HttpsConfig {
+        trust: Trust::Webpki,
+        ..HttpsConfig::default()
+    })
+    .unwrap();
     assert!(t.post(&url(port), &Request::headers(), b"{}").is_err());
 }
 
@@ -204,14 +217,14 @@ fn plain_http_is_refused_without_a_connection() {
 #[test]
 fn bad_bundles_are_refused() {
     let missing = HttpsConfig {
-        ca_bundle: Some("/nonexistent/ca.pem".into()),
+        trust: Trust::Bundle("/nonexistent/ca.pem".into()),
         ..HttpsConfig::default()
     };
     assert!(HttpsTransport::new(&missing).is_err());
     let empty = std::env::temp_dir().join(format!("sim-doctor-{}-empty.pem", std::process::id()));
     std::fs::write(&empty, "not a certificate\n").unwrap();
     let cfg = HttpsConfig {
-        ca_bundle: Some(empty),
+        trust: Trust::Bundle(empty),
         ..HttpsConfig::default()
     };
     assert!(HttpsTransport::new(&cfg).is_err());
@@ -310,7 +323,7 @@ fn slow_server_times_out() {
         http("200 OK", "", b"{}")
     });
     let mut t = HttpsTransport::new(&HttpsConfig {
-        ca_bundle: Some(bundle),
+        trust: Trust::Bundle(bundle),
         timeout: Duration::from_millis(500),
         max_response: 1000,
     })
