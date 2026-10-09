@@ -9,10 +9,13 @@
 //! [`aes_kcv`] / [`des_kcv`] / [`kcv_matches`], and the byte builders
 //! [`install_for_load`], [`load_commands`] and [`dap_block`].
 //!
+//! `gp ara` ([`ara`]) and `gp status` ([`status`]) add SELECT of the ARA-M and GET
+//! STATUS (INS F2), both unauthenticated; a refusal is data.
+//!
 //! **Does not own, and never sends.** INITIALIZE UPDATE, EXTERNAL AUTHENTICATE,
 //! STORE DATA, INSTALL, LOAD, DELETE, PUT KEY, SET STATUS, MANAGE CHANNEL (that
 //! one is [`session::open_channel`], used by nothing here). The only
-//! instructions [`info`] sends are SELECT and GET DATA (plus the GET RESPONSE
+//! instructions [`info`], [`ara`] and [`status`] send are SELECT, GET DATA and GET STATUS (plus the GET RESPONSE
 //! that [`session::send`] adds for a `61 xx`). A `91 xx` is deliberately NOT
 //! followed (no FETCH), and a refusal is recorded once, never retried.
 //! The INSTALL / LOAD builders return [`Command`]s and nothing calls
@@ -25,7 +28,7 @@ pub const NAME: &str = "gp";
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use serde_json::{json, Value};
 
-use crate::apdu::{Command, CorrectedLength, Header, Le};
+use crate::apdu::{Command, CorrectedLength, Header, Le, CLA_GET_RESPONSE_ISO};
 use crate::session::{self, PendingFollowUp, Policy};
 use crate::transport::CardSession;
 
@@ -447,6 +450,510 @@ pub fn info<S: CardSession + ?Sized>(
         data["trace"] = Value::Array(steps);
     }
     Ok(Report { isd_found, data })
+}
+
+/// The ARA-M (Access Rule Application Master) AID, from the architecture
+/// chapter of GlobalPlatform Secure Element Access Control v1.1 (GPD_SPE_013,
+/// 2024 public review).
+pub const ARA_M_AID: [u8; 9] = [0xA0, 0x00, 0x00, 0x01, 0x51, 0x41, 0x43, 0x4C, 0x00];
+
+/// Status words that mean "a secure channel is needed", not "broken". GP's own
+/// codes for this are 6985 (conditions of use not satisfied) and 6A88; 6982 is
+/// kept as the ISO 7816-4 "security status not satisfied" meaning.
+const AUTH_REQUIRED: [&str; 2] = ["6982", "6985"];
+
+/// Sends `build(le)` and, on `6C xx`, the same command once with the Le the
+/// card named. Nothing else is retried. Records every APDU in `steps`.
+fn read_once<S: CardSession + ?Sized>(
+    session: &mut S,
+    steps: &mut Vec<Value>,
+    label: &str,
+    build: impl Fn(Le) -> Command,
+) -> Result<session::Exchange, session::Error> {
+    // The ARA-M and the ISD are GP applets: a 61 xx is answered with the ISO
+    // class (00) GET RESPONSE, not the GSM class (A0) that Policy defaults to.
+    let policy = Policy {
+        proactive_command: PendingFollowUp::Ignore,
+        get_response_class: CLA_GET_RESPONSE_ISO,
+        ..Policy::default()
+    };
+    let mut ex = session::send(session, &build(Le::Short(0)), &policy)?;
+    if let Some(CorrectedLength::Accepts(le)) = ex.status().and_then(|s| s.corrected_length()) {
+        for s in ex.steps() {
+            steps.push(json!({"step": label, "command": hex_of(s.command()), "response": hex_of(s.response())}));
+        }
+        ex = session::send(session, &build(Le::Short(le)), &policy)?;
+    }
+    for s in ex.steps() {
+        steps.push(
+            json!({"step": label, "command": hex_of(s.command()), "response": hex_of(s.response())}),
+        );
+    }
+    Ok(ex)
+}
+
+fn sw_hex(ex: &session::Exchange) -> Option<String> {
+    ex.status().map(|s| hex::encode_upper(s.to_bytes()))
+}
+
+fn select_by_aid(aid: &[u8]) -> impl Fn(Le) -> Command + '_ {
+    move |le| Command::case4(Header::new(0x00, 0xA4, 0x04, 0x00), aid, le)
+}
+
+fn tlv_get<'a>(l: &[(u16, &'a [u8])], t: u16) -> Option<&'a [u8]> {
+    l.iter().find(|(x, _)| *x == t).map(|(_, v)| *v)
+}
+
+fn byte_rule(name: &str, v: &[u8]) -> Result<Value, String> {
+    match v {
+        [0] => Ok(json!("never")),
+        [1] => Ok(json!("always")),
+        _ => Err(format!("{name} is {} bytes, expected 1", v.len())),
+    }
+}
+
+/// Decodes the ARA-M GET DATA [all] answer (`FF40 { E2 { E1 { 4F|C0, C1 [, CA] },
+/// E3 { D0, D1, DB } } ... }`). FF40 is section 4.1 (Table 4-2) and the rule
+/// encoding is chapter 6 (Tables 6-3 to 6-9) of GlobalPlatform Secure Element
+/// Access Control v1.1 (GPD_SPE_013, 2024 public review). CA (PKG-REF-DO) and
+/// DB (PERM-AR-DO) are AOSP SecureElement extensions, not in the GP text. One object per REF-AR-DO with the applet (`aid`: hex,
+/// `"all"` for an empty 4F, `"default_selected"` for C0), the device app hash
+/// (`"any"` when empty), and the APDU, NFC and permission access rules.
+/// `grants_all_apps_all_access` is set for a rule naming all applets and any
+/// device app with APDU access always. A bare run of `E2` is accepted too.
+pub fn decode_ara_rules(data: &[u8]) -> Result<Value, String> {
+    let outer = parse_tlvs(data).ok_or("malformed TLV")?;
+    let refs = match outer.iter().find(|(t, _)| *t == 0xFF40) {
+        Some((_, v)) => parse_tlvs(v).ok_or("malformed TLV inside FF40")?,
+        None => outer,
+    };
+    let mut rules = Vec::new();
+    for (tag, body) in refs {
+        if tag != 0xE2 {
+            continue; // e.g. DF20 refresh tag
+        }
+        let parts = parse_tlvs(body).ok_or("malformed TLV inside E2")?;
+        let find = |t| parts.iter().find(|(x, _)| *x == t).map(|(_, v)| *v);
+        let ref_do = parse_tlvs(find(0xE1).ok_or("REF-AR-DO without E1")?)
+            .ok_or("malformed TLV inside E1")?;
+        let ar_do = parse_tlvs(find(0xE3).ok_or("REF-AR-DO without E3")?)
+            .ok_or("malformed TLV inside E3")?;
+        let get = tlv_get;
+        let aid = match (get(&ref_do, 0x4F), get(&ref_do, 0xC0)) {
+            (Some([]), _) => json!("all"),
+            (Some(a), _) => json!(hex::encode_upper(a)),
+            (None, Some(_)) => json!("default_selected"),
+            _ => return Err("E1 has neither 4F nor C0".into()),
+        };
+        let device = match get(&ref_do, 0xC1).ok_or("E1 without C1 device app hash")? {
+            [] => json!("any"),
+            h @ &[_, ..] if h.len() == 20 || h.len() == 32 => json!(hex::encode_upper(h)),
+            h => {
+                return Err(format!(
+                    "device app hash is {} bytes, expected 0, 20 or 32",
+                    h.len()
+                ))
+            }
+        };
+        let mut rule = json!({ "aid": aid, "device_app": device });
+        if let Some(p) = get(&ref_do, 0xCA) {
+            rule["package"] = json!(String::from_utf8_lossy(p));
+        }
+        let mut apdu_always = false;
+        if let Some(v) = get(&ar_do, 0xD0) {
+            if v.is_empty() {
+                rule["apdu"] = json!("never"); // AOSP: an empty APDU-AR-DO denies
+            } else if let [b @ (0 | 1)] = v {
+                apdu_always = *b == 1;
+                rule["apdu"] = byte_rule("D0", v)?;
+            } else if v.len() % 8 == 0 {
+                rule["apdu"] = json!({ "filters": v.chunks(8).map(|c| json!({
+                    "header": hex::encode_upper(&c[..4]), "mask": hex::encode_upper(&c[4..])
+                })).collect::<Vec<_>>() });
+            } else {
+                return Err(format!(
+                    "APDU-AR-DO is {} bytes, expected 1 or a multiple of 8",
+                    v.len()
+                ));
+            }
+        }
+        if let Some(v) = get(&ar_do, 0xD1) {
+            rule["nfc"] = byte_rule("D1", v)?;
+        }
+        if let Some(v) = get(&ar_do, 0xDB) {
+            if v.len() != 8 {
+                return Err(format!("PERM-AR-DO is {} bytes, expected 8", v.len()));
+            }
+            rule["permissions"] = hex_of(v);
+        }
+        rule["grants_all_apps_all_access"] =
+            json!(rule["aid"] == "all" && rule["device_app"] == "any" && apdu_always);
+        rules.push(rule);
+    }
+    Ok(Value::Array(rules))
+}
+
+/// Longest ARA-M rule list read across GET DATA [Next] calls, and the most calls.
+const ARA_MAX_BYTES: usize = 64 * 1024;
+const ARA_MAX_NEXT: usize = 255;
+
+/// For a response starting `FF40 <BER length>`: (header bytes, declared length).
+fn ff40_header(data: &[u8]) -> Option<(usize, usize)> {
+    let rest = data.strip_prefix(&[0xFF, 0x40])?;
+    match *rest.first()? {
+        n @ 0..=0x7F => Some((3, usize::from(n))),
+        0x81 => Some((4, usize::from(*rest.get(1)?))),
+        0x82 => Some((
+            5,
+            usize::from(u16::from_be_bytes([*rest.get(1)?, *rest.get(2)?])),
+        )),
+        _ => None,
+    }
+}
+
+/// `gp ara`: SELECT the ARA-M by AID and GET DATA [all] (`80 CA FF 40`), then
+/// decode the rules. Read-only; a refusal (`6982`) is reported as
+/// `requires_authentication`, not an error.
+///
+/// # Errors
+///
+/// Only transport and encoding failures.
+pub fn ara<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+) -> Result<Report, session::Error> {
+    let mut steps = Vec::new();
+    let sel = read_once(session, &mut steps, "select", select_by_aid(&ARA_M_AID))?;
+    let found = sel.is_success();
+    let mut data = json!({
+        "card_touched": true,
+        "ara_m": { "aid": hex::encode_upper(ARA_M_AID), "status": sw_hex(&sel) },
+        "rules": Value::Null,
+    });
+    if found {
+        let ex = read_once(session, &mut steps, "get_data_all", |le| {
+            Command::case2(Header::new(0x80, 0xCA, 0xFF, 0x40), le)
+        })?;
+        let status = sw_hex(&ex);
+        data["get_data_status"] = json!(status);
+        data["requires_authentication"] = json!(status
+            .as_deref()
+            .is_some_and(|s| AUTH_REQUIRED.contains(&s)));
+        if ex.is_success() {
+            let mut all = ex.data().to_vec();
+            // FF40's length is the whole list; the card may deliver it over
+            // several GET DATA [Next] (80 CA FF 60), raw bytes with no header.
+            let mut short = None;
+            if let Some((head, want)) = ff40_header(&all) {
+                let want = head + want;
+                let mut calls = 0;
+                while all.len() < want {
+                    if calls == ARA_MAX_NEXT || all.len() >= ARA_MAX_BYTES {
+                        short = Some("read bound reached".to_string());
+                        break;
+                    }
+                    calls += 1;
+                    let next = read_once(session, &mut steps, "get_data_next", |le| {
+                        Command::case2(Header::new(0x80, 0xCA, 0xFF, 0x60), le)
+                    })?;
+                    if !next.is_success() {
+                        let sw = sw_hex(&next).unwrap_or_default();
+                        data["get_data_next_status"] = json!(sw);
+                        data["requires_authentication"] = json!(AUTH_REQUIRED.contains(&&*sw));
+                        short = Some(format!("GET DATA [Next] answered {sw}"));
+                        break;
+                    }
+                    if next.data().is_empty() {
+                        short = Some("GET DATA [Next] returned no data".into());
+                        break;
+                    }
+                    all.extend_from_slice(next.data());
+                }
+                if short.is_none() && all.len() < want {
+                    short = Some("incomplete".into());
+                }
+                if let Some(why) = short.as_ref() {
+                    data["truncated"] = json!(true);
+                    data["decode_error"] = json!(format!(
+                        "truncated: got {} of {want} bytes ({why})",
+                        all.len()
+                    ));
+                }
+            }
+            data["raw"] = hex_of(&all);
+            if short.is_none() {
+                match decode_ara_rules(&all) {
+                    Ok(v) => data["rules"] = v,
+                    Err(e) => data["decode_error"] = json!(e),
+                }
+            }
+        }
+    }
+    if trace {
+        data["trace"] = Value::Array(steps);
+    }
+    Ok(Report {
+        isd_found: found,
+        data,
+    })
+}
+
+/// GET STATUS scopes: P1, name.
+const STATUS_SCOPES: [(u8, &str); 4] = [
+    (0x80, "isd"),
+    (0x40, "applications"),
+    (0x20, "load_files"),
+    (0x10, "load_files_and_modules"),
+];
+
+/// Pages of `63 10` ("more data") followed per scope before saying so.
+const STATUS_MAX_PAGES: usize = 16;
+
+fn lifecycle_name(scope: &str, v: u8) -> &'static str {
+    match (scope, v) {
+        ("isd", 0x01) => "OP_READY",
+        ("isd", 0x07) => "INITIALIZED",
+        ("isd", 0x0F) => "SECURED",
+        ("isd", 0x7F) => "CARD_LOCKED",
+        ("isd", 0xFF) => "TERMINATED",
+        ("applications", 0x03) => "INSTALLED",
+        ("applications", 0x83) => "LOCKED",
+        ("applications", v) if v & 0x87 == 0x07 => "SELECTABLE",
+        (s, 0x01) if s.starts_with("load_files") => "LOADED",
+        _ => "unknown",
+    }
+}
+
+/// Privilege names per (byte, bit), GlobalPlatform Card Spec v2.3.1 table 11-7.
+const PRIVILEGES: [(usize, u8, &str); 15] = [
+    (0, 0x80, "security_domain"),
+    (0, 0x40, "dap_verification"),
+    (0, 0x20, "delegated_management"),
+    (0, 0x10, "card_lock"),
+    (0, 0x08, "card_terminate"),
+    (0, 0x04, "card_reset"),
+    (0, 0x02, "cvm_management"),
+    (0, 0x01, "mandated_dap_verification"),
+    (1, 0x80, "trusted_path"),
+    (1, 0x40, "authorized_management"),
+    (1, 0x20, "token_verification"),
+    (1, 0x10, "global_delete"),
+    (1, 0x08, "global_lock"),
+    (1, 0x04, "global_registry"),
+    (1, 0x02, "final_application"),
+];
+
+/// Decodes GET STATUS TLV data (`E3 { 4F aid, 9F70 lifecycle, C5 privileges,
+/// CC associated SD, CE version, 84 module AIDs }` repeated, GP Card Spec
+/// v2.3.1 section 11.4.2.1) into one object per registry entry.
+pub fn decode_registry(scope: &str, data: &[u8]) -> Result<Value, String> {
+    let mut out = Vec::new();
+    for (tag, body) in parse_tlvs(data).ok_or("malformed TLV")? {
+        if tag != 0xE3 {
+            return Err(format!("unexpected tag {tag:02X}, expected E3"));
+        }
+        let parts = parse_tlvs(body).ok_or("malformed TLV inside E3")?;
+        let one = |t| parts.iter().find(|(x, _)| *x == t).map(|(_, v)| *v);
+        let mut e = json!({ "aid": hex_of(one(0x4F).ok_or("E3 without 4F AID")?) });
+        if let Some(l) = one(0x9F70) {
+            let [v] = l else {
+                return Err("lifecycle is not one byte".into());
+            };
+            e["lifecycle"] = json!(format!("{v:02X}"));
+            e["lifecycle_name"] = json!(lifecycle_name(scope, *v));
+        }
+        if let Some(p) = one(0xC5) {
+            if p.len() != 3 {
+                return Err(format!("privileges are {} bytes, expected 3", p.len()));
+            }
+            e["privileges"] = hex_of(p);
+            e["privilege_names"] = json!(PRIVILEGES
+                .iter()
+                .filter(|(i, m, _)| p[*i] & m != 0)
+                .map(|(_, _, n)| *n)
+                .collect::<Vec<_>>());
+        }
+        if let Some(v) = one(0xCC) {
+            e["associated_security_domain"] = hex_of(v);
+        }
+        if let Some(v) = one(0xCE) {
+            e["version"] = hex_of(v);
+        }
+        let modules: Vec<Value> = parts
+            .iter()
+            .filter(|(t, _)| *t == 0x84)
+            .map(|(_, v)| hex_of(v))
+            .collect();
+        if !modules.is_empty() {
+            e["modules"] = Value::Array(modules);
+        }
+        out.push(e);
+    }
+    Ok(Value::Array(out))
+}
+
+/// `gp status`: SELECT the ISD, GET DATA tag 66 (Card Recognition Data), then
+/// GET STATUS (`80 F2 <scope> 02`, TLV format) for the ISD, applications,
+/// executable load files and load files with modules. Read-only and
+/// unauthenticated: a card that wants a secure channel answers `6982`/`6985`
+/// and the scope is reported as `requires_authentication`. `63 10` is followed
+/// with GET STATUS "next" up to [`STATUS_MAX_PAGES`] pages.
+///
+/// # Errors
+///
+/// Only transport and encoding failures.
+pub fn status<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+) -> Result<Report, session::Error> {
+    let mut steps = Vec::new();
+    let mut attempts = Vec::new();
+    let mut selected = None;
+    for aid in ISD_AIDS {
+        let ex = read_once(session, &mut steps, "select", select_by_aid(aid))?;
+        attempts.push(json!({ "aid": hex::encode_upper(aid), "status": sw_hex(&ex) }));
+        if ex.is_success() {
+            selected = Some(hex::encode_upper(aid));
+            break;
+        }
+    }
+    let mut data = json!({ "card_touched": true, "isd": selected, "isd_attempts": attempts });
+    if selected.is_some() {
+        let ex = read_once(session, &mut steps, "card_data", |le| {
+            Command::case2(Header::new(0x80, 0xCA, 0x00, 0x66), le)
+        })?;
+        let mut crd = json!({ "status": sw_hex(&ex) });
+        if ex.is_success() {
+            crd["data"] = hex_of(ex.data());
+            match decode_card_recognition(ex.data()) {
+                Ok(v) => {
+                    // SCP01/SCP02 are the old, weak secure channels.
+                    let weak: Vec<u64> = v["scp"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s["scp"].as_u64())
+                        .filter(|n| *n < 3)
+                        .collect();
+                    crd["weak_scp"] = json!(weak);
+                    crd["decoded"] = v;
+                }
+                Err(e) => crd["decode_error"] = json!(e),
+            }
+        }
+        data["card_recognition"] = crd;
+        let mut scopes = Vec::new();
+        for (p1, name) in STATUS_SCOPES {
+            let mut collected = Vec::new();
+            let mut p2 = 0x02;
+            let mut pages = 0;
+            let (last, truncated) = loop {
+                let ex = read_once(session, &mut steps, name, |le| {
+                    Command::case4(Header::new(0x80, 0xF2, p1, p2), vec![0x4F, 0x00], le)
+                })?;
+                let sw = sw_hex(&ex);
+                if ex.is_success() || sw.as_deref() == Some("6310") {
+                    collected.extend_from_slice(ex.data());
+                }
+                pages += 1;
+                if sw.as_deref() != Some("6310") {
+                    break (sw, false);
+                }
+                if pages == STATUS_MAX_PAGES {
+                    break (sw, true);
+                }
+                p2 = 0x03;
+            };
+            let mut item = json!({
+                "scope": name,
+                "p1": format!("{p1:02X}"),
+                "status": last,
+                "requires_authentication":
+                    last.as_deref().is_some_and(|s| AUTH_REQUIRED.contains(&s)),
+                "entries": [],
+            });
+            if truncated {
+                item["truncated"] = json!(true);
+            }
+            if last.as_deref() == Some("9000") || truncated {
+                match decode_registry(name, &collected) {
+                    Ok(v) => item["entries"] = v,
+                    Err(e) => item["decode_error"] = json!(e),
+                }
+            }
+            scopes.push(item);
+        }
+        data["registry"] = Value::Array(scopes);
+    }
+    if trace {
+        data["trace"] = Value::Array(steps);
+    }
+    Ok(Report {
+        isd_found: selected.is_some(),
+        data,
+    })
+}
+
+/// Plain-text rendering of a `gp ara` / `gp status` `data`, one fact per line.
+/// Card bytes only reach it as hex or as the package name, which goes through
+/// [`crate::contract::sanitize`] (JSON output is escaped by the serialiser).
+pub fn render_text(data: &Value) -> String {
+    let s = |v: &Value| crate::contract::sanitize(v.as_str().unwrap_or("-"));
+    let mut out = Vec::new();
+    if let Some(rules) = data["rules"].as_array() {
+        out.push(format!("ARA-M: {} rule(s)", rules.len()));
+        for r in rules {
+            let mut line = format!(
+                "  applet {} device-app {}",
+                s(&r["aid"]),
+                s(&r["device_app"])
+            );
+            for k in ["apdu", "nfc", "permissions", "package"] {
+                if let Some(v) = r.get(k) {
+                    let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+                    line += &format!(" {k} {}", crate::contract::sanitize(&v));
+                }
+            }
+            if r["grants_all_apps_all_access"] == true {
+                line += "  [GRANTS ALL APPS ALL ACCESS]";
+            }
+            out.push(line);
+        }
+    } else if data.get("ara_m").is_some() {
+        out.push(format!(
+            "ARA-M: not read (select {})",
+            s(&data["ara_m"]["status"])
+        ));
+    }
+    if data["requires_authentication"] == true {
+        out.push("ARA-M: requires authentication".into());
+    }
+    if let Some(e) = data.get("decode_error") {
+        out.push(format!("decode error: {}", s(e)));
+    }
+    if let Some(c) = data.get("card_recognition") {
+        out.push(format!("Card Recognition Data: status {}", s(&c["status"])));
+        if let Some(w) = c["weak_scp"].as_array().filter(|w| !w.is_empty()) {
+            out.push(format!("  weak secure channel offered: SCP0{}", w[0]));
+        }
+    }
+    for scope in data["registry"].as_array().into_iter().flatten() {
+        let n = scope["entries"].as_array().map_or(0, Vec::len);
+        let note = if scope["requires_authentication"] == true {
+            " (requires authentication)"
+        } else {
+            ""
+        };
+        out.push(format!(
+            "{}: status {}, {n} entr(ies){note}",
+            s(&scope["scope"]),
+            s(&scope["status"])
+        ));
+        for e in scope["entries"].as_array().into_iter().flatten() {
+            out.push(format!("  {} {}", s(&e["aid"]), s(&e["lifecycle_name"])));
+        }
+    }
+    out.join("\n")
 }
 
 /// Why an INSTALL or LOAD command could not be built.
@@ -956,6 +1463,358 @@ mod tests {
                 "unexpected {sent}"
             );
         }
+    }
+
+    fn tlv(tag: &str, inner: &str) -> String {
+        let n = inner.len() / 2;
+        let len = if n < 0x80 {
+            format!("{n:02X}")
+        } else {
+            format!("81{n:02X}")
+        };
+        format!("{tag}{len}{inner}")
+    }
+
+    const ARA_SEL: &str = "00A4040009A00000015141434C0000";
+    const ARA_GET: &str = "80CAFF4000";
+
+    fn ara_rules_hex() -> String {
+        let wild = tlv(
+            "E2",
+            &(tlv("E1", &(tlv("4F", "") + &tlv("C1", "")))
+                + &tlv("E3", &(tlv("D0", "01") + &tlv("D1", "01")))),
+        );
+        let narrow = tlv(
+            "E2",
+            &(tlv(
+                "E1",
+                &(tlv("4F", "A000000062")
+                    + &tlv("C1", &"AB".repeat(20))
+                    + &tlv("CA", "636F6D2E78")),
+            ) + &tlv(
+                "E3",
+                &(tlv("D0", "FFFFFF00FFFFFF00")
+                    + &tlv("D1", "00")
+                    + &tlv("DB", "0000000000000001")),
+            )),
+        );
+        tlv("FF40", &(wild + &narrow + &tlv("DF20", "0000000000000001")))
+    }
+
+    #[test]
+    fn ara_rules_decode_and_flag_the_wildcard() {
+        let v = decode_ara_rules(&hex::decode(ara_rules_hex()).unwrap()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v[0]["aid"], "all");
+        assert_eq!(v[0]["device_app"], "any");
+        assert_eq!(v[0]["apdu"], "always");
+        assert_eq!(v[0]["nfc"], "always");
+        assert_eq!(v[0]["grants_all_apps_all_access"], true);
+        assert_eq!(v[1]["aid"], "A000000062");
+        assert_eq!(v[1]["device_app"], "AB".repeat(20));
+        assert_eq!(v[1]["package"], "com.x");
+        assert_eq!(v[1]["apdu"]["filters"][0]["header"], "FFFFFF00");
+        assert_eq!(v[1]["apdu"]["filters"][0]["mask"], "FFFFFF00");
+        assert_eq!(v[1]["nfc"], "never");
+        assert_eq!(v[1]["permissions"], "0000000000000001");
+        assert_eq!(v[1]["grants_all_apps_all_access"], false);
+        // empty list and a bare run of E2 are fine
+        assert_eq!(decode_ara_rules(&[0xFF, 0x40, 0x00]).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn malformed_ara_data_is_an_error_not_a_panic() {
+        for bad in [
+            "FF4005E2",                                                         // truncated
+            "FF40",                                                             // no length
+            &tlv("FF40", &tlv("E2", &tlv("E1", &tlv("4F", "A000000062"))))[..], // no C1, no E3
+            &tlv(
+                "FF40",
+                &tlv(
+                    "E2",
+                    &(tlv("E1", &(tlv("4F", "") + &tlv("C1", "AA"))) + &tlv("E3", "")),
+                ),
+            ), // 1-byte hash
+            &tlv(
+                "FF40",
+                &tlv(
+                    "E2",
+                    &(tlv("E1", &(tlv("4F", "") + &tlv("C1", "")))
+                        + &tlv("E3", &tlv("D0", "0102030405"))),
+                ),
+            ),
+            &tlv(
+                "FF40",
+                &tlv(
+                    "E2",
+                    &(tlv("E1", &(tlv("4F", "") + &tlv("C1", ""))) + &tlv("E3", &tlv("DB", "00"))),
+                ),
+            ),
+        ] {
+            assert!(
+                decode_ara_rules(&hex::decode(bad).unwrap()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn ara_reads_rules_with_select_and_get_data_only() {
+        let resp = ara_rules_hex() + "9000";
+        let mut card = Card::new(&[(ARA_SEL, "9000"), (ARA_GET, &resp)]);
+        let report = ara(&mut card, true).unwrap();
+        assert!(report.isd_found);
+        assert_eq!(report.data["rules"][0]["grants_all_apps_all_access"], true);
+        assert_eq!(report.data["requires_authentication"], false);
+        assert_eq!(report.data["trace"].as_array().unwrap().len(), 2);
+        assert_eq!(card.sent, [ARA_SEL, ARA_GET]);
+        let text = render_text(&report.data);
+        assert!(text.contains("2 rule(s)") && text.contains("GRANTS ALL APPS ALL ACCESS"));
+    }
+
+    #[test]
+    fn ara_refusals_are_data() {
+        let mut card = Card::new(&[(ARA_SEL, "9000"), (ARA_GET, "6982")]);
+        let r = ara(&mut card, false).unwrap();
+        assert_eq!(r.data["requires_authentication"], true);
+        assert!(r.data["rules"].is_null());
+        assert!(render_text(&r.data).contains("requires authentication"));
+
+        let mut card = Card::new(&[(ARA_SEL, "9000"), (ARA_GET, "6A88")]);
+        let r = ara(&mut card, false).unwrap();
+        assert_eq!(r.data["get_data_status"], "6A88");
+        assert_eq!(r.data["requires_authentication"], false);
+
+        let mut card = Card::new(&[(ARA_SEL, "6A82")]);
+        let r = ara(&mut card, false).unwrap();
+        assert!(!r.isd_found);
+        assert_eq!(card.sent, [ARA_SEL]);
+
+        // a complete FF40 whose content is malformed is "malformed", not truncated
+        let mut card = Card::new(&[(ARA_SEL, "9000"), (ARA_GET, "FF4003E201FF9000")]);
+        let r = ara(&mut card, false).unwrap();
+        assert!(r.data["decode_error"].is_string());
+        assert!(r.data.get("truncated").is_none());
+    }
+
+    const ARA_NEXT: &str = "80CAFF6000";
+
+    /// A card that answers each command from a queue of responses (key
+    /// "00C0" matches any GET RESPONSE in ISO class); empty queue is `6D00`.
+    struct SeqCard {
+        reader: ReaderName,
+        table: HashMap<String, std::collections::VecDeque<Vec<u8>>>,
+        sent: Vec<String>,
+    }
+
+    impl SeqCard {
+        fn new(rows: &[(&str, Vec<String>)]) -> Self {
+            Self {
+                reader: ReaderName::new("scripted").unwrap(),
+                table: rows
+                    .iter()
+                    .map(|(c, rs)| {
+                        (
+                            c.to_string(),
+                            rs.iter().map(|r| hex::decode(r).unwrap()).collect(),
+                        )
+                    })
+                    .collect(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl CardSession for SeqCard {
+        fn reader(&self) -> &ReaderName {
+            &self.reader
+        }
+        fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, TransportError> {
+            let key = hex::encode_upper(command);
+            self.sent.push(key.clone());
+            let slot = if self.table.contains_key(&key) {
+                key
+            } else {
+                key[..4].to_string()
+            };
+            Ok(self
+                .table
+                .get_mut(&slot)
+                .and_then(|q| q.pop_front())
+                .unwrap_or(vec![0x6D, 0x00]))
+        }
+        fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ara_rules_split_over_get_data_next() {
+        let full = ara_rules_hex();
+        let n = full.len() / 2;
+        for cuts in [vec![30, n], vec![30, 60, n]] {
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for c in &cuts {
+                parts.push(full[at * 2..c * 2].to_string() + "9000");
+                at = *c;
+            }
+            let mut card = SeqCard::new(&[
+                (ARA_SEL, vec!["9000".into()]),
+                (ARA_GET, vec![parts[0].clone()]),
+                (ARA_NEXT, parts[1..].to_vec()),
+            ]);
+            let r = ara(&mut card, false).unwrap();
+            assert!(r.data.get("decode_error").is_none(), "{:?}", r.data);
+            assert_eq!(r.data["rules"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                card.sent.iter().filter(|s| *s == ARA_NEXT).count(),
+                parts.len() - 1
+            );
+        }
+    }
+
+    #[test]
+    fn ara_early_stop_is_truncated_and_next_refusal_is_clean() {
+        let full = ara_rules_hex();
+        let first = &full[..60];
+        let mut card = SeqCard::new(&[
+            (ARA_SEL, vec!["9000".into()]),
+            (ARA_GET, vec![first.to_string() + "9000"]),
+            (ARA_NEXT, vec!["9000".into()]),
+        ]);
+        let r = ara(&mut card, false).unwrap();
+        assert_eq!(r.data["truncated"], true);
+        assert!(r.data["decode_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("truncated"));
+        assert!(r.data["rules"].is_null());
+
+        let mut card = SeqCard::new(&[
+            (ARA_SEL, vec!["9000".into()]),
+            (ARA_GET, vec![first.to_string() + "9000"]),
+            (ARA_NEXT, vec!["6985".into()]),
+        ]);
+        let r = ara(&mut card, false).unwrap();
+        assert_eq!(r.data["get_data_next_status"], "6985");
+        assert_eq!(r.data["requires_authentication"], true);
+        assert_eq!(r.data["truncated"], true);
+    }
+
+    #[test]
+    fn ara_61xx_is_followed_with_the_iso_class_get_response() {
+        let full = ara_rules_hex();
+        let n = full.len() / 2;
+        let mut card = SeqCard::new(&[
+            (ARA_SEL, vec!["9000".into()]),
+            (ARA_GET, vec![format!("61{n:02X}")]),
+            ("00C0", vec![full + "9000"]),
+        ]);
+        let r = ara(&mut card, false).unwrap();
+        assert_eq!(r.data["rules"].as_array().unwrap().len(), 2, "{:?}", r.data);
+        assert!(card.sent.iter().any(|s| s.starts_with("00C0")));
+        assert!(!card.sent.iter().any(|s| s.starts_with("A0C0")));
+    }
+
+    #[test]
+    fn empty_apdu_ar_do_denies() {
+        let rule = tlv(
+            "E2",
+            &(tlv("E1", &(tlv("4F", "") + &tlv("C1", ""))) + &tlv("E3", &tlv("D0", ""))),
+        );
+        let v = decode_ara_rules(&hex::decode(tlv("FF40", &rule)).unwrap()).unwrap();
+        assert_eq!(v[0]["apdu"], "never");
+        assert_eq!(v[0]["grants_all_apps_all_access"], false);
+    }
+
+    #[test]
+    fn ara_text_is_sanitized() {
+        let data = json!({"rules": [{"aid": "all", "device_app": "any", "package": "a\u{1b}[31m\u{202e}b"}]});
+        let text = render_text(&data);
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
+    }
+
+    fn status_get(p1: &str, p2: &str) -> String {
+        format!("80F2{p1}{p2}024F0000")
+    }
+
+    fn recognition_hex(scps: &[&str]) -> String {
+        let gp = "2A864886FC6B";
+        let oid = |arcs: &str| format!("06{:02X}{}", arcs.len() / 2, arcs);
+        let mut body = oid(&format!("{gp}01")) + &tlv("60", &oid(&format!("{gp}02020301")));
+        for s in scps {
+            body += &tlv("64", &oid(&format!("{gp}04{s}")));
+        }
+        tlv("66", &tlv("73", &body))
+    }
+
+    #[test]
+    fn status_lists_the_registry_and_reports_auth_cleanly() {
+        let isd = tlv(
+            "E3",
+            &(tlv("4F", "A000000151000000") + &tlv("9F70", "0F") + &tlv("C5", "9E0000")),
+        );
+        let app1 = tlv(
+            "E3",
+            &(tlv("4F", "A0000000620001") + &tlv("9F70", "07") + &tlv("C5", "000000")),
+        );
+        let app2 = tlv(
+            "E3",
+            &(tlv("4F", "A0000000620002") + &tlv("9F70", "83") + &tlv("C5", "800000")),
+        );
+        let crd = recognition_hex(&["0215", "0370"]) + "9000";
+        let rows = [
+            (SEL1, "9000".to_string()),
+            ("80CA006600", crd),
+            (&status_get("80", "02")[..], isd + "9000"),
+            (&status_get("40", "02")[..], app1 + "6310"),
+            (&status_get("40", "03")[..], app2 + "9000"),
+            (&status_get("20", "02")[..], "6A88".into()),
+            (&status_get("10", "02")[..], "6982".into()),
+        ];
+        let rows: Vec<(&str, &str)> = rows.iter().map(|(a, b)| (*a, b.as_str())).collect();
+        let mut card = Card::new(&rows);
+        let r = status(&mut card, false).unwrap();
+        assert!(r.isd_found);
+        assert_eq!(r.data["card_recognition"]["weak_scp"], json!([2]));
+        let reg = &r.data["registry"];
+        assert_eq!(reg[0]["entries"][0]["lifecycle_name"], "SECURED");
+        assert_eq!(
+            reg[0]["entries"][0]["privilege_names"][0],
+            "security_domain"
+        );
+        assert_eq!(reg[1]["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(reg[1]["entries"][1]["lifecycle_name"], "LOCKED");
+        assert_eq!(reg[2]["status"], "6A88");
+        assert_eq!(reg[2]["requires_authentication"], false);
+        assert_eq!(reg[3]["requires_authentication"], true);
+        assert!(reg[3]["entries"].as_array().unwrap().is_empty());
+        let text = render_text(&r.data);
+        assert!(text.contains("requires authentication") && text.contains("SCP02"));
+        for sent in &card.sent {
+            assert!(
+                ["A4", "CA", "C0", "F2"].contains(&&sent[2..4]),
+                "unexpected {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_without_an_isd_sends_nothing_more_and_bad_tlv_is_data() {
+        let mut card = Card::new(&[(SEL1, "6A82"), (SEL2, "6A82")]);
+        let r = status(&mut card, false).unwrap();
+        assert!(!r.isd_found);
+        assert_eq!(card.sent.len(), 2);
+
+        let mut card = Card::new(&[(SEL1, "9000")]);
+        let r = status(&mut card, false).unwrap();
+        assert_eq!(r.data["registry"][0]["status"], "6D00");
+        let mut card = Card::new(&[(SEL1, "9000"), (&status_get("80", "02"), "E3054F9000")]);
+        let r = status(&mut card, false).unwrap();
+        assert!(r.data["registry"][0]["decode_error"].is_string());
+        assert!(decode_registry("isd", &[0xE3, 0x02, 0x9F, 0x70]).is_err());
+        assert!(decode_registry("isd", &[0x4F, 0x00]).is_err());
     }
 
     #[test]

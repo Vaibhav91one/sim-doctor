@@ -51,6 +51,7 @@ sim-doctor install
 - `rules_list`: the rule catalogue. No card.
 - `rules_explain`: one rule by `id`. No card.
 - `euicc_info`, `euicc_profiles`, `euicc_notifications`: the read-only `euicc` commands below, one optional `reader` argument each; they return the lpac envelope of `euicc <sub> --json` byte for byte. Need an eUICC and a reader. `euicc nickname` (the only eUICC write) is deliberately not an MCP tool.
+- `gp_info`, `gp_ara`, `gp_status`: the read-only `gp` commands below, one optional `reader` argument each; they return the envelope of `gp <sub> --json` byte for byte. Need a card and a reader.
 
 Every `scan` flag is an argument (`baseline`, `fail-on` and `sarif` included) except `tui`, `json` (always on), `help` and `version`; `baseline` and `sarif` take a file path, as on the command line. Each call runs `sim-doctor` itself as a subprocess and returns its doctor/1 envelope byte for byte as the tool text. Exit 0, 1 and 3 are normal results (isError false): findings at or above `--fail-on`, or a new finding against a baseline. 2 (the scan could not run: its envelope has `data.error`), 130 or any other exit is a tool error (isError true) carrying the child's stderr. Arguments are validated first: an unknown property, a wrong type or a string value starting with `-` is refused without running anything.
 
@@ -151,6 +152,7 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `completions <shell>` | shell completion script for the whole flag surface |
 | `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
 | `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; `fix` strips zero-width joiners (U+200C/U+200D), the combining grapheme joiner and variation selectors from agent-bound text, so emoji ZWJ sequences and Persian/Indic shaping marks are removed; unassigned code points and some other Cf characters (e.g. U+0600-0605, U+06DD) are NOT stripped. card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent; `SIM_DOCTOR_HANDOFF_SKIP_APPROVALS=1` is the same as `--skip-approvals`; an agent that is not installed exits 1, and one killed by a signal exits 128+signal. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
+| `gp info\|ara\|status [--json] [--reader NAME] [--trace]` | read-only GlobalPlatform reads, see below |
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 
@@ -223,6 +225,20 @@ and ICCID and the current and the new nickname, and exits 0 without sending SetN
 it sends SetNickname, re-reads the profile list and exits 1 (`verify-failed`) unless the nickname
 changed. An ICCID the eUICC does not hold is `iccid-not-found`, and nothing is written. The nickname
 write is **not exposed over MCP**: the MCP server offers the three read-only `euicc_*` tools only.
+
+### `gp`
+
+Read-only GlobalPlatform: SELECT, GET DATA and GET STATUS only, no keys, no authentication, no writes.
+`gp info` reads the ISD, CPLC, card data, key information and counters. `gp ara` selects the ARA-M
+(`A00000015141434C00`) and reads every access rule (GET DATA `FF40`), decoding applet AID, device
+app hash, APDU filters, NFC rule and permissions; a rule that lets every device app send any APDU to
+every applet is marked `grants_all_apps_all_access`. `gp status` lists the ISD, applications and load
+files (GET STATUS) with lifecycle and privilege names, and decodes Card Recognition Data, listing any
+SCP01/SCP02 offered as `weak_scp`. A card that wants a secure channel (`6982`/`6985`) is reported as
+`requires_authentication`, exit 0. Exit 1 when the ISD (or ARA-M) does not answer SELECT. Human
+output is sanitized; `--json` is the lpac envelope of kind `gp`. Tested against synthetic replay
+responses only; not yet checked on a live card with an ARA-M. Not done: authenticated GET STATUS, and
+a `scan` rule for the all-access ARA-M rule (scan does not select the ARA-M).
 
 ### `trace`
 

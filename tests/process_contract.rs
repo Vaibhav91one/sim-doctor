@@ -1802,7 +1802,10 @@ mod mcp_server {
                 "rules_explain",
                 "euicc_info",
                 "euicc_profiles",
-                "euicc_notifications"
+                "euicc_notifications",
+                "gp_info",
+                "gp_ara",
+                "gp_status"
             ]
         );
         let props = tools[0]["inputSchema"]["properties"].as_object().unwrap();

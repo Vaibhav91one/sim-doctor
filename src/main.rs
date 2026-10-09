@@ -393,6 +393,38 @@ enum GpAction {
         #[arg(long)]
         trace: bool,
     },
+    /// Select the ARA-M (Access Rule Application Master) and read every access
+    /// rule with GET DATA [all], decoded (read-only, no keys).
+    ///
+    /// Exit 0 when the ARA-M answered, 1 when it did not.
+    Ara {
+        /// The reader to use, matched against the driver's own name.
+        #[arg(long, value_name = "NAME")]
+        reader: Option<String>,
+        /// Emit one JSON envelope of kind "gp" on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Add every APDU exchange (command and response hex) as data.trace.
+        #[arg(long)]
+        trace: bool,
+    },
+    /// GlobalPlatform registry inventory: GET STATUS for the ISD, applications
+    /// and load files, plus Card Recognition Data (read-only, no keys). A scope
+    /// the card only gives over a secure channel is reported as requiring
+    /// authentication.
+    ///
+    /// Exit 0 when an ISD answered, 1 when none did.
+    Status {
+        /// The reader to use, matched against the driver's own name.
+        #[arg(long, value_name = "NAME")]
+        reader: Option<String>,
+        /// Emit one JSON envelope of kind "gp" on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Add every APDU exchange (command and response hex) as data.trace.
+        #[arg(long)]
+        trace: bool,
+    },
 }
 
 /// The long description of `sim-doctor scan`.
@@ -962,7 +994,17 @@ fn main() -> process::ExitCode {
                 reader,
                 json,
                 trace,
-            } => run_gp_info(reader.as_deref(), json, trace),
+            } => run_gp("gp info", reader.as_deref(), json, trace, gp::info),
+            GpAction::Ara {
+                reader,
+                json,
+                trace,
+            } => run_gp("gp ara", reader.as_deref(), json, trace, gp::ara),
+            GpAction::Status {
+                reader,
+                json,
+                trace,
+            } => run_gp("gp status", reader.as_deref(), json, trace, gp::status),
         },
         Command::Euicc(args) => match args.action {
             EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
@@ -1725,8 +1767,14 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     }
 }
 
-/// `sim-doctor gp info`: one read-only GlobalPlatform pass over one card.
-fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitCode {
+/// `sim-doctor gp <info|ara|status>`: one read-only GlobalPlatform pass over one card.
+fn run_gp(
+    what: &str,
+    reader: Option<&str>,
+    json: bool,
+    trace: bool,
+    pass: fn(&mut PcscSession, bool) -> Result<gp::Report, session::Error>,
+) -> contract::ExitCode {
     const KIND: &str = "gp";
     guard_exchange(KIND, json);
     let refuse =
@@ -1749,23 +1797,23 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
             return refuse(scan::Failure::new(kind, err.to_string()));
         }
     };
-    let report = match gp::info(&mut session, trace) {
+    let report = match pass(&mut session, trace) {
         Ok(report) => report,
         Err(err) => return refuse(scan::Failure::new("gp-exchange-failed", err.to_string())),
     };
     let mut data = report.data;
     data["reader"] = serde_json::json!(reader.as_str());
     if !report.isd_found {
-        data["error"] = serde_json::json!({
-            "kind": "isd-not-found",
-            "message": "no issuer security domain answered SELECT at either AID",
-        });
-        return report_refusal(
-            KIND,
-            "no issuer security domain answered SELECT at either AID",
-            data,
-            json,
-        );
+        let (kind, message) = if what == "gp ara" {
+            ("ara-m-not-found", "no ARA-M answered SELECT at its AID")
+        } else {
+            (
+                "isd-not-found",
+                "no issuer security domain answered SELECT at either AID",
+            )
+        };
+        data["error"] = serde_json::json!({ "kind": kind, "message": message });
+        return report_refusal(KIND, message, data, json);
     }
     let rendered = if json {
         match contract::Envelope::new(
@@ -1782,10 +1830,12 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
                 return contract::ExitCode::Findings;
             }
         }
-    } else {
+    } else if what == "gp info" {
         serde_json::to_string_pretty(&data).unwrap_or_default()
+    } else {
+        gp::render_text(&data)
     };
-    if let Err(err) = emit_stdout(&rendered, "the gp info report") {
+    if let Err(err) = emit_stdout(&rendered, &format!("the {what} report")) {
         eprintln!("sim-doctor: {err}");
         return contract::ExitCode::Findings;
     }
