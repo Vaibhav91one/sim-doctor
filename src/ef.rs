@@ -42,7 +42,7 @@ use crate::transport::CardSession;
 use crate::walk::{ContentRead, Node, Tree};
 
 /// The most records of one linear fixed EF read (EF.DIR and EF.MSISDN hold a
-/// handful).
+/// handful). A phonebook (EF.ADN, EF.FDN) is read only up to this many records.
 const MAX_RECORDS: usize = 16;
 /// The most octets of one transparent EF read. The longest decoded here is a
 /// service table (19 octets covers 146 UST services).
@@ -106,6 +106,33 @@ pub enum Ef {
     Keys,
     /// EF.KeysPS `6F09`, read as raw bytes.
     KeysPs,
+    /// EF.FPLMN `6F7B`.
+    Fplmn,
+    /// EF.OPLMNwAcT `6F61`.
+    OplmnWact,
+    /// EF.HPLMNwAcT `6F62`.
+    HplmnWact,
+    /// EF.LOCI `6F7E`.
+    Loci,
+    /// EF.PSLOCI `6F73`.
+    Psloci,
+    /// EF.EPSLOCI `6FE3`.
+    Epsloci,
+    /// EF.ACC `6F78`.
+    Acc,
+    /// EF.ADN `6F3A`, or `4F3A` in a phonebook.
+    Adn,
+    /// EF.FDN `6F3B`.
+    Fdn,
+    /// ISIM EF.IMPI `6F02`.
+    Impi,
+    /// ISIM EF.IMPU `6F04`.
+    Impu,
+    /// ISIM EF.P-CSCF `6F09`.
+    Pcscf,
+    /// EF.MANUAREA `0002` under the master file, read as raw bytes. Not a
+    /// 3GPP/ETSI file: SIMTester reads it where a card has it (issue #102).
+    ManuArea,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,12 +155,27 @@ impl Ef {
             Self::Est => "EF.EST",
             Self::Keys => "EF.Keys",
             Self::KeysPs => "EF.KeysPS",
+            Self::Fplmn => "EF.FPLMN",
+            Self::OplmnWact => "EF.OPLMNwAcT",
+            Self::HplmnWact => "EF.HPLMNwAcT",
+            Self::Loci => "EF.LOCI",
+            Self::Psloci => "EF.PSLOCI",
+            Self::Epsloci => "EF.EPSLOCI",
+            Self::Acc => "EF.ACC",
+            Self::Adn => "EF.ADN",
+            Self::Fdn => "EF.FDN",
+            Self::Impi => "EF.IMPI",
+            Self::Impu => "EF.IMPU",
+            Self::Pcscf => "EF.P-CSCF",
+            Self::ManuArea => "EF.MANUAREA",
         }
     }
 
     const fn shape(self) -> Shape {
         match self {
-            Self::Dir | Self::Msisdn => Shape::LinearFixed,
+            Self::Dir | Self::Msisdn | Self::Adn | Self::Fdn | Self::Impu | Self::Pcscf => {
+                Shape::LinearFixed
+            }
             _ => Shape::Transparent,
         }
     }
@@ -148,6 +190,17 @@ impl Ef {
 pub fn classify(path: &Path) -> Option<Ef> {
     let seg = path.segments();
     let leaf = path.leaf().to_bytes();
+    // The ISIM application, by AID (RID A000000087, PIX 1004): the identifiers
+    // 6F02/6F04/6F09 mean something else under the USIM, and `7FFF` cannot say.
+    let isim = path
+        .adf()
+        .is_some_and(|aid| aid.starts_with(&[0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04]));
+    // A phonebook directory `5F3A` under DF.TELECOM or an application.
+    let phonebook = seg.len() >= 3
+        && seg[seg.len() - 2].to_bytes() == [0x5F, 0x3A]
+        && (path.adf().is_some() && seg.len() == 3
+            || seg.len() >= 4
+                && matches!(seg[seg.len() - 3].to_bytes(), [0x7F, 0x10] | [0x7F, 0xFF]));
     let (adf, gsm, telecom, mf) = match seg.len() {
         2 => (path.adf().is_some(), false, false, path.adf().is_none()),
         n if n >= 3 => {
@@ -162,6 +215,11 @@ pub fn classify(path: &Path) -> Option<Ef> {
         _ => return None,
     };
     match leaf {
+        [0x6F, 0x02] if isim => Some(Ef::Impi),
+        [0x6F, 0x04] if isim => Some(Ef::Impu),
+        [0x6F, 0x09] if isim => Some(Ef::Pcscf),
+        [0x4F, 0x3A] if phonebook => Some(Ef::Adn),
+        [0x00, 0x02] if mf => Some(Ef::ManuArea),
         [0x2F, 0xE2] if mf => Some(Ef::Iccid),
         [0x2F, 0x00] if mf => Some(Ef::Dir),
         [0x6F, 0x07] if adf || gsm => Some(Ef::Imsi),
@@ -172,6 +230,15 @@ pub fn classify(path: &Path) -> Option<Ef> {
         [0x6F, 0x56] if adf => Some(Ef::Est),
         [0x6F, 0x08] if adf => Some(Ef::Keys),
         [0x6F, 0x09] if adf => Some(Ef::KeysPs),
+        [0x6F, 0x7B] if adf || gsm => Some(Ef::Fplmn),
+        [0x6F, 0x61] if adf => Some(Ef::OplmnWact),
+        [0x6F, 0x62] if adf => Some(Ef::HplmnWact),
+        [0x6F, 0x7E] if adf || gsm => Some(Ef::Loci),
+        [0x6F, 0x73] if adf => Some(Ef::Psloci),
+        [0x6F, 0xE3] if adf => Some(Ef::Epsloci),
+        [0x6F, 0x78] if adf || gsm => Some(Ef::Acc),
+        [0x6F, 0x3A] if telecom => Some(Ef::Adn),
+        [0x6F, 0x3B] if adf || telecom => Some(Ef::Fdn),
         _ => None,
     }
 }
@@ -234,9 +301,12 @@ pub fn decode_imsi(bytes: &[u8]) -> Result<Digits, Malformed> {
 
 /// One used EF.MSISDN record (TS 31.102 clause 4.2.26 / TS 51.011 clause
 /// 10.5.5: alpha identifier, then 14 octets: BCD length, TON/NPI, 10 octets of
-/// number, capability id, extension id). The alpha identifier is not kept.
+/// number, capability id, extension id). EF.ADN (TS 51.011 clause 10.5.1) and
+/// EF.FDN (the same clause's layout, per pySim; USIM clause not verified here) share it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Msisdn {
+    /// The alpha identifier (printable ASCII; empty when absent or UCS-2).
+    pub alpha: String,
     /// Type of number and numbering plan identification octet.
     pub ton_npi: u8,
     /// The dialling number (`*`, `#` and `a`..`c` kept as written).
@@ -270,6 +340,7 @@ pub fn decode_msisdn_record(record: &[u8]) -> Result<Option<Msisdn>, Malformed> 
         }
     }
     Ok(Some(Msisdn {
+        alpha: alpha_text(&record[..record.len() - 14]),
         ton_npi,
         number: Digits(out),
     }))
@@ -423,6 +494,259 @@ pub fn decode_spn(bytes: &[u8]) -> Result<Spn, Malformed> {
     })
 }
 
+/// An alpha identifier: printable ASCII up to the `FF` padding. UCS-2 (first
+/// octet `80`..`82`, TS 31.102 annex A) is not decoded and reads as empty.
+fn alpha_text(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0xFF).unwrap_or(bytes.len());
+    let bytes = &bytes[..end];
+    if bytes.first().is_some_and(|b| (0x80..=0x82).contains(b)) {
+        String::new()
+    } else {
+        printable(bytes, 32)
+    }
+}
+
+/// A PLMN: MCC and MNC digits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plmn {
+    /// Three digits.
+    pub mcc: String,
+    /// Two or three digits.
+    pub mnc: String,
+}
+
+impl fmt::Display for Plmn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.mcc, self.mnc)
+    }
+}
+
+/// A PLMN in three octets (TS 24.008 clause 10.5.1.13, used by TS 31.102 for
+/// EF.FPLMN and the PLMN files): octet 1 = MCC digit 2 | MCC digit 1, octet 2 = MNC digit 3 | MCC digit 3, octet 3 = MNC digit 2 |
+/// MNC digit 1; MNC digit 3 `F` means a two-digit MNC. `FFFFFF` is unused (`None`).
+pub fn decode_plmn(b: [u8; 3]) -> Result<Option<Plmn>, Malformed> {
+    if b == [0xFF; 3] {
+        return Ok(None);
+    }
+    let digit = |n: u8| match n {
+        0..=9 => Ok(char::from(b'0' + n)),
+        _ => Err(Malformed("a PLMN nibble that is not a decimal digit")),
+    };
+    let mcc = [b[0] & 0x0F, b[0] >> 4, b[1] & 0x0F]
+        .into_iter()
+        .map(digit)
+        .collect::<Result<String, _>>()?;
+    let mut mnc = [b[2] & 0x0F, b[2] >> 4]
+        .into_iter()
+        .map(digit)
+        .collect::<Result<String, _>>()?;
+    if b[1] >> 4 != 0xF {
+        mnc.push(digit(b[1] >> 4)?);
+    }
+    Ok(Some(Plmn { mcc, mnc }))
+}
+
+/// One used entry of a PLMN list, with its access technologies when the file has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlmnEntry {
+    /// The network.
+    pub plmn: Plmn,
+    /// The two AcT octets (TS 31.102 clause 4.2.5), for the `wAcT` files.
+    pub act: Option<[u8; 2]>,
+}
+
+impl PlmnEntry {
+    /// Access technology names from the AcT bits (TS 31.102 clause 4.2.5:
+    /// octet 1 b8 UTRAN, b7 E-UTRAN, b6 NG-RAN; octet 2 b8 GSM, b7 GSM COMPACT,
+    /// b6 cdma2000 HRPD, b5 cdma2000 1xRTT). Unnamed bits are not listed.
+    pub fn act_names(&self) -> Vec<&'static str> {
+        const NAMES: [(usize, u8, &str); 6] = [
+            (0, 0x80, "UTRAN"),
+            (0, 0x40, "E-UTRAN"),
+            (0, 0x20, "NG-RAN"),
+            (1, 0x80, "GSM"),
+            (1, 0x40, "GSM COMPACT"),
+            (1, 0x20, "cdma2000 HRPD"),
+        ];
+        let act = self.act.unwrap_or_default();
+        let mut out: Vec<&'static str> = NAMES
+            .iter()
+            .filter(|(i, bit, _)| act[*i] & bit != 0)
+            .map(|(_, _, n)| *n)
+            .collect();
+        if act[1] & 0x10 != 0 {
+            out.push("cdma2000 1xRTT");
+        }
+        out
+    }
+}
+
+/// A PLMN list file: `entry` octets per entry, 3 for EF.FPLMN (TS 31.102
+/// EF.FPLMN; its clause number is not verified here) and 5 for
+/// EF.OPLMNwAcT / EF.HPLMNwAcT (PLMN, then the two AcT octets; TS 51.011
+/// clauses 10.3.35 to 10.3.37, USIM clause numbers not verified here).
+/// Unused entries (`FFFFFF`) are dropped.
+pub fn decode_plmn_list(bytes: &[u8], entry: usize) -> Result<Vec<PlmnEntry>, Malformed> {
+    if bytes.is_empty() || bytes.len() % entry != 0 {
+        return Err(Malformed("a PLMN list is not a whole number of entries"));
+    }
+    let mut out = Vec::new();
+    for e in bytes.chunks_exact(entry) {
+        if let Some(plmn) = decode_plmn([e[0], e[1], e[2]])? {
+            out.push(PlmnEntry {
+                plmn,
+                act: (entry == 5).then(|| [e[3], e[4]]),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// EF.ACC (TS 31.102 clause 4.2.15 / TS 51.011 clause 10.3.13): two octets, a
+/// bit per access class, class 15 = octet 1 b8 down to class 0 = octet 2 b1.
+/// Returns the classes set, ascending.
+pub fn decode_acc(bytes: &[u8]) -> Result<Vec<u8>, Malformed> {
+    let [hi, lo, ..] = bytes else {
+        return Err(Malformed("EF.ACC is shorter than 2 octets"));
+    };
+    let word = u16::from_be_bytes([*hi, *lo]);
+    Ok((0..16u8).filter(|c| word >> c & 1 == 1).collect())
+}
+
+/// A location-information file (EF.LOCI, EF.PSLOCI, EF.EPSLOCI): the fields in
+/// the clause's order, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// The temporary identity (TMSI, P-TMSI or GUTI) as hex.
+    pub tmp_id: String,
+    /// The P-TMSI signature (EF.PSLOCI only), as hex.
+    pub signature: Option<String>,
+    /// The registered PLMN of the LAI, RAI or TAI; `None` when unset.
+    pub plmn: Option<Plmn>,
+    /// The LAC, or LAC and RAC (RAI), or TAC.
+    pub area: String,
+    /// The update status octet's b3..b1.
+    pub status: u8,
+}
+
+impl Registration {
+    /// The status as the clauses name it: 0 updated, 1 not updated; 2 PLMN (or
+    /// roaming) not allowed; 3 location/routing area not allowed (not for EPS).
+    pub fn status_label(&self, ef: Ef) -> &'static str {
+        match self.status {
+            0 => "updated",
+            1 => "not-updated",
+            2 if ef == Ef::Epsloci => "roaming-not-allowed",
+            2 => "plmn-not-allowed",
+            3 if ef != Ef::Epsloci => "area-not-allowed",
+            _ => "reserved",
+        }
+    }
+}
+
+/// EF.LOCI: TS 31.102 clause 4.2.17 is 11 octets: TMSI
+/// (4), LAI (PLMN 3 + LAC 2), TMSI TIME (1), location update status (1, b3..b1).
+pub fn decode_loci(bytes: &[u8]) -> Result<Registration, Malformed> {
+    let [t0, t1, t2, t3, p0, p1, p2, l0, l1, _time, status, ..] = bytes else {
+        return Err(Malformed("EF.LOCI is shorter than 11 octets"));
+    };
+    Ok(Registration {
+        tmp_id: hex(&[*t0, *t1, *t2, *t3]),
+        signature: None,
+        plmn: decode_plmn([*p0, *p1, *p2])?,
+        area: hex(&[*l0, *l1]),
+        status: status & 0x07,
+    })
+}
+
+/// EF.PSLOCI: TS 31.102 clause 4.2.23 (the clause the sensitive-EF rule cites), 14 octets: P-TMSI (4), P-TMSI signature
+/// (3), RAI (PLMN 3 + LAC 2 + RAC 1), routing area update status (1, b3..b1).
+pub fn decode_psloci(bytes: &[u8]) -> Result<Registration, Malformed> {
+    let (Some(ptmsi), Some(sig), Some(rai), Some(&status)) = (
+        bytes.get(..4),
+        bytes.get(4..7),
+        bytes.get(7..13),
+        bytes.get(13),
+    ) else {
+        return Err(Malformed("EF.PSLOCI is shorter than 14 octets"));
+    };
+    Ok(Registration {
+        tmp_id: hex(ptmsi),
+        signature: Some(hex(sig)),
+        plmn: decode_plmn([rai[0], rai[1], rai[2]])?,
+        area: hex(&rai[3..]),
+        status: status & 0x07,
+    })
+}
+
+/// EF.EPSLOCI: TS 31.102 clause 4.2.91 (as pySim cites it), 18 octets: GUTI (12), last visited
+/// registered TAI (PLMN 3 + TAC 2), EPS update status (1, b3..b1: 0 updated,
+/// 1 not updated, 2 roaming not allowed).
+pub fn decode_epsloci(bytes: &[u8]) -> Result<Registration, Malformed> {
+    let (Some(guti), Some(tai), Some(&status)) =
+        (bytes.get(..12), bytes.get(12..17), bytes.get(17))
+    else {
+        return Err(Malformed("EF.EPSLOCI is shorter than 18 octets"));
+    };
+    Ok(Registration {
+        tmp_id: hex(guti),
+        signature: None,
+        plmn: decode_plmn([tai[0], tai[1], tai[2]])?,
+        area: hex(&tai[3..]),
+        status: status & 0x07,
+    })
+}
+
+/// A `80 <len> <value>` object as ISIM files hold them (TS 31.103 clauses
+/// 4.2.2, 4.2.4, 4.2.8); `None` for an unused (`FF`) record.
+fn tag80(bytes: &[u8]) -> Result<Option<&[u8]>, Malformed> {
+    let bad = Malformed("an ISIM record is not a tag 80 object");
+    match bytes {
+        [] | [0xFF, ..] => Ok(None),
+        [0x80, 0x81, len, rest @ ..] => rest.get(..usize::from(*len)).map(Some).ok_or(bad),
+        [0x80, len, rest @ ..] if *len < 0x80 => rest.get(..usize::from(*len)).map(Some).ok_or(bad),
+        _ => Err(bad),
+    }
+}
+
+/// UTF-8 text from the card, control characters as `?`.
+fn utf8(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// EF.IMPI: TS 31.103 clause 4.2.2, tag `80` holding the NAI in UTF-8. `None`
+/// when the file is unprovisioned.
+pub fn decode_impi(bytes: &[u8]) -> Result<Option<String>, Malformed> {
+    Ok(tag80(bytes)?.map(utf8))
+}
+
+/// One EF.IMPU record: TS 31.103 clause 4.2.4, tag `80` holding a SIP or tel URI.
+pub fn decode_impu_record(record: &[u8]) -> Result<Option<String>, Malformed> {
+    Ok(tag80(record)?.map(utf8))
+}
+
+/// One EF.P-CSCF record: TS 31.103 clause 4.2.8, tag `80` holding an address
+/// type octet (`00` FQDN, `01` IPv4, `02` IPv6) and the address.
+pub fn decode_pcscf_record(record: &[u8]) -> Result<Option<String>, Malformed> {
+    let Some(value) = tag80(record)? else {
+        return Ok(None);
+    };
+    let bad = Malformed("EF.P-CSCF address does not match its type");
+    Ok(Some(match value {
+        [0x00, name @ ..] if !name.is_empty() => utf8(name),
+        [0x01, a, b, c, d] => std::net::Ipv4Addr::new(*a, *b, *c, *d).to_string(),
+        [0x02, rest @ ..] if rest.len() == 16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(rest);
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        _ => return Err(bad),
+    }))
+}
+
 /// Which service table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
@@ -512,6 +836,18 @@ pub enum Decoded {
     Raw(Vec<u8>),
     /// EF.UST or EF.EST.
     Services(Services),
+    /// EF.FPLMN, EF.OPLMNwAcT or EF.HPLMNwAcT: the used entries.
+    Plmns(Ef, Vec<PlmnEntry>),
+    /// EF.ACC: the access classes set.
+    Acc(Vec<u8>),
+    /// EF.LOCI, EF.PSLOCI or EF.EPSLOCI.
+    Registration(Ef, Registration),
+    /// The used records of EF.ADN or EF.FDN.
+    Numbers(Ef, Vec<Msisdn>),
+    /// EF.IMPI (`None` when unprovisioned).
+    Impi(Option<String>),
+    /// The used records of EF.IMPU or EF.P-CSCF.
+    Uris(Ef, Vec<String>),
 }
 
 /// Decodes the bytes read from an EF `ef` (a record per element for a linear
@@ -548,6 +884,40 @@ pub fn decode(ef: Ef, records: &[Vec<u8>], mnc_len: Option<u8>) -> Result<Decode
                 .flatten()
                 .collect(),
         ),
+        Ef::Fplmn => Decoded::Plmns(ef, decode_plmn_list(first, 3)?),
+        Ef::OplmnWact | Ef::HplmnWact => Decoded::Plmns(ef, decode_plmn_list(first, 5)?),
+        Ef::Acc => Decoded::Acc(decode_acc(first)?),
+        Ef::Loci => Decoded::Registration(ef, decode_loci(first)?),
+        Ef::Psloci => Decoded::Registration(ef, decode_psloci(first)?),
+        Ef::Epsloci => Decoded::Registration(ef, decode_epsloci(first)?),
+        Ef::Adn | Ef::Fdn => Decoded::Numbers(
+            ef,
+            records
+                .iter()
+                .map(|r| decode_msisdn_record(r))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        Ef::Impi => Decoded::Impi(decode_impi(first)?),
+        Ef::Impu | Ef::Pcscf => Decoded::Uris(
+            ef,
+            records
+                .iter()
+                .map(|r| {
+                    if ef == Ef::Impu {
+                        decode_impu_record(r)
+                    } else {
+                        decode_pcscf_record(r)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        Ef::ManuArea => Decoded::Raw(first.to_vec()),
         Ef::Keys | Ef::KeysPs if first.is_empty() => {
             return Err(Malformed("key file read back empty"))
         }
@@ -573,7 +943,7 @@ impl Decoded {
         match self {
             Self::Iccid(d) => format!("ICCID {}", d.as_str()),
             Self::Imsi(d, _) => format!("IMSI {}", d.as_str()),
-            Self::Msisdn(list) => format!(
+            Self::Msisdn(list) | Self::Numbers(_, list) => format!(
                 "{} number(s){}",
                 list.len(),
                 list.first().map_or(String::new(), |m| format!(
@@ -581,6 +951,65 @@ impl Decoded {
                     m.ton_npi,
                     m.number.as_str()
                 ))
+            ),
+            Self::Plmns(_, list) => {
+                let shown: Vec<String> = list
+                    .iter()
+                    .take(EVIDENCE_ITEMS)
+                    .map(|e| match e.act {
+                        Some(_) => format!("{} [{}]", e.plmn, e.act_names().join("+")),
+                        None => e.plmn.to_string(),
+                    })
+                    .collect();
+                format!(
+                    "{} PLMN(s): {}{}",
+                    list.len(),
+                    if shown.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        shown.join(", ")
+                    },
+                    list.len()
+                        .checked_sub(EVIDENCE_ITEMS)
+                        .filter(|n| *n > 0)
+                        .map_or(String::new(), |n| format!(" (+{n} more)"))
+                )
+            }
+            Self::Acc(classes) => format!(
+                "{} access class(es): {}",
+                classes.len(),
+                if classes.is_empty() {
+                    "none".to_owned()
+                } else {
+                    classes
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            ),
+            Self::Registration(ef, r) => format!(
+                "{} {} PLMN {} area {} status={}",
+                match ef {
+                    Ef::Loci => "TMSI",
+                    Ef::Psloci => "P-TMSI",
+                    _ => "GUTI",
+                },
+                r.tmp_id,
+                r.plmn.as_ref().map_or("unset".to_owned(), Plmn::to_string),
+                r.area,
+                r.status_label(*ef)
+            ),
+            Self::Impi(nai) => format!("IMPI {}", nai.as_deref().unwrap_or("unprovisioned")),
+            Self::Uris(ef, list) => format!(
+                "{} {}(s): {}",
+                list.len(),
+                if *ef == Ef::Impu { "IMPU" } else { "P-CSCF" },
+                list.iter()
+                    .take(EVIDENCE_ITEMS)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::Raw(b) => hex(b),
             Self::Dir(apps) => {
@@ -651,14 +1080,41 @@ impl Decoded {
                     "mnc_len_source": if mnc.is_some() { "EF.AD" } else { "assumed 2" },
                 })
             }
-            Self::Msisdn(list) => json!({
+            Self::Msisdn(list) | Self::Numbers(_, list) => json!({
                 "used_records": list.len(),
                 "numbers": list.iter().map(|m| json!({
+                    "alpha": m.alpha,
                     "ton_npi": format!("{:02X}", m.ton_npi),
                     "digits": m.number.len(),
                     "number": m.number.as_str(),
                 })).collect::<Vec<_>>(),
             }),
+            Self::Plmns(_, list) => json!({
+                "count": list.len(),
+                "plmns": list.iter().map(|e| json!({
+                    "mcc": e.plmn.mcc,
+                    "mnc": e.plmn.mnc,
+                    "act": e.act.map(|a| hex(&a)),
+                    "act_names": e.act.map(|_| e.act_names()),
+                })).collect::<Vec<_>>(),
+            }),
+            Self::Acc(classes) => json!({ "classes": classes }),
+            Self::Registration(ef, r) => json!({
+                "kind": match ef {
+                    Ef::Loci => "TMSI",
+                    Ef::Psloci => "P-TMSI",
+                    _ => "GUTI",
+                },
+                "identity": r.tmp_id,
+                "signature": r.signature,
+                "mcc": r.plmn.as_ref().map(|p| p.mcc.clone()),
+                "mnc": r.plmn.as_ref().map(|p| p.mnc.clone()),
+                "area": r.area,
+                "status": r.status_label(*ef),
+                "status_value": r.status,
+            }),
+            Self::Impi(nai) => json!({ "impi": nai }),
+            Self::Uris(_, list) => json!({ "count": list.len(), "values": list }),
             Self::Raw(b) => json!({ "bytes": b.len(), "hex": hex(b) }),
             Self::Dir(apps) => json!({
                 "applications": apps.iter().map(|a| json!({
@@ -719,28 +1175,42 @@ pub struct Entry {
 /// Every recognised EF in the tree, decoded from what [`read`] stored.
 /// Pure: sends nothing.
 pub fn entries(tree: &Tree) -> Vec<Entry> {
-    tree.selected()
+    let mut out: Vec<Entry> = tree
+        .selected()
         .filter_map(|node| Some((node, classify(node.path())?)))
-        .map(|(node, ef)| {
-            let path = node.path().clone();
-            let outcome = match (ef.shape(), tree.content_read(&path)) {
-                (_, None) => Outcome::NotRead,
-                (_, Some(ContentRead::Refused(sw))) => Outcome::Refused(*sw),
-                (_, Some(ContentRead::Records(records))) => {
-                    match decode(ef, records, ad_mnc_len(tree, &path)) {
-                        Ok(d) => Outcome::Decoded(d),
-                        Err(m) => Outcome::Malformed(m),
-                    }
-                }
-            };
-            Entry {
-                access: access::access_of(tree, node),
-                path,
-                ef,
-                outcome,
-            }
-        })
-        .collect()
+        .map(|(node, ef)| entry(tree, node.path(), ef, access::access_of(tree, node)))
+        .collect();
+    // EF.MANUAREA is outside the walk's candidate families, so [`read`] probes
+    // it directly; it is listed only when that probe found the file.
+    let manu = manuarea_path();
+    if tree.content_read(&manu).is_some() && !out.iter().any(|e| e.path == manu) {
+        out.push(entry(tree, &manu, Ef::ManuArea, None));
+    }
+    out
+}
+
+fn entry(tree: &Tree, path: &Path, ef: Ef, access: Option<Access>) -> Entry {
+    let outcome = match tree.content_read(path) {
+        None => Outcome::NotRead,
+        Some(ContentRead::Refused(sw)) => Outcome::Refused(*sw),
+        Some(ContentRead::Records(records)) => match decode(ef, records, ad_mnc_len(tree, path)) {
+            Ok(d) => Outcome::Decoded(d),
+            Err(m) => Outcome::Malformed(m),
+        },
+    };
+    Entry {
+        access,
+        path: path.clone(),
+        ef,
+        outcome,
+    }
+}
+
+/// `3F00/0002`.
+fn manuarea_path() -> Path {
+    Path::master_file()
+        .child(FileId::from_bytes([0x00, 0x02]))
+        .expect("0002 is not the master file")
 }
 
 /// The full decoded value of the EF at `path`, when it was read and decoded
@@ -827,6 +1297,37 @@ pub fn read<S: CardSession + ?Sized>(
         let outcome = read_one(session, &path, shape, length, count, policy)?;
         tree.record_content_read(path, outcome);
     }
+    read_manuarea(session, tree, policy)
+}
+
+/// EF.MANUAREA: SELECT `3F00/0002`, then READ BINARY of up to [`MAX_BINARY`]
+/// octets (one `6C xx` correction, the standard short-file answer). A file the
+/// card will not SELECT is taken as absent, never as an error: `0002` is not a
+/// standard identifier, so most cards do not have it.
+fn read_manuarea<S: CardSession + ?Sized>(
+    session: &mut S,
+    tree: &mut Tree,
+    policy: &Policy,
+) -> Result<(), session::Error> {
+    let path = manuarea_path();
+    if tree.content_read(&path).is_some() || access::select_file(session, &path, policy)?.is_err() {
+        return Ok(());
+    }
+    let header = Header::new(0x00, 0xB0, 0x00, 0x00);
+    let mut le = Le::for_byte_count(MAX_BINARY).expect("a non-zero short length");
+    let mut read = session::send(session, &Command::case2(header, le), policy)?;
+    if let Some(sw) = read.status().filter(|s| s.sw1() == 0x6C && s.sw2() != 0) {
+        le = Le::for_byte_count(u32::from(sw.sw2())).expect("non-zero");
+        read = session::send(session, &Command::case2(header, le), policy)?;
+    }
+    tree.record_content_read(
+        path,
+        if read.status().is_some_and(|s| s.is_normal_processing()) {
+            ContentRead::Records(vec![read.data().to_vec()])
+        } else {
+            ContentRead::Refused(read.status())
+        },
+    );
     Ok(())
 }
 
@@ -1075,5 +1576,235 @@ mod tests {
         assert_eq!(classify(&p("3F00/7FFF/5F3B/6F07")), None);
         assert_eq!(classify(&p("3F00/7FFF/6F08")), Some(Ef::Keys));
         assert_eq!(classify(&Path::master_file()), None);
+    }
+
+    // --- issue #108 remaining decoders: synthetic vectors, each with a valid,
+    // a truncated and an all-0xFF (unused) case ---
+
+    const PLMN_001_01: [u8; 3] = [0x00, 0xF1, 0x10];
+    const PLMN_310_410: [u8; 3] = [0x13, 0x00, 0x14];
+
+    #[test]
+    fn plmn_two_and_three_digit_mnc() {
+        let a = decode_plmn(PLMN_001_01).unwrap().unwrap();
+        assert_eq!((a.mcc.as_str(), a.mnc.as_str()), ("001", "01"));
+        let b = decode_plmn(PLMN_310_410).unwrap().unwrap();
+        assert_eq!(b.to_string(), "310-410");
+        assert_eq!(decode_plmn([0xFF; 3]).unwrap(), None);
+        assert!(decode_plmn([0xAB, 0xF1, 0x10]).is_err());
+    }
+
+    #[test]
+    fn fplmn_list() {
+        let bytes = [PLMN_001_01, [0xFF; 3], PLMN_310_410, [0xFF; 3]].concat();
+        let d = decode(Ef::Fplmn, &[bytes], None).unwrap();
+        assert_eq!(d.evidence(), "2 PLMN(s): 001-01, 310-410");
+        assert_eq!(d.fields()["plmns"][1]["mnc"], "410");
+        let unused = decode(Ef::Fplmn, &[vec![0xFF; 12]], None).unwrap();
+        assert_eq!(unused.evidence(), "0 PLMN(s): none");
+        assert!(decode(Ef::Fplmn, &[vec![0x00, 0xF1, 0x10, 0x00]], None).is_err());
+        assert!(decode(Ef::Fplmn, &[], None).is_err());
+    }
+
+    #[test]
+    fn plmn_with_act_files() {
+        // UTRAN + GSM, then E-UTRAN only, then an unused entry.
+        let bytes = [
+            [PLMN_001_01.as_slice(), &[0x80, 0x80]].concat(),
+            [PLMN_310_410.as_slice(), &[0x40, 0x00]].concat(),
+            vec![0xFF; 5],
+        ]
+        .concat();
+        for ef in [Ef::OplmnWact, Ef::HplmnWact] {
+            let d = decode(ef, std::slice::from_ref(&bytes), None).unwrap();
+            assert_eq!(
+                d.evidence(),
+                "2 PLMN(s): 001-01 [UTRAN+GSM], 310-410 [E-UTRAN]"
+            );
+            assert_eq!(d.fields()["plmns"][0]["act"], "8080");
+            assert!(decode(ef, &[bytes[..7].to_vec()], None).is_err());
+            assert_eq!(
+                decode(ef, &[vec![0xFF; 10]], None).unwrap().evidence(),
+                "0 PLMN(s): none"
+            );
+        }
+    }
+
+    #[test]
+    fn acc_classes() {
+        // Octet 1 b3 = class 10, octet 2 b1 = class 0 (TS 51.011 clause 10.3.15).
+        assert_eq!(decode_acc(&[0x04, 0x01]).unwrap(), [0, 10]);
+        assert_eq!(
+            Decoded::Acc(decode_acc(&[0x00, 0x00]).unwrap()).evidence(),
+            "0 access class(es): none"
+        );
+        assert_eq!(decode_acc(&[0xFF, 0xFF]).unwrap().len(), 16);
+        assert!(decode_acc(&[0x04]).is_err());
+    }
+
+    fn loci() -> Vec<u8> {
+        // TMSI 12345678, LAI 001-01 LAC 002A, TMSI TIME FF, status 0.
+        let mut v = vec![0x12, 0x34, 0x56, 0x78];
+        v.extend(PLMN_001_01);
+        v.extend([0x00, 0x2A, 0xFF, 0x00]);
+        v
+    }
+
+    #[test]
+    fn loci_psloci_epsloci() {
+        let d = decode(Ef::Loci, &[loci()], None).unwrap();
+        assert_eq!(
+            d.evidence(),
+            "TMSI 12345678 PLMN 001-01 area 002A status=updated"
+        );
+        let mut not_allowed = loci();
+        not_allowed[10] = 0x02;
+        assert_eq!(
+            decode_loci(&not_allowed).unwrap().status_label(Ef::Loci),
+            "plmn-not-allowed"
+        );
+        assert!(decode_loci(&loci()[..10]).is_err());
+        let unused = decode(Ef::Loci, &[vec![0xFF; 11]], None).unwrap();
+        assert_eq!(unused.fields()["identity"], "FFFFFFFF");
+        assert!(unused.fields()["mcc"].is_null());
+
+        // P-TMSI A1B2C3D4, signature 010203, RAI 001-01 LAC 002A RAC 05, status 1.
+        let mut ps = vec![0xA1, 0xB2, 0xC3, 0xD4, 0x01, 0x02, 0x03];
+        ps.extend(PLMN_001_01);
+        ps.extend([0x00, 0x2A, 0x05, 0x01]);
+        let d = decode(Ef::Psloci, &[ps.clone()], None).unwrap();
+        assert_eq!(
+            d.evidence(),
+            "P-TMSI A1B2C3D4 PLMN 001-01 area 002A05 status=not-updated"
+        );
+        assert_eq!(d.fields()["signature"], "010203");
+        assert!(decode_psloci(&ps[..13]).is_err());
+        assert!(decode(Ef::Psloci, &[vec![0xFF; 14]], None).is_ok());
+
+        // GUTI (12 octets), TAI 001-01 TAC 0102, status 2 (roaming not allowed).
+        // Opaque here: 12 octets, shown as hex.
+        let mut eps = vec![0x0B, 0xF6];
+        eps.extend(PLMN_001_01);
+        eps.extend([0x80, 0x01, 0x01, 0xDE, 0xAD, 0xBE, 0xEF]);
+        eps.extend(PLMN_001_01);
+        eps.extend([0x01, 0x02, 0x02]);
+        let d = decode(Ef::Epsloci, &[eps.clone()], None).unwrap();
+        assert_eq!(
+            d.evidence(),
+            "GUTI 0BF600F110800101DEADBEEF PLMN 001-01 area 0102 status=roaming-not-allowed"
+        );
+        assert!(decode_epsloci(&eps[..17]).is_err());
+        assert!(decode(Ef::Epsloci, &[vec![0xFF; 18]], None).is_ok());
+    }
+
+    fn adn_record() -> Vec<u8> {
+        // Alpha "Bob" + FF padding, then len 7, TON/NPI 91, 15555550100, CCP, ext.
+        let mut r = vec![b'B', b'o', b'b', 0xFF, 0xFF, 0xFF];
+        r.extend([
+            0x07, 0x91, 0x51, 0x55, 0x55, 0x05, 0x01, 0xF0, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        r.extend([0xFF, 0xFF]);
+        r
+    }
+
+    #[test]
+    fn adn_and_fdn_records() {
+        for ef in [Ef::Adn, Ef::Fdn] {
+            let d = decode(ef, &[adn_record(), vec![0xFF; 20]], None).unwrap();
+            assert_eq!(d.evidence(), "1 number(s), first: TON/NPI 91, 15555550100");
+            assert_eq!(d.fields()["numbers"][0]["alpha"], "Bob");
+            assert_eq!(
+                decode(ef, &[vec![0xFF; 20]], None).unwrap().evidence(),
+                "0 number(s)"
+            );
+            assert!(decode(ef, &[vec![0x07; 5]], None).is_err());
+        }
+        // A UCS-2 alpha identifier is not decoded.
+        let mut ucs2 = adn_record();
+        ucs2[..3].copy_from_slice(&[0x80, 0x00, 0x42]);
+        assert_eq!(
+            decode_msisdn_record(&ucs2).unwrap().unwrap().alpha,
+            String::new()
+        );
+    }
+
+    #[test]
+    fn isim_files() {
+        let nai = b"001010123456789@ims.mnc001.mcc001.3gppnetwork.org";
+        let mut impi = vec![0x80, nai.len() as u8];
+        impi.extend(nai);
+        impi.resize(80, 0xFF);
+        assert_eq!(
+            decode(Ef::Impi, &[impi.clone()], None).unwrap().evidence(),
+            "IMPI 001010123456789@ims.mnc001.mcc001.3gppnetwork.org"
+        );
+        assert_eq!(
+            decode(Ef::Impi, &[vec![0xFF; 16]], None)
+                .unwrap()
+                .evidence(),
+            "IMPI unprovisioned"
+        );
+        assert!(decode(Ef::Impi, &[impi[..10].to_vec()], None).is_err());
+        assert!(decode(Ef::Impi, &[vec![0x81, 0x01, 0x00]], None).is_err());
+
+        let impu = [&[0x80, 11][..], b"sip:a@b.org", &[0xFF; 5]].concat();
+        let d = decode(Ef::Impu, &[impu.clone(), vec![0xFF; 16]], None).unwrap();
+        assert_eq!(d.evidence(), "1 IMPU(s): sip:a@b.org");
+        assert!(decode(Ef::Impu, &[impu[..6].to_vec()], None).is_err());
+
+        let fqdn = [&[0x80, 9, 0x00][..], b"pcscf.ex", &[0xFF; 4]].concat();
+        let v4 = vec![0x80, 5, 0x01, 10, 0, 0, 1, 0xFF];
+        let mut v6 = vec![0x80, 17, 0x02];
+        v6.extend([0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let d = decode(Ef::Pcscf, &[fqdn, v4, v6, vec![0xFF; 8]], None).unwrap();
+        assert_eq!(d.evidence(), "3 P-CSCF(s): pcscf.ex, 10.0.0.1, 2001:db8::1");
+        assert!(decode(Ef::Pcscf, &[vec![0x80, 4, 0x01, 10, 0, 0]], None).is_err());
+        assert!(decode(Ef::Pcscf, &[vec![0x80, 2, 0x07, 1]], None).is_err());
+    }
+
+    #[test]
+    fn manuarea_is_raw_bytes() {
+        let d = decode(Ef::ManuArea, &[vec![0x01, 0xAB]], None).unwrap();
+        assert_eq!(d.evidence(), "01AB");
+        assert!(decode(Ef::ManuArea, &[vec![]], None).is_ok());
+    }
+
+    #[test]
+    fn new_files_are_classified_by_place_and_application() {
+        let p = |s: &str| s.parse::<Path>().unwrap();
+        assert_eq!(classify(&p("3F00/0002")), Some(Ef::ManuArea));
+        assert_eq!(classify(&p("3F00/7FFF/6F7B")), Some(Ef::Fplmn));
+        assert_eq!(classify(&p("3F00/7F20/6F7B")), Some(Ef::Fplmn));
+        assert_eq!(classify(&p("3F00/7FFF/6F61")), Some(Ef::OplmnWact));
+        assert_eq!(classify(&p("3F00/7FFF/6F62")), Some(Ef::HplmnWact));
+        assert_eq!(classify(&p("3F00/7FFF/6F78")), Some(Ef::Acc));
+        assert_eq!(classify(&p("3F00/7FFF/6F7E")), Some(Ef::Loci));
+        assert_eq!(classify(&p("3F00/7FFF/6F73")), Some(Ef::Psloci));
+        assert_eq!(classify(&p("3F00/7FFF/6FE3")), Some(Ef::Epsloci));
+        assert_eq!(classify(&p("3F00/7F10/6F3A")), Some(Ef::Adn));
+        assert_eq!(classify(&p("3F00/7F10/5F3A/4F3A")), Some(Ef::Adn));
+        assert_eq!(classify(&p("3F00/7FFF/5F3A/4F3A")), Some(Ef::Adn));
+        assert_eq!(classify(&p("3F00/7FFF/6F3B")), Some(Ef::Fdn));
+        // Not these files: another directory, or the ISIM identifiers on a USIM.
+        assert_eq!(classify(&p("3F00/5F3A/4F3A")), None);
+        assert_eq!(classify(&p("3F00/7FFF/6F02")), None);
+        assert_eq!(classify(&p("3F00/7FFF/6F3A")), None);
+        let isim = "3F00/ADF:A0000000871004";
+        assert_eq!(classify(&p(&format!("{isim}/6F02"))), Some(Ef::Impi));
+        assert_eq!(classify(&p(&format!("{isim}/6F04"))), Some(Ef::Impu));
+        // 6F09 is EF.P-CSCF under the ISIM and EF.KeysPS under the USIM.
+        assert_eq!(classify(&p(&format!("{isim}/6F09"))), Some(Ef::Pcscf));
+        assert_eq!(
+            classify(&p("3F00/ADF:A0000000871002/6F09")),
+            Some(Ef::KeysPs)
+        );
+        assert_eq!(classify(&p("3F00/ADF:A0000000871002/6F02")), None);
+    }
+
+    #[test]
+    fn long_plmn_lists_are_bounded() {
+        let d = decode(Ef::Fplmn, &[PLMN_001_01.repeat(30)], None).unwrap();
+        assert!(d.evidence().starts_with("30 PLMN(s): "));
+        assert!(d.evidence().ends_with("(+6 more)"), "{}", d.evidence());
     }
 }

@@ -292,8 +292,12 @@ about 2 minutes with nothing truncated.
 a repo; test fixtures are synthetic.
 
 Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always`,
-`identity/readable-without-pin` and `gsma/msl-zero-allowed` (behind `--tar`). `scan` also decodes the
-security-relevant EFs (identity, service tables) and reads key files where the card allows. Every rule is gated by the corpus precision/recall test
+`identity/readable-without-pin`, `exposure/risky-service-available` (EF.UST services 28, SMS-PP data
+download, and 32, RUN AT COMMAND; low) and `gsma/msl-zero-allowed` (behind `--tar`). `scan` also decodes the
+security-relevant EFs and reads key files where the card allows: ICCID, IMSI, MSISDN, EF.DIR, AD, SPN,
+UST/EST, FPLMN, OPLMNwAcT, HPLMNwAcT, ACC, LOCI, PSLOCI, EPSLOCI, ADN, FDN, the ISIM IMPI/IMPU/P-CSCF,
+and EF.MANUAREA (`3F00/0002`, shown as hex: not a 3GPP/ETSI file, so it is probed directly and
+simply absent on most cards). Every rule is gated by the corpus precision/recall test
 (`tests/corpus.rs`). `auth/scp03-missing-mac` is registered, but no scan path records SCP03, so it
 has no evidence on a real card. Still missing ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)):
 crypto rules (COMP128/Milenage, weak keys) and eUICC/SGP.22 rules. The MSL 0 check runs on a real

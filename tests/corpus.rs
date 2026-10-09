@@ -267,6 +267,7 @@ struct Case {
 
 const BASIC_PROBE: &[&str] = &["2F01", "2FE2", "6F07", "7F20"];
 const USIM_IDENTITY_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F07", "6F40"];
+const UST_PROBE: &[&str] = &["2F06", "6F06", "7FFF", "6F38"];
 const USIM_PROBE: &[&str] = &[
     "2F06", "6F06", "7FFF", "5F3B", "5F3C", "4F20", "6F07", "6F08", "6F73", "6F7E",
 ];
@@ -358,6 +359,16 @@ fn corpus() -> Vec<Case> {
         complete: true,
         nodes,
         probe: USIM_PROBE,
+    };
+    let ust_case = |name, ust: &[u8], findings: usize| Case {
+        probe: UST_PROBE,
+        ..usim_case(
+            name,
+            usim(pin_status(true, false), &[], &[ARR_ALWAYS], &[ARR_ALWAYS])
+                .transparent("3F00/7FFF/6F38", ust),
+            vec![(scan::RISKY_SERVICE_RULE, file("3F00/7FFF/6F38")); findings],
+            9,
+        )
     };
     vec![
         case(
@@ -521,6 +532,13 @@ fn corpus() -> Vec<Case> {
                 11,
             )
         },
+        // Issue #108: the risky-service rule reads the decoded EF.UST (TS 31.102 clause 4.2.8).
+        // Service 28 is octet 4 b4 (08), service 32 is octet 4 b8 (80).
+        ust_case("usim-ust-sms-pp-and-run-at", &[0x00, 0x00, 0x00, 0x88], 2),
+        ust_case("usim-ust-run-at-only", &[0x00, 0x00, 0x00, 0x80], 1),
+        ust_case("usim-ust-sms-pp-only", &[0x00, 0x00, 0x00, 0x08], 1),
+        // Typical UST without either (services 2-5, 8, 9, 11-13, 17): silent.
+        ust_case("usim-ust-benign", &[0x9E, 0x1D, 0x01, 0x00], 0),
         usim_case(
             "usim-pin1-off-universal-in-use",
             usim(pin_status(false, true), &[], &[ARR_ALWAYS], &[ARR_ALWAYS]),
@@ -591,7 +609,7 @@ fn ratio(num: usize, den: usize) -> f64 {
 /// The table, and whether every rule met its thresholds.
 fn report(counts: &BTreeMap<String, Counts>) -> (String, bool) {
     let mut table = format!(
-        "{:<28} {:>3} {:>3} {:>3} {:>9} {:>7}\n",
+        "{:<34} {:>3} {:>3} {:>3} {:>9} {:>7}\n",
         "rule", "TP", "FP", "FN", "precision", "recall"
     );
     let mut ok = true;
@@ -604,7 +622,7 @@ fn report(counts: &BTreeMap<String, Counts>) -> (String, bool) {
         let pass = p >= min_p && r >= min_r;
         ok &= pass;
         table += &format!(
-            "{rule:<28} {:>3} {:>3} {:>3} {p:>9.2} {r:>7.2}  {}\n",
+            "{rule:<34} {:>3} {:>3} {:>3} {p:>9.2} {r:>7.2}  {}\n",
             c.tp,
             c.fp,
             c.fn_,
@@ -746,10 +764,34 @@ fn ef_contents_are_decoded_end_to_end_with_full_values() {
         .linear("3F00/7FFF/6F40", &[msisdn]);
     // A key file is read like any other EF (synthetic bytes).
     card = card.transparent("3F00/7FFF/6F08", &[0x07, 0xAB, 0xCD, 0xEF]);
+    // Issue #108's remaining EFs and #102's EF.MANUAREA (synthetic bytes). The PLMN is 001-01.
+    let mut adn = vec![b'B', b'o', b'b', 0xFF, 0xFF, 0xFF];
+    adn.extend([
+        0x07, 0x91, 0x51, 0x55, 0x55, 0x05, 0x01, 0xF0, 0xFF, 0xFF, 0xFF, 0xFF,
+    ]);
+    adn.extend([0xFF, 0xFF]);
+    let mut loci = vec![
+        0x12, 0x34, 0x56, 0x78, 0x00, 0xF1, 0x10, 0x00, 0x2A, 0xFF, 0x00,
+    ];
+    loci.resize(11, 0xFF);
+    card = card
+        .file("3F00/7F10", Fcp::Ts102221, None)
+        .transparent(
+            "3F00/7FFF/6F7B",
+            &[0x00, 0xF1, 0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        )
+        .transparent("3F00/7FFF/6F61", &[0x00, 0xF1, 0x10, 0x80, 0x80])
+        .transparent("3F00/7FFF/6F62", &[0xFF; 5])
+        .transparent("3F00/7FFF/6F78", &[0x04, 0x01])
+        .transparent("3F00/7FFF/6F7E", &loci)
+        .linear("3F00/7F10/6F3A", &[adn.clone(), vec![0xFF; 20]])
+        .linear("3F00/7FFF/6F3B", &[adn])
+        .transparent("3F00/0002", &[0x4D, 0x41, 0x4E, 0x55]);
     let options = walk::Options {
         candidates: Candidates::List(
             [
-                "2FE2", "7FFF", "6F07", "6FAD", "6F46", "6F38", "6F40", "6F08",
+                "2FE2", "7FFF", "7F10", "6F07", "6FAD", "6F46", "6F38", "6F40", "6F08", "6F7B",
+                "6F61", "6F62", "6F78", "6F7E", "6F3A", "6F3B",
             ]
             .iter()
             .map(|s| s.parse().unwrap())
@@ -794,6 +836,27 @@ fn ef_contents_are_decoded_end_to_end_with_full_values() {
     // Keys: read like any other EF and shown in full.
     assert_eq!(entry("EF.Keys")["read"], "decoded");
     assert_eq!(entry("EF.Keys")["fields"]["hex"], "07ABCDEF");
+    assert_eq!(entry("EF.FPLMN")["evidence"], "1 PLMN(s): 001-01");
+    assert_eq!(
+        entry("EF.OPLMNwAcT")["evidence"],
+        "1 PLMN(s): 001-01 [UTRAN+GSM]"
+    );
+    assert_eq!(entry("EF.HPLMNwAcT")["evidence"], "0 PLMN(s): none");
+    assert_eq!(
+        entry("EF.ACC")["fields"]["classes"],
+        serde_json::json!([0, 10])
+    );
+    assert_eq!(
+        entry("EF.LOCI")["evidence"],
+        "TMSI 12345678 PLMN 001-01 area 002A status=updated"
+    );
+    assert_eq!(entry("EF.ADN")["fields"]["numbers"][0]["alpha"], "Bob");
+    assert_eq!(
+        entry("EF.FDN")["fields"]["numbers"][0]["number"],
+        "15555550100"
+    );
+    // 0002 is outside the walk's candidates: found by the direct probe.
+    assert_eq!(entry("EF.MANUAREA")["fields"]["hex"], "4D414E55");
 }
 
 #[test]
@@ -832,4 +895,6 @@ fn a_short_iccid_is_shown_in_full_by_the_scan_json() {
     );
     let text = scan::to_json(&tree, &context, &verdict).to_string();
     assert!(text.contains("ICCID 89123456"), "{text}");
+    // No 3F00/0002 on this card: no EF.MANUAREA entry, and the scan went on.
+    assert!(!text.contains("EF.MANUAREA"), "{text}");
 }
