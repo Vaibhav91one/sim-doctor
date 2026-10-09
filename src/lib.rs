@@ -27,7 +27,7 @@
 //! layer 1  fs         file identifiers, file kinds and paths over apdu + fcp
 //! layer 1  session     typed exchanges: chaining, follow-ups, reassembly
 //! layer 1  es10        ES10x: STORE DATA segmentation, ES10b/ES10c encoders and decoders
-//! layer 1  euicc      eUICC queries (ISD-R, ES10) and the nickname write behind `sim-doctor euicc`
+//! layer 1  euicc      eUICC queries (ISD-R, ES10) and the nickname, enable and disable writes behind `sim-doctor euicc`
 //! layer 1  es9         ES9+: the JSON-over-HTTPS messages to an SM-DP+, behind a transport trait
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
@@ -315,7 +315,7 @@ pub const MODULES: &[ModuleInfo] = &[
     },
     ModuleInfo {
         name: euicc::NAME,
-        owns: "Read-only eUICC queries: select the ISD-R on a logical channel and run GetEID, GetEuiccInfo1/2, GetProfilesInfo and ListNotification (metadata only) through es10; changes no profile and no notification. The one write is nickname (SetNickname): a dry run unless confirmed, verified by a re-read.",
+        owns: "Read-only eUICC queries: select the ISD-R on a logical channel and run GetEID, GetEuiccInfo1/2, GetProfilesInfo and ListNotification (metadata only) through es10; changes no notification. The writes are nickname (SetNickname), enable and disable (EnableProfile, DisableProfile with REFRESH): each a dry run unless confirmed, verified by a re-read.",
         depends_on: &[apdu::NAME, session::NAME, es10::NAME, ef::NAME, contract::NAME, transport::NAME],
     },
     ModuleInfo {

@@ -972,13 +972,23 @@ sends one ES10 STORE DATA request ([src/euicc.rs](src/euicc.rs) over [src/es10.r
 closes the channel on every path. `euicc info` also reads ES10a GetEuiccConfiguredAddresses (default SM-DP+, root SM-DS); `--max-segment` (1-255, default 120 as lpac) sets the STORE DATA block size. They speak the lpac envelope (`type` `lpa`), human table without
 `--json`. Exit 0 answered; 1 not an eUICC (`data.error.kind` `not-an-euicc`), no channel, ISD-R
 refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Never sent:
-EnableProfile, DeleteProfile, RetrieveNotificationsList, RemoveNotification (the rest of #117, #119).
-The one write is `euicc nickname <iccid> <name>` (ES10c SetNickname, `profile nickname`), the first PR of #117 and
+DeleteProfile, RetrieveNotificationsList, RemoveNotification (the rest of #117, #119).
+The writes are `euicc nickname <iccid> <name>` (ES10c SetNickname, `profile nickname`), the first PR of #117 and
 the owner's safeguards, all binding: **dry run by default** (reads EID and profile list, prints EID, ICCID, current and new
 nickname, sends no SetNickname); `--yes` sends it, then re-reads the profile list and fails (`verify-failed`) if the nickname
 did not change; the ICCID and the name (<= 64 bytes UTF-8, no control characters) are validated before any reader is
 opened; and it is **not exposed over MCP** (`mcp.rs` lists only the read-only `euicc_*` tools, a test pins the list).
-Every later #117 write (enable, disable, delete, purge, notifications) takes the same safeguards.
+`euicc enable|disable <iccid|isdp-aid>` (ES10c EnableProfile `BF31` / DisableProfile `BF32`, REFRESH requested, the second PR of
+#117) take the same safeguards: identifier validated first (`bad-profile-id`); pre-flight profile list refuses an unknown
+profile, enabling an enabled one (`already-enabled`) and disabling a disabled one (`already-disabled`) with nothing sent;
+the dry run states the consequence (enable: the active profile switches and the device loses its connection until it
+re-attaches; disable of the only enabled profile: no active profile); `--yes` sends, maps every result code to its own
+error kind (`profile-not-found`, `profile-not-in-disabled-state`/`-enabled-state`, `disallowed-by-policy`,
+`wrong-profile-reenabling`, `cat-busy`, `undefined-error`; unlisted codes `es10-refused`), re-reads and fails
+`verify-failed` on no change; not on MCP. Encoding `BFxx { A0 { 4F|5A id } 81 01 FF|00 }` checked against pySim `rsp.asn` and
+lpac `es10c.c` (cited in `es10.rs`); `catBusy(5)` is in the SGP.22 enum this repo already used for enable but not in
+pySim's `rsp.asn`, so the disable decoder keeps it as an extension. Every later #117 write (delete, purge,
+notifications) takes the same safeguards.
 The swSIM fixture is not an eUICC, so the card-side check is the live-card item on #92; the tests
 use synthetic ES10 responses through the replay transport.
 
