@@ -228,11 +228,12 @@ enum Command {
     /// command line, 130 if interrupted.
     Fuzz(FuzzArgs),
 
-    /// Read-only eUICC queries over ES10 (lpac: chip info, profile list, notification list).
+    /// eUICC queries over ES10 (lpac: chip info, profile list, notification list), and nickname.
     ///
-    /// Opens a logical channel, selects the ISD-R by AID, sends one STORE DATA
-    /// request, and closes the channel. Never enables, disables or deletes a
-    /// profile and never retrieves or removes a notification. The output is the
+    /// Opens a logical channel, selects the ISD-R by AID, sends STORE DATA
+    /// requests, and closes the channel. info, profiles and notifications only
+    /// read. `nickname` is the one write: a dry run unless --yes. Never enables,
+    /// disables or deletes a profile and never retrieves or removes a notification. The output is the
     /// lpac envelope under --json. Exit codes: 0 answered, 1 the card is not an
     /// eUICC, refused, or answered something malformed (the envelope carries
     /// `data.error.kind`), 129 for a bad command line, 130 if interrupted.
@@ -254,6 +255,26 @@ enum EuiccAction {
     Profiles(EuiccFlags),
     /// Pending notification metadata, nothing retrieved or removed (lpac `notification list`).
     Notifications(EuiccFlags),
+    /// Set a profile's nickname (lpac `profile nickname`). The only write here:
+    /// a dry run unless `--yes`, never exposed over MCP.
+    Nickname(NicknameArgs),
+}
+
+/// Everything `sim-doctor euicc nickname` takes.
+#[derive(Args)]
+struct NicknameArgs {
+    /// ICCID of the profile (18 to 20 digits).
+    iccid: String,
+    /// The new nickname, at most 64 bytes of UTF-8; "" clears it.
+    #[arg(allow_hyphen_values = true)]
+    name: String,
+    /// Send SetNickname, then re-read the profile list and confirm. Without
+    /// it nothing is changed: the target EID and ICCID, the current and the
+    /// new nickname are printed and the command exits.
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    flags: EuiccFlags,
 }
 
 /// Flags every `euicc` subcommand shares.
@@ -268,6 +289,10 @@ struct EuiccFlags {
     /// ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100).
     #[arg(long, value_name = "HEX")]
     aid: Option<String>,
+    /// Most data bytes in one STORE DATA block, 1 to 255 (default 255, the
+    /// SGP.22 maximum). Lower it for a reader that mishandles long blocks.
+    #[arg(long, value_name = "BYTES", default_value_t = 255, value_parser = clap::value_parser!(u16).range(1..=255))]
+    max_segment: u16,
 }
 
 /// Everything `sim-doctor fuzz` takes.
@@ -943,6 +968,7 @@ fn main() -> process::ExitCode {
             EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
             EuiccAction::Profiles(f) => run_euicc(euicc::Query::Profiles, &f),
             EuiccAction::Notifications(f) => run_euicc(euicc::Query::Notifications, &f),
+            EuiccAction::Nickname(n) => run_euicc_nickname(&n),
         },
         Command::Trace(args) => run_trace(&args),
         Command::Mcp => run_mcp(),
@@ -1768,6 +1794,38 @@ fn run_gp_info(reader: Option<&str>, json: bool, trace: bool) -> contract::ExitC
 
 /// `sim-doctor euicc <info|profiles|notifications>`: one read-only ES10 query.
 fn run_euicc(query: euicc::Query, flags: &EuiccFlags) -> contract::ExitCode {
+    let max = usize::from(flags.max_segment);
+    run_euicc_op(
+        flags,
+        |session, aid| euicc::run_with(session, aid, query, max),
+        |data| euicc::to_human(query, data),
+    )
+}
+
+/// `sim-doctor euicc nickname <iccid> <name> [--yes]`: SetNickname, a dry run
+/// unless `--yes`. The ICCID and name are checked before a reader is opened.
+fn run_euicc_nickname(args: &NicknameArgs) -> contract::ExitCode {
+    let request = match euicc::Nickname::new(&args.iccid, &args.name, args.yes) {
+        Ok(request) => request,
+        Err(f) => {
+            return report_refusal(contract::DEFAULT_KIND, &f.message, f.data, args.flags.json)
+        }
+    };
+    let max = usize::from(args.flags.max_segment);
+    run_euicc_op(
+        &args.flags,
+        |session, aid| euicc::nickname(session, aid, max, &request),
+        euicc::nickname_to_human,
+    )
+}
+
+/// Connects to the reader and card named by `flags`, runs `op` against the
+/// ISD-R, and prints its data (lpac envelope under `--json`, else `human`).
+fn run_euicc_op(
+    flags: &EuiccFlags,
+    op: impl FnOnce(&mut PcscSession, &[u8]) -> Result<serde_json::Value, euicc::Failure>,
+    human: impl FnOnce(&serde_json::Value) -> String,
+) -> contract::ExitCode {
     const KIND: &str = contract::DEFAULT_KIND;
     let json = flags.json;
     guard_exchange(KIND, json);
@@ -1803,7 +1861,7 @@ fn run_euicc(query: euicc::Query, flags: &EuiccFlags) -> contract::ExitCode {
             return refuse(scan::Failure::new(kind, err.to_string()));
         }
     };
-    let mut data = match euicc::run(&mut session, &aid, query) {
+    let mut data = match op(&mut session, &aid) {
         Ok(data) => data,
         Err(failure) => {
             let mut data = failure.data;
@@ -1828,7 +1886,7 @@ fn run_euicc(query: euicc::Query, flags: &EuiccFlags) -> contract::ExitCode {
             }
         }
     } else {
-        euicc::to_human(query, &data).trim_end().to_owned()
+        human(&data).trim_end().to_owned()
     };
     if let Err(err) = emit_stdout(&rendered, "the euicc report") {
         eprintln!("sim-doctor: {err}");

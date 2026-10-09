@@ -956,14 +956,20 @@ disable / delete / download / discovery), `notification` (list / process / remov
 (apdu / http / list). Backend selection via env: `LPAC_APDU` = pcsc|at|at_csim|stdio,
 `LPAC_HTTP` = curl|stdio.
 
-sim-doctor's read-only subset (issues #116, #132), lpac name in brackets: `euicc info` [`chip info`],
+sim-doctor's subset (issues #116, #132, #117), lpac name in brackets: `euicc info` [`chip info`],
 `euicc profiles` [`profile list`], `euicc notifications` [`notification list`]. Each opens a logical
 channel (MANAGE CHANNEL), SELECTs the ISD-R (`A0000005591010FFFFFFFF8900000100`, `--aid` overrides),
 sends one ES10 STORE DATA request ([src/euicc.rs](src/euicc.rs) over [src/es10.rs](src/es10.rs)) and
-closes the channel on every path. They speak the lpac envelope (`type` `lpa`), human table without
+closes the channel on every path. `euicc info` also reads ES10a GetEuiccConfiguredAddresses (default SM-DP+, root SM-DS); `--max-segment` (1-255) lowers the STORE DATA block size. They speak the lpac envelope (`type` `lpa`), human table without
 `--json`. Exit 0 answered; 1 not an eUICC (`data.error.kind` `not-an-euicc`), no channel, ISD-R
 refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Never sent:
-EnableProfile, DeleteProfile, RetrieveNotificationsList, RemoveNotification (those are #117/#119).
+EnableProfile, DeleteProfile, RetrieveNotificationsList, RemoveNotification (the rest of #117, #119).
+The one write is `euicc nickname <iccid> <name>` (ES10c SetNickname, `profile nickname`), the first PR of #117 and
+the owner's safeguards, all binding: **dry run by default** (reads EID and profile list, prints EID, ICCID, current and new
+nickname, sends no SetNickname); `--yes` sends it, then re-reads the profile list and fails (`verify-failed`) if the nickname
+did not change; the ICCID and the name (<= 64 bytes UTF-8, no control characters) are validated before any reader is
+opened; and it is **not exposed over MCP** (`mcp.rs` lists only the read-only `euicc_*` tools, a test pins the list).
+Every later #117 write (enable, disable, delete, purge, notifications) takes the same safeguards.
 The swSIM fixture is not an eUICC, so the card-side check is the live-card item on #92; the tests
 use synthetic ES10 responses through the replay transport.
 

@@ -2,17 +2,19 @@
 //! ES10 will say without changing anything (issues #116, #132).
 //!
 //! **Owns.** The three read-only queries behind `sim-doctor euicc`: `info`
-//! (GetEID, GetEuiccInfo1, GetEuiccInfo2), `profiles` (GetProfilesInfo) and
-//! `notifications` (ListNotification, metadata only), the JSON each produces
-//! and the sanitized human table. lpac names: `chip info`, `profile list`,
-//! `notification list`.
+//! (GetEID, GetEuiccInfo1, GetEuiccInfo2, GetEuiccConfiguredAddresses),
+//! `profiles` (GetProfilesInfo) and `notifications` (ListNotification,
+//! metadata only), the JSON each produces and the sanitized human table. lpac
+//! names: `chip info`, `profile list`, `notification list`. Also the one write,
+//! [`nickname`] (SetNickname, lpac `profile nickname`): a dry run by default,
+//! sent only when [`Nickname::apply`] is set, and then verified by a re-read.
 //!
 //! **Does not own, and never sends.** EnableProfile, DeleteProfile,
 //! RetrieveNotificationsList, RemoveNotificationFromList, the download
 //! functions or anything over HTTPS. The only commands on the wire are MANAGE
 //! CHANNEL (open, close), SELECT of the ISD-R, and STORE DATA carrying one of
-//! the three requests above. The channel is closed again on every path, a
-//! failure included.
+//! the read requests above, or SetNickname when applying. The channel is
+//! closed again on every path, a failure included.
 //!
 //! **Card safety.** A card that is not an eUICC refuses the ISD-R SELECT; that
 //! is reported as [`Failure`] `not-an-euicc` and no STORE DATA is sent.
@@ -37,6 +39,9 @@ pub const ISDR_AID: [u8; 16] = [
 /// provider, name, class. The icon (`94`) is left out on purpose: it is large
 /// and nothing here shows it.
 const PROFILE_TAGS: [u16; 7] = [0x5A, 0x4F, 0x9F70, 0x90, 0x91, 0x92, 0x95];
+
+/// STORE DATA data bytes per block unless `--max-segment` lowers it.
+pub const DEFAULT_MAX_SEGMENT: usize = es10::MAX_BLOCK_DATA;
 
 /// Which read-only query to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +110,10 @@ fn channel_cla(proprietary: bool, n: u8) -> u8 {
     }
 }
 
+/// Asks the ISD-R one ES10 function: the request goes out as STORE DATA, the
+/// response data comes back. The `&'static str` names the function in errors.
+type Ask<'a> = dyn FnMut(&'static str, Vec<u8>) -> Result<Vec<u8>, Failure> + 'a;
+
 /// Runs `query` against the ISD-R with AID `aid` on a freshly opened logical
 /// channel, and closes the channel afterwards.
 ///
@@ -115,6 +124,31 @@ pub fn run<S: CardSession + ?Sized>(
     session: &mut S,
     aid: &[u8],
     query: Query,
+) -> Result<Value, Failure> {
+    run_with(session, aid, query, DEFAULT_MAX_SEGMENT)
+}
+
+/// [`run`] with at most `max_segment` data bytes per STORE DATA block.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_with<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    query: Query,
+    max_segment: usize,
+) -> Result<Value, Failure> {
+    in_channel(session, aid, max_segment, |ask| read_query(ask, query))
+}
+
+/// Opens a logical channel, selects the ISD-R, hands `body` a way to ask it
+/// ES10 functions, then closes the channel on every path.
+fn in_channel<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    body: impl FnOnce(&mut Ask<'_>) -> Result<Value, Failure>,
 ) -> Result<Value, Failure> {
     let (channel, open) = session::open_channel(session).map_err(exchange_failed)?;
     let Some(channel) = channel else {
@@ -128,7 +162,7 @@ pub fn run<S: CardSession + ?Sized>(
             json!({ "status": status_hex(&open) }),
         ));
     };
-    let result = on_channel(session, channel, aid, query);
+    let result = on_channel(session, channel, aid, max_segment, body);
     let closed = matches!(
         session::close_channel(session, channel),
         Ok(Some(ex)) if ex.is_success()
@@ -142,7 +176,8 @@ fn on_channel<S: CardSession + ?Sized>(
     session: &mut S,
     channel: u8,
     aid: &[u8],
-    query: Query,
+    max_segment: usize,
+    body: impl FnOnce(&mut Ask<'_>) -> Result<Value, Failure>,
 ) -> Result<Value, Failure> {
     let policy = Policy {
         get_response_class: channel_cla(false, channel),
@@ -168,7 +203,8 @@ fn on_channel<S: CardSession + ?Sized>(
     }
     let cla = channel_cla(true, channel);
     let mut ask = |what: &'static str, request: Vec<u8>| -> Result<Vec<u8>, Failure> {
-        let sent = es10::store_data(session, cla, &request, &policy).map_err(exchange_failed)?;
+        let sent = es10::store_data_sized(session, cla, &request, max_segment, &policy)
+            .map_err(exchange_failed)?;
         let last = sent.exchanges.last();
         if !sent.complete || !last.is_some_and(session::Exchange::is_success) {
             return Err(Failure::new(
@@ -184,45 +220,67 @@ fn on_channel<S: CardSession + ?Sized>(
         }
         Ok(sent.data().to_vec())
     };
-    let bad = |what: &'static str, e: es10::DecodeError| {
-        Failure::new(
-            "decode-failed",
-            format!("{what} response is malformed: {e}"),
-            json!({ "function": what }),
-        )
-    };
-    let mut data = json!({ "aid": hex::encode_upper(aid) });
+    let mut data = body(&mut ask)?;
+    data["aid"] = json!(hex::encode_upper(aid));
+    Ok(data)
+}
+
+fn bad(what: &'static str, e: es10::DecodeError) -> Failure {
+    Failure::new(
+        "decode-failed",
+        format!("{what} response is malformed: {e}"),
+        json!({ "function": what }),
+    )
+}
+
+/// GetProfilesInfo for every profile, with [`PROFILE_TAGS`].
+fn read_profiles(ask: &mut Ask<'_>) -> Result<Vec<es10::ProfileInfo>, Failure> {
+    let request =
+        es10::get_profiles_info_request(None, Some(&PROFILE_TAGS)).map_err(exchange_failed)?;
+    match es10::decode_profiles_info(&ask("GetProfilesInfo", request)?)
+        .map_err(|e| bad("GetProfilesInfo", e))?
+    {
+        es10::ProfileInfoListResponse::Ok { profiles, .. } => Ok(profiles),
+        es10::ProfileInfoListResponse::Error(code) => Err(Failure::new(
+            "es10-refused",
+            format!("GetProfilesInfo returned error code {}", code.code()),
+            json!({ "function": "GetProfilesInfo", "code": code.code() }),
+        )),
+    }
+}
+
+fn read_eid(ask: &mut Ask<'_>) -> Result<String, Failure> {
+    let eid = es10::decode_get_eid(&ask("GetEID", es10::get_eid_request())?)
+        .map_err(|e| bad("GetEID", e))?;
+    Ok(hex::encode_upper(eid))
+}
+
+fn read_query(ask: &mut Ask<'_>, query: Query) -> Result<Value, Failure> {
+    let mut data = json!({});
     match query {
         Query::Info => {
-            let eid = es10::decode_get_eid(&ask("GetEID", es10::get_eid_request())?)
-                .map_err(|e| bad("GetEID", e))?;
+            let eid = read_eid(ask)?;
             let info1 =
                 es10::decode_euicc_info1(&ask("GetEuiccInfo1", es10::get_euicc_info1_request())?)
                     .map_err(|e| bad("GetEuiccInfo1", e))?;
             let info2 =
                 es10::decode_euicc_info2(&ask("GetEuiccInfo2", es10::get_euicc_info2_request())?)
                     .map_err(|e| bad("GetEuiccInfo2", e))?;
-            data["eid"] = json!(hex::encode_upper(eid));
+            let addresses = es10::decode_configured_addresses(&ask(
+                "GetEuiccConfiguredAddresses",
+                es10::get_euicc_configured_addresses_request(),
+            )?)
+            .map_err(|e| bad("GetEuiccConfiguredAddresses", e))?;
+            data["eid"] = json!(eid);
+            data["configured_addresses"] = json!({
+                "default_smdp": addresses.default_dp_address,
+                "root_smds": addresses.root_ds_address,
+            });
             data["euicc_info1"] = info1_json(&info1);
             data["euicc_info2"] = info2_json(&info2);
         }
         Query::Profiles => {
-            let request = es10::get_profiles_info_request(None, Some(&PROFILE_TAGS))
-                .map_err(exchange_failed)?;
-            let response = es10::decode_profiles_info(&ask("GetProfilesInfo", request)?)
-                .map_err(|e| bad("GetProfilesInfo", e))?;
-            match response {
-                es10::ProfileInfoListResponse::Ok { profiles, .. } => {
-                    data["profiles"] = profiles.iter().map(profile_json).collect();
-                }
-                es10::ProfileInfoListResponse::Error(code) => {
-                    return Err(Failure::new(
-                        "es10-refused",
-                        format!("GetProfilesInfo returned error code {}", code.code()),
-                        json!({ "function": "GetProfilesInfo", "code": code.code() }),
-                    ));
-                }
-            }
+            data["profiles"] = read_profiles(ask)?.iter().map(profile_json).collect();
         }
         Query::Notifications => {
             let response = es10::decode_list_notification(&ask(
@@ -245,6 +303,146 @@ fn on_channel<S: CardSession + ?Sized>(
         }
     }
     Ok(data)
+}
+
+/// A request to set one profile's nickname. Built by [`Nickname::new`], which
+/// checks the ICCID and the name before anything touches a card.
+#[derive(Debug, Clone)]
+pub struct Nickname {
+    iccid: String,
+    raw_iccid: [u8; 10],
+    name: String,
+    /// Send SetNickname. `false` (the default of the CLI) reads the card and
+    /// reports what would change, sending nothing that changes it.
+    pub apply: bool,
+}
+
+impl Nickname {
+    /// Validates `iccid` (18 to 20 decimal digits) and `name` (SGP.22 v2.5
+    /// section 5.7.21: 0 to 64 bytes of UTF-8; an empty name clears the
+    /// nickname; control characters are refused so the name cannot drive a
+    /// terminal when it is shown).
+    ///
+    /// # Errors
+    ///
+    /// A [`Failure`] of kind `bad-iccid` or `bad-nickname`.
+    pub fn new(iccid: &str, name: &str, apply: bool) -> Result<Self, Failure> {
+        if !(18..=20).contains(&iccid.len()) || !iccid.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Failure::new(
+                "bad-iccid",
+                format!("the ICCID must be 18 to 20 decimal digits, got {iccid:?}"),
+                json!({}),
+            ));
+        }
+        if name.len() > es10::MAX_NICKNAME_BYTES {
+            return Err(Failure::new(
+                "bad-nickname",
+                format!(
+                    "the nickname is {} bytes of UTF-8; SGP.22 allows at most {}",
+                    name.len(),
+                    es10::MAX_NICKNAME_BYTES
+                ),
+                json!({ "bytes": name.len(), "max": es10::MAX_NICKNAME_BYTES }),
+            ));
+        }
+        if name.chars().any(char::is_control) {
+            return Err(Failure::new(
+                "bad-nickname",
+                "the nickname must not contain control characters".to_owned(),
+                json!({}),
+            ));
+        }
+        // BCD with the nibbles swapped, padded with F (ETSI TS 102 221 EF.ICCID).
+        let mut padded = iccid.as_bytes().to_vec();
+        padded.resize(20, b'F');
+        let mut raw_iccid = [0u8; 10];
+        for (out, pair) in raw_iccid.iter_mut().zip(padded.chunks(2)) {
+            let nibble = |c: u8| if c == b'F' { 0xF } else { c - b'0' };
+            *out = (nibble(pair[1]) << 4) | nibble(pair[0]);
+        }
+        Ok(Self {
+            iccid: iccid.to_owned(),
+            raw_iccid,
+            name: name.to_owned(),
+            apply,
+        })
+    }
+}
+
+/// SetNickname (lpac `profile nickname`). Reads the EID and the profile list
+/// first. Without [`Nickname::apply`] it stops there and reports the planned
+/// change (`dry_run` true, `applied` false) having sent no write. With it, it
+/// sends SetNickname, re-reads the profile list and fails with kind
+/// `verify-failed` unless the nickname is now the requested one.
+///
+/// # Errors
+///
+/// A [`Failure`]; `iccid-not-found` when no profile has that ICCID (nothing is
+/// written), `es10-refused` when the ISD-R rejects the change.
+pub fn nickname<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    request: &Nickname,
+) -> Result<Value, Failure> {
+    in_channel(session, aid, max_segment, |ask| {
+        let eid = read_eid(ask)?;
+        let nickname_of = |profiles: &[es10::ProfileInfo]| {
+            profiles
+                .iter()
+                .find(|p| p.iccid.as_deref() == Some(&request.raw_iccid[..]))
+                .map(|p| p.profile_nickname.clone().unwrap_or_default())
+        };
+        let profiles = read_profiles(ask)?;
+        let Some(current) = nickname_of(&profiles) else {
+            return Err(Failure::new(
+                "iccid-not-found",
+                format!("no profile with ICCID {} on this eUICC", request.iccid),
+                json!({
+                    "eid": eid,
+                    "iccid": request.iccid,
+                    "iccids": profiles.iter().filter_map(|p| p.iccid.as_deref().map(iccid_text)).collect::<Vec<_>>(),
+                }),
+            ));
+        };
+        let mut data = json!({
+            "eid": eid,
+            "iccid": request.iccid,
+            "current_nickname": current,
+            "new_nickname": request.name,
+            "dry_run": !request.apply,
+            "applied": false,
+        });
+        if !request.apply {
+            return Ok(data);
+        }
+        let frame = es10::set_nickname_request(&request.raw_iccid, &request.name)
+            .map_err(exchange_failed)?;
+        let result = es10::decode_set_nickname(&ask("SetNickname", frame)?)
+            .map_err(|e| bad("SetNickname", e))?;
+        if result != es10::SetNicknameResult::Ok {
+            return Err(Failure::new(
+                "es10-refused",
+                format!("SetNickname returned result code {}", result.code()),
+                json!({ "function": "SetNickname", "code": result.code(), "eid": data["eid"] }),
+            ));
+        }
+        let after = nickname_of(&read_profiles(ask)?);
+        data["verified_nickname"] = json!(after);
+        if after.as_deref() != Some(request.name.as_str()) {
+            return Err(Failure::new(
+                "verify-failed",
+                format!(
+                    "SetNickname was accepted but the profile list now shows {:?}, not {:?}",
+                    after.as_deref().unwrap_or("(profile missing)"),
+                    request.name
+                ),
+                json!({ "eid": data["eid"], "iccid": request.iccid, "expected": request.name, "actual": after }),
+            ));
+        }
+        data["applied"] = json!(true);
+        Ok(data)
+    })
 }
 
 fn version(v: [u8; 3]) -> String {
@@ -372,6 +570,11 @@ pub fn to_human(query: Query, data: &Value) -> String {
     match query {
         Query::Info => {
             out += &format!("EID: {}\n", text(&data["eid"]));
+            out += &format!(
+                "SM-DP+ (default): {}\nSM-DS (root): {}\n",
+                text(&data["configured_addresses"]["default_smdp"]),
+                text(&data["configured_addresses"]["root_smds"]),
+            );
             for (title, key) in [("EUICCInfo1", "euicc_info1"), ("EUICCInfo2", "euicc_info2")] {
                 out += &format!("{title}:\n");
                 if let Some(map) = data[key].as_object() {
@@ -417,6 +620,28 @@ pub fn to_human(query: Query, data: &Value) -> String {
             }
         }
     }
+    out
+}
+
+/// The human report for [`nickname`]'s `data`.
+pub fn nickname_to_human(data: &Value) -> String {
+    let text = |v: &Value| match v {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => sanitize(s),
+        other => sanitize(&other.to_string()),
+    };
+    let mut out = format!(
+        "EID: {}\nICCID: {}\nCurrent nickname: {:?}\nNew nickname: {:?}\n",
+        text(&data["eid"]),
+        text(&data["iccid"]),
+        text(&data["current_nickname"]),
+        text(&data["new_nickname"]),
+    );
+    out += if data["applied"] == true {
+        "SetNickname sent; the profile list now shows the new nickname.\n"
+    } else {
+        "Dry run: nothing was sent. Re-run with --yes to set the nickname.\n"
+    };
     out
 }
 
@@ -487,6 +712,14 @@ mod tests {
                 (es10::get_eid_request(), ok(&format!("BF3E12 5A10 {EID}"))),
                 (es10::get_euicc_info1_request(), ok(&info1)),
                 (es10::get_euicc_info2_request(), ok(INFO2)),
+                (
+                    es10::get_euicc_configured_addresses_request(),
+                    ok(&format!(
+                        "BF3C19 8007 {} 810E {}",
+                        hex::encode("dp.exam"),
+                        hex::encode("ds.example.org")
+                    )),
+                ),
             ],
         );
         let data = run(&mut card, &ISDR_AID, Query::Info).unwrap();
@@ -495,9 +728,216 @@ mod tests {
         assert_eq!(data["euicc_info1"]["svn"], "2.2.0");
         assert_eq!(data["euicc_info1"]["ci_pk_id_for_verification"][0], SKI);
         assert_eq!(data["euicc_info2"]["profile_version"], "2.1.0");
+        assert_eq!(data["configured_addresses"]["default_smdp"], "dp.exam");
+        assert_eq!(data["configured_addresses"]["root_smds"], "ds.example.org");
         assert_eq!(data["channel"], json!({ "number": 1, "closed": true }));
         let human = to_human(Query::Info, &data);
         assert!(human.starts_with(&format!("EID: {EID}\n")));
+        assert!(human.contains("SM-DS (root): ds.example.org\n"));
+    }
+
+    /// A GetProfilesInfo response with one profile holding `nick` (none when
+    /// empty) and the test ICCID.
+    fn profile_response(nick: &str) -> String {
+        let nick = if nick.is_empty() {
+            String::new()
+        } else {
+            format!("90{:02X}{}", nick.len(), hex::encode(nick))
+        };
+        let body = format!(
+            "5A0A{ICCID_RAW} 4F10A0000005591010FFFFFFFF89000010 00 9F700101 {nick} 9108 4F70657261746F72 9501 02"
+        );
+        ok(&fix_lengths(&body))
+    }
+
+    fn profiles_request() -> Vec<u8> {
+        es10::get_profiles_info_request(None, Some(&PROFILE_TAGS)).unwrap()
+    }
+
+    fn eid_response() -> String {
+        ok(&format!("BF3E12 5A10 {EID}"))
+    }
+
+    fn set_request(name: &str) -> Vec<u8> {
+        es10::set_nickname_request(&h(ICCID_RAW), name).unwrap()
+    }
+
+    #[test]
+    fn segment_size_cuts_the_store_data_blocks() {
+        // GetProfilesInfo request is 12 bytes; at 5 bytes per block that is
+        // three blocks: P1 11/11/91, P2 0/1/2, one logical exchange each.
+        let request = profiles_request();
+        let body = profile_response("nick");
+        let mut pairs = vec![
+            ("0070000001".to_owned(), "019000".to_owned()),
+            (
+                format!(
+                    "01A40400{:02X}{}00",
+                    ISDR_AID.len(),
+                    hex::encode_upper(ISDR_AID)
+                ),
+                "9000".to_owned(),
+            ),
+        ];
+        let chunks: Vec<&[u8]> = request.chunks(5).collect();
+        for (i, c) in chunks.iter().enumerate() {
+            let p1 = if i + 1 == chunks.len() { "91" } else { "11" };
+            let resp = if i + 1 == chunks.len() {
+                body.clone()
+            } else {
+                "9000".to_owned()
+            };
+            pairs.push((
+                format!("81E2{p1}{i:02X}{:02X}{}00", c.len(), hex::encode_upper(c)),
+                resp,
+            ));
+        }
+        pairs.push(("00708001".to_owned(), "9000".to_owned()));
+        let mut card = Replay::from_log(&log(&pairs)).unwrap();
+        let data = run_with(&mut card, &ISDR_AID, Query::Profiles, 5).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["profiles"][0]["nickname"], "nick");
+        assert!(chunks.len() > 1);
+        // 0 and 256 are refused before anything is sent.
+        let mut card = script("9000", &[]);
+        assert_eq!(
+            run_with(&mut card, &ISDR_AID, Query::Profiles, 0)
+                .unwrap_err()
+                .kind,
+            "exchange-failed"
+        );
+    }
+
+    #[test]
+    fn nickname_dry_run_reads_and_sends_no_write() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), profile_response("old")),
+            ],
+        );
+        let req = Nickname::new(ICCID, "new", false).unwrap();
+        let data = nickname(&mut card, &ISDR_AID, 255, &req).unwrap();
+        // open, select, GetEID, GetProfilesInfo, close; no SetNickname.
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["eid"], EID);
+        assert_eq!(data["iccid"], ICCID);
+        assert_eq!(data["current_nickname"], "old");
+        assert_eq!(data["new_nickname"], "new");
+        assert_eq!(data["dry_run"], true);
+        assert_eq!(data["applied"], false);
+        let human = nickname_to_human(&data);
+        assert!(human.contains("Dry run: nothing was sent"));
+        assert!(human.contains(&format!("ICCID: {ICCID}")));
+    }
+
+    #[test]
+    fn nickname_with_yes_sends_set_nickname_then_verifies() {
+        // Exact SetNickname frame, hand-written: BF29 12 5A0A <iccid> 9003 'n' 'e' 'w'.
+        assert_eq!(
+            set_request("new"),
+            h(&format!("BF2911 5A0A{ICCID_RAW} 9003 6E6577"))
+        );
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), profile_response("old")),
+                (set_request("new"), ok("BF2903 8001 00")),
+                (profiles_request(), profile_response("new")),
+            ],
+        );
+        let req = Nickname::new(ICCID, "new", true).unwrap();
+        let data = nickname(&mut card, &ISDR_AID, 255, &req).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["applied"], true);
+        assert_eq!(data["dry_run"], false);
+        assert_eq!(data["verified_nickname"], "new");
+        assert!(nickname_to_human(&data).contains("SetNickname sent"));
+    }
+
+    #[test]
+    fn nickname_accepted_but_not_visible_is_a_verify_failure() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), profile_response("old")),
+                (set_request("new"), ok("BF2903 8001 00")),
+                (profiles_request(), profile_response("old")),
+            ],
+        );
+        let req = Nickname::new(ICCID, "new", true).unwrap();
+        let failure = nickname(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "verify-failed");
+        assert_eq!(failure.data["actual"], "old");
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn nickname_refused_by_the_isdr_is_es10_refused_and_not_verified() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), profile_response("old")),
+                (set_request("new"), ok("BF2903 8001 01")),
+            ],
+        );
+        let req = Nickname::new(ICCID, "new", true).unwrap();
+        let failure = nickname(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "es10-refused");
+        assert_eq!(failure.data["code"], 1);
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn nickname_for_an_unknown_iccid_sends_no_write() {
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (profiles_request(), profile_response("old")),
+            ],
+        );
+        let req = Nickname::new("89000123456789012349", "new", true).unwrap();
+        let failure = nickname(&mut card, &ISDR_AID, 255, &req).unwrap_err();
+        assert_eq!(failure.kind, "iccid-not-found");
+        assert_eq!(failure.data["iccids"], json!([ICCID]));
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn nickname_validation_happens_before_any_card_contact() {
+        let long = "x".repeat(65);
+        assert_eq!(
+            Nickname::new(ICCID, &long, true).unwrap_err().kind,
+            "bad-nickname"
+        );
+        assert_eq!(
+            Nickname::new(ICCID, "a\u{1b}[31m", true).unwrap_err().kind,
+            "bad-nickname"
+        );
+        assert_eq!(
+            Nickname::new("1234", "ok", true).unwrap_err().kind,
+            "bad-iccid"
+        );
+        assert_eq!(
+            Nickname::new("8900012345678901234x", "ok", true)
+                .unwrap_err()
+                .kind,
+            "bad-iccid"
+        );
+        assert!(Nickname::new(ICCID, &"x".repeat(64), true).is_ok());
+        assert!(Nickname::new(ICCID, "", true).is_ok());
+        // 19 digits pad with F in the last byte's high nibble.
+        assert_eq!(
+            Nickname::new("8900012345678901234", "a", false)
+                .unwrap()
+                .raw_iccid[9],
+            0xF4
+        );
     }
 
     #[test]

@@ -2218,3 +2218,34 @@ fn euicc_commands_without_a_reader_exit_1_with_one_lpa_envelope() {
         "bad-aid"
     );
 }
+
+#[test]
+fn euicc_nickname_validates_before_touching_a_reader() {
+    // Issue #117. Bad input is refused with no reader named at all; a good
+    // request against a reader that cannot exist fails at the reader.
+    let long = "x".repeat(65);
+    for (iccid, name, kind) in [
+        ("89000123456789012341", long.as_str(), "bad-nickname"),
+        ("123", "ok", "bad-iccid"),
+    ] {
+        let run = run_piped(&["euicc", "nickname", iccid, name, "--yes", "--json"]);
+        assert_eq!(run.code(), 1, "{}", run.stderr);
+        assert_eq!(
+            assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings)
+                .payload()
+                .data()["error"]["kind"],
+            kind
+        );
+    }
+    let run = run_piped(&[
+        "euicc",
+        "nickname",
+        "89000123456789012341",
+        "ok",
+        "--json",
+        "--reader",
+        NO_SUCH_READER,
+    ]);
+    assert_eq!(run.code(), 1, "{}", run.stderr);
+    assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
+}
