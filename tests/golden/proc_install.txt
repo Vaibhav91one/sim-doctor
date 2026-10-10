@@ -1,0 +1,714 @@
+# a directory that does not exist yet: sim-doctor install --dir <TMP>/a/b
+exit 0
+--- stdout
+wrote <TMP>/a/b/.claude/skills/sim-doctor/SKILL.md
+wrote <TMP>/a/b/.cursor/rules/sim-doctor.mdc
+wrote <TMP>/a/b/AGENTS.md
+--- tree
+===== .claude/skills/sim-doctor/SKILL.md
+---
+name: sim-doctor
+description: Scan a SIM/UICC card over PC/SC with `sim-doctor scan --json` and read the result envelope. Use when asked to examine, audit or score a SIM card.
+---
+
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+
+===== .cursor/rules/sim-doctor.mdc
+---
+description: How to run sim-doctor and read its JSON envelope
+alwaysApply: false
+---
+
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+
+===== AGENTS.md
+<!-- sim-doctor:start -->
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+<!-- sim-doctor:end -->
+
+
+# --agent claude: sim-doctor install --agent claude --dir <TMP>/claude
+exit 0
+--- stdout
+wrote <TMP>/claude/.claude/skills/sim-doctor/SKILL.md
+--- tree
+===== .claude/skills/sim-doctor/SKILL.md
+---
+name: sim-doctor
+description: Scan a SIM/UICC card over PC/SC with `sim-doctor scan --json` and read the result envelope. Use when asked to examine, audit or score a SIM card.
+---
+
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+
+
+# --agent cursor: sim-doctor install --agent cursor --dir <TMP>/cursor
+exit 0
+--- stdout
+wrote <TMP>/cursor/.cursor/rules/sim-doctor.mdc
+--- tree
+===== .cursor/rules/sim-doctor.mdc
+---
+description: How to run sim-doctor and read its JSON envelope
+alwaysApply: false
+---
+
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+
+
+# --agent codex: sim-doctor install --agent codex --dir <TMP>/codex
+exit 0
+--- stdout
+wrote <TMP>/codex/AGENTS.md
+--- tree
+===== AGENTS.md
+<!-- sim-doctor:start -->
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+<!-- sim-doctor:end -->
+
+
+# --agent opencode: sim-doctor install --agent opencode --dir <TMP>/opencode
+exit 0
+--- stdout
+wrote <TMP>/opencode/AGENTS.md
+--- tree
+===== AGENTS.md
+<!-- sim-doctor:start -->
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+<!-- sim-doctor:end -->
+
+
+# a stale block in the middle of AGENTS.md: sim-doctor install --agent codex --dir <TMP>/middle
+exit 0
+--- stdout
+wrote <TMP>/middle/AGENTS.md
+--- tree
+===== AGENTS.md
+# Mine
+
+before
+
+<!-- sim-doctor:start -->
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+<!-- sim-doctor:end -->
+
+after
+
+
+# AGENTS.md without a trailing newline: sim-doctor install --agent opencode --dir <TMP>/bare
+exit 0
+--- stdout
+wrote <TMP>/bare/AGENTS.md
+--- tree
+===== AGENTS.md
+no newline at the end
+
+<!-- sim-doctor:start -->
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+<!-- sim-doctor:end -->
+
+
+# an older SKILL.md: sim-doctor install --agent claude --dir <TMP>/old
+exit 0
+--- stdout
+wrote <TMP>/old/.claude/skills/sim-doctor/SKILL.md
+--- tree
+===== .claude/skills/sim-doctor/SKILL.md
+---
+name: sim-doctor
+description: Scan a SIM/UICC card over PC/SC with `sim-doctor scan --json` and read the result envelope. Use when asked to examine, audit or score a SIM card.
+---
+
+# sim-doctor
+
+`sim-doctor` examines a SIM/UICC card over PC/SC and reports what it found. It is a
+CLI-first tool: every command has a headless mode with a stable JSON envelope and a
+meaningful exit code. Run it; do not guess what a card holds.
+
+## Run a scan
+
+```sh
+sim-doctor scan --json              # one doctor/1 JSON envelope on stdout, nothing else
+sim-doctor scan --json --severity high   # drop findings below a level
+sim-doctor scan --json --fail-on high    # exit 1 on a finding at or above high (default critical)
+sim-doctor scan --json --tar focused     # probe TARs for MSL 0 (gsma/msl-zero-allowed)
+sim-doctor scan --json | jq -f scripts/reduce-baseline.jq > baseline.json   # card-data-free baseline; later: scan --baseline baseline.json
+sim-doctor scan --help              # the full contract, including what it cannot do
+```
+
+stdout carries the envelope and nothing else; diagnostics go to stderr.
+
+## Read the envelope
+
+```json
+{ "schema": "doctor/1", "tool": "sim-doctor", "version": "...", "exit_code": 0,
+  "score": { "value": 100, "label": "incomplete", "model": "sim/1", "coverage_gaps": 1 },
+  "findings": [ ], "data": { } }
+```
+
+- `findings[]` holds the failed checks, critical first. Each has `id` (`namespace/name`),
+  `fingerprint`, `severity`, `category`, `message`, `location` (`{kind, ref}`), `evidence`
+  and `remedy`; its `coverage` is `complete` or `partial`. A `partial` finding came from a
+  scan that did not finish: the list may be short.
+- `score.value` is `100 - sum of penalties`, floored at 0. **`label: incomplete` or
+  `coverage_gaps > 0` means part of the card or a rule was not checked** (a truncated walk,
+  or MSL 0 without `--tar`): a 100 is then not a clean card.
+- **The exit code follows findings, not whether the walk finished.** Also read
+  `data.complete`: `false` means a bound was hit (`truncated_by`, `limits_hit`) and you read
+  only part of the card.
+- On failure `data.error.kind` names why (`no-reader`, ...), `scanned` is false and
+  `findings` is empty.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ran; no finding at or above `--fail-on` (default `critical`) |
+| 1 | ran; a finding at or above `--fail-on` |
+| 2 | bad command line or input, or the scan could not run (no reader, no card) |
+| 3 | `--baseline` given; a new finding at or above `--fail-on` |
+| 130 | interrupted |
+
+## What it does not tell you
+
+- Only one rule runs today, `gsma/msl-zero-allowed`, behind `--tar`. A clean scan is not a
+  clean bill of health for the card.
+- The default FCP dialect and candidate set are assumptions the output names; they can miss
+  a file. `--dialect` and `--max-children` say how.
+- Never commit card secrets (keys, KI/OPc, ADM codes) found while testing.
+
+Docs: AGENTS.md (contract, domain facts), docs/swsim-fixture.md (software card for testing
+without hardware).
+
+
+# --dir is a file: exit 1

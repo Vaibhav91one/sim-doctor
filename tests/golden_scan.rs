@@ -706,3 +706,133 @@ fn sarif_and_baseline_are_one_file_however_spelled() {
         &show("same file, spelled two ways", &args, &r, &tmp, &[], true),
     );
 }
+
+// ---------------------------------------------------------------------------
+// install: the files it writes, merged into what is there
+// ---------------------------------------------------------------------------
+
+/// Files `install` writes, byte for byte, in the situations a project really has:
+/// no directory yet, one agent, an `AGENTS.md` with the block in the middle or with no trailing
+/// newline, an older skill file to replace. stderr of the failing cases is not pinned (the
+/// kit words a write error its own way); their exit codes are.
+#[test]
+fn install_writes_the_same_files_everywhere() {
+    let tmp = tmp_dir("install");
+    let mut text = String::new();
+    let tree = |root: &Path| -> String {
+        let mut out = String::new();
+        let mut stack = vec![root.to_path_buf()];
+        let mut files = vec![];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        for f in files {
+            writeln!(
+                out,
+                "===== {}\n{}",
+                f.strip_prefix(root).unwrap().display(),
+                std::fs::read_to_string(&f).unwrap()
+            )
+            .unwrap();
+        }
+        out
+    };
+    let mut case = |label: &str, args: &[&str], dir: &Path| {
+        let r = run(args, None);
+        writeln!(
+            text,
+            "# {label}: sim-doctor {}\nexit {}\n--- stdout\n{}--- tree\n{}",
+            norm(&args.join(" "), &tmp),
+            r.code,
+            norm(&r.stdout, &tmp),
+            if dir.is_dir() {
+                tree(dir)
+            } else {
+                "(no directory)\n".into()
+            }
+        )
+        .unwrap();
+    };
+
+    let nested = tmp.join("a").join("b");
+    case(
+        "a directory that does not exist yet",
+        &["install", "--dir", nested.to_str().unwrap()],
+        &nested,
+    );
+    for agent in ["claude", "cursor", "codex", "opencode"] {
+        let dir = tmp.join(agent);
+        case(
+            &format!("--agent {agent}"),
+            &["install", "--agent", agent, "--dir", dir.to_str().unwrap()],
+            &dir,
+        );
+    }
+    // The block sits in the middle of a hand-written file: replaced in place.
+    let middle = tmp.join("middle");
+    std::fs::create_dir_all(&middle).unwrap();
+    std::fs::write(
+        middle.join("AGENTS.md"),
+        "# Mine\n\nbefore\n\n<!-- sim-doctor:start -->\nstale\n<!-- sim-doctor:end -->\n\nafter\n",
+    )
+    .unwrap();
+    case(
+        "a stale block in the middle of AGENTS.md",
+        &[
+            "install",
+            "--agent",
+            "codex",
+            "--dir",
+            middle.to_str().unwrap(),
+        ],
+        &middle,
+    );
+    // No trailing newline, and no block yet: appended after a blank line.
+    let bare = tmp.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("AGENTS.md"), "no newline at the end").unwrap();
+    case(
+        "AGENTS.md without a trailing newline",
+        &[
+            "install",
+            "--agent",
+            "opencode",
+            "--dir",
+            bare.to_str().unwrap(),
+        ],
+        &bare,
+    );
+    // An older skill file is replaced whole.
+    let old = tmp.join("old");
+    std::fs::create_dir_all(old.join(".claude/skills/sim-doctor")).unwrap();
+    std::fs::write(
+        old.join(".claude/skills/sim-doctor/SKILL.md"),
+        "old skill\n",
+    )
+    .unwrap();
+    case(
+        "an older SKILL.md",
+        &[
+            "install",
+            "--agent",
+            "claude",
+            "--dir",
+            old.to_str().unwrap(),
+        ],
+        &old,
+    );
+    // The root is a file: nothing can be written (exit code only).
+    let file = tmp.join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    let r = run(&["install", "--dir", file.to_str().unwrap()], None);
+    writeln!(text, "# --dir is a file: exit {}", r.code).unwrap();
+    check("proc_install.txt", &text);
+}
