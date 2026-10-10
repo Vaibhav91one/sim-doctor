@@ -220,3 +220,55 @@ fn read_commands_return_what_the_selected_file_holds() {
     assert!(r[7]["error"].as_str().unwrap().contains("6A83"));
     assert_eq!(r[9]["data"]["length"], 300);
 }
+
+#[test]
+fn decoded_reads_name_the_standard_file_and_decode_it() {
+    let out = card(
+        "cardsh_decoded.jsonl",
+        &[
+            "--json",
+            "-c",
+            "select ADF.USIM; select EF.IMSI; read_binary_decoded; select EF.AD; read_binary_decoded; \
+             select 3F00/7F10/6F3A; read_records_decoded; select 3F00/2FE2; read_binary_decoded",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[2]["data"]["ef"], "EF.IMSI");
+    assert_eq!(r[2]["data"]["decoded"]["imsi"], "001010123456789");
+    assert_eq!(r[4]["data"]["decoded"]["mnc_len"], 2);
+    assert_eq!(r[6]["data"]["decoded"]["records"][0]["alpha"], "Ann");
+    assert_eq!(r[8]["data"]["decoded"]["iccid"], "89010123456789012345");
+}
+
+#[test]
+fn files_and_decode_work_without_a_card() {
+    // No SIM_DOCTOR_TEST_REPLAY and no reader: `card` cannot open one, so these run through the library path
+    // of the same grammar via an empty replay log.
+    let dir = std::env::temp_dir().join("cardsh-offline.jsonl");
+    std::fs::write(&dir, "").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "card",
+            "--json",
+            "-c",
+            "decode EF.SPN 01414253FFFF; files IMSI",
+        ])
+        .env("SIM_DOCTOR_TEST_REPLAY", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[0]["data"]["decoded"]["name"], "ABS");
+    assert!(r[1]["data"]["count"].as_u64().unwrap() >= 2);
+}

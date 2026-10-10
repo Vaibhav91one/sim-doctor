@@ -2118,4 +2118,18 @@ fn card_shell_drives_a_real_card() {
     assert_eq!(records[1]["ok"], true, "{records:?}");
     assert_eq!(records[3]["ok"], false);
     println!("card shell: read_binary 10 octets, read_record 1 of EF.DIR");
+
+    // Decoded: EF.ICCID by its identifier under the MF, plus the offline decoder.
+    let (code, records) = run("select 3F00/2FE2; read_binary_decoded; decode EF.SPN 01414253FFFF");
+    assert_eq!(code, Some(0), "{records:?}");
+    assert_eq!(records[1]["data"]["ef"], "EF.ICCID");
+    let iccid = records[1]["data"]["decoded"]["iccid"]
+        .as_str()
+        .expect("digits");
+    assert!(
+        iccid.len() >= 18 && iccid.bytes().all(|b| b.is_ascii_digit()),
+        "{iccid}"
+    );
+    assert_eq!(records[2]["data"]["decoded"]["name"], "ABS");
+    println!("card shell: decoded EF.ICCID of {} digits", iccid.len());
 }

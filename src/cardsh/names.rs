@@ -1,178 +1,130 @@
-//! Names of the standard files and where they live (ETSI TS 102 221, 3GPP TS 31.102 / 31.103, TS 51.011).
-//! Cross-checked against pySim's file system tables (`ts_102_221.py`, `ts_31_102.py`, `ts_51_011.py`);
-//! the table is written here.
+//! Names of the standard files and where they live (ETSI TS 102 221, 3GPP TS 31.102 / 31.103 / 31.104,
+//! TS 51.011). The table is in `efs.rs`: every (name, identifier) pySim defines is in it with the same
+//! identifier (checked when it was generated), plus the files the specifications list that pySim does not model.
 
 use crate::fs::FileId;
 
-/// A named file: its name, identifier and the directory it lives under.
-pub struct Named {
+pub use super::efs::{DIRS, EFS};
+
+/// A standard EF found by name or by identifier and place.
+#[derive(Debug, Clone, Copy)]
+pub struct StdEf {
+    /// The directory it lives under (`ADF.USIM`, `DF.TELECOM` ...).
+    pub scope: &'static str,
     /// `EF.IMSI`.
     pub name: &'static str,
-    /// The two identifier octets.
-    pub fid: u16,
-    /// `MF`, `ADF.USIM`, `DF.TELECOM` ...
-    pub scope: &'static str,
+    /// The identifier.
+    pub fid: FileId,
+    /// `T` transparent, `L` linear fixed, `C` cyclic, `B` BER-TLV.
+    pub structure: char,
+    /// The decoder `decode::decode_ef` uses (`hex` when only the bytes are shown).
+    pub kind: &'static str,
+    /// What the specification calls it.
+    pub desc: &'static str,
 }
 
-/// The files `select` knows by name.
-pub const NAMES: &[Named] = &[
-    Named {
-        name: "MF",
-        fid: 0x3F00,
-        scope: "MF",
-    },
-    Named {
-        name: "DF.TELECOM",
-        fid: 0x7F10,
-        scope: "MF",
-    },
-    Named {
-        name: "DF.GSM",
-        fid: 0x7F20,
-        scope: "MF",
-    },
-    Named {
-        name: "DF.PHONEBOOK",
-        fid: 0x5F3A,
-        scope: "DF.TELECOM",
-    },
-    Named {
-        name: "DF.5GS",
-        fid: 0x5FC0,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.DIR",
-        fid: 0x2F00,
-        scope: "MF",
-    },
-    Named {
-        name: "EF.ICCID",
-        fid: 0x2FE2,
-        scope: "MF",
-    },
-    Named {
-        name: "EF.PL",
-        fid: 0x2F05,
-        scope: "MF",
-    },
-    Named {
-        name: "EF.ARR",
-        fid: 0x2F06,
-        scope: "MF",
-    },
-    Named {
-        name: "EF.IMSI",
-        fid: 0x6F07,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.AD",
-        fid: 0x6FAD,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.UST",
-        fid: 0x6F38,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.EST",
-        fid: 0x6F56,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.SPN",
-        fid: 0x6F46,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.MSISDN",
-        fid: 0x6F40,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.ACC",
-        fid: 0x6F78,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.FPLMN",
-        fid: 0x6F7B,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.LOCI",
-        fid: 0x6F7E,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.PSLOCI",
-        fid: 0x6F73,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.EPSLOCI",
-        fid: 0x6FE3,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.KEYS",
-        fid: 0x6F08,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.KEYSPS",
-        fid: 0x6F09,
-        scope: "ADF.USIM",
-    },
-    Named {
-        name: "EF.ADN",
-        fid: 0x6F3A,
-        scope: "DF.TELECOM",
-    },
-    Named {
-        name: "EF.FDN",
-        fid: 0x6F3B,
-        scope: "DF.TELECOM",
-    },
-    Named {
-        name: "EF.SMS",
-        fid: 0x6F3C,
-        scope: "DF.TELECOM",
-    },
-    Named {
-        name: "EF.IMSI(GSM)",
-        fid: 0x6F07,
-        scope: "DF.GSM",
-    },
-];
+fn std_ef(e: &'static (&str, &str, u16, char, &str, &str)) -> StdEf {
+    StdEf {
+        scope: e.0,
+        name: e.1,
+        fid: FileId::from_bytes(e.2.to_be_bytes()),
+        structure: e.3,
+        kind: e.4,
+        desc: e.5,
+    }
+}
 
-/// The identifier of a file name (`EF.IMSI`, `imsi`, `df.gsm`), case-insensitive; the `EF.` / `DF.`
-/// prefix may be left out when the rest is unique.
+/// Every standard EF.
+pub fn all() -> impl Iterator<Item = StdEf> {
+    EFS.iter().map(std_ef)
+}
+
+/// The identifier of a file name (`EF.IMSI`, `imsi`, `df.gsm`, `MF`), case-insensitive. The `EF.` / `DF.`
+/// prefix may be left out. A name that exists in several directories under different identifiers is
+/// ambiguous and gives `None` (name it by identifier then).
 pub fn fid_of(name: &str) -> Option<FileId> {
     let n = name.to_ascii_uppercase();
-    let hit = |f: &Named| f.name.eq_ignore_ascii_case(&n) && !f.name.contains('(');
-    let by_full = NAMES.iter().find(|f| hit(f));
-    let by_bare = || {
-        let mut found = NAMES.iter().filter(|f| {
-            f.name
-                .split_once('.')
-                .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(&n))
-                && !f.name.contains('(')
-        });
-        let first = found.next()?;
-        found.next().is_none().then_some(first)
+    let mut ids: Vec<u16> = Vec::new();
+    let mut add = |id: u16| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
     };
-    by_full
-        .or_else(by_bare)
-        .map(|f| FileId::from_bytes(f.fid.to_be_bytes()))
+    for (d, id, _) in DIRS {
+        if d.eq_ignore_ascii_case(&n)
+            || d.split_once('.')
+                .is_some_and(|(_, r)| r.eq_ignore_ascii_case(&n))
+        {
+            add(*id);
+        }
+    }
+    for e in EFS {
+        if e.1.eq_ignore_ascii_case(&n)
+            || e.1
+                .split_once('.')
+                .is_some_and(|(_, r)| r.eq_ignore_ascii_case(&n))
+        {
+            add(e.2);
+        }
+    }
+    match ids.as_slice() {
+        [one] => Some(FileId::from_bytes(one.to_be_bytes())),
+        _ => None,
+    }
 }
 
-/// Where the standard file with this identifier lives (the first match), for a refusal's hint.
+/// Where a standard file with this identifier lives (the first match), for a refusal's hint.
 pub fn scope_of(id: FileId) -> Option<&'static str> {
-    NAMES
-        .iter()
-        .find(|f| f.fid.to_be_bytes() == id.to_bytes() && !f.name.contains('('))
-        .map(|f| f.scope)
+    let want = u16::from_be_bytes(id.to_bytes());
+    const FIRST: [&str; 4] = ["ADF.USIM", "DF.TELECOM", "DF.GSM", "MF"];
+    let rank = |s: &str| FIRST.iter().position(|f| *f == s).unwrap_or(FIRST.len());
+    EFS.iter()
+        .filter(|e| e.2 == want)
+        .min_by_key(|e| rank(e.0))
+        .map(|e| e.0)
+}
+
+/// The directory names a path through `dir` (identifiers under the MF) and application `adf` is in:
+/// the scopes a file there may be listed under, innermost first.
+pub fn scopes_of(dir: &[FileId], adf: Option<&[u8]>) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let under = |parent: &str, id: FileId| {
+        DIRS.iter()
+            .find(|(_, fid, p)| fid.to_be_bytes() == id.to_bytes() && (*p == parent))
+            .map(|(n, _, _)| *n)
+    };
+    let mut parent: &str = "MF";
+    let start = if let Some(aid) = adf {
+        parent = if aid.starts_with(&[0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04]) {
+            "ADF.ISIM"
+        } else {
+            "ADF.USIM"
+        };
+        out.push(parent);
+        2
+    } else {
+        1
+    };
+    for id in dir.iter().skip(start) {
+        match under(parent, *id) {
+            Some(n) => {
+                out.push(n);
+                parent = n;
+            }
+            None => break,
+        }
+    }
+    if adf.is_none() && dir.len() == 1 {
+        out.clear();
+        out.push("MF");
+    }
+    out.reverse();
+    out
+}
+
+/// The standard EF `fid` is in a place whose scopes are `scopes`.
+pub fn find(scopes: &[&str], fid: FileId) -> Option<StdEf> {
+    all()
+        .find(|e| e.fid == fid && scopes.first().is_some_and(|s| *s == e.scope))
+        .or_else(|| all().find(|e| e.fid == fid && scopes.contains(&e.scope)))
 }

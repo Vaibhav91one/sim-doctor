@@ -77,12 +77,12 @@ impl TestCard {
                 ],
             ),
             f(&[mf, ADF], true, None, vec![]),
-            // IMSI 001010123456789: 08 09 10 10 21 43 65 87 F9
+            // IMSI 001010123456789
             f(
                 &[mf, ADF, 0x6F07],
                 false,
                 Some(0),
-                vec![vec![0x08, 0x09, 0x10, 0x10, 0x21, 0x43, 0x65, 0x87, 0xF9]],
+                vec![vec![0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98]],
             ),
             // EF.AD: operation mode normal, MNC length 2.
             f(
@@ -439,6 +439,12 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         false,
         "select 2FE2; read_binary; read_binary --offset 2 --length 3; read_binary --length 20; select 3F00/7F10/6F3A; \
          read_record 1; read_records; read_record 4; select 3F00/7F10/6F99; read_binary",
+    ),
+    (
+        "cardsh_decoded.jsonl",
+        false,
+        "select ADF.USIM; select EF.IMSI; read_binary_decoded; select EF.AD; read_binary_decoded; \
+         select 3F00/7F10/6F3A; read_records_decoded; select 3F00/2FE2; read_binary_decoded",
     ),
 ];
 

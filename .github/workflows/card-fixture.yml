@@ -389,6 +389,7 @@ jobs:
           grep -q 'card shell: apdu SELECT MF 9000' "$log"
           grep -q 'card shell: select kept the path across commands' "$log"
           grep -q 'card shell: read_binary 10 octets' "$log"
+          grep -q 'card shell: decoded EF.ICCID of' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job
