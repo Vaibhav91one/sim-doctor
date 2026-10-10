@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format follows
 - `card`: `select NAME|FID|AID|PATH`, `select_path` and `select_adf` (#157): select by FID, standard file name, AID,
   absolute or relative path, or application name (`ADF.USIM` through EF.DIR). The selection is kept per logical channel,
   the FCP is decoded in the reply, and `--profile sim` selects by FID with GSM 11.11 responses.
+- `card`: `read_binary [--offset] [--length]`, `read_record N` and `read_records [--from] [--to]` (#167): generic reads of the
+  selected EF with offset, length and record number, chunked past 256 bytes, one `6C xx` correction, empty records marked.
 
 ## [0.4.0]
 

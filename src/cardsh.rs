@@ -299,7 +299,84 @@ fn read_gsm_response(body: &[u8]) -> FileInfo {
     info
 }
 
+/// A record whose octets are all `FF` is unused.
+fn is_empty_record(data: &[u8]) -> bool {
+    !data.is_empty() && data.iter().all(|b| *b == 0xFF)
+}
+
 impl Equipped {
+    /// The EF that is selected, or the sentence saying there is none.
+    fn ef(&self) -> Result<FileInfo, CmdErr> {
+        match &self.chans[&self.channel].file {
+            Some(f) if !f.is_df => Ok(f.clone()),
+            Some(_) => Err(CmdErr::new(
+                "a directory is selected, not an elementary file: `select` an EF first",
+            )),
+            None => Err(CmdErr::new("no file selected: `select` an EF first")),
+        }
+    }
+
+    /// One read command with `le` bytes asked for; a `6C xx` (the card says it holds `xx`) is answered
+    /// with exactly one corrected re-send, the standard answer to a short file, and never more.
+    fn read(&mut self, ins: u8, p1: u8, p2: u8, le: u32) -> Result<Vec<u8>, CmdErr> {
+        let cla = self.cla();
+        let header = apdu::Header::new(cla, ins, p1, p2);
+        let mut want = le;
+        for attempt in 0..2 {
+            let le =
+                apdu::Le::for_byte_count(want).ok_or_else(|| CmdErr::new("a read of no bytes"))?;
+            let ex = self.send(&Command::case2(header, le))?;
+            let sw = ex.status();
+            if attempt == 0 {
+                if let Some(n) = sw.and_then(|s| match s.corrected_length() {
+                    Some(apdu::CorrectedLength::Accepts(n)) => Some(n),
+                    _ => None,
+                }) {
+                    want = u32::from(n);
+                    continue;
+                }
+            }
+            if !sw.is_some_and(StatusWord::is_normal_processing) {
+                return Err(CmdErr {
+                    message: format!(
+                        "{} refused: {}",
+                        if ins == 0xB0 {
+                            "READ BINARY"
+                        } else {
+                            "READ RECORD"
+                        },
+                        sw_text(sw)
+                    ),
+                    data: json!({ "sw": sw.map(|s| s.to_string()) }),
+                });
+            }
+            return Ok(ex.data().to_vec());
+        }
+        unreachable!("the second attempt always returns")
+    }
+
+    /// READ BINARY of `length` bytes from `offset`, in reads of at most 256.
+    fn read_binary(&mut self, offset: u16, length: u32) -> Result<Vec<u8>, CmdErr> {
+        let mut out = Vec::new();
+        while (out.len() as u32) < length {
+            let at = u32::from(offset) + out.len() as u32;
+            if at > 0x7FFF {
+                return Err(CmdErr::new(
+                    "READ BINARY addresses 32767 bytes at most (P1-P2 offset)",
+                ));
+            }
+            let want = (length - out.len() as u32).min(256);
+            let chunk = self.read(0xB0, (at >> 8) as u8, at as u8, want)?;
+            let short = (chunk.len() as u32) < want;
+            out.extend_from_slice(&chunk);
+            // The card held less than asked for (the end of the file): that is all there is.
+            if short {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Sends one SELECT and returns what the card said about the file.
     fn select(&mut self, by: &SelectBy, dialect: &TagSet) -> Result<FileInfo, CmdErr> {
         let (header, data) = match (by, self.profile) {
@@ -463,6 +540,107 @@ fn parse_segment(word: &str) -> Result<Seg, CmdErr> {
 }
 
 impl Shell {
+    fn cmd_read_binary(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let card = self.equipped()?;
+        let ef = card.ef()?;
+        if ef.structure.is_some_and(|st| st != "transparent") {
+            return Err(CmdErr::new(format!(
+                "the selected file is {}: use read_record / read_records",
+                ef.structure.unwrap_or("record-structured")
+            )));
+        }
+        let offset = *args.get_one::<u16>("offset").expect("default");
+        let length = match args.get_one::<u32>("length") {
+            Some(l) => *l,
+            None => match ef.size {
+                Some(sz) if u32::from(offset) >= sz && sz > 0 => {
+                    return Err(CmdErr::new(format!(
+                        "offset {offset} is beyond the end of the file ({sz} bytes)"
+                    )))
+                }
+                Some(sz) => sz - u32::from(offset),
+                None => 256,
+            },
+        };
+        let data = card.read_binary(offset, length)?;
+        let h = hex::encode(&data);
+        Ok(Reply::ok(
+            h.clone(),
+            json!({ "offset": offset, "length": data.len(), "data": h, "path": card.chans[&card.channel].path() }),
+        ))
+    }
+
+    fn record_length(ef: &FileInfo, args: &clap::ArgMatches) -> Result<u32, CmdErr> {
+        if ef.structure == Some("transparent") {
+            return Err(CmdErr::new(
+                "the selected file is transparent: use read_binary",
+            ));
+        }
+        Ok(args
+            .try_get_one::<u16>("length")
+            .ok()
+            .flatten()
+            .map(|l| u32::from(*l))
+            .or(ef.record_length.map(u32::from))
+            .unwrap_or(256))
+    }
+
+    fn cmd_read_record(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let card = self.equipped()?;
+        let ef = card.ef()?;
+        let le = Self::record_length(&ef, args)?;
+        let n = *args.get_one::<u8>("record").expect("required");
+        let data = card.read(0xB2, n, 0x04, le)?;
+        let h = hex::encode(&data);
+        Ok(Reply::ok(
+            h.clone(),
+            json!({ "record": n, "length": data.len(), "data": h, "empty": is_empty_record(&data), "path": card.chans[&card.channel].path() }),
+        ))
+    }
+
+    fn cmd_read_records(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let card = self.equipped()?;
+        let ef = card.ef()?;
+        let le = Self::record_length(&ef, args)?;
+        let from = *args.get_one::<u8>("from").expect("default");
+        let to = args
+            .get_one::<u8>("to")
+            .copied()
+            .or(ef.records.map(|r| r.min(254) as u8))
+            .unwrap_or(254);
+        let (mut records, mut lines) = (Vec::new(), Vec::new());
+        for n in from..=to {
+            match card.read(0xB2, n, 0x04, le) {
+                Ok(data) => {
+                    let h = hex::encode(&data);
+                    lines.push(format!(
+                        "{n}: {}{h}",
+                        if is_empty_record(&data) {
+                            "(empty) "
+                        } else {
+                            ""
+                        }
+                    ));
+                    records
+                        .push(json!({ "record": n, "data": h, "empty": is_empty_record(&data) }));
+                }
+                // Past the last record: the card says so (6A83); that ends an open-ended read.
+                Err(e)
+                    if e.data["sw"] == "6A83"
+                        && args.get_one::<u8>("to").is_none()
+                        && ef.records.is_none() =>
+                {
+                    break
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Reply::ok(
+            lines.join("\n"),
+            json!({ "count": records.len(), "records": records, "path": card.chans[&card.channel].path() }),
+        ))
+    }
+
     /// The AID the card lists in EF.DIR for the application called `name`.
     fn adf_aid(&mut self, name: &str) -> Result<Vec<u8>, CmdErr> {
         let prefix = adf_prefix(name)
@@ -852,6 +1030,24 @@ pub fn grammar() -> clap::Command {
                 .arg(Arg::new("adf").required(true).value_name("AID|NAME")),
         )
         .subcommand(
+            C::new("read_binary")
+                .about("READ BINARY of the selected transparent EF (whole file by default)")
+                .arg(Arg::new("offset").long("offset").value_name("N").default_value("0").value_parser(clap::value_parser!(u16).range(0..=0x7FFF)))
+                .arg(Arg::new("length").long("length").value_name("N").value_parser(clap::value_parser!(u32).range(1..=0x8000))),
+        )
+        .subcommand(
+            C::new("read_record")
+                .about("READ RECORD number N (1 is the first) of the selected record EF")
+                .arg(Arg::new("record").required(true).value_name("N").value_parser(clap::value_parser!(u8).range(1..=254)))
+                .arg(Arg::new("length").long("length").value_name("N").value_parser(clap::value_parser!(u16).range(1..=256))),
+        )
+        .subcommand(
+            C::new("read_records")
+                .about("READ RECORD of every record (or --from .. --to) of the selected record EF")
+                .arg(Arg::new("from").long("from").value_name("N").default_value("1").value_parser(clap::value_parser!(u8).range(1..=254)))
+                .arg(Arg::new("to").long("to").value_name("N").value_parser(clap::value_parser!(u8).range(1..=254))),
+        )
+        .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
                 .about("Leave the shell"),
@@ -947,6 +1143,9 @@ impl Shell {
             "equip" => self.cmd_equip(args),
             "status" => self.cmd_status(),
             "apdu" => self.cmd_apdu(args),
+            "read_binary" => self.cmd_read_binary(args),
+            "read_record" => self.cmd_read_record(args),
+            "read_records" => self.cmd_read_records(args),
             "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
             "select_path" => {
                 self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
@@ -1451,6 +1650,66 @@ mod tests {
         assert!(sh.exec("select 7F10").ok);
         assert!(sh.exec("channel 0").ok);
         assert_eq!(sh.pwd(), "3F00/7F20");
+    }
+
+    #[test]
+    fn read_binary_reads_whole_ranges_and_long_files_in_chunks() {
+        let (mut sh, log) = shell_log();
+        assert!(!sh.exec("read_binary").ok, "nothing selected");
+        assert!(sh.exec("select 2FE2").ok);
+        let r = sh.exec("read_binary");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.text, "98101032547698103254");
+        let r = sh.exec("read_binary --offset 2 --length 3");
+        assert_eq!(r.data["data"], "103254");
+        assert_eq!(r.data["offset"], 2);
+        // Longer than the file: the card answers 6C0A, the shell re-sends once with 10.
+        log.borrow_mut().clear();
+        let r = sh.exec("read_binary --length 20");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["length"], 10);
+        assert_eq!(log.borrow().len(), 2);
+        assert!(!sh.exec("read_binary --offset 10").ok, "offset at the end");
+        // 300 bytes need two reads.
+        assert!(sh.exec("select 3F00/7F10/6F99").ok);
+        log.borrow_mut().clear();
+        let r = sh.exec("read_binary");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["length"], 300);
+        assert_eq!(log.borrow().len(), 2);
+        let h = r.data["data"].as_str().unwrap();
+        assert!(h.starts_with("000102") && h.ends_with(&format!("{:02x}", 299 % 251)));
+        let r = sh.exec("read_binary --offset 256");
+        assert_eq!(r.data["length"], 44);
+    }
+
+    #[test]
+    fn read_record_and_read_records_use_the_record_length() {
+        let (mut sh, _) = shell_log();
+        assert!(sh.exec("select 3F00/7F10/6F3A").ok);
+        let r = sh.exec("read_record 1");
+        assert!(r.ok, "{}", r.text);
+        assert!(r.text.starts_with("416e6e"), "{}", r.text);
+        assert_eq!(r.data["length"], 28);
+        assert_eq!(r.data["empty"], false);
+        let r = sh.exec("read_record 2");
+        assert_eq!(r.data["empty"], true);
+        let r = sh.exec("read_record 4");
+        assert!(!r.ok && r.text.contains("6A83"), "{}", r.text);
+        let r = sh.exec("read_records");
+        assert_eq!(r.data["count"], 3);
+        assert_eq!(r.data["records"][2]["empty"], true);
+        let r = sh.exec("read_records --from 2 --to 3");
+        assert_eq!(r.data["count"], 2);
+        assert!(!sh.exec("read_records --to 4").ok, "past the last record");
+        // The wrong command for the structure says which one to use.
+        let r = sh.exec("read_binary");
+        assert!(!r.ok && r.text.contains("read_record"), "{}", r.text);
+        assert!(sh.exec("select 3F00/2FE2").ok);
+        let r = sh.exec("read_record 1");
+        assert!(!r.ok && r.text.contains("read_binary"), "{}", r.text);
+        assert!(sh.exec("select 3F00").ok);
+        assert!(!sh.exec("read_binary").ok, "a directory is selected");
     }
 
     #[test]
