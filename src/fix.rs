@@ -12,45 +12,17 @@ const MAX_FIELD: usize = 300;
 /// The most findings put in one prompt.
 pub const MAX_FINDINGS: usize = 20;
 
-/// A coding agent this tool can start.
-pub struct Agent {
-    /// The value of `--agent`.
-    pub name: &'static str,
-    /// The executable looked up on `PATH`.
-    pub bin: &'static str,
-    /// The agent's flag that skips its own approval prompts; only added by `--skip-approvals`.
-    ///
-    /// Copied from the sibling tool android-doctor; not verified against every CLI version.
-    pub skip_flag: &'static str,
-}
+/// A coding agent this tool can start: the kit's table (`claude`, `codex`, `cursor`).
+#[deprecated(since = "0.4.0", note = "use `doctor_kit::fix::AgentSpec`")]
+pub use doctor_kit::fix::AgentSpec as Agent;
 
 /// Every agent `--agent` accepts.
-pub const AGENTS: [Agent; 3] = [
-    Agent {
-        name: "claude",
-        bin: "claude",
-        skip_flag: "--dangerously-skip-permissions",
-    },
-    Agent {
-        name: "codex",
-        bin: "codex",
-        skip_flag: "--dangerously-bypass-approvals-and-sandbox",
-    },
-    Agent {
-        name: "cursor",
-        bin: "cursor-agent",
-        skip_flag: "--force",
-    },
-];
+#[deprecated(since = "0.4.0", note = "use `doctor_kit::fix::AGENTS`")]
+pub use doctor_kit::fix::AGENTS;
 
-/// Variables set inside a coding agent's own shell, plus the manual switch.
-const AGENT_ENV: [&str; 5] = [
-    "CLAUDECODE",
-    "CODEX_THREAD_ID",
-    "CODEX_SANDBOX",
-    "CURSOR_SANDBOX",
-    "SIM_DOCTOR_AGENT",
-];
+/// Set by hand to say "this is inside an agent" (the kit's own markers are `CLAUDECODE`,
+/// `CODEX_THREAD_ID`, `CODEX_SANDBOX` and `CURSOR_SANDBOX`).
+const AGENT_ENV: &str = "SIM_DOCTOR_AGENT";
 
 /// Replaces control and invisible characters with a space, a backtick with an apostrophe
 /// (so text cannot close the fence), and caps the length.
@@ -107,20 +79,16 @@ pub fn build_prompt(
 }
 
 /// True when running inside a coding agent: any marker variable set to something
-/// other than empty or `0`.
+/// other than empty or `0` (the kit treats `0` as set; here it never was).
 pub fn in_agent(get: impl Fn(&str) -> Option<String>) -> bool {
-    AGENT_ENV
-        .iter()
-        .any(|key| get(key).is_some_and(|v| !v.is_empty() && v != "0"))
+    doctor_kit::fix::in_agent(|key| get(key).filter(|v| v != "0"), &[AGENT_ENV])
 }
 
-/// The argv that starts `agent` with `prompt`. Never a shell string.
-pub fn launch_argv(agent: &Agent, prompt: &str, skip: bool) -> Vec<String> {
+/// The argv that starts `agent` with `prompt`: the executable, the flag that skips its approval
+/// prompts when asked, the prompt. Never a shell string.
+pub fn launch_argv(agent: &doctor_kit::fix::AgentSpec, prompt: &str, skip: bool) -> Vec<String> {
     let mut argv = vec![agent.bin.to_owned()];
-    if skip {
-        argv.push(agent.skip_flag.to_owned());
-    }
-    argv.push(prompt.to_owned());
+    argv.extend(doctor_kit::fix::launch_argv(agent, prompt, skip));
     argv
 }
 
@@ -253,7 +221,10 @@ mod tests {
             ),
             ("cursor", "cursor-agent", "--force"),
         ] {
-            let agent = AGENTS.iter().find(|a| a.name == name).unwrap();
+            let agent = doctor_kit::fix::AGENTS
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap();
             assert_eq!(launch_argv(agent, "P", false), [bin, "P"]);
             assert_eq!(launch_argv(agent, "P", true), [bin, flag, "P"]);
         }
