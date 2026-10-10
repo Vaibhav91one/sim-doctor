@@ -64,8 +64,8 @@
 //! # Not implemented
 //!
 //! The "alternative case 3" form of EnableProfile and DeleteProfile (P1 `90`,
-//! no response data, 5.7.16 and 5.7.18), and the RetrieveNotificationsList,
-//! HandleNotification and SetDefaultDpAddress functions. None is
+//! no response data, 5.7.16 and 5.7.18), and the SetDefaultDpAddress function
+//! (HandleNotification is ES9+, in [`crate::es9`]). None is
 //! in issue #18. Decoders preserve tags they do not know in `unknown` fields
 //! instead of dropping them.
 
@@ -1054,6 +1054,11 @@ pub fn memory_reset_request(options: ResetOptions) -> Result<Vec<u8>, EncodeErro
 /// [48] SEQUENCE { seqNumber [0] INTEGER }`) and lpac `euicc/es10b.c`
 /// (`es10b_remove_notification_from_list` sends `BF30 { 80 <long2bin> }`).
 pub fn remove_notification_request(seq_number: u32) -> Vec<u8> {
+    tlv(0xBF30, &tlv(0x80, &seq_integer(seq_number)))
+}
+
+/// `seqNumber` as the shortest two's-complement INTEGER content.
+fn seq_integer(seq_number: u32) -> Vec<u8> {
     let mut int: Vec<u8> = seq_number
         .to_be_bytes()
         .iter()
@@ -1063,7 +1068,28 @@ pub fn remove_notification_request(seq_number: u32) -> Vec<u8> {
     if int.first().is_none_or(|b| b & 0x80 != 0) {
         int.insert(0, 0);
     }
-    tlv(0xBF30, &tlv(0x80, &int))
+    int
+}
+
+/// `RetrieveNotificationsListRequest`, `BF2B` ([SGP.22 v2.5 §5.7], clause
+/// number not checked): the signed `PendingNotification`s, read-only
+/// (retrieving removes nothing; that is RemoveNotificationFromList). `None` is
+/// `BF2B 00`, the OPTIONAL `searchCriteria` left out, so every pending
+/// notification comes back. `Some(seq)` is `BF2B { A0 { 80 <seqNumber> } }`.
+///
+/// Checked 2026-10-10 against lpac `euicc/es10b.c`
+/// (`es10b_retrieve_notifications_list`: `BF2B`, constructed `A0`
+/// `searchCriteria`, `80 <long2bin>`; lpac never sends the no-filter form)
+/// and pySim `pySim/esim/asn1/rsp/rsp.asn` (`RetrieveNotificationsListRequest
+/// ::= [43] SEQUENCE { searchCriteria CHOICE { seqNumber [0] INTEGER,
+/// profileManagementOperation [1] NotificationEvent } OPTIONAL }`). The `A0`
+/// is the AUTOMATIC TAGS context tag of the lone, untagged `searchCriteria`
+/// member (see the module's Tagging section), so both agree.
+pub fn retrieve_notifications_request(seq_number: Option<u32>) -> Vec<u8> {
+    match seq_number {
+        None => tlv(0xBF2B, &[]),
+        Some(seq) => tlv(0xBF2B, &tlv(0xA0, &tlv(0x80, &seq_integer(seq)))),
+    }
 }
 
 /// The `searchCriteria` of GetProfilesInfo ([SGP.22 v2.5 §5.7.15]).
@@ -1536,6 +1562,130 @@ fn decode_notification_metadata(value: &[u8]) -> Result<NotificationMetadata, De
         iccid,
         unknown,
     })
+}
+
+/// Which `PendingNotification` CHOICE arm a notification is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingKind {
+    /// `profileInstallationResult` (`BF37`), sent after a profile install.
+    ProfileInstallationResult,
+    /// `otherSignedNotification` (a SEQUENCE, `30`): enable, disable, delete.
+    OtherSigned,
+}
+
+/// One signed `PendingNotification`: the exact bytes to hand to
+/// ES9+.HandleNotification, and the metadata read out of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingNotification {
+    /// The CHOICE arm.
+    pub kind: PendingKind,
+    /// The whole encoding (`BF37 ..` or `30 ..`), unmodified: the eUICC's
+    /// signature covers it.
+    pub raw: Vec<u8>,
+    /// The `NotificationMetadata` (`BF2F`) inside it.
+    pub metadata: NotificationMetadata,
+    /// `transactionId` (`80`) of a profile installation result.
+    pub transaction_id: Option<Vec<u8>>,
+}
+
+/// Decodes one `PendingNotification`, as far as lpac does and a little
+/// further: the arm, the `BF2F` metadata, and for `BF37` the `transactionId`.
+/// The signature and certificates are not checked.
+///
+/// Checked 2026-10-10 against lpac `euicc/es10b.c`
+/// (`es10b_retrieve_notifications_list`: tag `BF37` descends `BF27` then
+/// `BF2F`; tag `30` finds `BF2F` directly; the notification address is the
+/// `0C` inside) and pySim `rsp.asn` (`PendingNotification ::= CHOICE {
+/// profileInstallationResult [55] ProfileInstallationResult, otherSignedNotification
+/// OtherSignedNotification }`; `ProfileInstallationResultData ::= [39]
+/// SEQUENCE { transactionId [0], notificationMetadata [47], .. }`;
+/// `OtherSignedNotification ::= SEQUENCE { tbsOtherNotification
+/// NotificationMetadata, .. }`).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for trailing data, an unknown arm or a missing `BF2F`.
+pub fn decode_pending_notification(raw: &[u8]) -> Result<PendingNotification, DecodeError> {
+    let outer = parse(raw)?;
+    let [node] = outer.as_slice() else {
+        return Err(match outer.first() {
+            None => DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            },
+            Some(first) => DecodeError::TrailingData(raw.len() - first.raw.len()),
+        });
+    };
+    let (kind, fields) = match node.tag {
+        0xBF37 => {
+            let data = parse(node.value)?
+                .into_iter()
+                .find(|n| n.tag == 0xBF27)
+                .ok_or(DecodeError::MissingField("profileInstallationResultData"))?;
+            (PendingKind::ProfileInstallationResult, parse(data.value)?)
+        }
+        0x30 => (PendingKind::OtherSigned, parse(node.value)?),
+        found => {
+            return Err(DecodeError::UnexpectedTag {
+                context: "PendingNotification",
+                found,
+            })
+        }
+    };
+    let meta = fields
+        .iter()
+        .find(|n| n.tag == 0xBF2F)
+        .ok_or(DecodeError::MissingField("notificationMetadata"))?;
+    let transaction_id = (kind == PendingKind::ProfileInstallationResult)
+        .then(|| fields.iter().find(|n| n.tag == 0x80))
+        .flatten()
+        .map(|n| n.value.to_vec());
+    Ok(PendingNotification {
+        kind,
+        raw: raw.to_vec(),
+        metadata: decode_notification_metadata(meta.value)?,
+        transaction_id,
+    })
+}
+
+/// `RetrieveNotificationsListResponse` (`BF2B`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetrieveNotificationsResponse {
+    /// `notificationList` (`A0`).
+    Ok(Vec<PendingNotification>),
+    /// `notificationsListResultError`: 1 noResultAvailable, 127 undefinedError.
+    Error(u8),
+}
+
+/// Decodes the response data of RetrieveNotificationsList (`BF2B`).
+///
+/// # Errors
+///
+/// A [`DecodeError`] for a malformed structure or notification.
+pub fn decode_retrieve_notifications(
+    data: &[u8],
+) -> Result<RetrieveNotificationsResponse, DecodeError> {
+    let outer = only(data, 0xBF2B)?;
+    let [choice] = outer.as_slice() else {
+        return Err(DecodeError::MissingField(
+            "retrieveNotificationsListResponse",
+        ));
+    };
+    match choice.tag {
+        0x81 => Ok(RetrieveNotificationsResponse::Error(small_int(
+            choice.value,
+            "notificationsListResultError",
+        )?)),
+        0xA0 => parse(choice.value)?
+            .into_iter()
+            .map(|node| decode_pending_notification(node.raw))
+            .collect::<Result<_, _>>()
+            .map(RetrieveNotificationsResponse::Ok),
+        found => Err(DecodeError::UnexpectedTag {
+            context: "RetrieveNotificationsListResponse",
+            found,
+        }),
+    }
 }
 
 /// `PrepareDownloadResponse` ([SGP.22 v2.5 §5.7.5]).

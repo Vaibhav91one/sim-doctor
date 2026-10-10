@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    access, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, rules, sarif, scan,
+    access, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, notif, rules, sarif, scan,
     session, signals, skill, tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
@@ -235,7 +235,8 @@ enum Command {
     /// requests, and closes the channel. info, profiles and notifications only
     /// read. `nickname`, `enable`, `disable`, `delete`, `reset` and
     /// `notifications remove` are the writes: dry runs unless --yes (`reset` also
-    /// needs --confirm-eid). Never retrieves a notification. The output is the
+    /// needs --confirm-eid). `notifications dump` retrieves (read-only), `notifications
+    /// replay` reaches the network (dry run unless --yes). The output is the
     /// lpac envelope under --json. Exit codes: 0 answered, 1 the card is not an
     /// eUICC, refused, or answered something malformed (the envelope carries
     /// `data.error.kind`), 129 for a bad command line, 130 if interrupted.
@@ -255,7 +256,7 @@ enum EuiccAction {
     Info(EuiccFlags),
     /// Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`).
     Profiles(EuiccFlags),
-    /// Pending notification metadata, nothing retrieved (lpac `notification list`);
+    /// Pending notification metadata (lpac `notification list`); `dump` and `replay` below;
     /// `notifications remove <seq>` removes one.
     Notifications(NotificationsArgs),
     /// Set a profile's nickname (lpac `profile nickname`). A write: a dry
@@ -296,6 +297,45 @@ enum NotificationAction {
     /// ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed
     /// notification is never sent to the operator's server. Never exposed over MCP.
     Remove(RemoveArgs),
+    /// Read the full signed pending notifications (lpac `notification dump`,
+    /// ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of
+    /// the signed bytes plus the decoded sequence number, operation, address
+    /// and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the
+    /// document itself is printed. Never exposed over MCP.
+    Dump(DumpArgs),
+    /// Send the notifications of a dump file to their operators (ES9+
+    /// HandleNotification over HTTPS). A dry run unless `--yes`: this reaches
+    /// the network and tells the operator's server about a profile event. Needs
+    /// no card and removes nothing. Never exposed over MCP.
+    Replay(ReplayArgs),
+}
+
+/// Everything `sim-doctor euicc notifications dump` takes.
+#[derive(Args)]
+struct DumpArgs {
+    /// Only the notification with this sequence number (default: all pending).
+    #[arg(long, value_name = "N")]
+    seq: Option<u32>,
+    /// Write the dump document to FILE (must not exist) instead of stdout.
+    #[arg(short = 'o', long, value_name = "FILE")]
+    output: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    flags: EuiccFlags,
+}
+
+/// Everything `sim-doctor euicc notifications replay` takes.
+#[derive(Args)]
+struct ReplayArgs {
+    /// A dump file written by `notifications dump` (or its `--json` output).
+    #[arg(long, value_name = "FILE")]
+    from: std::path::PathBuf,
+    /// Actually send. Without it nothing leaves this machine: the targets and
+    /// what would be sent are printed.
+    #[arg(long)]
+    yes: bool,
+    /// Emit one lpac envelope on stdout, and nothing else.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Everything `sim-doctor euicc notifications remove` takes.
@@ -1194,6 +1234,8 @@ fn main() -> process::ExitCode {
             EuiccAction::Notifications(n) => match n.action {
                 None => run_euicc(euicc::Query::Notifications, &n.flags),
                 Some(NotificationAction::Remove(a)) => run_euicc_remove(&a),
+                Some(NotificationAction::Dump(a)) => run_euicc_dump(&a),
+                Some(NotificationAction::Replay(a)) => run_euicc_replay(&a),
             },
             EuiccAction::Nickname(n) => run_euicc_nickname(&n),
             EuiccAction::Enable(a) => run_euicc_state(euicc::Action::Enable, &a),
@@ -2174,6 +2216,115 @@ fn run_euicc_remove(args: &RemoveArgs) -> contract::ExitCode {
         |session, aid| euicc::remove_notification(session, aid, max, request),
         euicc::erase_to_human,
     )
+}
+
+/// `sim-doctor euicc notifications dump [--seq N] [-o FILE]`: read-only.
+fn run_euicc_dump(args: &DumpArgs) -> contract::ExitCode {
+    let max = usize::from(args.flags.max_segment);
+    let output = args.output.clone();
+    let to_file = output.is_some();
+    run_euicc_op(
+        &args.flags,
+        |session, aid| {
+            let mut data = euicc::dump_notifications(session, aid, max, args.seq)?;
+            if let Some(path) = &output {
+                let doc = serde_json::json!({
+                    "format": data["format"], "eid": data["eid"],
+                    "notifications": data["notifications"],
+                });
+                let text = serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n";
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .and_then(|mut f| io::Write::write_all(&mut f, text.as_bytes()))
+                    .map_err(|e| {
+                        euicc::Failure::new(
+                            "write-failed",
+                            format!("cannot write {}: {e}", path.display()),
+                            serde_json::json!({}),
+                        )
+                    })?;
+                data["written_to"] = serde_json::json!(path.display().to_string());
+            }
+            Ok(data)
+        },
+        |data| {
+            if to_file {
+                euicc::dump_to_human(data)
+            } else {
+                // The document itself, re-loadable by `notifications replay`.
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "format": data["format"], "eid": data["eid"],
+                    "notifications": data["notifications"],
+                }))
+                .unwrap_or_default()
+            }
+        },
+    )
+}
+
+/// `sim-doctor euicc notifications replay --from FILE [--yes]`: a dry run
+/// unless `--yes`. Touches no card; opens a transport only when sending.
+fn run_euicc_replay(args: &ReplayArgs) -> contract::ExitCode {
+    const KIND: &str = contract::DEFAULT_KIND;
+    let refuse = |f: euicc::Failure| report_refusal(KIND, &f.message, f.data, args.json);
+    let text = match std::fs::read_to_string(&args.from) {
+        Ok(text) => text,
+        Err(e) => {
+            return refuse(euicc::Failure::new(
+                "bad-dump",
+                format!("cannot read {}: {e}", args.from.display()),
+                serde_json::json!({}),
+            ))
+        }
+    };
+    let mut transport = if args.yes {
+        match sim_doctor::backend::HttpBackend::open_from_env() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                return refuse(euicc::Failure::new(
+                    "transport-unavailable",
+                    e,
+                    serde_json::json!({}),
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let data = match notif::replay(
+        &text,
+        transport
+            .as_mut()
+            .map(|t| &mut **t as &mut dyn sim_doctor::es9::Es9Transport),
+    ) {
+        Ok(data) => data,
+        Err(f) => return refuse(f),
+    };
+    let rendered = if args.json {
+        match contract::Envelope::new(
+            KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        )
+        .to_json()
+        {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("sim-doctor: {err}");
+                return contract::ExitCode::Findings;
+            }
+        }
+    } else {
+        notif::to_human(&data).trim_end().to_owned()
+    };
+    if let Err(err) = emit_stdout(&rendered, "the replay report") {
+        eprintln!("sim-doctor: {err}");
+        return contract::ExitCode::Findings;
+    }
+    contract::ExitCode::Success
 }
 
 /// Connects to the reader and card named by `flags`, runs `op` against the
