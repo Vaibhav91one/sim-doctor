@@ -6,6 +6,52 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0]
+
+sim-doctor now runs on [doctor-kit](https://crates.io/crates/doctor-kit) 0.2.1, the CLI skeleton shared by the doctor
+tools. **Machine output is unchanged**: the `--json` envelopes (compact, sorted keys), the finding fingerprints, the SARIF
+files (card-path locations), the exit codes 0/1/2/3/129/130 with `--fail-on` defaulting to `critical`, the `rules`, `why`,
+`trace`, `ts48`, `gp`, `euicc`, `fuzz`, `modules`, `completions` and `ci` commands, the install file bodies, the MCP tool
+names, schemas and wire text, and the `--help` command names are byte-identical to 0.3.0. They are pinned by
+`tests/golden.rs` and the new `tests/golden_scan.rs`, which runs the real binary over a recorded card session (the goldens
+were generated on the 0.3.0 code). What the kit does differently by default is kept as it was through its hooks: the
+baseline file rules and refusals, the multiset `new` / `unchanged` labels, the JSON style, the human report, the MCP error
+texts, the `install` file merge.
+
+### Fixed (contract)
+
+- `--sarif` and `--baseline` naming one file are refused (exit 2, nothing written) however the two paths are spelled
+  (`x.json` and `sub/../x.json` are one file); before, only identical spellings were. The doctor/1 exit code 2 for errors
+  and the MCP `ping` / `-32600` answers were already sim-doctor's; they are now also guaranteed by the kit's loop.
+
+### Added
+
+- `shell` and `explore`: an interactive shell and a full-screen explorer over the card (doctor-kit). The session reads the card
+  once and shows the findings by category and, under `card`, the file system: master file, directories and files,
+  one directory at a time, with what the walk read of an EF (`ls`, `cd`, `info`, `cat`, `decode`, `find`; `shell -c "..."`,
+  `shell --json` for agents). They take `--reader`, `--dialect`, the walk bounds and `--tar`, read only, and are on by default;
+  `cargo build --no-default-features` leaves them (and `reedline`) out.
+- `scan --face rich|plain|compact`, `--theme mono|clinical|contrast`, `--color auto|always|never` and `--headless`: the findings
+  in a doctor-kit face. The default report (files, TAR audit, `--score`) is the one it always was; `--tui` is the findings
+  view it always was (the kit's explorer does not show the walk's coverage, truncation and TAR-stop notes, so it did not replace it).
+- `SIM_DOCTOR_TEST_REPLAY=<log>` (test seam): `scan` answers from a `SIM_DOCTOR_RECORD` log instead of a reader.
+
+### Changed
+
+- The report pipeline of `scan` (baseline gate and exit code, the one write of the report), the MCP server loop, the
+  `install` file writer and the SIGINT / SIGTERM flag are doctor-kit's. Known edges, none of them in machine output:
+  `install` refuses to write through a symlink and writes by temp file and rename (`ci install` already refused symlinks);
+  an MCP request with neither `id` nor a string `method` is no longer answered (it got `-32600` with a null `id`); an
+  interrupt that arrives after the last checkpoint but before the report is written gives the kit's interrupted
+  envelope and exit 130 instead of the finished report.
+- Library API: `sim_doctor::signals` is a shim over `doctor_kit::interrupt` (`install`, `interrupted` deprecated);
+  `skill`, `fix` and `mcp` keep their names, with `skill::Agent`, `fix::{Agent, AGENTS}` and `mcp::{handle, process_line, serve}`
+  as deprecated re-exports of the kit's (same names, the kit's signatures). Removed: `skill::{Target, targets, upsert_block,
+  install}` and `fix::launch_argv`'s agent type (now the kit's `AgentSpec`, field `bypass`). `mcp::tools` and `mcp::run_self` are new;
+  `scan::node_json` is now public. `modules --json` lists the same modules.
+- `doctor-kit` 0.2.1 is a new dependency (with `toml`); `reedline` comes with the default `shell` feature.
+
+
 ### Changed
 
 - Point URLs at the doctor-labs org (the repository moved from Vaibhav91one).

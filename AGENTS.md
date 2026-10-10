@@ -201,7 +201,7 @@ exit codes (rule IDs, TAR scanning, EF full visibility, the score formula) is un
 
 ```json
 {
-  "schema": "doctor/1", "tool": "sim-doctor", "version": "0.3.0", "exit_code": 1,
+  "schema": "doctor/1", "tool": "sim-doctor", "version": "0.4.0", "exit_code": 1,
   "score": { "value": 61, "label": "needs work", "model": "sim/1", "coverage_gaps": 0 },
   "findings": [ { "id": "gsma/msl-zero-allowed", "fingerprint": "f405c45b121ae11d",
                   "severity": "critical", "category": "gsma", "message": "...",
@@ -1300,5 +1300,6 @@ identifiers 7FF0-7FFF inside an application are aliases (TS 102 221 clause 8.3 d
 | What is the dependency set and why? | [Cargo.toml](Cargo.toml) + section 4 above |
 | What is the output contract? | Section 3 above |
 | What protocol facts can I trust? | Section 5 above, `[V]` tags only |
+| How is the CLI wired? | `src/kit.rs`: sim-doctor runs on [doctor-kit](https://crates.io/crates/doctor-kit) (`run_with`); every command of the derive-built `Cli` in `src/main.rs` is mounted unchanged, `scan` reports through the kit's `preflight` / `finish`, `install` and `mcp` use the kit's writer and server loop, `shell` / `explore` are the kit's. What the kit does differently from the contract in section 3 is kept through `Doctor` hooks and pinned by `tests/golden.rs` and `tests/golden_scan.rs`: change those goldens only for an intended change of machine output. |
 
 

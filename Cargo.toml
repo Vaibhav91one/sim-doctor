@@ -1,6 +1,6 @@
 [package]
 name = "sim-doctor"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"
 description = "CLI-first SIM/UICC/eUICC security testing tool: scans a card over PC/SC and reports findings as a table or one stable JSON envelope"
@@ -85,8 +85,12 @@ version = "1.53.2"
 optional = true
 
 [features]
-default = []
+default = ["shell"]
 remote  = ["dep:tokio"]   # only for remote-SIM / ATC-UICCS; pure PC/SC is sync
+# `shell` (a REPL over a card: its findings and its files) and `explore` (the full-screen
+# version), from doctor-kit. On by default; build with --no-default-features to leave them, and
+# reedline and the kit's ratatui view, out.
+shell   = ["doctor-kit/repl", "doctor-kit/tui"]
 
 # Opt-in gate for the software-card fixture added by issue #4. OFF by default,
 # so a plain `cargo test` needs no reader, no pcscd and no swSIM: with this

@@ -2090,7 +2090,8 @@ fn selected_line(node: &Node) -> String {
 }
 
 /// The JSON record for one node, whatever state it is in.
-fn node_json(node: &Node) -> Value {
+/// One walked file as the `files` entries of the scan JSON carry it (the shell shows the same).
+pub fn node_json(node: &Node) -> Value {
     let mut value = json!({
         "path": node.path().to_string(),
         "state": state_name(node),

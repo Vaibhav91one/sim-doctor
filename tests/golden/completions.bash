@@ -2612,7 +2612,7 @@ _sim__doctor() {
             return 0
             ;;
         sim__subcmd__doctor__subcmd__scan)
-            opts="-h --json --tui --dialect --reader --max-depth --max-children --max-nodes --max-directories --score --severity --baseline --fail-on --sarif --tar --terminal-profile --help"
+            opts="-h --json --tui --dialect --reader --max-depth --max-children --max-nodes --max-directories --score --severity --baseline --fail-on --sarif --tar --terminal-profile --face --theme --color --headless --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2660,6 +2660,18 @@ _sim__doctor() {
                     ;;
                 --tar)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --face)
+                    COMPREPLY=($(compgen -W "plain rich compact" -- "${cur}"))
+                    return 0
+                    ;;
+                --theme)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --color)
+                    COMPREPLY=($(compgen -W "auto always never" -- "${cur}"))
                     return 0
                     ;;
                 *)

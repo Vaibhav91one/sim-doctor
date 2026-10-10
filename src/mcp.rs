@@ -38,10 +38,13 @@ pub const NAME: &str = "mcp";
 pub use doctor_kit::mcp::{handle, process_line, serve};
 
 /// `scan` flags an agent cannot reach: `tui` is interactive, `json` is always
-/// forced on, and `help` and `version` make no sense over MCP. `baseline`,
+/// forced on, `help` and `version` make no sense over MCP, and `face`, `theme`, `color` and
+/// `headless` only style a terminal report. `baseline`,
 /// `fail-on` and `sarif` ARE exposed (doctor/1 section 7); `baseline` and
 /// `sarif` take a path the agent chooses, as the CLI does.
-const EXCLUDED: &[&str] = &["tui", "json", "help", "version"];
+const EXCLUDED: &[&str] = &[
+    "tui", "json", "help", "version", "face", "theme", "color", "headless",
+];
 
 /// A call's default wall-clock limit; `SIM_DOCTOR_MCP_TIMEOUT_SECONDS` overrides it.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);

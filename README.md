@@ -62,6 +62,7 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | Command | What it does |
 | --- | --- |
 | `sim-doctor scan` | walk the card and report; `--json` for the doctor/1 envelope, `--sarif FILE` for SARIF, `--tui` for the terminal view, `--baseline FILE` to gate on new findings |
+| `sim-doctor shell` / `explore` | browse the card's findings and files: an interactive shell, and a full-screen explorer ([below](#explore-a-card)) |
 | `sim-doctor mcp` | serve the scan and rules to agents over stdio ([MCP server](#mcp-server)) |
 | `sim-doctor fix <rule-id> --from FILE` | print (or launch an agent with) a prompt for one finding |
 | `sim-doctor install` | write the agent skill and rules into a project |
@@ -120,7 +121,7 @@ sim-doctor scan --json
 With no reader attached, this is the real output, and it exits `2`:
 
 ```json
-{"data":{"card_touched":false,"error":{"kind":"no-reader","message":"no PC/SC reader is attached. Start pcscd and attach a card, or see docs/swsim-fixture.md for the software SIM this project tests against"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"0.3.0"}
+{"data":{"card_touched":false,"error":{"kind":"no-reader","message":"no PC/SC reader is attached. Start pcscd and attach a card, or see docs/swsim-fixture.md for the software SIM this project tests against"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"0.4.0"}
 ```
 
 With a card, `findings` and `score` are the result and `data` carries the file tree, the dialect
@@ -163,6 +164,20 @@ It is a view over the data `--json` carries and never shows anything the envelop
 with `--json` (usage error, exit 2). When stdin or stdout is not a terminal it prints the normal report and
 writes `sim-doctor: --tui needs a terminal; showing the plain report` to stderr. The rendering is unit-tested
 against an in-memory backend; the interactive loop is **not** tested against a real terminal in CI.
+
+## Explore a card
+
+`sim-doctor shell` reads the card once (the same walk as `scan`, no TAR audit unless `--tar` asks for one) and opens a
+shell over it: the findings by category, and under `card` the file system, one directory at a time (`cd card`,
+`cd 3F00`, `ls`, `info 2FE2`, `cat 6F07`, `decode`, `find`). `shell -c "ls; cd card; ls"` runs commands and exits;
+`--json` prints one `doctor-shell/1` record per reply, for agents. `sim-doctor explore` is the full-screen version of
+the same session (`hjkl`, enter, `/` filter, `d` decode, `w` why, `x` export, tab, `q`). Both take `--reader`,
+`--dialect`, the walk bounds and `--tar`; both read only (SELECT, READ BINARY, READ RECORD), come from doctor-kit and are
+on by default (build with `--no-default-features` to leave them out).
+
+`scan` prints its own report by default. `--face rich|plain|compact`, `--theme mono|clinical|contrast`, `--color
+auto|always|never` and `--headless` print the findings with a doctor-kit face instead; `--json`, `--sarif`,
+`--baseline` and the exit codes do not change. `scan --tui` is still the findings view described above.
 
 ## CLI reference
 
@@ -452,7 +467,7 @@ android-doctor and ble-doctor print, so one parser reads all five. The contract 
 [docs/doctor-contract.md](docs/doctor-contract.md); the sim-doctor specifics are in AGENTS.md section 3.
 
 ```json
-{"schema":"doctor/1","tool":"sim-doctor","version":"0.3.0","exit_code":1,
+{"schema":"doctor/1","tool":"sim-doctor","version":"0.4.0","exit_code":1,
  "score":{"value":61,"label":"needs work","model":"sim/1","coverage_gaps":0},
  "findings":[{"id":"...","fingerprint":"<16 hex>","severity":"critical","category":"gsma",
               "message":"...","location":{"kind":"card-path","ref":"3F00/2F00/6F07"},
@@ -591,7 +606,7 @@ permissions:
   security-events: write
 steps:
   - uses: actions/checkout@v5
-  - uses: doctor-labs/sim-doctor@<tag> # a release tag, e.g. v0.3.0
+  - uses: doctor-labs/sim-doctor@<tag> # a release tag, e.g. v0.4.0
     with:
       swsim: "true"   # build the pinned software card; omit when the runner has a real reader
 ```
@@ -616,7 +631,7 @@ against the baseline) fails the job ("GATE FAILED"); a CLI exit 2 or 130, an err
 What is verified: the script logic (gate mapping, argv, summary, sanitising of card/tool text) locally against a fake
 `sim-doctor` in `tests/action_script.rs`. The software-card build, install, scan and SARIF upload are exercised only by the
 `action-selftest` workflow on a hosted runner, with no baseline (so it reports, it does not gate). A gating run against a
-real baseline, and acceptance of the SARIF by code scanning, are not verified. Use a released tag (v0.3.0 or later) for `@<tag>`.
+real baseline, and acceptance of the SARIF by code scanning, are not verified. Use a released tag (v0.4.0 or later) for `@<tag>`.
 
 ### `sim-doctor ci install`
 
