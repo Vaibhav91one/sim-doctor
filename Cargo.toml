@@ -69,6 +69,13 @@ chrono = "0.4.45"
 zip = { version = "5.1.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }  # read-only CAP (zip) files for src/cap.rs
 regex = "1.13.1"   # TAR selection patterns for --tar regex:PATTERN. NOT a new package
 
+# --- ES9+ HTTPS transport (src/es9_https.rs) ---
+# ureq 3 with rustls: a small blocking client, no async runtime, no OpenSSL, no
+# C TLS library to cross-build (the aarch64 CI job needs none). Redirects can be
+# switched off and bodies capped, which the ES9+ rules need. The default
+# features (gzip, ...) are off; "rustls" brings ring and the Mozilla web roots.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+
 [dependencies.tokio]
 version = "1.53.2"
 optional = true
@@ -88,3 +95,9 @@ remote  = ["dep:tokio"]   # only for remote-SIM / ATC-UICCS; pure PC/SC is sync
 # `cargo test --all-features` stays green on a laptop with no reader. See
 # docs/swsim-fixture.md for the full fixture and local reproduction steps.
 card-fixture = []
+
+[dev-dependencies]
+# Local TLS server for tests/es9_https.rs: a CA and a leaf certificate made at
+# test time. Dev-only, never in the shipped binary. ring, as ureq's rustls uses.
+rcgen  = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

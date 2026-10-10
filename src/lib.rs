@@ -29,6 +29,8 @@
 //! layer 1  es10        ES10x: STORE DATA segmentation, ES10b/ES10c encoders and decoders
 //! layer 1  euicc      eUICC queries (ISD-R, ES10) and the profile and notification writes behind `sim-doctor euicc`
 //! layer 1  es9         ES9+: the JSON-over-HTTPS messages to an SM-DP+, behind a transport trait
+//! layer 1  es9_https   the verified HTTPS (and lpac stdio) ES9+ transport; the only socket in the crate
+//! layer 1  backend     SIM_DOCTOR_HTTP / SIM_DOCTOR_CA_BUNDLE selection, after lpac
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
@@ -104,6 +106,7 @@ pub mod access;
 pub mod aka;
 pub mod apdu;
 pub mod apdu_scan;
+pub mod backend;
 pub mod baseline;
 pub mod bpp;
 pub mod cap;
@@ -113,6 +116,7 @@ pub mod der;
 pub mod ef;
 pub mod es10;
 pub mod es9;
+pub mod es9_https;
 pub mod euicc;
 pub mod fcp;
 pub mod fix;

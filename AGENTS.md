@@ -1046,6 +1046,19 @@ GPShell3 DAP token family: `sign-load-token`, `sign-install-token`, `sign-delete
 
 ### 5.6 SGP.22 ES9+ / ES10x
 
+**ES9+ HTTPS transport (issue #20, `src/es9_https.rs`, `src/backend.rs`).** Binding decisions:
+the tool is offline unless a command explicitly needs ES9+; TLS verification is always on and
+there is no insecure flag or variable (lpac's curl backend disables it, do not copy that); the
+default trust anchor is the bundled GSMA RSP2 Root CI1 (`certs/gsma-rsp2-root-ci1.pem`, SHA-256
+pinned by a test) because SGP.22 v2.2.2 §4.5.2.2 requires a chain to a GSMA CI [V] and a live
+handshake to smdp.io shows exactly that chain [V, 2026-10-09]; `SIM_DOCTOR_CA_BUNDLE` (PEM path)
+replaces it and the word `webpki` selects the Mozilla roots, which are never a silent fallback.
+Redirects are never followed; timeout and response cap are mandatory. One HTTP dependency,
+`ureq` 3 with rustls (blocking, no tokio, no C TLS library). `SIM_DOCTOR_HTTP` (`https`|`stdio`)
+is read only by library callers until a command uses ES9+ (#118); there is no APDU selector
+variable, do not add one that nothing reads. lpac's `LPAC_*` names are deliberately not read.
+Tests use a local rustls server and an rcgen CA made at test time (`tests/es9_https.rs`).
+
 ES9+ section mapping [V] SGP.22 v2.5 §5.6 (headings checked 2026-10-07):
 
 | Section | Function |

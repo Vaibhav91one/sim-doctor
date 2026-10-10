@@ -447,7 +447,7 @@ anything that needs PIN, ADM or SCP keys. eUICC/SGP.22 rules need the eUICC read
 separate work. The MSL 0 check runs on a real
 card, but a card that answers every ENVELOPE with `6F00` gives an inconclusive result
 ([#98](https://github.com/Vaibhav91one/sim-doctor/issues/98)). The eUICC stack (SCP03t, BPP, ES10x,
-ES9+) is library code with no card or network path yet.
+ES9+) is library code with no card or network path from the CLI yet; the HTTPS transport for ES9+ exists (see Privacy and telemetry) but no command calls it.
 See [CONTEXT.md](CONTEXT.md) for the plan.
 
 `sim-doctor scan --sarif FILE` also writes the findings as SARIF 2.1.0, using logical locations
@@ -530,9 +530,28 @@ The file is written atomically (a temp file renamed over the target); a director
 
 ## Privacy and telemetry
 
-`sim-doctor` sends nothing anywhere. It talks to the PC/SC reader you point it at. The
-only network access is the npm launcher's one-time release download. Never commit card
+`sim-doctor` is offline by default and sends nothing anywhere. It talks to the PC/SC reader
+you point it at. The only network access is the npm launcher's one-time release download, and
+the ES9+ HTTPS transport in the library (`sim_doctor::es9_https`), which opens a socket only
+when a command explicitly needs an SM-DP+ (no shipped command does yet). Never commit card
 secrets (keys, KI/OPc, ADM codes).
+
+ES9+ HTTPS always verifies the server certificate; there is no insecure option. SGP.22
+section 4.5.2.2 anchors an SM-DP+ TLS certificate at a GSMA CI, and a plain handshake to
+`smdp.io` (1GLOBAL) shows its leaf is issued directly by `GSM Association - RSP2 Root CI1`, which
+no web root signs. So the default trust anchor is that CI, bundled as
+`certs/gsma-rsp2-root-ci1.pem` (SHA-256 `5E3E91FD...A56BB3`, full value and provenance in
+`src/es9_https.rs`; gsma.com blocks scripted downloads, so compare it with GSMA's published file).
+Other CIs (for example OISTE GSMA CI G1) need `SIM_DOCTOR_CA_BUNDLE=<pem file>`, which replaces
+the default; `SIM_DOCTOR_CA_BUNDLE=webpki` selects the Mozilla web roots explicitly. Redirects are
+never followed; a 30 s timeout and a 16 MiB response cap apply. lpac's curl backend turns
+verification off; this tool does not.
+
+`SIM_DOCTOR_HTTP` = `https` (default) or `stdio` (lpac's JSON-lines protocol, the host does the
+HTTP) mirrors lpac's `LPAC_HTTP`. Both variables take effect once a command uses ES9+
+([#118](https://github.com/Vaibhav91one/sim-doctor/issues/118)); no shipped command reads them
+today. There is no APDU selector: `euicc` commands open a PC/SC reader directly. lpac's
+AT/QMI/MBIM/curl/WinHTTP backends are not supported.
 
 ## Design principles
 
