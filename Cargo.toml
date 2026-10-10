@@ -51,6 +51,9 @@ owo-colors = "4.4.0"   # zero-alloc, best fit with ratatui
 
 # --- Serialization / errors ---
 doctor-core = "0.1"   # shared doctor/1 contract pieces (score label + score shape, SARIF fingerprint key)
+# The CLI skeleton (run_with: the shared commands, the report pipeline, the MCP loop). `repl` and `tui`
+# (the shell and explore commands) stay off until the PR that wires them.
+doctor-kit = { version = "0.2.1", default-features = false, features = ["mcp", "signals"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 anyhow = "1.0.104"

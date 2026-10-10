@@ -25,8 +25,10 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
+mod kit;
+
 use sim_doctor::{
     access, apdu_fuzz, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, notif, rules,
     sarif, scan, session, signals, skill, tar, trace,
@@ -1445,12 +1447,12 @@ fn main() -> process::ExitCode {
         eprintln!("sim-doctor: {err}");
     }
 
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(err) => return exit_with_clap_error(err),
-    };
+    kit::run()
+}
 
-    exit(match cli.command {
+/// Runs the parsed command and returns its exit code.
+fn dispatch(command: Command) -> contract::ExitCode {
+    match command {
         Command::Modules(args) => run_modules(args),
         Command::Scan(args) => run_scan(args),
         Command::Ts48(args) => match args.action {
@@ -1601,7 +1603,7 @@ fn main() -> process::ExitCode {
             FuzzAction::Ota(args) => run_fuzz_ota(args),
             FuzzAction::Mutate(args) => run_fuzz_mutate(args),
         },
-    })
+    }
 }
 
 /// Routes every `tracing` event to stderr, at a level quiet enough to leave it
@@ -4093,37 +4095,6 @@ fn report_scan_failure(failure: &scan::Failure, json: bool) -> contract::ExitCod
         }
     }
     contract::ExitCode::Error
-}
-
-/// Turns a clap failure into one of the four contract exit codes.
-///
-/// clap exits with 2 by default. That number is not in AGENTS.md section 3,
-/// so passing it through would mean a caller could not tell a typo from a
-/// crash. `--help` and `--version` are not failures and exit 0.
-fn exit_with_clap_error(err: clap::Error) -> process::ExitCode {
-    let code = match err.kind() {
-        ErrorKind::DisplayHelp
-        | ErrorKind::DisplayVersion
-        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => contract::ExitCode::Success,
-        // `scan` is a doctor/1 findings command: a usage error is 2 there.
-        _ if std::env::args()
-            .skip(1)
-            .find(|a| !a.starts_with('-'))
-            .as_deref()
-            == Some("scan") =>
-        {
-            contract::ExitCode::Error
-        }
-        _ => contract::ExitCode::InvalidUsage,
-    };
-    // clap already routes help to stdout and errors to stderr; do not print
-    // twice, and do not stack a second message on top of the one it built.
-    let _ = err.print();
-    exit(code)
-}
-/// Converts a contract exit code into the exit status of this process.
-fn exit(code: contract::ExitCode) -> process::ExitCode {
-    process::ExitCode::from(code.process_code())
 }
 
 #[cfg(test)]
