@@ -1,5 +1,0 @@
--> {"jsonrpc":"2.0"}
--> {"jsonrpc":"2.0","method":5}
--> ping (id 1)
-<- (only this)
-{"id":1,"jsonrpc":"2.0","result":{}}

@@ -4,6 +4,10 @@ exit 0
 sim-doctor: warning: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
 --- stdout
 /
+WARNING: INCOMPLETE: 11 coverage gap(s); findings may be missing
+WARNING: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+WARNING: score: the TAR audit probed nothing, so the MSL 0 check did not run: this score says nothing about whether the card refuses TAR 0, because no TAR was probed. Run with --tar focused to check
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 card           card      the card's files
 3F00           MF        master file
 2FE2           EF        transparent EF, 10 bytes, EF.ICCID
@@ -57,6 +61,8 @@ sim-doctor: warning: the TAR scan did not finish, so its findings are partial: t
 exit 0
 --- stderr
 --- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 gsma           category  1 findings
 card           card      the card's files
 1              finding   critical  gsma/msl-zero-allowed  tar:00000000
@@ -69,5 +75,6 @@ advice: none
 
 # explore without a terminal: exit 2
 --- stderr
-sim-doctor: explore needs a terminal; use `shell -c` for scripts
+sim-doctor: warning: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+error: explore needs an interactive terminal (stdin and stdout must be a TTY); use `shell -c "..."` in scripts
 

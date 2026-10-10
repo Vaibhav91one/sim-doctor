@@ -133,6 +133,10 @@ jobs:
       - name: cargo test --locked
         run: cargo test --locked
 
+      # The test seams (SIM_DOCTOR_TEST_*) must not exist in a release binary.
+      - name: release build ignores the test seams
+        run: cargo test --locked --test release_seams -- --ignored
+
   # Proves the release workflow's aarch64-unknown-linux-gnu build (native ARM runner) on every PR.
   # Build only, no tests: the unit/integration tests already run on x86_64 above.
   build-aarch64:

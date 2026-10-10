@@ -23,7 +23,7 @@ use std::env;
 use std::io::{self, Write};
 use std::process;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
@@ -63,6 +63,7 @@ const MODULES_KIND: &str = contract::DEFAULT_KIND;
 /// Unset in every normal invocation. When unset this costs one failed
 /// environment lookup and nothing else, and the checkpoint behaves exactly as
 /// it would without it.
+#[cfg(feature = "test-seams")]
 const SIGNAL_HOLD_ENV: &str = "SIM_DOCTOR_TEST_SIGNAL_HOLD_MS";
 
 /// The phrase [`SIGNAL_HOLD_ENV`] announces on stderr once the process is
@@ -74,6 +75,7 @@ const SIGNAL_HOLD_ENV: &str = "SIM_DOCTOR_TEST_SIGNAL_HOLD_MS";
 /// default disposition and kills the process, which is indistinguishable in a
 /// shell from the exit status we are trying to prove but is a different thing
 /// entirely.
+#[cfg(feature = "test-seams")]
 const PARKED_MARKER: &str = "parked at the interrupt checkpoint";
 
 /// Whether this process has already parked at a checkpoint.
@@ -84,11 +86,13 @@ const PARKED_MARKER: &str = "parked at the interrupt checkpoint";
 /// multiplied by thirty seconds, on a run that was going to be interrupted at
 /// the first. Parking once makes the hold mean "the first checkpoint", which is
 /// what the tests that set it actually mean.
+#[cfg(feature = "test-seams")]
 static PARKED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only, and only honoured together with [`SIGNAL_HOLD_ENV`]: after parking,
 /// block this thread forever instead of polling the interrupt flag, standing in
 /// for a PC/SC transmit that never returns. Unset in every normal invocation.
+#[cfg(feature = "test-seams")]
 const WEDGE_ENV: &str = "SIM_DOCTOR_TEST_WEDGE";
 
 /// How long a card command gets to unwind on its own after SIGINT/SIGTERM
@@ -1290,13 +1294,14 @@ struct ScanArgs {
     #[arg(long)]
     terminal_profile: bool,
 
-    /// Print the findings with a doctor-kit face instead of the full report.
+    /// The human report: a doctor-kit face (rich, plain or compact), or the full legacy report.
     ///
-    /// rich (colour and a score bar), plain (text, for pipes) or compact. Without
-    /// --face, --theme, --color or --headless the report is the one described above, which
-    /// also lists the files and the TAR audit. --json and --tui have their own output.
-    #[arg(long, value_enum, conflicts_with_all = ["json", "tui"])]
-    face: Option<doctor_kit::Face>,
+    /// The default is the kit's face (rich on a terminal, plain otherwise): the findings, the
+    /// score, and first of all notes for everything that makes the result partial (a truncated
+    /// walk, an unfinished TAR audit, the candidate-set warning). `legacy` is the report that also
+    /// lists the files and the TAR evidence. --json and --tui have their own output.
+    #[arg(long, value_name = "FACE", value_parser = ["rich", "plain", "compact", "legacy"], conflicts_with_all = ["json", "tui"])]
+    face: Option<String>,
 
     /// The face's colours: mono, clinical or contrast (default: the tool's own).
     #[arg(long, value_name = "THEME", conflicts_with_all = ["json", "tui"])]
@@ -1750,6 +1755,7 @@ fn checkpoint() -> bool {
 /// and a walk can take minutes; a test whose signal never landed would
 /// otherwise sit out the full hold at each of them. Parking only at the first
 /// keeps the hold meaning what the tests that set it mean.
+#[cfg(feature = "test-seams")]
 fn hold_for_the_signal_test() {
     let Ok(milliseconds) = env::var(SIGNAL_HOLD_ENV) else {
         return;
@@ -1769,14 +1775,18 @@ fn hold_for_the_signal_test() {
         }
     }
 
-    let deadline = Instant::now() + Duration::from_millis(milliseconds);
-    while Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + Duration::from_millis(milliseconds);
+    while std::time::Instant::now() < deadline {
         if doctor_kit::interrupt::interrupted() {
             return;
         }
         thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// Release builds have no such seam: the hold does not exist there.
+#[cfg(not(feature = "test-seams"))]
+fn hold_for_the_signal_test() {}
 
 /// Makes a card command interruptible even while it is stuck inside an exchange
 /// (issue #88).
@@ -2032,7 +2042,9 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
 /// What `SIM_DOCTOR_TEST_REPLAY` names: a `SIM_DOCTOR_RECORD` log that `scan`
 /// answers from instead of a reader. Test seam only (tests/golden_scan.rs): it
 /// lets the real binary's whole scan path run, deterministically, on a machine
-/// with no PC/SC service. Unset in every normal invocation.
+/// with no PC/SC service. Compiled only with the `test-seams` feature, which `cargo test`
+/// turns on and a release build never has (tests/release_seams.rs proves it).
+#[cfg(feature = "test-seams")]
 const REPLAY_ENV: &str = "SIM_DOCTOR_TEST_REPLAY";
 
 /// What [`open_scan_session`] hands `scan`: the session, its reader and the ATR.
@@ -2042,6 +2054,7 @@ type ScanSession = (Box<dyn CardSession>, ReaderName, Option<Vec<u8>>);
 /// transport can say, and the session itself (wrapped in the record log when
 /// `SIM_DOCTOR_RECORD` is set).
 fn open_scan_session(requested: Option<&str>) -> Result<ScanSession, scan::Failure> {
+    #[cfg(feature = "test-seams")]
     if let Some(path) = env::var_os(REPLAY_ENV) {
         let log = std::fs::read_to_string(&path)
             .map_err(|err| scan::Failure::new("reader-unavailable", err.to_string()))?;

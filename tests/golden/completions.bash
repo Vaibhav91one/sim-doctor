@@ -2663,7 +2663,7 @@ _sim__doctor() {
                     return 0
                     ;;
                 --face)
-                    COMPREPLY=($(compgen -W "plain rich compact" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "rich plain compact legacy" -- "${cur}"))
                     return 0
                     ;;
                 --theme)

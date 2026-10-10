@@ -55,7 +55,7 @@ set edit:completion:arg-completer[sim-doctor] = {|@words|
             cand --fail-on 'Exit 1 (3 under --baseline) when a finding is at or above this severity'
             cand --sarif 'Also write the findings to FILE as SARIF 2.1.0'
             cand --tar 'Which TARs to probe for MSL 0, and how many'
-            cand --face 'Print the findings with a doctor-kit face instead of the full report'
+            cand --face 'The human report: a doctor-kit face (rich, plain or compact), or the full legacy report'
             cand --theme 'The face''s colours: mono, clinical or contrast (default: the tool''s own)'
             cand --color 'Colour the face: auto (a terminal and no NO_COLOR), always or never'
             cand --json 'Emit one JSON envelope on stdout, and nothing else'
