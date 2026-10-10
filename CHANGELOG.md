@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Point URLs at the doctor-labs org (the repository moved from Vaibhav91one).
+
 ### Added
 
 - `gp put-key` and `gp install --dap-key-file|--dap-key-env` (#115, completing #133 and #19): PUT KEY and DAP over the SCP03 channel. `gp put-key` adds or replaces the ISD's SCP03 AES-128 key set (ENC, MAC, DEK) with PUT KEY (GP Card Spec v2.3.1 11.8; every key AES-encrypted under the current static DEK, Amendment D 6.2.8; KCV per B.6), addressed with `--new-key-version`, `--replace-key-version` and `--key-id`. **It can permanently lock the card's administrative access**, and every output says so. The new keys come only from `--new-keys-file`/`--new-keys-env`, are never printed (the plan and `--trace` withhold the encrypted PUT KEY data as well; each new key's KCV is shown) and a stated KCV that does not match refuses the run before any card is touched. Dry run unless `--yes` (which needs the current keys including the DEK); same one-attempt SCP03 interlock; **refuses to add, replace or overwrite the key version the session authenticated with unless `--replace-current-keyset` is given** (`refusing-current-keyset`), and refuses a replaced version the card lacks or an added one it holds; after `90 00` the card's returned key version and KCVs must equal the computed ones and its key information must list the new keys (`card-kcv-mismatch`, `verify-failed`). DAP: `gp install` signs the Load File Data Block Hash (SHA-256/384/512) with a symmetric AES DAP key as AES-CMAC (Card Spec C.2, C.3, B.2.2), sends the hash in INSTALL [for load] and the `E2` DAP block before the load file, and refuses (nothing sent) when the Security Domain is not in the registry or lacks the DAP Verification privilege (`--dap-sd` names it; default the authenticated ISD). Not exposed over MCP. Not done: DES/RSA/ECC DAP keys, SHA-1, tokens, RSA/ECC/DES PUT KEY, 192/256-bit SCP03 key sets. Replay tests with wire vectors produced by pySim's own SCP03 and PUT KEY code; the DAP CMAC checked with python `cryptography` and openssl.

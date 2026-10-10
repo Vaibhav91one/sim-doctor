@@ -221,7 +221,7 @@ mod tests {
         let text = workflow(&Options::default(), &ref_);
         assert!(text.starts_with("# Written by `sim-doctor ci install`."));
         for line in [
-            format!("uses: Vaibhav91one/sim-doctor@{ref_}").as_str(),
+            format!("uses: doctor-labs/sim-doctor@{ref_}").as_str(),
             "swsim: \"true\"",
             "baseline: \".sim-doctor/baseline.json\"",
             "require-baseline: \"true\"",

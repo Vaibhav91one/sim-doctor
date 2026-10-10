@@ -1987,7 +1987,7 @@ mod ci_install {
             .stdout
             .starts_with("# Written by `sim-doctor ci install`."));
         assert!(run.stdout.contains(concat!(
-            "Vaibhav91one/sim-doctor@v",
+            "doctor-labs/sim-doctor@v",
             env!("CARGO_PKG_VERSION")
         )));
         assert_eq!(run.stderr, "");

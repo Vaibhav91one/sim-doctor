@@ -73,7 +73,7 @@ jobs:
 
   crates:
     # Trusted publishing: crates.io checks this workflow's OIDC identity against the publisher
-    # configured on the crate (Vaibhav91one/sim-doctor, release.yml) and hands back a short-lived
+    # configured on the crate (doctor-labs/sim-doctor, release.yml) and hands back a short-lived
     # token. CARGO_REGISTRY_TOKEN stays only as a fallback until an OIDC release has succeeded;
     # delete the secret and the fallback after that.
     needs: verify
@@ -99,7 +99,7 @@ jobs:
             exit 0
           fi
           version="${GITHUB_REF_NAME#v}"
-          code=$(curl -s -o /dev/null -w '%{http_code}' -A "sim-doctor-release (github.com/Vaibhav91one/sim-doctor)" "https://crates.io/api/v1/crates/sim-doctor/$version")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A "sim-doctor-release (github.com/doctor-labs/sim-doctor)" "https://crates.io/api/v1/crates/sim-doctor/$version")
           if [ "$code" = "200" ]; then
             echo "::notice::sim-doctor $version is already on crates.io; nothing to publish"
             exit 0
@@ -108,7 +108,7 @@ jobs:
 
   npm:
     # Trusted publishing: npm checks this workflow's OIDC identity against the publisher
-    # configured on the package (Vaibhav91one/sim-doctor, release.yml). Needs npm 11.5.1 or
+    # configured on the package (doctor-labs/sim-doctor, release.yml). Needs npm 11.5.1 or
     # later. NPM_TOKEN stays only as a fallback until an OIDC release has succeeded.
     needs: release
     runs-on: ubuntu-latest

@@ -153,7 +153,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec], score: &Value) -> Valu
             "tool": {"driver": {
                 "name": "sim-doctor",
                 "version": env!("CARGO_PKG_VERSION"),
-                "informationUri": "https://github.com/Vaibhav91one/sim-doctor",
+                "informationUri": "https://github.com/doctor-labs/sim-doctor",
                 "rules": rules,
             }},
             "results": results,
