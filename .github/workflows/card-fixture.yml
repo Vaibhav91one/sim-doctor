@@ -373,8 +373,8 @@ jobs:
           # exits 0; the names pin the set and the count is what fails when a
           # fifth test is added and not wired up here (6 with issue #25's ts48
           # compare, 7 with issue #16's fuzz apdu --quick, 8 with the doctor/1 conformance test,
-          # 9 with issue #40's security-rule agreement test).
-          grep -q '9 passed' "$log"
+          # 9 with issue #40's security-rule agreement test, 10 with the card shell's).
+          grep -q '10 passed' "$log"
           grep -q 'drives_a_real_card_through_the_pcsc_transport' "$log"
           grep -q 'walks_the_file_system_of_a_real_card' "$log"
           grep -q 'scans_a_real_card_end_to_end' "$log"
@@ -384,6 +384,8 @@ jobs:
           grep -q 'ts48_compare_accounts_for_every_profile_file_against_a_real_card' "$log"
           grep -q 'fuzz_apdu_quick_discovers_within_the_cap_against_a_real_card' "$log"
           grep -q 'security_rules_agree_with_what_a_real_card_reports' "$log"
+          grep -q 'card_shell_drives_a_real_card' "$log"
+          grep -q 'card shell: status named reader' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job

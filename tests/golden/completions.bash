@@ -16,6 +16,9 @@ _sim__doctor() {
             ",$1")
                 cmd="sim__doctor"
                 ;;
+            sim__doctor,card)
+                cmd="sim__doctor__subcmd__card"
+                ;;
             sim__doctor,ci)
                 cmd="sim__doctor__subcmd__ci"
                 ;;
@@ -262,6 +265,9 @@ _sim__doctor() {
             sim__doctor__subcmd__gp__subcmd__help__subcmd__channel,open)
                 cmd="sim__doctor__subcmd__gp__subcmd__help__subcmd__channel__subcmd__open"
                 ;;
+            sim__doctor__subcmd__help,card)
+                cmd="sim__doctor__subcmd__help__subcmd__card"
+                ;;
             sim__doctor__subcmd__help,ci)
                 cmd="sim__doctor__subcmd__help__subcmd__ci"
                 ;;
@@ -428,12 +434,46 @@ _sim__doctor() {
 
     case "${cmd}" in
         sim__doctor)
-            opts="-h -V --help --version modules scan ts48 install ci completions mcp rules why fix gp trace fuzz euicc help"
+            opts="-h -V --help --version modules scan ts48 install ci completions mcp rules why fix gp trace fuzz euicc card help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__card)
+            opts="-c -h --reader --profile --dialect --script --json --yes --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --reader)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --profile)
+                    COMPREPLY=($(compgen -W "uicc sim" -- "${cur}"))
+                    return 0
+                    ;;
+                --dialect)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --script)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -1848,8 +1888,22 @@ _sim__doctor() {
             return 0
             ;;
         sim__subcmd__doctor__subcmd__help)
-            opts="modules scan ts48 install ci completions mcp rules why fix gp trace fuzz euicc help"
+            opts="modules scan ts48 install ci completions mcp rules why fix gp trace fuzz euicc card help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__help__subcmd__card)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

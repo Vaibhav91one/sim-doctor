@@ -36,6 +36,7 @@ set edit:completion:arg-completer[sim-doctor] = {|@words|
             cand trace 'Decode a captured APDU trace offline (no card, no reader)'
             cand fuzz 'APDU discovery and the OTA/SMS fuzz sweep'
             cand euicc 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes'
+            cand card 'A pySim-shell style shell over the card: select files, read them, send APDUs'
             cand help 'Print this message or the help of the given subcommand(s)'
         }
         &'sim-doctor;modules'= {
@@ -570,6 +571,17 @@ set edit:completion:arg-completer[sim-doctor] = {|@words|
         }
         &'sim-doctor;euicc;help;help'= {
         }
+        &'sim-doctor;card'= {
+            cand --reader 'The reader to use, matched against the driver''s own name (default: the first reader)'
+            cand --profile 'The command set the card speaks: uicc (class 00) or sim (class A0, GSM 11.11)'
+            cand --dialect 'Which FCP tag table the card answers SELECT with (see `scan --help`)'
+            cand -c 'Run these `;`-separated commands and exit'
+            cand --script 'Run the commands in this file, one per line (`#` starts a comment), and exit'
+            cand --json 'Print every reply as one JSON record (for agents)'
+            cand --yes 'Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
         &'sim-doctor;help'= {
             cand modules 'Describe the crate module roots and the layering between them'
             cand scan 'Select a card''s master file, walk everything under it, and report'
@@ -585,6 +597,7 @@ set edit:completion:arg-completer[sim-doctor] = {|@words|
             cand trace 'Decode a captured APDU trace offline (no card, no reader)'
             cand fuzz 'APDU discovery and the OTA/SMS fuzz sweep'
             cand euicc 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes'
+            cand card 'A pySim-shell style shell over the card: select files, read them, send APDUs'
             cand help 'Print this message or the help of the given subcommand(s)'
         }
         &'sim-doctor;help;modules'= {
@@ -698,6 +711,8 @@ set edit:completion:arg-completer[sim-doctor] = {|@words|
         &'sim-doctor;help;euicc;delete'= {
         }
         &'sim-doctor;help;euicc;reset'= {
+        }
+        &'sim-doctor;help;card'= {
         }
         &'sim-doctor;help;help'= {
         }

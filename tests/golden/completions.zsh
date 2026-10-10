@@ -892,6 +892,19 @@ esac
     ;;
 esac
 ;;
+(card)
+_arguments "${_arguments_options[@]}" : \
+'--reader=[The reader to use, matched against the driver'\''s own name (default\: the first reader)]:NAME:_default' \
+'--profile=[The command set the card speaks\: uicc (class 00) or sim (class A0, GSM 11.11)]:PROFILE:(uicc sim)' \
+'--dialect=[Which FCP tag table the card answers SELECT with (see \`scan --help\`)]:TABLE:_default' \
+'(--script)-c+[Run these \`;\`-separated commands and exit]:COMMANDS:_default' \
+'--script=[Run the commands in this file, one per line (\`#\` starts a comment), and exit]:PATH:_files' \
+'--json[Print every reply as one JSON record (for agents)]' \
+'--yes[Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_sim-doctor__subcmd__help_commands" \
@@ -1168,6 +1181,10 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(card)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1198,9 +1215,15 @@ _sim-doctor_commands() {
 'trace:Decode a captured APDU trace offline (no card, no reader)' \
 'fuzz:APDU discovery and the OTA/SMS fuzz sweep' \
 'euicc:eUICC queries over ES10 (lpac\: chip info, profile list, notification list), and the profile and notification writes' \
+'card:A pySim-shell style shell over the card\: select files, read them, send APDUs' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'sim-doctor commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__card_commands] )) ||
+_sim-doctor__subcmd__card_commands() {
+    local commands; commands=()
+    _describe -t commands 'sim-doctor card commands' commands "$@"
 }
 (( $+functions[_sim-doctor__subcmd__ci_commands] )) ||
 _sim-doctor__subcmd__ci_commands() {
@@ -1665,9 +1688,15 @@ _sim-doctor__subcmd__help_commands() {
 'trace:Decode a captured APDU trace offline (no card, no reader)' \
 'fuzz:APDU discovery and the OTA/SMS fuzz sweep' \
 'euicc:eUICC queries over ES10 (lpac\: chip info, profile list, notification list), and the profile and notification writes' \
+'card:A pySim-shell style shell over the card\: select files, read them, send APDUs' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'sim-doctor help commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__help__subcmd__card_commands] )) ||
+_sim-doctor__subcmd__help__subcmd__card_commands() {
+    local commands; commands=()
+    _describe -t commands 'sim-doctor help card commands' commands "$@"
 }
 (( $+functions[_sim-doctor__subcmd__help__subcmd__ci_commands] )) ||
 _sim-doctor__subcmd__help__subcmd__ci_commands() {

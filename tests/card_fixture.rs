@@ -2048,3 +2048,44 @@ fn security_rules_agree_with_what_a_real_card_reports() {
             .count()
     );
 }
+
+/// Issue #155 (and the card-shell issues after it): `sim-doctor card` as the built binary against
+/// the live swSIM card. Every step runs in ONE process, so the assertions about state carried
+/// between commands are about the real reader and the real card.
+#[test]
+#[ignore = "needs the swSIM fixture; see docs/swsim-fixture.md"]
+fn card_shell_drives_a_real_card() {
+    let readers = Pcsc::readers().expect("could not enumerate PC/SC readers");
+    let reader = readers
+        .iter()
+        .find(|name| name.as_str().to_ascii_lowercase().contains("swicc"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the swICC virtual reader is not present. Readers seen: {}",
+                reader_list(&readers)
+            )
+        });
+    let run = |script: &str| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+            .args(["card", "--json", "--reader", reader.as_str(), "-c", script])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary should run");
+        let records: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l}: {e}")))
+            .collect();
+        (output.status.code(), records)
+    };
+
+    let (code, records) = run("status");
+    assert_eq!(code, Some(0));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["data"]["reader"], reader.as_str());
+    assert_eq!(records[0]["data"]["profile"], "uicc");
+    assert_eq!(records[0]["data"]["channel"], 0);
+    println!(
+        "card shell: status named reader {} on channel 0",
+        reader.as_str()
+    );
+}

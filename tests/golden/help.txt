@@ -21,6 +21,7 @@ Commands:
   trace        Decode a captured APDU trace offline (no card, no reader)
   fuzz         APDU discovery and the OTA/SMS fuzz sweep
   euicc        eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes
+  card         A pySim-shell style shell over the card: select files, read them, send APDUs
   shell        The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
   explore      The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
   help         Print this message or the help of the given subcommand(s)
@@ -659,6 +660,21 @@ Options:
       --aid <HEX>            ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)
       --max-segment <BYTES>  Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks [default: 120]
   -h, --help                 Print help
+
+$ sim-doctor card -h [exit 0]
+A pySim-shell style shell over the card: select files, read them, send APDUs
+
+Usage: sim-doctor card [OPTIONS]
+
+Options:
+      --reader <NAME>      The reader to use, matched against the driver's own name (default: the first reader)
+      --profile <PROFILE>  The command set the card speaks: uicc (class 00) or sim (class A0, GSM 11.11) [default: uicc] [possible values: uicc, sim]
+      --dialect <TABLE>    Which FCP tag table the card answers SELECT with (see `scan --help`) [default: ts-102-221]
+  -c <COMMANDS>            Run these `;`-separated commands and exit
+      --script <PATH>      Run the commands in this file, one per line (`#` starts a comment), and exit
+      --json               Print every reply as one JSON record (for agents)
+      --yes                Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them
+  -h, --help               Print help (see more with '--help')
 
 $ sim-doctor shell -h [exit 0]
 The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift

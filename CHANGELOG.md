@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `card`: a pySim-shell style shell over the card (#155). It keeps the equipped card, the logical channel and the
+  selected file between commands; interactive, `-c "a; b"`, `--script FILE` and `--json` (one record per command).
+  `equip`, `status`, `open_channel`, `close_channel`, `channel`, `quit`. Reads are sent; commands that change the card are
+  dry runs unless `--yes`. The file commands arrive in the issues that follow.
+
 ## [0.4.0]
 
 sim-doctor now runs on [doctor-kit](https://crates.io/crates/doctor-kit) 0.2.2, the CLI skeleton shared by the doctor
