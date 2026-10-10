@@ -775,13 +775,13 @@ against Amendment D v1.2 (7.1.1, 7.1.2, 6.2.2-6.2.4), pySim `pySim/global_platfo
 card key information (GET DATA E0) has no KCV, so a KCV cannot be compared with the card's: the
 cryptogram check is what proves the MAC key. Findings are `data.registry_findings` entries
 (`gp/weak-secure-channel`, `gp/isd-lifecycle`, `gp/app-locked`, `gp/app-excess-privilege`), not
-doctor/1 findings. Sensitive-data encryption (#19) belongs with PUT KEY (#115). ARA-M is `A00000015141434C00`, GET DATA
+doctor/1 findings. Sensitive-data encryption (#19) is done for PUT KEY only (#115): the new keys are AES-encrypted under the static DEK. ARA-M is `A00000015141434C00`, GET DATA
 `FF40`; rules decode from `E2 { E1 {4F|C0, C1, CA}, E3 {D0, D1, DB} }` (GP Secure Element Access
 Control v1.1, GPD_SPE_013 2024 public review: FF40 is 4.1 Table 4-2, rules are chapter 6; CA and DB are AOSP extensions). A first GET DATA that holds less than FF40's declared length is continued with GET DATA [Next] `80 CA FF 60` (raw bytes, bounded 255 calls / 64 KiB); a short list is `truncated`. ARA and GET STATUS reads answer `61 xx` with the ISO-class (00) GET RESPONSE. GET STATUS uses P2 `02` (TLV)
 and `03` (next) on `63 10`, bounded at 16 pages. `6982`/`6985` is data (`requires_authentication`),
 `6A88` is an empty scope. Replay tests only; no live ARA-M card was available.
 
-#### GlobalPlatform writes (`gp channel`, `gp delete`, `gp install`)
+#### GlobalPlatform writes (`gp channel`, `gp delete`, `gp install`, `gp put-key`)
 
 Issues #133 and #19 (owner approved key use and card writes, 2026-10-10). Code: `src/gp.rs`
 (`channel_open/close`, `delete`, `install`, `OnChannel`), `src/apdu.rs` (`class_on_channel`), `src/scp03.rs`
@@ -813,11 +813,43 @@ sent (`Channel::on_logical_channel`, as pySim patches the channel into CLA befor
 traces and plans are corrected afterwards by `retarget_channel`. Dry-run plans show the class as it will
 be sent on the channel.
 
-**Not done (scoped out):** DAP. `dap_block` frames bytes, but the signature needs the Security Domain's
-DAP key, which is not in the SCP03 set: DAP signing, PUT KEY and C-DECRYPTION for key data are #115.
-No tokens (delegated management), DELETE [key], other INSTALL kinds or STORE DATA. Replay tests only;
-the wire vectors for DELETE/INSTALL/LOAD and the channel-1 flow come from an independent Python SCP03
-model that first reproduces pySim's `SCP03_Test_AES128_11` and the existing GET STATUS vectors.
+**PUT KEY and DAP (issue #115).** Same rules (1) to (7), plus: `gp put-key` ships an SCP03 AES-128 key set
+(ENC, MAC, DEK) with PUT KEY `80 D8 <P1> <P2|80>`: GP Card Spec v2.3.1 11.8 (Tables 11-64..11-68, 11-71, P1
+= replaced version or 00, P2 = first key id with b8 set), key type `88`, each key AES-CBC (zero ICV, one
+block, so ECB) under the **current static DEK** (Amendment D v1.1.2 6.2.8: "no padding is required" for
+16 byte AES keys, so the Table 11-71 block without length prefix; pySim `build_put_key_data` emits exactly
+this and the replay vectors are pySim's own; GlobalPlatformPro `putKeys` uses the Table 11-70 prefix
+`88 11 10`, also legal), KCV per B.6 (first 3 bytes of AES of 16 x `01`). **Safety, all enforced and tested:**
+(a) the new keys come only from `--new-keys-file/--new-keys-env`, must be three keys, and a stated KCV that is
+wrong refuses the run before any card is touched; (b) the dry run states that replacing the card's own
+SCP03 keys with unknown values permanently locks administrative access (`PUT_KEY_WARNING`, also in text);
+(c) a request that adds, replaces or overwrites the key version the session authenticated with (INITIALIZE
+UPDATE's key version) is refused (`refusing-current-keyset`, nothing sent) unless `--replace-current-keyset`;
+(d) the card's key information (GET DATA E0, read before authentication) must hold the replaced version
+(`replace-target-absent`) and not the added one (`key-version-exists`), else `key-information-unreadable`;
+(e) the PUT KEY data (keys encrypted under the DEK) is key material: `plan_json` and `push_steps` withhold it
+(header only; the card's `KVN || KCVs` response is kept), and tests assert no key, DEK, session key or
+ciphertext is in any output; (f) after `90 00` the returned `KVN || KCV(s)` (11.8.3.1) must equal the
+computed ones (`card-kcv-mismatch`; a card that returns none is noted) and a MAC'd GET DATA E0 must list the
+three keys (`verify-failed`). The authentication keys need a DEK (third key, or one key for all three).
+DAP: `gp install --dap-key-file|--dap-key-env` (one AES key, 16/24/32 bytes, optional `/KCV`; `--dap-sd`,
+`--dap-hash sha256|sha384|sha512`) computes LFDBH = hash of the load file without `C4` and its length
+(C.2), signs it with AES-CMAC (C.3 -> B.2.2, 16 bytes), sends it as the INSTALL [for load] hash field
+(mandatory with a DAP, 11.5.2.3.1) and as `E2 { 4F SD, C3 sig }` before `C4` in the LOAD data (Table
+11-58; GlobalPlatformPro `loadCapFile` frames it identically). The DAP Security Domain must be in the
+registry with DAP Verification or Mandated DAP Verification (`dap-sd-not-present`,
+`dap-sd-without-dap-privilege`), else nothing is sent; without `--dap-key-*` behaviour is unchanged and
+`pre_read.dap_security_domains` only informs. The task brief cited "Amendment B" for DAP: Amendment B is
+SCP81/RAM over HTTP; DAP is in the Card Spec (9.2.1, 11.6.2.3, C.2, C.3). Replay vectors: SCP03 wrapping and
+PUT KEY data by pySim itself (`SCP03`, `build_put_key_data`), CMAC checked with python `cryptography` and
+`openssl mac`.
+
+**Not done (scoped out):** DES, RSA and ECC DAP keys and DAP verification (the card verifies), SHA-1 LFDBH,
+several DAP blocks, PUT KEY of anything but an SCP03 AES-128 key set (RSA/ECC/DES, a lone DAP key such as
+KVN 73, extended format, chained PUT KEY), 192/256-bit SCP03 key sets, C-DECRYPTION. No tokens (delegated
+management), DELETE [key], other INSTALL kinds or STORE DATA. Replay tests only; the wire vectors for
+DELETE/INSTALL/LOAD and the channel-1 flow come from an independent Python SCP03 model that first
+reproduces pySim's `SCP03_Test_AES128_11` and the existing GET STATUS vectors.
 
 ### MCP
 
