@@ -67,6 +67,7 @@ tests live behind the gate:
 | `the_score_and_severity_flags_reach_the_envelope_against_a_real_card` | `sim-doctor scan --score --severity` as the **built binary**: the score block, its formula, and the difference between an earned 100 and an unearned one on real stdout (issue #14, rewritten by #24) |
 | `a_saved_envelope_is_a_baseline_and_a_truncated_one_is_refused` | the saved `scan --json` envelope records what the run did (`data.run`), and `--baseline` against one whose walk stopped at a bound is refused with `baseline-truncated` and exits 2, because this fixture's walk is always truncated (issue #12, doctor/1) |
 | `scan_json_conforms_to_doctor_1_against_a_real_card` | contract section 9 on real stdout: keys, finding fields, 16-hex fingerprints, `exit_code` equals the status, two runs identical outside `data` |
+| `card_shell_drives_a_real_card` | `sim-doctor card --json -c ...` as the **built binary** against the real reader: the shell's state (reader, profile, channel, selected file) is what the card did, one process per script (issues #155 onward) |
 | `security_rules_agree_with_what_a_real_card_reports` | each access-condition and SUCI rule's findings equal what the card's own `ef_contents` (access, UST, SUCI_Calc_Info) imply; it cannot force a true positive on swSIM's generated profile, so TP/TN cases live in `tests/corpus.rs` (issue #40, #110) |
 
 The third is the M1 acceptance criterion, and it is the only one that runs the
@@ -1064,6 +1065,14 @@ permutations are over 400 000 values, which is why `-str` there says "go get a
 - Services: `est_service_*`, `ist_service_*`, `ust_service_*`, `sst_service_*`, `aram_*`
 - Utility: `apdu`, `apdu_trace`, `numeric_path`, `json_pretty_print`, `bulk_script`,
   `conserve_write`
+
+sim-doctor's subset is `sim-doctor card` (`src/cardsh.rs`, the loop in `src/card_cmd.rs`): the pySim-shell
+command names where we have the command (`equip`, `apdu`, `select`, `read_binary`, `read_record`, `verify_chv`,
+`unblock_chv`, ...), the state kept between commands (the equipped card, the logical channel, per channel the directory
+path and the selected file), `-c`, `--script` and `--json`. Reads are sent; every command that changes the card is a dry
+run unless `--yes`, and secrets come from a file or an environment variable, never an argument. The shell's tests run a
+stateful test card (`src/cardsh/testcard.rs`, test builds only) and replay logs recorded from it
+(`tests/corpus/cardsh_*.jsonl`, regenerate with `cargo test --lib cardsh -- --ignored regenerate_fixtures`).
 
 ### 5.4 lpac CLI - best existing agent-friendly contract
 

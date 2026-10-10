@@ -112,6 +112,7 @@ pub mod backend;
 pub mod baseline;
 pub mod bpp;
 pub mod cap;
+pub mod cardsh;
 pub mod ci;
 pub mod contract;
 pub mod der;
@@ -351,6 +352,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: ts48::NAME,
         owns: "The public GSMA TS.48 test profile's expected file list, the extractor that derives it from the SAIP package, and the diff of a walked card against it; read-only, and not a conformance check.",
         depends_on: &[fcp::NAME, fs::NAME, rules::NAME, walk::NAME],
+    },
+    ModuleInfo {
+        name: cardsh::NAME,
+        owns: "The card shell: a pySim-shell style command interpreter that keeps the equipped card, the logical channel and the selected file between commands; reads are sent, anything that changes the card is a dry run unless --yes.",
+        depends_on: &[apdu::NAME, fcp::NAME, fs::NAME, session::NAME, trace::NAME, transport::NAME],
     },
 ];
 

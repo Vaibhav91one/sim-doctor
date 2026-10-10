@@ -202,6 +202,7 @@ exit codes do not change. `scan --tui` is still the findings view described abov
 | `gp delete --aid HEX [--related] [--keys-file PATH \| --keys-env VAR] [--yes]` | DELETE over SCP03, **changes the card**, dry run unless `--yes`, see below |
 | `gp install --load CAP [--module HEX] [--app HEX] [--params HEX] [--privileges HEX] [--dap-key-file PATH \| --dap-key-env VAR] [--dap-sd HEX] [--dap-hash H] [--keys-file PATH \| --keys-env VAR] [--yes]` | INSTALL [for load] + LOAD + INSTALL [for install and make selectable] over SCP03, **changes the card**, dry run unless `--yes`, see below |
 | `gp put-key --new-key-version HEX (--new-keys-file PATH \| --new-keys-env VAR) [--replace-key-version HEX] [--key-id HEX] [--replace-current-keyset] [--keys-file PATH \| --keys-env VAR] [--yes]` | PUT KEY of an SCP03 AES-128 key set over SCP03, **changes the card and can permanently lock administrative access**, dry run unless `--yes`, see below |
+| `card [--reader NAME] [--profile uicc\|sim] [-c "cmd; cmd"] [--script FILE] [--json] [--yes]` | a pySim-shell style shell over the card, see below |
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 | `euicc enable\|disable ICCID\|AID [--yes] [...]` | enable or disable a profile; a dry run unless `--yes`, see below |
@@ -449,6 +450,27 @@ Reset, Global Delete, Global Lock or Global Registry). They are entries in the l
 SCP02/SCP11, a secure channel to a
 supplementary security domain, C-DECRYPTION and R-MAC. Replay tests only
 (pySim and GlobalPlatformPro vectors); no live card has been authenticated yet.
+
+### `card`
+
+An interactive shell over one card, after pySim-shell. `sim-doctor card` opens the reader (first one, or
+`--reader NAME`) and reads commands from the terminal; `-c "select 3F00; status"` and `--script FILE` run them and exit,
+and `--json` prints one record per command (`{"command", "ok", "data"}` and `"error"` when it failed), for agents. The
+shell **keeps state between commands**: the equipped card, the logical channel in use, and for each channel the directory
+path and the selected file. (`shell` and `explore` are the doctor-kit browsers over a scan; `card` talks to the card.)
+
+| Command | What it does |
+| --- | --- |
+| `equip [--reader NAME] [--profile uicc\|sim]` | (re)open the card, possibly on another reader; `sim` is class `A0` (GSM 11.11), `uicc` class `00` |
+| `status` | the reader, ATR, profile, channel, path and selected file |
+| `open_channel`, `close_channel [N]`, `channel N` | MANAGE CHANNEL open and close, and which channel the next commands use (each channel has its own selection) |
+| `quit` (`exit`, `eof`) | leave |
+
+Reads are sent; **anything that changes the card is a dry run** that prints the APDU it would send, unless `--yes` is
+given. PINs and keys are never read from the command line: they come from a file or an environment variable (see the
+commands that use them). Exit codes: 0 every command worked, 1 at least one failed (the rest still ran), 2 the card could
+not be opened, 129 usage. Tests run the built binary over recorded sessions (`tests/cardsh.rs`) and against swSIM in the
+`card-fixture` workflow.
 
 ### `trace`
 

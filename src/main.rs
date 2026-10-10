@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
+mod card_cmd;
 mod kit;
 
 use sim_doctor::{
@@ -247,6 +248,16 @@ enum Command {
     /// eUICC, refused, or answered something malformed (the envelope carries
     /// `data.error.kind`), 129 for a bad command line, 130 if interrupted.
     Euicc(EuiccArgs),
+
+    /// A pySim-shell style shell over the card: select files, read them, send APDUs.
+    ///
+    /// The shell keeps the equipped card, the logical channel and the selected file between
+    /// commands. Interactive on a terminal; `-c "a; b"` or `--script FILE` for scripts; `--json`
+    /// prints one record per command. Reads are sent; every command that changes the card is a
+    /// dry run (it prints the APDU it would send) unless `--yes`. Type `help` inside.
+    /// Exit codes: 0 every command worked, 1 at least one failed, 2 the card could not be opened,
+    /// 129 for a bad command line.
+    Card(card_cmd::CardShellArgs),
 }
 
 /// Everything `sim-doctor euicc` takes.
@@ -1530,6 +1541,7 @@ fn dispatch(d: &kit::SimDoctor, command: Command) -> contract::ExitCode {
             Ts48Action::Compare(args) => run_ts48_compare(args),
         },
         Command::Install(args) => kit::install(d, args),
+        Command::Card(args) => card_cmd::run(args),
         Command::Completions(args) => run_completions(args),
         Command::Ci(args) => run_ci(args),
         Command::Rules(args) => match args.action {

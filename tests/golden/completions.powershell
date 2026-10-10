@@ -39,6 +39,7 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('trace', 'trace', [CompletionResultType]::ParameterValue, 'Decode a captured APDU trace offline (no card, no reader)')
             [CompletionResult]::new('fuzz', 'fuzz', [CompletionResultType]::ParameterValue, 'APDU discovery and the OTA/SMS fuzz sweep')
             [CompletionResult]::new('euicc', 'euicc', [CompletionResultType]::ParameterValue, 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes')
+            [CompletionResult]::new('card', 'card', [CompletionResultType]::ParameterValue, 'A pySim-shell style shell over the card: select files, read them, send APDUs')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -665,6 +666,18 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
         'sim-doctor;euicc;help;help' {
             break
         }
+        'sim-doctor;card' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name (default: the first reader)')
+            [CompletionResult]::new('--profile', '--profile', [CompletionResultType]::ParameterName, 'The command set the card speaks: uicc (class 00) or sim (class A0, GSM 11.11)')
+            [CompletionResult]::new('--dialect', '--dialect', [CompletionResultType]::ParameterName, 'Which FCP tag table the card answers SELECT with (see `scan --help`)')
+            [CompletionResult]::new('-c', '-c', [CompletionResultType]::ParameterName, 'Run these `;`-separated commands and exit')
+            [CompletionResult]::new('--script', '--script', [CompletionResultType]::ParameterName, 'Run the commands in this file, one per line (`#` starts a comment), and exit')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print every reply as one JSON record (for agents)')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
         'sim-doctor;help' {
             [CompletionResult]::new('modules', 'modules', [CompletionResultType]::ParameterValue, 'Describe the crate module roots and the layering between them')
             [CompletionResult]::new('scan', 'scan', [CompletionResultType]::ParameterValue, 'Select a card''s master file, walk everything under it, and report')
@@ -680,6 +693,7 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('trace', 'trace', [CompletionResultType]::ParameterValue, 'Decode a captured APDU trace offline (no card, no reader)')
             [CompletionResult]::new('fuzz', 'fuzz', [CompletionResultType]::ParameterValue, 'APDU discovery and the OTA/SMS fuzz sweep')
             [CompletionResult]::new('euicc', 'euicc', [CompletionResultType]::ParameterValue, 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes')
+            [CompletionResult]::new('card', 'card', [CompletionResultType]::ParameterValue, 'A pySim-shell style shell over the card: select files, read them, send APDUs')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -835,6 +849,9 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             break
         }
         'sim-doctor;help;euicc;reset' {
+            break
+        }
+        'sim-doctor;help;card' {
             break
         }
         'sim-doctor;help;help' {
