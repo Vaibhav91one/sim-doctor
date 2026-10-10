@@ -21,22 +21,25 @@ SUCI privacy, and not yet crypto or eUICC weaknesses: see [Status](#status) befo
 clean result.**
 
 ```text
-!! TRUNCATED: this walk did NOT see the whole card.
-reader           swICC PC/SC IFD Driver v1.2.0 00 00
-walk             42210 files, 33 directories, 251 selected, 41959 absent, 0 forbidden, 0 refused, 30 repeated identifiers
-[... lines omitted ...]
-FINDINGS: 62 (no severity filter)
-  [medium] auth/pin1-disabled at file:3F00 selected: PIN Appl 1 (key reference 01) is disabled, so files that need PIN1 are open to anyone holding the card [key reference 01 disabled in 36 of 36 PIN status templates] (partial (the walk stopped at a bound, so this list may be short))
-  [high] filesystem/sensitive-ef-always at file:3F00/ADF:A0000000871002FFFFFFFF8917050000/6F07 selected: EF.IMSI is readable and updatable without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays (IMSI 999990000000001) [read=ALW update=ALW IMSI 999990000000001] (partial (the walk stopped at a bound, so this list may be short))
-  [high] filesystem/sensitive-ef-always at file:3F00/7FFF/5F3B/4F20 selected: EF.Kc is readable and updatable without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays [read=ALW update=ALW] (partial (the walk stopped at a bound, so this list may be short))
-[... lines omitted ...]
-  coverage: partial (the walk stopped at a bound, so this list may be short)
-SCORE 0/100 (penalty 1224)
-  formula: max(0, 100 - sum(penalty[severity] for every finding in this report))
-  from 62 finding(s)
+sim-doctor: warning: the walk stopped early, so this is not the whole card; bounds hit: maximum path depth
+sim-doctor: warning: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+WARNING: INCOMPLETE: 5 coverage gap(s); findings may be missing
+ERROR: TRUNCATED: this walk did NOT see the whole card; a file outside it is neither present nor absent here; first bound hit: depth; every bound h...
+WARNING: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+WARNING: score: the TAR audit probed nothing, so the MSL 0 check did not run: this score says nothing about whether the card refuses TAR 0, because...
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier ...
+WARNING: 30 repeated identifier(s) in the walk (a directory that lists one of its own ancestors)
+NOTE: 2591 walk note(s) on individual files; `--json` lists them
+sim-doctor 0.4.0  score 0/100 critical
+high  filesystem/config-ef-updatable-always 3F00/ADF:A0000000871002FFFFFFFF8917050000/6F56  EF.EST is updatable without ver...
+high  filesystem/config-ef-updatable-always 3F00/7FFF/6F38  EF.UST is updatable without ver...
+high  filesystem/config-ef-updatable-always 3F00/ADF:A0000000871002FFFFFFFF8917050000/6F38  EF.UST is updatable without ver...
+[... 58 lines omitted ...]
+low  identity/readable-without-pin 3F00/7FFF/6F3B  EF.FDN is readable without a PIN, so th...
+44 high · 10 medium · 8 low
 ```
 
-This is `sim-doctor scan --score` run in the CI swSIM job against the swSIM software SIM, trimmed to the banner, the walk, the first findings and the score ([run](https://github.com/doctor-labs/sim-doctor/actions/runs/38051273478/job/114210725611); the `999990...` IMSI is swSIM's fake test identity, see [docs/swsim-fixture.md](docs/swsim-fixture.md)). Findings need a card or this software SIM, see [Get started](#get-started).
+This is `sim-doctor scan` run in the CI swSIM job against the swSIM software SIM ([run](https://github.com/doctor-labs/sim-doctor/actions/runs/38072521788/job/114272709312)): the default doctor-kit face, whose notes come first, trimmed to the notes, the first findings and the summary (column padding squeezed, long lines cut at 150 characters, 58 finding lines omitted).
 
 
 ## Install
