@@ -1,0 +1,843 @@
+
+using namespace System.Management.Automation
+using namespace System.Management.Automation.Language
+
+Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $commandElements = $commandAst.CommandElements
+    $command = @(
+        'sim-doctor'
+        for ($i = 1; $i -lt $commandElements.Count; $i++) {
+            $element = $commandElements[$i]
+            if ($element -isnot [StringConstantExpressionAst] -or
+                $element.StringConstantType -ne [StringConstantType]::BareWord -or
+                $element.Value.StartsWith('-') -or
+                $element.Value -eq $wordToComplete) {
+                break
+        }
+        $element.Value
+    }) -join ';'
+
+    $completions = @(switch ($command) {
+        'sim-doctor' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('-V', '-V ', [CompletionResultType]::ParameterName, 'Print version')
+            [CompletionResult]::new('--version', '--version', [CompletionResultType]::ParameterName, 'Print version')
+            [CompletionResult]::new('modules', 'modules', [CompletionResultType]::ParameterValue, 'Describe the crate module roots and the layering between them')
+            [CompletionResult]::new('scan', 'scan', [CompletionResultType]::ParameterValue, 'Select a card''s master file, walk everything under it, and report')
+            [CompletionResult]::new('ts48', 'ts48', [CompletionResultType]::ParameterValue, 'Compare a card against the public GSMA TS.48 test profile')
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Write agent guidance (Claude skill, Cursor rule, AGENTS.md block) into a project')
+            [CompletionResult]::new('ci', 'ci', [CompletionResultType]::ParameterValue, 'Write the GitHub Actions workflow that runs this repo''s action on pull requests')
+            [CompletionResult]::new('completions', 'completions', [CompletionResultType]::ParameterValue, 'Write a shell completion script to stdout')
+            [CompletionResult]::new('mcp', 'mcp', [CompletionResultType]::ParameterValue, 'Serve the scan and the rules as MCP tools over stdio')
+            [CompletionResult]::new('rules', 'rules', [CompletionResultType]::ParameterValue, 'List the rules a scan runs, or explain one, without a card')
+            [CompletionResult]::new('why', 'why', [CompletionResultType]::ParameterValue, 'Explain a rule, or every rule in a saved `scan --json` envelope')
+            [CompletionResult]::new('fix', 'fix', [CompletionResultType]::ParameterValue, 'Hand one finding from a saved scan to a coding agent')
+            [CompletionResult]::new('gp', 'gp', [CompletionResultType]::ParameterValue, 'Read-only GlobalPlatform queries')
+            [CompletionResult]::new('trace', 'trace', [CompletionResultType]::ParameterValue, 'Decode a captured APDU trace offline (no card, no reader)')
+            [CompletionResult]::new('fuzz', 'fuzz', [CompletionResultType]::ParameterValue, 'APDU discovery and the OTA/SMS fuzz sweep')
+            [CompletionResult]::new('euicc', 'euicc', [CompletionResultType]::ParameterValue, 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;modules' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit the JSON envelope on stdout instead of a human-readable table')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;scan' {
+            [CompletionResult]::new('--dialect', '--dialect', [CompletionResultType]::ParameterName, 'Which FCP tag table this card answers SELECT with')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--max-depth', '--max-depth', [CompletionResultType]::ParameterName, 'Deepest path below the master file the walk descends into')
+            [CompletionResult]::new('--max-children', '--max-children', [CompletionResultType]::ParameterName, 'Identifiers probed per directory')
+            [CompletionResult]::new('--max-nodes', '--max-nodes', [CompletionResultType]::ParameterName, 'Files the card selected across the whole walk (default 16384)')
+            [CompletionResult]::new('--max-directories', '--max-directories', [CompletionResultType]::ParameterName, 'Directories whose children are enumerated')
+            [CompletionResult]::new('--severity', '--severity', [CompletionResultType]::ParameterName, 'Drop findings below this severity')
+            [CompletionResult]::new('--baseline', '--baseline', [CompletionResultType]::ParameterName, 'Compare this run against a previous `scan --json` envelope (doctor/1)')
+            [CompletionResult]::new('--fail-on', '--fail-on', [CompletionResultType]::ParameterName, 'Exit 1 (3 under --baseline) when a finding is at or above this severity')
+            [CompletionResult]::new('--sarif', '--sarif', [CompletionResultType]::ParameterName, 'Also write the findings to FILE as SARIF 2.1.0')
+            [CompletionResult]::new('--tar', '--tar', [CompletionResultType]::ParameterName, 'Which TARs to probe for MSL 0, and how many')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope on stdout, and nothing else')
+            [CompletionResult]::new('--tui', '--tui', [CompletionResultType]::ParameterName, 'Show the findings in an interactive terminal view instead of the report')
+            [CompletionResult]::new('--score', '--score', [CompletionResultType]::ParameterName, 'Add one quality score for this card, for CI gating')
+            [CompletionResult]::new('--terminal-profile', '--terminal-profile', [CompletionResultType]::ParameterName, 'Send a TERMINAL PROFILE to the card before the TAR audit')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;ts48' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('compare', 'compare', [CompletionResultType]::ParameterValue, 'Walk the card and diff its file system against the GSMA TS.48 test profile')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;ts48;compare' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--dialect', '--dialect', [CompletionResultType]::ParameterName, 'Which FCP tag table this card answers SELECT with (see `scan --help`)')
+            [CompletionResult]::new('--max-depth', '--max-depth', [CompletionResultType]::ParameterName, 'Deepest path below the master file the walk descends into')
+            [CompletionResult]::new('--max-children', '--max-children', [CompletionResultType]::ParameterName, 'Identifiers probed per directory')
+            [CompletionResult]::new('--max-nodes', '--max-nodes', [CompletionResultType]::ParameterName, 'Files the card selected across the whole walk (default 16384)')
+            [CompletionResult]::new('--max-directories', '--max-directories', [CompletionResultType]::ParameterName, 'Directories whose children are enumerated')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope (type "ts48") on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;ts48;help' {
+            [CompletionResult]::new('compare', 'compare', [CompletionResultType]::ParameterValue, 'Walk the card and diff its file system against the GSMA TS.48 test profile')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;ts48;help;compare' {
+            break
+        }
+        'sim-doctor;ts48;help;help' {
+            break
+        }
+        'sim-doctor;install' {
+            [CompletionResult]::new('--agent', '--agent', [CompletionResultType]::ParameterName, 'Install for one agent only; omit for all of them')
+            [CompletionResult]::new('--dir', '--dir', [CompletionResultType]::ParameterName, 'Project root to write under (default: the current directory)')
+            [CompletionResult]::new('--print-only', '--print-only', [CompletionResultType]::ParameterName, 'Print what would be written instead of writing it')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;ci' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Write .github/workflows/sim-doctor.yml, pinned to this version''s tag')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;ci;install' {
+            [CompletionResult]::new('--swsim', '--swsim', [CompletionResultType]::ParameterName, 'Build the software card on the runner (CI has no card otherwise)')
+            [CompletionResult]::new('--baseline', '--baseline', [CompletionResultType]::ParameterName, 'Committed baseline path (letters, digits and . _ / - only)')
+            [CompletionResult]::new('--require-baseline', '--require-baseline', [CompletionResultType]::ParameterName, 'Fail the job when the baseline file is missing')
+            [CompletionResult]::new('--severity', '--severity', [CompletionResultType]::ParameterName, 'Pass --severity to the scan')
+            [CompletionResult]::new('--ref', '--ref', [CompletionResultType]::ParameterName, 'The action ref to pin (default: v<this version>; it exists once that release is cut)')
+            [CompletionResult]::new('--dir', '--dir', [CompletionResultType]::ParameterName, 'Project root to write under (default: the current directory)')
+            [CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'Overwrite a differing existing workflow')
+            [CompletionResult]::new('--print-only', '--print-only', [CompletionResultType]::ParameterName, 'Print the workflow instead of writing it')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;ci;help' {
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Write .github/workflows/sim-doctor.yml, pinned to this version''s tag')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;ci;help;install' {
+            break
+        }
+        'sim-doctor;ci;help;help' {
+            break
+        }
+        'sim-doctor;completions' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;mcp' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;rules' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'One row per rule: id, severity, summary')
+            [CompletionResult]::new('explain', 'explain', [CompletionResultType]::ParameterValue, 'What a rule means and how to fix it')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;rules;list' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "rules" on stdout')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;rules;explain' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "rules" on stdout')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;rules;help' {
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'One row per rule: id, severity, summary')
+            [CompletionResult]::new('explain', 'explain', [CompletionResultType]::ParameterValue, 'What a rule means and how to fix it')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;rules;help;list' {
+            break
+        }
+        'sim-doctor;rules;help;explain' {
+            break
+        }
+        'sim-doctor;rules;help;help' {
+            break
+        }
+        'sim-doctor;why' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "rules" on stdout')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;fix' {
+            [CompletionResult]::new('--from', '--from', [CompletionResultType]::ParameterName, 'A saved `sim-doctor scan --json` envelope holding a finding for that rule')
+            [CompletionResult]::new('--agent', '--agent', [CompletionResultType]::ParameterName, 'Start this coding agent with the prompt instead of only printing it')
+            [CompletionResult]::new('--skip-approvals', '--skip-approvals', [CompletionResultType]::ParameterName, 'Pass the agent its flag that skips approval prompts (unverified for every CLI version)')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Select the issuer security domain and read CPLC, card data, key information, IIN and CIN with GET DATA')
+            [CompletionResult]::new('ara', 'ara', [CompletionResultType]::ParameterValue, 'Select the ARA-M (Access Rule Application Master) and read every access rule with GET DATA [all], decoded (read-only, no keys)')
+            [CompletionResult]::new('status', 'status', [CompletionResultType]::ParameterValue, 'GlobalPlatform registry inventory: GET STATUS for the ISD, applications and load files, plus Card Recognition Data (read-only). A scope the card only gives over a secure channel is reported as requiring authentication')
+            [CompletionResult]::new('select', 'select', [CompletionResultType]::ParameterValue, 'SELECT a GlobalPlatform (or any) application by AID and report the status word and the FCI. Read-only, no keys; it only changes the card''s current selection')
+            [CompletionResult]::new('channel', 'channel', [CompletionResultType]::ParameterValue, 'Open or close a supplementary logical channel (MANAGE CHANNEL). A channel stays open on the card until it is closed or the card loses power, and the other gp commands can then run on it with --channel N')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete an application or an executable load file over an SCP03 channel (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT')
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Load a CAP file and install an applet over an SCP03 channel: INSTALL [for load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT')
+            [CompletionResult]::new('put-key', 'put-key', [CompletionResultType]::ParameterValue, 'Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD''S ADMINISTRATIVE ACCESS')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;gp;info' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;ara' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;status' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--keys-file', '--keys-file', [CompletionResultType]::ParameterName, 'File holding the keys (keep it chmod 600)')
+            [CompletionResult]::new('--keys-env', '--keys-env', [CompletionResultType]::ParameterName, 'Environment variable holding the keys')
+            [CompletionResult]::new('--key-version', '--key-version', [CompletionResultType]::ParameterName, 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;select' {
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'The application AID, 5 to 16 bytes of hex')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;channel' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('open', 'open', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL open: the card picks the number and it is printed')
+            [CompletionResult]::new('close', 'close', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL close of a channel opened earlier')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;gp;channel;open' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;gp;channel;close' {
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'The channel to close, 1 to 19')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;gp;channel;help' {
+            [CompletionResult]::new('open', 'open', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL open: the card picks the number and it is printed')
+            [CompletionResult]::new('close', 'close', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL close of a channel opened earlier')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;gp;channel;help;open' {
+            break
+        }
+        'sim-doctor;gp;channel;help;close' {
+            break
+        }
+        'sim-doctor;gp;channel;help;help' {
+            break
+        }
+        'sim-doctor;gp;delete' {
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'The AID to delete, 5 to 16 bytes of hex')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--keys-file', '--keys-file', [CompletionResultType]::ParameterName, 'File holding the keys (keep it chmod 600)')
+            [CompletionResult]::new('--keys-env', '--keys-env', [CompletionResultType]::ParameterName, 'Environment variable holding the keys')
+            [CompletionResult]::new('--key-version', '--key-version', [CompletionResultType]::ParameterName, 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--related', '--related', [CompletionResultType]::ParameterName, 'Also delete related objects (P2 80): for a load file, its applications')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the commands. Without it nothing is written. Needs --keys-file or --keys-env')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;install' {
+            [CompletionResult]::new('--load', '--load', [CompletionResultType]::ParameterName, 'The CAP file (a zip of javacard/*.cap components)')
+            [CompletionResult]::new('--module', '--module', [CompletionResultType]::ParameterName, 'The Executable Module AID (the applet class). Optional when the CAP has one applet')
+            [CompletionResult]::new('--app', '--app', [CompletionResultType]::ParameterName, 'The application (instance) AID. Defaults to the module AID')
+            [CompletionResult]::new('--params', '--params', [CompletionResultType]::ParameterName, 'The Install Parameters field as TLV with the mandatory C9 tag (default C900: none)')
+            [CompletionResult]::new('--privileges', '--privileges', [CompletionResultType]::ParameterName, 'Privileges, 1 or 3 bytes of hex (default 000000). Card Lock and Card Terminate are refused')
+            [CompletionResult]::new('--dap-key-file', '--dap-key-file', [CompletionResultType]::ParameterName, 'File holding the AES DAP key (hex, optionally KEY/KCV; chmod 600)')
+            [CompletionResult]::new('--dap-key-env', '--dap-key-env', [CompletionResultType]::ParameterName, 'Environment variable holding the AES DAP key')
+            [CompletionResult]::new('--dap-sd', '--dap-sd', [CompletionResultType]::ParameterName, 'The Security Domain that verifies the DAP, 5 to 16 bytes of hex (default: the issuer security domain being authenticated)')
+            [CompletionResult]::new('--dap-hash', '--dap-hash', [CompletionResultType]::ParameterName, 'The Load File Data Block Hash the DAP signs')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--keys-file', '--keys-file', [CompletionResultType]::ParameterName, 'File holding the keys (keep it chmod 600)')
+            [CompletionResult]::new('--keys-env', '--keys-env', [CompletionResultType]::ParameterName, 'Environment variable holding the keys')
+            [CompletionResult]::new('--key-version', '--key-version', [CompletionResultType]::ParameterName, 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the commands. Without it nothing is written. Needs --keys-file or --keys-env')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;put-key' {
+            [CompletionResult]::new('--new-key-version', '--new-key-version', [CompletionResultType]::ParameterName, 'The Key Version Number of the new keys, 01 to 7F')
+            [CompletionResult]::new('--replace-key-version', '--replace-key-version', [CompletionResultType]::ParameterName, 'P1: 00 (default) adds the key set; 01 to 7F replaces the key set with that version')
+            [CompletionResult]::new('--key-id', '--key-id', [CompletionResultType]::ParameterName, 'The Key Identifier of the first key (the other two follow at +1 and +2)')
+            [CompletionResult]::new('--new-keys-file', '--new-keys-file', [CompletionResultType]::ParameterName, 'File holding the new keys (keep it chmod 600)')
+            [CompletionResult]::new('--new-keys-env', '--new-keys-env', [CompletionResultType]::ParameterName, 'Environment variable holding the new keys')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--keys-file', '--keys-file', [CompletionResultType]::ParameterName, 'File holding the keys (keep it chmod 600)')
+            [CompletionResult]::new('--keys-env', '--keys-env', [CompletionResultType]::ParameterName, 'Environment variable holding the keys')
+            [CompletionResult]::new('--key-version', '--key-version', [CompletionResultType]::ParameterName, 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set')
+            [CompletionResult]::new('--channel', '--channel', [CompletionResultType]::ParameterName, 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it')
+            [CompletionResult]::new('--replace-current-keyset', '--replace-current-keyset', [CompletionResultType]::ParameterName, 'Allow the request to add, replace or overwrite the key version this session authenticated with. Without it such a request is refused')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "gp" on stdout')
+            [CompletionResult]::new('--trace', '--trace', [CompletionResultType]::ParameterName, 'Add every APDU exchange (command and response hex) as data.trace')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the commands. Without it nothing is written. Needs --keys-file or --keys-env')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;gp;help' {
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Select the issuer security domain and read CPLC, card data, key information, IIN and CIN with GET DATA')
+            [CompletionResult]::new('ara', 'ara', [CompletionResultType]::ParameterValue, 'Select the ARA-M (Access Rule Application Master) and read every access rule with GET DATA [all], decoded (read-only, no keys)')
+            [CompletionResult]::new('status', 'status', [CompletionResultType]::ParameterValue, 'GlobalPlatform registry inventory: GET STATUS for the ISD, applications and load files, plus Card Recognition Data (read-only). A scope the card only gives over a secure channel is reported as requiring authentication')
+            [CompletionResult]::new('select', 'select', [CompletionResultType]::ParameterValue, 'SELECT a GlobalPlatform (or any) application by AID and report the status word and the FCI. Read-only, no keys; it only changes the card''s current selection')
+            [CompletionResult]::new('channel', 'channel', [CompletionResultType]::ParameterValue, 'Open or close a supplementary logical channel (MANAGE CHANNEL). A channel stays open on the card until it is closed or the card loses power, and the other gp commands can then run on it with --channel N')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete an application or an executable load file over an SCP03 channel (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT')
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Load a CAP file and install an applet over an SCP03 channel: INSTALL [for load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT')
+            [CompletionResult]::new('put-key', 'put-key', [CompletionResultType]::ParameterValue, 'Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD''S ADMINISTRATIVE ACCESS')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;gp;help;info' {
+            break
+        }
+        'sim-doctor;gp;help;ara' {
+            break
+        }
+        'sim-doctor;gp;help;status' {
+            break
+        }
+        'sim-doctor;gp;help;select' {
+            break
+        }
+        'sim-doctor;gp;help;channel' {
+            [CompletionResult]::new('open', 'open', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL open: the card picks the number and it is printed')
+            [CompletionResult]::new('close', 'close', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL close of a channel opened earlier')
+            break
+        }
+        'sim-doctor;gp;help;channel;open' {
+            break
+        }
+        'sim-doctor;gp;help;channel;close' {
+            break
+        }
+        'sim-doctor;gp;help;delete' {
+            break
+        }
+        'sim-doctor;gp;help;install' {
+            break
+        }
+        'sim-doctor;gp;help;put-key' {
+            break
+        }
+        'sim-doctor;gp;help;help' {
+            break
+        }
+        'sim-doctor;trace' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "trace" on stdout')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;fuzz' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('apdu', 'apdu', [CompletionResultType]::ParameterValue, 'CLA discovery (level 1) or CLA+INS discovery (level 2) over a session')
+            [CompletionResult]::new('ota', 'ota', [CompletionResultType]::ParameterValue, 'The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR scanner''s ENVELOPE builder')
+            [CompletionResult]::new('mutate', 'mutate', [CompletionResultType]::ParameterValue, 'Allowlist-only APDU mutation fuzzer, against a replay log or the built-in mock card only (no reader)')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;fuzz;apdu' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--level', '--level', [CompletionResultType]::ParameterName, '1 for CLA discovery, 2 for CLA+INS discovery')
+            [CompletionResult]::new('--class', '--class', [CompletionResultType]::ParameterName, 'The CLA level 2 probes INS values at, as two hex digits (e.g. A0). Required for --level 2')
+            [CompletionResult]::new('--i-understand-this-can-brick-the-card', '--i-understand-this-can-brick-the-card', [CompletionResultType]::ParameterName, 'Required. Without it, `fuzz` refuses to run at all (exit 1, error kind fuzz-needs-opt-in)')
+            [CompletionResult]::new('--allow-real-hardware', '--allow-real-hardware', [CompletionResultType]::ParameterName, 'Required in addition to the opt-in above when the reader''s name does not match the software card (swicc-pcsc names its reader with "swICC"). Without it, `fuzz` refuses to run against anything that is not recognisably the software card')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope on stdout, and nothing else')
+            [CompletionResult]::new('--quick', '--quick', [CompletionResultType]::ParameterName, 'Probe a small, documented subset instead of the full space')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;fuzz;ota' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--i-understand-this-can-brick-the-card', '--i-understand-this-can-brick-the-card', [CompletionResultType]::ParameterName, 'Required. Without it, `fuzz` refuses to run at all (exit 1, error kind fuzz-needs-opt-in)')
+            [CompletionResult]::new('--allow-real-hardware', '--allow-real-hardware', [CompletionResultType]::ParameterName, 'Required in addition to the opt-in above when the reader''s name does not match the software card (swicc-pcsc names its reader with "swICC"). Without it, `fuzz` refuses to run against anything that is not recognisably the software card')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope on stdout, and nothing else')
+            [CompletionResult]::new('--quick', '--quick', [CompletionResultType]::ParameterName, 'Probe a small, documented subset instead of the full space')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;fuzz;mutate' {
+            [CompletionResult]::new('--replay', '--replay', [CompletionResultType]::ParameterName, 'Answer from a recorded exchange log (one {"command","response"} JSON object per line, as SIM_DOCTOR_RECORD writes) instead of a card')
+            [CompletionResult]::new('--max-cases', '--max-cases', [CompletionResultType]::ParameterName, 'Cases to send (1 to 10000)')
+            [CompletionResult]::new('--timeout', '--timeout', [CompletionResultType]::ParameterName, 'Stop sending after this many seconds')
+            [CompletionResult]::new('--seed', '--seed', [CompletionResultType]::ParameterName, 'PRNG seed. The same seed gives the same APDUs')
+            [CompletionResult]::new('--mock', '--mock', [CompletionResultType]::ParameterName, 'Answer from the built-in strict mock card')
+            [CompletionResult]::new('--dry-run', '--dry-run', [CompletionResultType]::ParameterName, 'Print the planned APDUs and the allowlist/denylist; send nothing')
+            [CompletionResult]::new('--stop-on-first-finding', '--stop-on-first-finding', [CompletionResultType]::ParameterName, 'Stop after the first finding')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'sim-doctor;fuzz;help' {
+            [CompletionResult]::new('apdu', 'apdu', [CompletionResultType]::ParameterValue, 'CLA discovery (level 1) or CLA+INS discovery (level 2) over a session')
+            [CompletionResult]::new('ota', 'ota', [CompletionResultType]::ParameterValue, 'The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR scanner''s ENVELOPE builder')
+            [CompletionResult]::new('mutate', 'mutate', [CompletionResultType]::ParameterValue, 'Allowlist-only APDU mutation fuzzer, against a replay log or the built-in mock card only (no reader)')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;fuzz;help;apdu' {
+            break
+        }
+        'sim-doctor;fuzz;help;ota' {
+            break
+        }
+        'sim-doctor;fuzz;help;mutate' {
+            break
+        }
+        'sim-doctor;fuzz;help;help' {
+            break
+        }
+        'sim-doctor;euicc' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`)')
+            [CompletionResult]::new('profiles', 'profiles', [CompletionResultType]::ParameterValue, 'Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`)')
+            [CompletionResult]::new('notifications', 'notifications', [CompletionResultType]::ParameterValue, 'Pending notification metadata (lpac `notification list`); `dump` and `replay` below; `notifications remove <seq>` removes one')
+            [CompletionResult]::new('nickname', 'nickname', [CompletionResultType]::ParameterValue, 'Set a profile''s nickname (lpac `profile nickname`). A write: a dry run unless `--yes`, never exposed over MCP')
+            [CompletionResult]::new('enable', 'enable', [CompletionResultType]::ParameterValue, 'Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH). A dry run unless `--yes`: switches the active profile and the device loses its connection until it re-attaches. Never exposed over MCP')
+            [CompletionResult]::new('disable', 'disable', [CompletionResultType]::ParameterValue, 'Disable a profile (lpac `profile disable`, ES10c DisableProfile with REFRESH). A dry run unless `--yes`: disabling the only enabled profile leaves no active profile. Never exposed over MCP')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run unless `--yes`: the profile is erased permanently and can only come back by downloading it again from the operator. An enabled profile is refused. Never exposed over MCP')
+            [CompletionResult]::new('reset', 'reset', [CompletionResultType]::ParameterValue, 'Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can erase every profile: nothing is selected by default, and sending needs both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;euicc;info' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;profiles' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;notifications' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('remove', 'remove', [CompletionResultType]::ParameterValue, 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP')
+            [CompletionResult]::new('dump', 'dump', [CompletionResultType]::ParameterValue, 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP')
+            [CompletionResult]::new('replay', 'replay', [CompletionResultType]::ParameterValue, 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;euicc;notifications;remove' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the request, then re-read the list and confirm. Without it nothing is changed')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;notifications;dump' {
+            [CompletionResult]::new('--seq', '--seq', [CompletionResultType]::ParameterName, 'Only the notification with this sequence number (default: all pending)')
+            [CompletionResult]::new('-o', '-o', [CompletionResultType]::ParameterName, 'Write the dump document to FILE (must not exist) instead of stdout')
+            [CompletionResult]::new('--output', '--output', [CompletionResultType]::ParameterName, 'Write the dump document to FILE (must not exist) instead of stdout')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;notifications;replay' {
+            [CompletionResult]::new('--from', '--from', [CompletionResultType]::ParameterName, 'A dump file written by `notifications dump` (or its `--json` output)')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Actually send. Without it nothing leaves this machine: the targets and what would be sent are printed')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;notifications;help' {
+            [CompletionResult]::new('remove', 'remove', [CompletionResultType]::ParameterValue, 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP')
+            [CompletionResult]::new('dump', 'dump', [CompletionResultType]::ParameterValue, 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP')
+            [CompletionResult]::new('replay', 'replay', [CompletionResultType]::ParameterValue, 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;euicc;notifications;help;remove' {
+            break
+        }
+        'sim-doctor;euicc;notifications;help;dump' {
+            break
+        }
+        'sim-doctor;euicc;notifications;help;replay' {
+            break
+        }
+        'sim-doctor;euicc;notifications;help;help' {
+            break
+        }
+        'sim-doctor;euicc;nickname' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send SetNickname, then re-read the profile list and confirm. Without it nothing is changed: the target EID and ICCID, the current and the new nickname are printed and the command exits')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;enable' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the request, then re-read the profile list and confirm. Without it nothing is changed: the plan and its consequence are printed')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;disable' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the request, then re-read the profile list and confirm. Without it nothing is changed: the plan and its consequence are printed')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;delete' {
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send DeleteProfile, then re-read the profile list and confirm. Without it nothing is changed: the profile and its consequence are printed')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;reset' {
+            [CompletionResult]::new('--confirm-eid', '--confirm-eid', [CompletionResultType]::ParameterName, 'The card''s EID (32 hex digits); must match the EID read from the card')
+            [CompletionResult]::new('--reader', '--reader', [CompletionResultType]::ParameterName, 'The reader to use, matched against the driver''s own name')
+            [CompletionResult]::new('--aid', '--aid', [CompletionResultType]::ParameterName, 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)')
+            [CompletionResult]::new('--max-segment', '--max-segment', [CompletionResultType]::ParameterName, 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks')
+            [CompletionResult]::new('--operational', '--operational', [CompletionResultType]::ParameterName, 'Delete the operational profiles (resetOptions bit 0)')
+            [CompletionResult]::new('--test', '--test', [CompletionResultType]::ParameterName, 'Delete the field-loaded test profiles (resetOptions bit 1)')
+            [CompletionResult]::new('--smdp-address', '--smdp-address', [CompletionResultType]::ParameterName, 'Reset the default SM-DP+ address (resetOptions bit 2)')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the reset (needs `--confirm-eid`), then re-read and confirm. Without it nothing is changed: the profiles that would be erased are listed')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one lpac envelope on stdout, and nothing else')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;euicc;help' {
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`)')
+            [CompletionResult]::new('profiles', 'profiles', [CompletionResultType]::ParameterValue, 'Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`)')
+            [CompletionResult]::new('notifications', 'notifications', [CompletionResultType]::ParameterValue, 'Pending notification metadata (lpac `notification list`); `dump` and `replay` below; `notifications remove <seq>` removes one')
+            [CompletionResult]::new('nickname', 'nickname', [CompletionResultType]::ParameterValue, 'Set a profile''s nickname (lpac `profile nickname`). A write: a dry run unless `--yes`, never exposed over MCP')
+            [CompletionResult]::new('enable', 'enable', [CompletionResultType]::ParameterValue, 'Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH). A dry run unless `--yes`: switches the active profile and the device loses its connection until it re-attaches. Never exposed over MCP')
+            [CompletionResult]::new('disable', 'disable', [CompletionResultType]::ParameterValue, 'Disable a profile (lpac `profile disable`, ES10c DisableProfile with REFRESH). A dry run unless `--yes`: disabling the only enabled profile leaves no active profile. Never exposed over MCP')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run unless `--yes`: the profile is erased permanently and can only come back by downloading it again from the operator. An enabled profile is refused. Never exposed over MCP')
+            [CompletionResult]::new('reset', 'reset', [CompletionResultType]::ParameterValue, 'Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can erase every profile: nothing is selected by default, and sending needs both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;euicc;help;info' {
+            break
+        }
+        'sim-doctor;euicc;help;profiles' {
+            break
+        }
+        'sim-doctor;euicc;help;notifications' {
+            [CompletionResult]::new('remove', 'remove', [CompletionResultType]::ParameterValue, 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP')
+            [CompletionResult]::new('dump', 'dump', [CompletionResultType]::ParameterValue, 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP')
+            [CompletionResult]::new('replay', 'replay', [CompletionResultType]::ParameterValue, 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP')
+            break
+        }
+        'sim-doctor;euicc;help;notifications;remove' {
+            break
+        }
+        'sim-doctor;euicc;help;notifications;dump' {
+            break
+        }
+        'sim-doctor;euicc;help;notifications;replay' {
+            break
+        }
+        'sim-doctor;euicc;help;nickname' {
+            break
+        }
+        'sim-doctor;euicc;help;enable' {
+            break
+        }
+        'sim-doctor;euicc;help;disable' {
+            break
+        }
+        'sim-doctor;euicc;help;delete' {
+            break
+        }
+        'sim-doctor;euicc;help;reset' {
+            break
+        }
+        'sim-doctor;euicc;help;help' {
+            break
+        }
+        'sim-doctor;help' {
+            [CompletionResult]::new('modules', 'modules', [CompletionResultType]::ParameterValue, 'Describe the crate module roots and the layering between them')
+            [CompletionResult]::new('scan', 'scan', [CompletionResultType]::ParameterValue, 'Select a card''s master file, walk everything under it, and report')
+            [CompletionResult]::new('ts48', 'ts48', [CompletionResultType]::ParameterValue, 'Compare a card against the public GSMA TS.48 test profile')
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Write agent guidance (Claude skill, Cursor rule, AGENTS.md block) into a project')
+            [CompletionResult]::new('ci', 'ci', [CompletionResultType]::ParameterValue, 'Write the GitHub Actions workflow that runs this repo''s action on pull requests')
+            [CompletionResult]::new('completions', 'completions', [CompletionResultType]::ParameterValue, 'Write a shell completion script to stdout')
+            [CompletionResult]::new('mcp', 'mcp', [CompletionResultType]::ParameterValue, 'Serve the scan and the rules as MCP tools over stdio')
+            [CompletionResult]::new('rules', 'rules', [CompletionResultType]::ParameterValue, 'List the rules a scan runs, or explain one, without a card')
+            [CompletionResult]::new('why', 'why', [CompletionResultType]::ParameterValue, 'Explain a rule, or every rule in a saved `scan --json` envelope')
+            [CompletionResult]::new('fix', 'fix', [CompletionResultType]::ParameterValue, 'Hand one finding from a saved scan to a coding agent')
+            [CompletionResult]::new('gp', 'gp', [CompletionResultType]::ParameterValue, 'Read-only GlobalPlatform queries')
+            [CompletionResult]::new('trace', 'trace', [CompletionResultType]::ParameterValue, 'Decode a captured APDU trace offline (no card, no reader)')
+            [CompletionResult]::new('fuzz', 'fuzz', [CompletionResultType]::ParameterValue, 'APDU discovery and the OTA/SMS fuzz sweep')
+            [CompletionResult]::new('euicc', 'euicc', [CompletionResultType]::ParameterValue, 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;help;modules' {
+            break
+        }
+        'sim-doctor;help;scan' {
+            break
+        }
+        'sim-doctor;help;ts48' {
+            [CompletionResult]::new('compare', 'compare', [CompletionResultType]::ParameterValue, 'Walk the card and diff its file system against the GSMA TS.48 test profile')
+            break
+        }
+        'sim-doctor;help;ts48;compare' {
+            break
+        }
+        'sim-doctor;help;install' {
+            break
+        }
+        'sim-doctor;help;ci' {
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Write .github/workflows/sim-doctor.yml, pinned to this version''s tag')
+            break
+        }
+        'sim-doctor;help;ci;install' {
+            break
+        }
+        'sim-doctor;help;completions' {
+            break
+        }
+        'sim-doctor;help;mcp' {
+            break
+        }
+        'sim-doctor;help;rules' {
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'One row per rule: id, severity, summary')
+            [CompletionResult]::new('explain', 'explain', [CompletionResultType]::ParameterValue, 'What a rule means and how to fix it')
+            break
+        }
+        'sim-doctor;help;rules;list' {
+            break
+        }
+        'sim-doctor;help;rules;explain' {
+            break
+        }
+        'sim-doctor;help;why' {
+            break
+        }
+        'sim-doctor;help;fix' {
+            break
+        }
+        'sim-doctor;help;gp' {
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Select the issuer security domain and read CPLC, card data, key information, IIN and CIN with GET DATA')
+            [CompletionResult]::new('ara', 'ara', [CompletionResultType]::ParameterValue, 'Select the ARA-M (Access Rule Application Master) and read every access rule with GET DATA [all], decoded (read-only, no keys)')
+            [CompletionResult]::new('status', 'status', [CompletionResultType]::ParameterValue, 'GlobalPlatform registry inventory: GET STATUS for the ISD, applications and load files, plus Card Recognition Data (read-only). A scope the card only gives over a secure channel is reported as requiring authentication')
+            [CompletionResult]::new('select', 'select', [CompletionResultType]::ParameterValue, 'SELECT a GlobalPlatform (or any) application by AID and report the status word and the FCI. Read-only, no keys; it only changes the card''s current selection')
+            [CompletionResult]::new('channel', 'channel', [CompletionResultType]::ParameterValue, 'Open or close a supplementary logical channel (MANAGE CHANNEL). A channel stays open on the card until it is closed or the card loses power, and the other gp commands can then run on it with --channel N')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete an application or an executable load file over an SCP03 channel (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT')
+            [CompletionResult]::new('install', 'install', [CompletionResultType]::ParameterValue, 'Load a CAP file and install an applet over an SCP03 channel: INSTALL [for load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT')
+            [CompletionResult]::new('put-key', 'put-key', [CompletionResultType]::ParameterValue, 'Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD''S ADMINISTRATIVE ACCESS')
+            break
+        }
+        'sim-doctor;help;gp;info' {
+            break
+        }
+        'sim-doctor;help;gp;ara' {
+            break
+        }
+        'sim-doctor;help;gp;status' {
+            break
+        }
+        'sim-doctor;help;gp;select' {
+            break
+        }
+        'sim-doctor;help;gp;channel' {
+            [CompletionResult]::new('open', 'open', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL open: the card picks the number and it is printed')
+            [CompletionResult]::new('close', 'close', [CompletionResultType]::ParameterValue, 'MANAGE CHANNEL close of a channel opened earlier')
+            break
+        }
+        'sim-doctor;help;gp;channel;open' {
+            break
+        }
+        'sim-doctor;help;gp;channel;close' {
+            break
+        }
+        'sim-doctor;help;gp;delete' {
+            break
+        }
+        'sim-doctor;help;gp;install' {
+            break
+        }
+        'sim-doctor;help;gp;put-key' {
+            break
+        }
+        'sim-doctor;help;trace' {
+            break
+        }
+        'sim-doctor;help;fuzz' {
+            [CompletionResult]::new('apdu', 'apdu', [CompletionResultType]::ParameterValue, 'CLA discovery (level 1) or CLA+INS discovery (level 2) over a session')
+            [CompletionResult]::new('ota', 'ota', [CompletionResultType]::ParameterValue, 'The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR scanner''s ENVELOPE builder')
+            [CompletionResult]::new('mutate', 'mutate', [CompletionResultType]::ParameterValue, 'Allowlist-only APDU mutation fuzzer, against a replay log or the built-in mock card only (no reader)')
+            break
+        }
+        'sim-doctor;help;fuzz;apdu' {
+            break
+        }
+        'sim-doctor;help;fuzz;ota' {
+            break
+        }
+        'sim-doctor;help;fuzz;mutate' {
+            break
+        }
+        'sim-doctor;help;euicc' {
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`)')
+            [CompletionResult]::new('profiles', 'profiles', [CompletionResultType]::ParameterValue, 'Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`)')
+            [CompletionResult]::new('notifications', 'notifications', [CompletionResultType]::ParameterValue, 'Pending notification metadata (lpac `notification list`); `dump` and `replay` below; `notifications remove <seq>` removes one')
+            [CompletionResult]::new('nickname', 'nickname', [CompletionResultType]::ParameterValue, 'Set a profile''s nickname (lpac `profile nickname`). A write: a dry run unless `--yes`, never exposed over MCP')
+            [CompletionResult]::new('enable', 'enable', [CompletionResultType]::ParameterValue, 'Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH). A dry run unless `--yes`: switches the active profile and the device loses its connection until it re-attaches. Never exposed over MCP')
+            [CompletionResult]::new('disable', 'disable', [CompletionResultType]::ParameterValue, 'Disable a profile (lpac `profile disable`, ES10c DisableProfile with REFRESH). A dry run unless `--yes`: disabling the only enabled profile leaves no active profile. Never exposed over MCP')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run unless `--yes`: the profile is erased permanently and can only come back by downloading it again from the operator. An enabled profile is refused. Never exposed over MCP')
+            [CompletionResult]::new('reset', 'reset', [CompletionResultType]::ParameterValue, 'Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can erase every profile: nothing is selected by default, and sending needs both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP')
+            break
+        }
+        'sim-doctor;help;euicc;info' {
+            break
+        }
+        'sim-doctor;help;euicc;profiles' {
+            break
+        }
+        'sim-doctor;help;euicc;notifications' {
+            [CompletionResult]::new('remove', 'remove', [CompletionResultType]::ParameterValue, 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP')
+            [CompletionResult]::new('dump', 'dump', [CompletionResultType]::ParameterValue, 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP')
+            [CompletionResult]::new('replay', 'replay', [CompletionResultType]::ParameterValue, 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP')
+            break
+        }
+        'sim-doctor;help;euicc;notifications;remove' {
+            break
+        }
+        'sim-doctor;help;euicc;notifications;dump' {
+            break
+        }
+        'sim-doctor;help;euicc;notifications;replay' {
+            break
+        }
+        'sim-doctor;help;euicc;nickname' {
+            break
+        }
+        'sim-doctor;help;euicc;enable' {
+            break
+        }
+        'sim-doctor;help;euicc;disable' {
+            break
+        }
+        'sim-doctor;help;euicc;delete' {
+            break
+        }
+        'sim-doctor;help;euicc;reset' {
+            break
+        }
+        'sim-doctor;help;help' {
+            break
+        }
+    })
+
+    $completions.Where{ $_.CompletionText -like "$wordToComplete*" } |
+        Sort-Object -Property ListItemText
+}

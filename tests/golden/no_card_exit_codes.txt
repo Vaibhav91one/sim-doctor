@@ -1,0 +1,68 @@
+# scan: unknown reader: sim-doctor scan --json --reader golden-no-such-reader
+exit 2
+{"data":{"card_touched":false,"error":<HOST_ERROR>,"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# scan: baseline missing: sim-doctor scan --json --baseline /nonexistent/golden.json
+exit 2
+{"data":{"card_touched":false,"error":{"kind":"baseline-unreadable","message":"the baseline file could not be read: /nonexistent/golden.json: No such file or directory (os error 2)"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# scan: baseline not json: sim-doctor scan --json --baseline <TMP>/garbage.json
+exit 2
+{"data":{"card_touched":false,"error":{"kind":"baseline-malformed","message":"this is not a readable sim-doctor baseline: expected ident at line 1 column 2"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# scan: baseline not an envelope: sim-doctor scan --json --baseline <TMP>/other.json
+exit 2
+{"data":{"card_touched":false,"error":{"kind":"baseline-malformed","message":"this is not a readable sim-doctor baseline: the file is not a doctor/1 envelope; save one with `sim-doctor scan --json`"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# scan: bad --tar: sim-doctor scan --json --tar bogus
+exit 2
+
+# scan: bad --severity: sim-doctor scan --json --severity bogus
+exit 2
+
+# scan: bad --fail-on: sim-doctor scan --json --fail-on bogus
+exit 2
+
+# scan: --terminal-profile needs --tar: sim-doctor scan --json --terminal-profile
+exit 2
+
+# ts48 compare: unknown reader: sim-doctor ts48 compare --json --reader golden-no-such-reader
+exit 1
+{"type":"ts48","payload":{"code":1,"message":<HOST_ERROR>,"data":{"card_touched":false,"error":<HOST_ERROR>,"scanned":false}}}
+
+# unknown subcommand: sim-doctor bogus
+exit 129
+
+# no subcommand: sim-doctor 
+exit 0
+
+# rules explain: unknown id: sim-doctor rules explain no/such-rule --json
+exit 1
+{"type":"rules","payload":{"code":1,"message":"unknown rule `no/such-rule`","data":{"did_you_mean":null,"error":"unknown rule `no/such-rule`"}}}
+
+# why: unknown id: sim-doctor why no/such-rule --json
+exit 1
+{"type":"rules","payload":{"code":1,"message":"cannot read no/such-rule: No such file or directory (os error 2)","data":{"error":"cannot read no/such-rule: No such file or directory (os error 2)"}}}
+
+# trace: missing file: sim-doctor trace /nonexistent/golden.hex --json
+exit 1
+{"type":"trace","payload":{"code":1,"message":"cannot read the trace: No such file or directory (os error 2)","data":{"error":"cannot read the trace: No such file or directory (os error 2)"}}}
+
+# trace: not a trace: sim-doctor trace <TMP>/garbage.json --json
+exit 1
+{"type":"trace","payload":{"code":1,"message":"line 1: Odd number of digits","data":{"error":"line 1: Odd number of digits"}}}
+
+# fix: unknown rule: sim-doctor fix no/such-rule --from <TMP>/other.json
+exit 1
+
+# fuzz apdu: refuses without opt-in: sim-doctor fuzz apdu --json
+exit 1
+{"type":"apdu_scan","payload":{"code":1,"message":"fuzz refuses to run without --i-understand-this-can-brick-the-card: a fuzz run sends undocumented CLA/INS values and OTA envelopes that can brick a SIM","data":{"error":{"kind":"fuzz-needs-opt-in"}}}}
+
+# fuzz mutate: bad replay file: sim-doctor fuzz mutate --json --replay <TMP>/garbage.json
+exit 1
+{"type":"apdu_fuzz","payload":{"code":1,"message":"log line 1: expected ident at line 1 column 2","data":{"error":{"kind":"bad-replay"}}}}
+
+# mcp: not a TTY, immediate EOF: sim-doctor mcp
+exit 0
+

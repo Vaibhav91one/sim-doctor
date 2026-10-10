@@ -1,0 +1,702 @@
+
+use builtin;
+use str;
+
+set edit:completion:arg-completer[sim-doctor] = {|@words|
+    fn spaces {|n|
+        builtin:repeat $n ' ' | str:join ''
+    }
+    fn cand {|text desc|
+        edit:complex-candidate $text &display=$text' '(spaces (- 14 (wcswidth $text)))$desc
+    }
+    var command = 'sim-doctor'
+    for word $words[1..-1] {
+        if (str:has-prefix $word '-') {
+            break
+        }
+        set command = $command';'$word
+    }
+    var completions = [
+        &'sim-doctor'= {
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand -V 'Print version'
+            cand --version 'Print version'
+            cand modules 'Describe the crate module roots and the layering between them'
+            cand scan 'Select a card''s master file, walk everything under it, and report'
+            cand ts48 'Compare a card against the public GSMA TS.48 test profile'
+            cand install 'Write agent guidance (Claude skill, Cursor rule, AGENTS.md block) into a project'
+            cand ci 'Write the GitHub Actions workflow that runs this repo''s action on pull requests'
+            cand completions 'Write a shell completion script to stdout'
+            cand mcp 'Serve the scan and the rules as MCP tools over stdio'
+            cand rules 'List the rules a scan runs, or explain one, without a card'
+            cand why 'Explain a rule, or every rule in a saved `scan --json` envelope'
+            cand fix 'Hand one finding from a saved scan to a coding agent'
+            cand gp 'Read-only GlobalPlatform queries'
+            cand trace 'Decode a captured APDU trace offline (no card, no reader)'
+            cand fuzz 'APDU discovery and the OTA/SMS fuzz sweep'
+            cand euicc 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;modules'= {
+            cand --json 'Emit the JSON envelope on stdout instead of a human-readable table'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;scan'= {
+            cand --dialect 'Which FCP tag table this card answers SELECT with'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --max-depth 'Deepest path below the master file the walk descends into'
+            cand --max-children 'Identifiers probed per directory'
+            cand --max-nodes 'Files the card selected across the whole walk (default 16384)'
+            cand --max-directories 'Directories whose children are enumerated'
+            cand --severity 'Drop findings below this severity'
+            cand --baseline 'Compare this run against a previous `scan --json` envelope (doctor/1)'
+            cand --fail-on 'Exit 1 (3 under --baseline) when a finding is at or above this severity'
+            cand --sarif 'Also write the findings to FILE as SARIF 2.1.0'
+            cand --tar 'Which TARs to probe for MSL 0, and how many'
+            cand --json 'Emit one JSON envelope on stdout, and nothing else'
+            cand --tui 'Show the findings in an interactive terminal view instead of the report'
+            cand --score 'Add one quality score for this card, for CI gating'
+            cand --terminal-profile 'Send a TERMINAL PROFILE to the card before the TAR audit'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;ts48'= {
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand compare 'Walk the card and diff its file system against the GSMA TS.48 test profile'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;ts48;compare'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --dialect 'Which FCP tag table this card answers SELECT with (see `scan --help`)'
+            cand --max-depth 'Deepest path below the master file the walk descends into'
+            cand --max-children 'Identifiers probed per directory'
+            cand --max-nodes 'Files the card selected across the whole walk (default 16384)'
+            cand --max-directories 'Directories whose children are enumerated'
+            cand --json 'Emit one JSON envelope (type "ts48") on stdout, and nothing else'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;ts48;help'= {
+            cand compare 'Walk the card and diff its file system against the GSMA TS.48 test profile'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;ts48;help;compare'= {
+        }
+        &'sim-doctor;ts48;help;help'= {
+        }
+        &'sim-doctor;install'= {
+            cand --agent 'Install for one agent only; omit for all of them'
+            cand --dir 'Project root to write under (default: the current directory)'
+            cand --print-only 'Print what would be written instead of writing it'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;ci'= {
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand install 'Write .github/workflows/sim-doctor.yml, pinned to this version''s tag'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;ci;install'= {
+            cand --swsim 'Build the software card on the runner (CI has no card otherwise)'
+            cand --baseline 'Committed baseline path (letters, digits and . _ / - only)'
+            cand --require-baseline 'Fail the job when the baseline file is missing'
+            cand --severity 'Pass --severity to the scan'
+            cand --ref 'The action ref to pin (default: v<this version>; it exists once that release is cut)'
+            cand --dir 'Project root to write under (default: the current directory)'
+            cand --force 'Overwrite a differing existing workflow'
+            cand --print-only 'Print the workflow instead of writing it'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;ci;help'= {
+            cand install 'Write .github/workflows/sim-doctor.yml, pinned to this version''s tag'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;ci;help;install'= {
+        }
+        &'sim-doctor;ci;help;help'= {
+        }
+        &'sim-doctor;completions'= {
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;mcp'= {
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;rules'= {
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+            cand list 'One row per rule: id, severity, summary'
+            cand explain 'What a rule means and how to fix it'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;rules;list'= {
+            cand --json 'Emit one JSON envelope of kind "rules" on stdout'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;rules;explain'= {
+            cand --json 'Emit one JSON envelope of kind "rules" on stdout'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;rules;help'= {
+            cand list 'One row per rule: id, severity, summary'
+            cand explain 'What a rule means and how to fix it'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;rules;help;list'= {
+        }
+        &'sim-doctor;rules;help;explain'= {
+        }
+        &'sim-doctor;rules;help;help'= {
+        }
+        &'sim-doctor;why'= {
+            cand --json 'Emit one JSON envelope of kind "rules" on stdout'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;fix'= {
+            cand --from 'A saved `sim-doctor scan --json` envelope holding a finding for that rule'
+            cand --agent 'Start this coding agent with the prompt instead of only printing it'
+            cand --skip-approvals 'Pass the agent its flag that skips approval prompts (unverified for every CLI version)'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp'= {
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+            cand info 'Select the issuer security domain and read CPLC, card data, key information, IIN and CIN with GET DATA'
+            cand ara 'Select the ARA-M (Access Rule Application Master) and read every access rule with GET DATA [all], decoded (read-only, no keys)'
+            cand status 'GlobalPlatform registry inventory: GET STATUS for the ISD, applications and load files, plus Card Recognition Data (read-only). A scope the card only gives over a secure channel is reported as requiring authentication'
+            cand select 'SELECT a GlobalPlatform (or any) application by AID and report the status word and the FCI. Read-only, no keys; it only changes the card''s current selection'
+            cand channel 'Open or close a supplementary logical channel (MANAGE CHANNEL). A channel stays open on the card until it is closed or the card loses power, and the other gp commands can then run on it with --channel N'
+            cand delete 'Delete an application or an executable load file over an SCP03 channel (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT'
+            cand install 'Load a CAP file and install an applet over an SCP03 channel: INSTALL [for load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT'
+            cand put-key 'Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD''S ADMINISTRATIVE ACCESS'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;gp;info'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;ara'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;status'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --keys-file 'File holding the keys (keep it chmod 600)'
+            cand --keys-env 'Environment variable holding the keys'
+            cand --key-version 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;select'= {
+            cand --aid 'The application AID, 5 to 16 bytes of hex'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;channel'= {
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand open 'MANAGE CHANNEL open: the card picks the number and it is printed'
+            cand close 'MANAGE CHANNEL close of a channel opened earlier'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;gp;channel;open'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;gp;channel;close'= {
+            cand --channel 'The channel to close, 1 to 19'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;gp;channel;help'= {
+            cand open 'MANAGE CHANNEL open: the card picks the number and it is printed'
+            cand close 'MANAGE CHANNEL close of a channel opened earlier'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;gp;channel;help;open'= {
+        }
+        &'sim-doctor;gp;channel;help;close'= {
+        }
+        &'sim-doctor;gp;channel;help;help'= {
+        }
+        &'sim-doctor;gp;delete'= {
+            cand --aid 'The AID to delete, 5 to 16 bytes of hex'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --keys-file 'File holding the keys (keep it chmod 600)'
+            cand --keys-env 'Environment variable holding the keys'
+            cand --key-version 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --related 'Also delete related objects (P2 80): for a load file, its applications'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand --yes 'Send the commands. Without it nothing is written. Needs --keys-file or --keys-env'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;install'= {
+            cand --load 'The CAP file (a zip of javacard/*.cap components)'
+            cand --module 'The Executable Module AID (the applet class). Optional when the CAP has one applet'
+            cand --app 'The application (instance) AID. Defaults to the module AID'
+            cand --params 'The Install Parameters field as TLV with the mandatory C9 tag (default C900: none)'
+            cand --privileges 'Privileges, 1 or 3 bytes of hex (default 000000). Card Lock and Card Terminate are refused'
+            cand --dap-key-file 'File holding the AES DAP key (hex, optionally KEY/KCV; chmod 600)'
+            cand --dap-key-env 'Environment variable holding the AES DAP key'
+            cand --dap-sd 'The Security Domain that verifies the DAP, 5 to 16 bytes of hex (default: the issuer security domain being authenticated)'
+            cand --dap-hash 'The Load File Data Block Hash the DAP signs'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --keys-file 'File holding the keys (keep it chmod 600)'
+            cand --keys-env 'Environment variable holding the keys'
+            cand --key-version 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand --yes 'Send the commands. Without it nothing is written. Needs --keys-file or --keys-env'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;put-key'= {
+            cand --new-key-version 'The Key Version Number of the new keys, 01 to 7F'
+            cand --replace-key-version 'P1: 00 (default) adds the key set; 01 to 7F replaces the key set with that version'
+            cand --key-id 'The Key Identifier of the first key (the other two follow at +1 and +2)'
+            cand --new-keys-file 'File holding the new keys (keep it chmod 600)'
+            cand --new-keys-env 'Environment variable holding the new keys'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --keys-file 'File holding the keys (keep it chmod 600)'
+            cand --keys-env 'Environment variable holding the keys'
+            cand --key-version 'Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets the card choose its first key set'
+            cand --channel 'Logical channel number, 0 (the basic channel, default) to 19. The SELECT and every following command, and the secure channel, use it'
+            cand --replace-current-keyset 'Allow the request to add, replace or overwrite the key version this session authenticated with. Without it such a request is refused'
+            cand --json 'Emit one JSON envelope of kind "gp" on stdout'
+            cand --trace 'Add every APDU exchange (command and response hex) as data.trace'
+            cand --yes 'Send the commands. Without it nothing is written. Needs --keys-file or --keys-env'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;gp;help'= {
+            cand info 'Select the issuer security domain and read CPLC, card data, key information, IIN and CIN with GET DATA'
+            cand ara 'Select the ARA-M (Access Rule Application Master) and read every access rule with GET DATA [all], decoded (read-only, no keys)'
+            cand status 'GlobalPlatform registry inventory: GET STATUS for the ISD, applications and load files, plus Card Recognition Data (read-only). A scope the card only gives over a secure channel is reported as requiring authentication'
+            cand select 'SELECT a GlobalPlatform (or any) application by AID and report the status word and the FCI. Read-only, no keys; it only changes the card''s current selection'
+            cand channel 'Open or close a supplementary logical channel (MANAGE CHANNEL). A channel stays open on the card until it is closed or the card loses power, and the other gp commands can then run on it with --channel N'
+            cand delete 'Delete an application or an executable load file over an SCP03 channel (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT'
+            cand install 'Load a CAP file and install an applet over an SCP03 channel: INSTALL [for load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT'
+            cand put-key 'Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD''S ADMINISTRATIVE ACCESS'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;gp;help;info'= {
+        }
+        &'sim-doctor;gp;help;ara'= {
+        }
+        &'sim-doctor;gp;help;status'= {
+        }
+        &'sim-doctor;gp;help;select'= {
+        }
+        &'sim-doctor;gp;help;channel'= {
+            cand open 'MANAGE CHANNEL open: the card picks the number and it is printed'
+            cand close 'MANAGE CHANNEL close of a channel opened earlier'
+        }
+        &'sim-doctor;gp;help;channel;open'= {
+        }
+        &'sim-doctor;gp;help;channel;close'= {
+        }
+        &'sim-doctor;gp;help;delete'= {
+        }
+        &'sim-doctor;gp;help;install'= {
+        }
+        &'sim-doctor;gp;help;put-key'= {
+        }
+        &'sim-doctor;gp;help;help'= {
+        }
+        &'sim-doctor;trace'= {
+            cand --json 'Emit one JSON envelope of kind "trace" on stdout'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;fuzz'= {
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+            cand apdu 'CLA discovery (level 1) or CLA+INS discovery (level 2) over a session'
+            cand ota 'The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR scanner''s ENVELOPE builder'
+            cand mutate 'Allowlist-only APDU mutation fuzzer, against a replay log or the built-in mock card only (no reader)'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;fuzz;apdu'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --level '1 for CLA discovery, 2 for CLA+INS discovery'
+            cand --class 'The CLA level 2 probes INS values at, as two hex digits (e.g. A0). Required for --level 2'
+            cand --i-understand-this-can-brick-the-card 'Required. Without it, `fuzz` refuses to run at all (exit 1, error kind fuzz-needs-opt-in)'
+            cand --allow-real-hardware 'Required in addition to the opt-in above when the reader''s name does not match the software card (swicc-pcsc names its reader with "swICC"). Without it, `fuzz` refuses to run against anything that is not recognisably the software card'
+            cand --json 'Emit one JSON envelope on stdout, and nothing else'
+            cand --quick 'Probe a small, documented subset instead of the full space'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;fuzz;ota'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --i-understand-this-can-brick-the-card 'Required. Without it, `fuzz` refuses to run at all (exit 1, error kind fuzz-needs-opt-in)'
+            cand --allow-real-hardware 'Required in addition to the opt-in above when the reader''s name does not match the software card (swicc-pcsc names its reader with "swICC"). Without it, `fuzz` refuses to run against anything that is not recognisably the software card'
+            cand --json 'Emit one JSON envelope on stdout, and nothing else'
+            cand --quick 'Probe a small, documented subset instead of the full space'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;fuzz;mutate'= {
+            cand --replay 'Answer from a recorded exchange log (one {"command","response"} JSON object per line, as SIM_DOCTOR_RECORD writes) instead of a card'
+            cand --max-cases 'Cases to send (1 to 10000)'
+            cand --timeout 'Stop sending after this many seconds'
+            cand --seed 'PRNG seed. The same seed gives the same APDUs'
+            cand --mock 'Answer from the built-in strict mock card'
+            cand --dry-run 'Print the planned APDUs and the allowlist/denylist; send nothing'
+            cand --stop-on-first-finding 'Stop after the first finding'
+            cand --json 'Emit one JSON envelope on stdout, and nothing else'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'sim-doctor;fuzz;help'= {
+            cand apdu 'CLA discovery (level 1) or CLA+INS discovery (level 2) over a session'
+            cand ota 'The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR scanner''s ENVELOPE builder'
+            cand mutate 'Allowlist-only APDU mutation fuzzer, against a replay log or the built-in mock card only (no reader)'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;fuzz;help;apdu'= {
+        }
+        &'sim-doctor;fuzz;help;ota'= {
+        }
+        &'sim-doctor;fuzz;help;mutate'= {
+        }
+        &'sim-doctor;fuzz;help;help'= {
+        }
+        &'sim-doctor;euicc'= {
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+            cand info 'EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`)'
+            cand profiles 'Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`)'
+            cand notifications 'Pending notification metadata (lpac `notification list`); `dump` and `replay` below; `notifications remove <seq>` removes one'
+            cand nickname 'Set a profile''s nickname (lpac `profile nickname`). A write: a dry run unless `--yes`, never exposed over MCP'
+            cand enable 'Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH). A dry run unless `--yes`: switches the active profile and the device loses its connection until it re-attaches. Never exposed over MCP'
+            cand disable 'Disable a profile (lpac `profile disable`, ES10c DisableProfile with REFRESH). A dry run unless `--yes`: disabling the only enabled profile leaves no active profile. Never exposed over MCP'
+            cand delete 'Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run unless `--yes`: the profile is erased permanently and can only come back by downloading it again from the operator. An enabled profile is refused. Never exposed over MCP'
+            cand reset 'Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can erase every profile: nothing is selected by default, and sending needs both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;euicc;info'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;profiles'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;notifications'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand remove 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP'
+            cand dump 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP'
+            cand replay 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;euicc;notifications;remove'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --yes 'Send the request, then re-read the list and confirm. Without it nothing is changed'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;notifications;dump'= {
+            cand --seq 'Only the notification with this sequence number (default: all pending)'
+            cand -o 'Write the dump document to FILE (must not exist) instead of stdout'
+            cand --output 'Write the dump document to FILE (must not exist) instead of stdout'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;notifications;replay'= {
+            cand --from 'A dump file written by `notifications dump` (or its `--json` output)'
+            cand --yes 'Actually send. Without it nothing leaves this machine: the targets and what would be sent are printed'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;notifications;help'= {
+            cand remove 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP'
+            cand dump 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP'
+            cand replay 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;euicc;notifications;help;remove'= {
+        }
+        &'sim-doctor;euicc;notifications;help;dump'= {
+        }
+        &'sim-doctor;euicc;notifications;help;replay'= {
+        }
+        &'sim-doctor;euicc;notifications;help;help'= {
+        }
+        &'sim-doctor;euicc;nickname'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --yes 'Send SetNickname, then re-read the profile list and confirm. Without it nothing is changed: the target EID and ICCID, the current and the new nickname are printed and the command exits'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;enable'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --yes 'Send the request, then re-read the profile list and confirm. Without it nothing is changed: the plan and its consequence are printed'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;disable'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --yes 'Send the request, then re-read the profile list and confirm. Without it nothing is changed: the plan and its consequence are printed'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;delete'= {
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --yes 'Send DeleteProfile, then re-read the profile list and confirm. Without it nothing is changed: the profile and its consequence are printed'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;reset'= {
+            cand --confirm-eid 'The card''s EID (32 hex digits); must match the EID read from the card'
+            cand --reader 'The reader to use, matched against the driver''s own name'
+            cand --aid 'ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)'
+            cand --max-segment 'Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks'
+            cand --operational 'Delete the operational profiles (resetOptions bit 0)'
+            cand --test 'Delete the field-loaded test profiles (resetOptions bit 1)'
+            cand --smdp-address 'Reset the default SM-DP+ address (resetOptions bit 2)'
+            cand --yes 'Send the reset (needs `--confirm-eid`), then re-read and confirm. Without it nothing is changed: the profiles that would be erased are listed'
+            cand --json 'Emit one lpac envelope on stdout, and nothing else'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'sim-doctor;euicc;help'= {
+            cand info 'EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`)'
+            cand profiles 'Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`)'
+            cand notifications 'Pending notification metadata (lpac `notification list`); `dump` and `replay` below; `notifications remove <seq>` removes one'
+            cand nickname 'Set a profile''s nickname (lpac `profile nickname`). A write: a dry run unless `--yes`, never exposed over MCP'
+            cand enable 'Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH). A dry run unless `--yes`: switches the active profile and the device loses its connection until it re-attaches. Never exposed over MCP'
+            cand disable 'Disable a profile (lpac `profile disable`, ES10c DisableProfile with REFRESH). A dry run unless `--yes`: disabling the only enabled profile leaves no active profile. Never exposed over MCP'
+            cand delete 'Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run unless `--yes`: the profile is erased permanently and can only come back by downloading it again from the operator. An enabled profile is refused. Never exposed over MCP'
+            cand reset 'Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can erase every profile: nothing is selected by default, and sending needs both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;euicc;help;info'= {
+        }
+        &'sim-doctor;euicc;help;profiles'= {
+        }
+        &'sim-doctor;euicc;help;notifications'= {
+            cand remove 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP'
+            cand dump 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP'
+            cand replay 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP'
+        }
+        &'sim-doctor;euicc;help;notifications;remove'= {
+        }
+        &'sim-doctor;euicc;help;notifications;dump'= {
+        }
+        &'sim-doctor;euicc;help;notifications;replay'= {
+        }
+        &'sim-doctor;euicc;help;nickname'= {
+        }
+        &'sim-doctor;euicc;help;enable'= {
+        }
+        &'sim-doctor;euicc;help;disable'= {
+        }
+        &'sim-doctor;euicc;help;delete'= {
+        }
+        &'sim-doctor;euicc;help;reset'= {
+        }
+        &'sim-doctor;euicc;help;help'= {
+        }
+        &'sim-doctor;help'= {
+            cand modules 'Describe the crate module roots and the layering between them'
+            cand scan 'Select a card''s master file, walk everything under it, and report'
+            cand ts48 'Compare a card against the public GSMA TS.48 test profile'
+            cand install 'Write agent guidance (Claude skill, Cursor rule, AGENTS.md block) into a project'
+            cand ci 'Write the GitHub Actions workflow that runs this repo''s action on pull requests'
+            cand completions 'Write a shell completion script to stdout'
+            cand mcp 'Serve the scan and the rules as MCP tools over stdio'
+            cand rules 'List the rules a scan runs, or explain one, without a card'
+            cand why 'Explain a rule, or every rule in a saved `scan --json` envelope'
+            cand fix 'Hand one finding from a saved scan to a coding agent'
+            cand gp 'Read-only GlobalPlatform queries'
+            cand trace 'Decode a captured APDU trace offline (no card, no reader)'
+            cand fuzz 'APDU discovery and the OTA/SMS fuzz sweep'
+            cand euicc 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'sim-doctor;help;modules'= {
+        }
+        &'sim-doctor;help;scan'= {
+        }
+        &'sim-doctor;help;ts48'= {
+            cand compare 'Walk the card and diff its file system against the GSMA TS.48 test profile'
+        }
+        &'sim-doctor;help;ts48;compare'= {
+        }
+        &'sim-doctor;help;install'= {
+        }
+        &'sim-doctor;help;ci'= {
+            cand install 'Write .github/workflows/sim-doctor.yml, pinned to this version''s tag'
+        }
+        &'sim-doctor;help;ci;install'= {
+        }
+        &'sim-doctor;help;completions'= {
+        }
+        &'sim-doctor;help;mcp'= {
+        }
+        &'sim-doctor;help;rules'= {
+            cand list 'One row per rule: id, severity, summary'
+            cand explain 'What a rule means and how to fix it'
+        }
+        &'sim-doctor;help;rules;list'= {
+        }
+        &'sim-doctor;help;rules;explain'= {
+        }
+        &'sim-doctor;help;why'= {
+        }
+        &'sim-doctor;help;fix'= {
+        }
+        &'sim-doctor;help;gp'= {
+            cand info 'Select the issuer security domain and read CPLC, card data, key information, IIN and CIN with GET DATA'
+            cand ara 'Select the ARA-M (Access Rule Application Master) and read every access rule with GET DATA [all], decoded (read-only, no keys)'
+            cand status 'GlobalPlatform registry inventory: GET STATUS for the ISD, applications and load files, plus Card Recognition Data (read-only). A scope the card only gives over a secure channel is reported as requiring authentication'
+            cand select 'SELECT a GlobalPlatform (or any) application by AID and report the status word and the FCI. Read-only, no keys; it only changes the card''s current selection'
+            cand channel 'Open or close a supplementary logical channel (MANAGE CHANNEL). A channel stays open on the card until it is closed or the card loses power, and the other gp commands can then run on it with --channel N'
+            cand delete 'Delete an application or an executable load file over an SCP03 channel (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT'
+            cand install 'Load a CAP file and install an applet over an SCP03 channel: INSTALL [for load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT'
+            cand put-key 'Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD''S ADMINISTRATIVE ACCESS'
+        }
+        &'sim-doctor;help;gp;info'= {
+        }
+        &'sim-doctor;help;gp;ara'= {
+        }
+        &'sim-doctor;help;gp;status'= {
+        }
+        &'sim-doctor;help;gp;select'= {
+        }
+        &'sim-doctor;help;gp;channel'= {
+            cand open 'MANAGE CHANNEL open: the card picks the number and it is printed'
+            cand close 'MANAGE CHANNEL close of a channel opened earlier'
+        }
+        &'sim-doctor;help;gp;channel;open'= {
+        }
+        &'sim-doctor;help;gp;channel;close'= {
+        }
+        &'sim-doctor;help;gp;delete'= {
+        }
+        &'sim-doctor;help;gp;install'= {
+        }
+        &'sim-doctor;help;gp;put-key'= {
+        }
+        &'sim-doctor;help;trace'= {
+        }
+        &'sim-doctor;help;fuzz'= {
+            cand apdu 'CLA discovery (level 1) or CLA+INS discovery (level 2) over a session'
+            cand ota 'The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR scanner''s ENVELOPE builder'
+            cand mutate 'Allowlist-only APDU mutation fuzzer, against a replay log or the built-in mock card only (no reader)'
+        }
+        &'sim-doctor;help;fuzz;apdu'= {
+        }
+        &'sim-doctor;help;fuzz;ota'= {
+        }
+        &'sim-doctor;help;fuzz;mutate'= {
+        }
+        &'sim-doctor;help;euicc'= {
+            cand info 'EID, EUICCInfo1 and EUICCInfo2 (lpac `chip info`)'
+            cand profiles 'Installed profiles: ICCID, state, class, nickname, provider, name (lpac `profile list`)'
+            cand notifications 'Pending notification metadata (lpac `notification list`); `dump` and `replay` below; `notifications remove <seq>` removes one'
+            cand nickname 'Set a profile''s nickname (lpac `profile nickname`). A write: a dry run unless `--yes`, never exposed over MCP'
+            cand enable 'Enable a profile (lpac `profile enable`, ES10c EnableProfile with REFRESH). A dry run unless `--yes`: switches the active profile and the device loses its connection until it re-attaches. Never exposed over MCP'
+            cand disable 'Disable a profile (lpac `profile disable`, ES10c DisableProfile with REFRESH). A dry run unless `--yes`: disabling the only enabled profile leaves no active profile. Never exposed over MCP'
+            cand delete 'Delete a profile (lpac `profile delete`, ES10c DeleteProfile). A dry run unless `--yes`: the profile is erased permanently and can only come back by downloading it again from the operator. An enabled profile is refused. Never exposed over MCP'
+            cand reset 'Reset the eUICC memory (lpac `chip purge`, ES10c eUICCMemoryReset). Can erase every profile: nothing is selected by default, and sending needs both `--yes` and `--confirm-eid <EID>` matching the card. Never exposed over MCP'
+        }
+        &'sim-doctor;help;euicc;info'= {
+        }
+        &'sim-doctor;help;euicc;profiles'= {
+        }
+        &'sim-doctor;help;euicc;notifications'= {
+            cand remove 'Remove a notification from the eUICC''s list (lpac `notification remove`, ES10b RemoveNotificationFromList). A dry run unless `--yes`: a removed notification is never sent to the operator''s server. Never exposed over MCP'
+            cand dump 'Read the full signed pending notifications (lpac `notification dump`, ES10b RetrieveNotificationsList) as a re-loadable JSON document: hex of the signed bytes plus the decoded sequence number, operation, address and ICCID. Read-only: nothing is removed. Without `-o` and `--json` the document itself is printed. Never exposed over MCP'
+            cand replay 'Send the notifications of a dump file to their operators (ES9+ HandleNotification over HTTPS). A dry run unless `--yes`: this reaches the network and tells the operator''s server about a profile event. Needs no card and removes nothing. Never exposed over MCP'
+        }
+        &'sim-doctor;help;euicc;notifications;remove'= {
+        }
+        &'sim-doctor;help;euicc;notifications;dump'= {
+        }
+        &'sim-doctor;help;euicc;notifications;replay'= {
+        }
+        &'sim-doctor;help;euicc;nickname'= {
+        }
+        &'sim-doctor;help;euicc;enable'= {
+        }
+        &'sim-doctor;help;euicc;disable'= {
+        }
+        &'sim-doctor;help;euicc;delete'= {
+        }
+        &'sim-doctor;help;euicc;reset'= {
+        }
+        &'sim-doctor;help;help'= {
+        }
+    ]
+    $completions[$command]
+}
