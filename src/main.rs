@@ -580,6 +580,8 @@ enum GpAction {
         /// Add every APDU exchange (command and response hex) as data.trace.
         #[arg(long)]
         trace: bool,
+        #[command(flatten)]
+        channel: GpChannelArg,
     },
     /// Select the ARA-M (Access Rule Application Master) and read every access
     /// rule with GET DATA [all], decoded (read-only, no keys).
@@ -595,6 +597,8 @@ enum GpAction {
         /// Add every APDU exchange (command and response hex) as data.trace.
         #[arg(long)]
         trace: bool,
+        #[command(flatten)]
+        channel: GpChannelArg,
     },
     /// GlobalPlatform registry inventory: GET STATUS for the ISD, applications
     /// and load files, plus Card Recognition Data (read-only). A scope
@@ -624,6 +628,8 @@ enum GpAction {
         #[arg(long)]
         trace: bool,
         #[command(flatten)]
+        channel: GpChannelArg,
+        #[command(flatten)]
         keys: GpKeyArgs,
     },
     /// SELECT a GlobalPlatform (or any) application by AID and report the status
@@ -644,7 +650,138 @@ enum GpAction {
         /// Add every APDU exchange (command and response hex) as data.trace.
         #[arg(long)]
         trace: bool,
+        #[command(flatten)]
+        channel: GpChannelArg,
     },
+    /// Open or close a supplementary logical channel (MANAGE CHANNEL). A channel
+    /// stays open on the card until it is closed or the card loses power, and
+    /// the other gp commands can then run on it with --channel N.
+    Channel {
+        #[command(subcommand)]
+        action: GpChannelAction,
+    },
+    /// Delete an application or an executable load file over an SCP03 channel
+    /// (DELETE, GlobalPlatform Card Spec v2.3.1 11.2). CHANGES CARD CONTENT.
+    ///
+    /// A dry run unless --yes: it prints the target and the exact APDUs and
+    /// sends nothing. With --keys-file/--keys-env the dry run also makes the one
+    /// SCP03 authentication attempt and reads the registry, and the command
+    /// refuses (nothing sent) when the AID is not present, is the issuer security
+    /// domain, or the registry cannot be read. --yes needs keys. The ISD keys are
+    /// read from a file or environment variable, never the command line, and are
+    /// never printed. Not available over MCP.
+    ///
+    /// Exit 0 for a dry run or a verified delete, 1 for a refusal, a card error or
+    /// a delete the registry does not confirm.
+    Delete {
+        /// The AID to delete, 5 to 16 bytes of hex.
+        #[arg(long, value_name = "HEX")]
+        aid: String,
+        /// Also delete related objects (P2 80): for a load file, its applications.
+        #[arg(long)]
+        related: bool,
+        #[command(flatten)]
+        write: GpWriteFlags,
+    },
+    /// Load a CAP file and install an applet over an SCP03 channel: INSTALL [for
+    /// load], LOAD, INSTALL [for install and make selectable] (GlobalPlatform Card
+    /// Spec v2.3.1 11.5, 11.6). CHANGES CARD CONTENT.
+    ///
+    /// Same safeguards as delete: a dry run unless --yes (offline without keys),
+    /// one authentication attempt, a registry pre-read that refuses a load file or
+    /// application AID that is already on the card, every command sent once and
+    /// in order, stopping at the first refusal, and a registry re-read to confirm.
+    /// DAP signing and tokens are not supported (PUT KEY and DAP keys are issue
+    /// #115): a card that demands a DAP block refuses the load. Not available over
+    /// MCP.
+    ///
+    /// Exit 0 for a dry run or a verified install, 1 otherwise.
+    Install {
+        /// The CAP file (a zip of javacard/*.cap components).
+        #[arg(long, value_name = "CAP")]
+        load: std::path::PathBuf,
+        /// The Executable Module AID (the applet class). Optional when the CAP has
+        /// one applet.
+        #[arg(long, value_name = "HEX")]
+        module: Option<String>,
+        /// The application (instance) AID. Defaults to the module AID.
+        #[arg(long, value_name = "HEX")]
+        app: Option<String>,
+        /// The Install Parameters field as TLV with the mandatory C9 tag (default
+        /// C900: none).
+        #[arg(long, value_name = "HEX", default_value = "C900")]
+        params: String,
+        /// Privileges, 1 or 3 bytes of hex (default 000000). Card Lock and Card
+        /// Terminate are refused.
+        #[arg(long, value_name = "HEX", default_value = "000000")]
+        privileges: String,
+        #[command(flatten)]
+        write: GpWriteFlags,
+    },
+}
+
+#[derive(Subcommand)]
+enum GpChannelAction {
+    /// MANAGE CHANNEL open: the card picks the number and it is printed.
+    Open {
+        /// The reader to use, matched against the driver's own name.
+        #[arg(long, value_name = "NAME")]
+        reader: Option<String>,
+        /// Emit one JSON envelope of kind "gp" on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Add every APDU exchange (command and response hex) as data.trace.
+        #[arg(long)]
+        trace: bool,
+    },
+    /// MANAGE CHANNEL close of a channel opened earlier.
+    Close {
+        /// The channel to close, 1 to 19.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=19))]
+        channel: u8,
+        /// The reader to use, matched against the driver's own name.
+        #[arg(long, value_name = "NAME")]
+        reader: Option<String>,
+        /// Emit one JSON envelope of kind "gp" on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Add every APDU exchange (command and response hex) as data.trace.
+        #[arg(long)]
+        trace: bool,
+    },
+}
+
+/// Runs a gp command on a supplementary logical channel (opened with `gp
+/// channel open`) instead of the basic channel.
+#[derive(Args, Clone, Copy)]
+struct GpChannelArg {
+    /// Logical channel number, 0 (the basic channel, default) to 19. The SELECT
+    /// and every following command, and the secure channel, use it.
+    #[arg(long, value_name = "N", default_value_t = 0,
+          value_parser = clap::value_parser!(u8).range(0..=19))]
+    channel: u8,
+}
+
+/// What `gp delete` and `gp install` share.
+#[derive(Args)]
+struct GpWriteFlags {
+    /// The reader to use, matched against the driver's own name.
+    #[arg(long, value_name = "NAME")]
+    reader: Option<String>,
+    /// Emit one JSON envelope of kind "gp" on stdout.
+    #[arg(long)]
+    json: bool,
+    /// Add every APDU exchange (command and response hex) as data.trace.
+    #[arg(long)]
+    trace: bool,
+    #[command(flatten)]
+    keys: GpKeyArgs,
+    #[command(flatten)]
+    channel: GpChannelArg,
+    /// Send the commands. Without it nothing is written. Needs --keys-file or
+    /// --keys-env.
+    #[arg(long, requires = "key_source")]
+    yes: bool,
 }
 
 /// Where `gp status` gets ISD keys. Never a value on the command line: it would
@@ -1245,36 +1382,97 @@ fn main() -> process::ExitCode {
                 reader,
                 json,
                 trace,
-            } => run_gp("gp info", reader.as_deref(), json, trace, gp::info),
+                channel,
+            } => run_gp(
+                "gp info",
+                reader.as_deref(),
+                json,
+                trace,
+                channel.channel,
+                |s, t| gp::info(s, t),
+            ),
             GpAction::Ara {
                 reader,
                 json,
                 trace,
-            } => run_gp("gp ara", reader.as_deref(), json, trace, gp::ara),
+                channel,
+            } => run_gp(
+                "gp ara",
+                reader.as_deref(),
+                json,
+                trace,
+                channel.channel,
+                |s, t| gp::ara(s, t),
+            ),
             GpAction::Status {
                 reader,
                 json,
                 trace,
+                channel,
                 keys,
-            } => run_gp_status(reader.as_deref(), json, trace, &keys),
+            } => run_gp_status(reader.as_deref(), json, trace, channel.channel, &keys),
             GpAction::Select {
                 aid,
                 reader,
                 json,
                 trace,
-            } => match hex::decode(&aid) {
-                Ok(aid) if (5..=16).contains(&aid.len()) => {
-                    run_gp("gp select", reader.as_deref(), json, trace, |s, t| {
-                        gp::select(s, &aid, t)
-                    })
-                }
-                _ => report_refusal(
+                channel,
+            } => match parse_aid(&aid) {
+                Some(aid) => run_gp(
+                    "gp select",
+                    reader.as_deref(),
+                    json,
+                    trace,
+                    channel.channel,
+                    |s, t| gp::select(s, &aid, t),
+                ),
+                None => report_refusal(
                     "gp",
                     "--aid must be 5 to 16 bytes of hex",
                     serde_json::json!({ "error": { "kind": "bad-aid" } }),
                     json,
                 ),
             },
+            GpAction::Channel { action } => match action {
+                GpChannelAction::Open {
+                    reader,
+                    json,
+                    trace,
+                } => run_gp(
+                    "gp channel open",
+                    reader.as_deref(),
+                    json,
+                    trace,
+                    0,
+                    |s, t| gp::channel_open(s, t),
+                ),
+                GpChannelAction::Close {
+                    channel,
+                    reader,
+                    json,
+                    trace,
+                } => run_gp(
+                    "gp channel close",
+                    reader.as_deref(),
+                    json,
+                    trace,
+                    0,
+                    |s, t| gp::channel_close(s, channel, t),
+                ),
+            },
+            GpAction::Delete {
+                aid,
+                related,
+                write,
+            } => run_gp_delete(&aid, related, &write),
+            GpAction::Install {
+                load,
+                module,
+                app,
+                params,
+                privileges,
+                write,
+            } => run_gp_install(&load, module, app, &params, &privileges, &write),
         },
         Command::Euicc(args) => match args.action {
             EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
@@ -2047,13 +2245,22 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
     }
 }
 
-/// `sim-doctor gp <info|ara|status>`: one read-only GlobalPlatform pass over one card.
+/// 5 to 16 bytes of hex.
+fn parse_aid(text: &str) -> Option<Vec<u8>> {
+    hex::decode(text)
+        .ok()
+        .filter(|a| (5..=16).contains(&a.len()))
+}
+
+/// `sim-doctor gp ...`: one GlobalPlatform pass over one card, on logical
+/// channel `channel` (0 is the basic channel).
 fn run_gp(
     what: &str,
     reader: Option<&str>,
     json: bool,
     trace: bool,
-    pass: impl FnOnce(&mut PcscSession, bool) -> Result<gp::Report, session::Error>,
+    channel: u8,
+    pass: impl FnOnce(&mut dyn CardSession, bool) -> Result<gp::Report, session::Error>,
 ) -> contract::ExitCode {
     const KIND: &str = "gp";
     guard_exchange(KIND, json);
@@ -2077,13 +2284,23 @@ fn run_gp(
             return refuse(scan::Failure::new(kind, err.to_string()));
         }
     };
-    let report = match pass(&mut session, trace) {
+    let result = if channel == 0 {
+        pass(&mut session, trace)
+    } else {
+        pass(&mut gp::OnChannel::new(&mut session, channel), trace)
+    };
+    let report = match result {
         Ok(report) => report,
         Err(err) => return refuse(scan::Failure::new("gp-exchange-failed", err.to_string())),
     };
     let mut data = report.data;
     data["reader"] = serde_json::json!(reader.as_str());
-    // An error the pass itself recorded (an authentication that stopped) wins.
+    if channel != 0 {
+        data["logical_channel"] = serde_json::json!(channel);
+        gp::retarget_channel(&mut data, channel);
+    }
+    // An error the pass itself recorded (an authentication that stopped, a
+    // refused write) wins.
     if let Some(message) = data["error"]["message"].as_str().map(str::to_owned) {
         return report_refusal(KIND, &message, data, json);
     }
@@ -2102,9 +2319,14 @@ fn run_gp(
         data["error"] = serde_json::json!({ "kind": kind, "message": message });
         return report_refusal(KIND, message, data, json);
     }
+    emit_gp(what, data, json)
+}
+
+/// Prints a successful `gp` `data`: the envelope with --json, text otherwise.
+fn emit_gp(what: &str, data: serde_json::Value, json: bool) -> contract::ExitCode {
     let rendered = if json {
         match contract::Envelope::new(
-            KIND,
+            "gp",
             contract::ExitCode::Success,
             contract::OK_MESSAGE,
             data,
@@ -2129,45 +2351,209 @@ fn run_gp(
     contract::ExitCode::Success
 }
 
-/// `sim-doctor gp status [--keys-file PATH | --keys-env VAR]`. The keys are read
-/// and checked (format, stated KCVs) before a reader is opened, so a typo costs
-/// the card nothing. The host challenge is fresh per run.
+/// Loads the ISD keys named by `--keys-file` / `--keys-env`, if any. The keys are
+/// read and checked (format, stated KCVs) before a reader is opened, so a typo
+/// costs the card nothing. `Err` is the exit code of the refusal already printed.
+fn load_gp_keys(args: &GpKeyArgs, json: bool) -> Result<Option<gp::Keys>, contract::ExitCode> {
+    let source = match (&args.keys_file, &args.keys_env) {
+        (Some(path), _) => gp::KeySource::File(path),
+        (None, Some(name)) => gp::KeySource::Env(name),
+        (None, None) => return Ok(None),
+    };
+    gp::Keys::load(source).map(Some).map_err(|err| {
+        let kind = match err {
+            gp::KeyError::Kcv { .. } => "key-kcv-mismatch",
+            _ => "keys-unusable",
+        };
+        let message = err.to_string();
+        let data = serde_json::json!({ "error": { "kind": kind, "message": message } });
+        report_refusal("gp", &message, data, json)
+    })
+}
+
+/// A fresh host challenge for one authentication attempt.
+fn gp_auth<'a>(keys: &'a gp::Keys, args: &GpKeyArgs, channel: u8) -> gp::Auth<'a> {
+    let mut host_challenge = [0u8; 8];
+    rand::fill(&mut host_challenge);
+    gp::Auth {
+        keys,
+        key_version: args.key_version,
+        host_challenge,
+        logical_channel: channel,
+    }
+}
+
+/// `sim-doctor gp status [--keys-file PATH | --keys-env VAR]`.
 fn run_gp_status(
     reader: Option<&str>,
     json: bool,
     trace: bool,
+    channel: u8,
     args: &GpKeyArgs,
 ) -> contract::ExitCode {
-    let source = match (&args.keys_file, &args.keys_env) {
-        (Some(path), _) => Some(gp::KeySource::File(path)),
-        (None, Some(name)) => Some(gp::KeySource::Env(name)),
-        (None, None) => None,
-    };
-    let Some(source) = source else {
-        return run_gp("gp status", reader, json, trace, gp::status);
-    };
-    let keys = match gp::Keys::load(source) {
-        Ok(keys) => keys,
-        Err(err) => {
-            let kind = match err {
-                gp::KeyError::Kcv { .. } => "key-kcv-mismatch",
-                _ => "keys-unusable",
-            };
-            let message = err.to_string();
-            let data = serde_json::json!({ "error": { "kind": kind, "message": message } });
-            return report_refusal("gp", &message, data, json);
+    let keys = match load_gp_keys(args, json) {
+        Ok(Some(keys)) => keys,
+        Ok(None) => {
+            return run_gp("gp status", reader, json, trace, channel, |s, t| {
+                gp::status(s, t)
+            })
         }
+        Err(code) => return code,
     };
-    let mut host_challenge = [0u8; 8];
-    rand::fill(&mut host_challenge);
-    let auth = gp::Auth {
-        keys: &keys,
-        key_version: args.key_version,
-        host_challenge,
-    };
-    run_gp("gp status", reader, json, trace, |s, t| {
+    let auth = gp_auth(&keys, args, channel);
+    run_gp("gp status", reader, json, trace, channel, |s, t| {
         gp::status_authenticated(s, t, &auth)
     })
+}
+
+/// `sim-doctor gp delete`: a dry run unless `--yes`, offline without keys.
+fn run_gp_delete(aid: &str, related: bool, w: &GpWriteFlags) -> contract::ExitCode {
+    let Some(aid) = parse_aid(aid) else {
+        return report_refusal(
+            "gp",
+            "--aid must be 5 to 16 bytes of hex",
+            serde_json::json!({ "error": { "kind": "bad-aid" } }),
+            w.json,
+        );
+    };
+    let req = gp::DeleteRequest { aid, related };
+    let keys = match load_gp_keys(&w.keys, w.json) {
+        Ok(keys) => keys,
+        Err(code) => return code,
+    };
+    let Some(keys) = keys else {
+        return match gp::delete_dry_run(&req) {
+            Ok(mut data) => {
+                if w.channel.channel != 0 {
+                    data["logical_channel"] = serde_json::json!(w.channel.channel);
+                    gp::retarget_channel(&mut data, w.channel.channel);
+                }
+                emit_gp("gp delete", data, w.json)
+            }
+            Err(e) => bad_gp_request(&e, w.json),
+        };
+    };
+    let auth = gp_auth(&keys, &w.keys, w.channel.channel);
+    run_gp(
+        "gp delete",
+        w.reader.as_deref(),
+        w.json,
+        w.trace,
+        w.channel.channel,
+        |s, t| gp::delete(s, t, &req, &auth, w.yes),
+    )
+}
+
+fn bad_gp_request(e: &gp::BuildError, json: bool) -> contract::ExitCode {
+    report_refusal(
+        "gp",
+        &e.to_string(),
+        serde_json::json!({ "error": { "kind": "bad-request", "message": e.to_string() } }),
+        json,
+    )
+}
+
+/// `sim-doctor gp install`: a dry run unless `--yes`, offline without keys. The
+/// CAP is read and checked, and every AID validated, before a reader is opened.
+fn run_gp_install(
+    load: &std::path::Path,
+    module: Option<String>,
+    app: Option<String>,
+    params: &str,
+    privileges: &str,
+    w: &GpWriteFlags,
+) -> contract::ExitCode {
+    let refuse = |kind: &str, message: String| {
+        let data = serde_json::json!({ "error": { "kind": kind, "message": message } });
+        report_refusal("gp", &message, data, w.json)
+    };
+    let bytes = match std::fs::read(load) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return refuse(
+                "cap-unreadable",
+                format!("cannot read {}: {e}", load.display()),
+            )
+        }
+    };
+    let cap = match sim_doctor::cap::Cap::parse(&bytes) {
+        Ok(cap) => cap,
+        Err(e) => return refuse("cap-invalid", e.to_string()),
+    };
+    let (package, applets) = match (cap.header_package_aid(), cap.applet_aids()) {
+        (Ok(p), Ok(a)) => (p, a),
+        (Err(e), _) | (_, Err(e)) => return refuse("cap-invalid", e.to_string()),
+    };
+    let aid_arg = |name: &str, text: &str| {
+        parse_aid(text).ok_or_else(|| format!("--{name} must be 5 to 16 bytes of hex"))
+    };
+    let module_aid = match module {
+        Some(text) => match aid_arg("module", &text) {
+            Ok(aid) if applets.contains(&aid) => aid,
+            Ok(_) => {
+                return refuse(
+                    "module-not-in-cap",
+                    "--module is not an applet AID of this CAP".into(),
+                )
+            }
+            Err(m) => return refuse("bad-aid", m),
+        },
+        None => match applets.as_slice() {
+            [only] => only.clone(),
+            _ => {
+                return refuse(
+                    "module-required",
+                    format!(
+                        "the CAP has {} applets; choose one with --module",
+                        applets.len()
+                    ),
+                )
+            }
+        },
+    };
+    let app_aid = match app {
+        Some(text) => match aid_arg("app", &text) {
+            Ok(aid) => aid,
+            Err(m) => return refuse("bad-aid", m),
+        },
+        None => module_aid.clone(),
+    };
+    let (Ok(params), Ok(privileges)) = (hex::decode(params), hex::decode(privileges)) else {
+        return refuse("bad-hex", "--params and --privileges must be hex".into());
+    };
+    let req = gp::InstallRequest {
+        load_file: cap.load_file(),
+        load_file_aid: package,
+        module_aid,
+        app_aid,
+        privileges,
+        params,
+    };
+    let keys = match load_gp_keys(&w.keys, w.json) {
+        Ok(keys) => keys,
+        Err(code) => return code,
+    };
+    let Some(keys) = keys else {
+        return match gp::install_dry_run(&req) {
+            Ok(mut data) => {
+                if w.channel.channel != 0 {
+                    data["logical_channel"] = serde_json::json!(w.channel.channel);
+                    gp::retarget_channel(&mut data, w.channel.channel);
+                }
+                emit_gp("gp install", data, w.json)
+            }
+            Err(e) => bad_gp_request(&e, w.json),
+        };
+    };
+    let auth = gp_auth(&keys, &w.keys, w.channel.channel);
+    run_gp(
+        "gp install",
+        w.reader.as_deref(),
+        w.json,
+        w.trace,
+        w.channel.channel,
+        |s, t| gp::install(s, t, &req, &auth, w.yes),
+    )
 }
 
 /// `sim-doctor euicc <info|profiles|notifications>`: one read-only ES10 query.

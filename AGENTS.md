@@ -781,9 +781,47 @@ Control v1.1, GPD_SPE_013 2024 public review: FF40 is 4.1 Table 4-2, rules are c
 and `03` (next) on `63 10`, bounded at 16 pages. `6982`/`6985` is data (`requires_authentication`),
 `6A88` is an empty scope. Replay tests only; no live ARA-M card was available.
 
+#### GlobalPlatform writes (`gp channel`, `gp delete`, `gp install`)
+
+Issues #133 and #19 (owner approved key use and card writes, 2026-10-10). Code: `src/gp.rs`
+(`channel_open/close`, `delete`, `install`, `OnChannel`), `src/apdu.rs` (`class_on_channel`), `src/scp03.rs`
+(`Channel::on_logical_channel`). **Binding rules, same spirit as the eUICC writes:** (1) **dry run by
+default; `--yes` sends and needs `--keys-file|--keys-env`** (clap `requires`, and the library takes the
+keys with `yes`); a dry run prints the target and the exact plain APDUs and sends no write; with no keys
+it is fully offline (`card_touched: false`, no reader opened); (2) the **same SCP03 interlock as
+`gp status`**: ONE attempt, local cryptogram pre-check, no key loop, keys from file/env only, never
+printed (the full-visibility exception above covers it); (3) **pre-read GET STATUS over the channel and
+refuse with nothing sent**: delete of an AID that is absent (`aid-not-present`), is the ISD
+(`refusing-isd`), or with a registry not read in full (`registry-unreadable`); install over a load file
+or application AID already present (`package-already-loaded`, `app-already-installed`); (4) each command
+is sent once, in order, stop at the first refusal; install is INSTALL [for load] `80 E6 02 00`, LOAD
+`80 E8` blocks of 240, INSTALL [for install and make selectable] `80 E6 0C 00` (GP Card Spec v2.3.1
+11.2, 11.5, 11.6 Tables 11-20..11-26, 11-40..11-49, 11-55..11-60; pySim `do_delete_card_content`,
+`do_install_cap`; GlobalPlatformPro `GPSession.deleteAID`, `loadCapFile`, `buildInstallData`); (5) every
+status word keeps its own `data.error.kind` (`status_word` in `gp.rs`, from Tables 11-10, 11-26, 11-55,
+11-60, 11-62, 11-63), no retry; (6) after `90 00` the registry is re-read and `verify-failed` if the
+result is not there; (7) **not exposed over MCP** (`mcp.rs` lists only the read tools; its test pins
+the list). Card Lock and Card Terminate privileges are refused by `gp install`.
+
+**Logical channels.** `gp channel open` (MANAGE CHANNEL, `00 70 00 00 01`) leaves the channel open on
+purpose; `gp channel close --channel N` closes it (the basic channel cannot be). `--channel N` (0 to 19)
+on every `gp` command wraps the session in `OnChannel`, which rewrites each command's class byte with
+`class_on_channel` (GP 11.1.4 Tables 11-11/11-12: channels 1-3 set b2b1, channels 4-19 use `Cx`, with
+secure messaging `Ex`; pySim's `lchan_nr_to_cla` refuses a GlobalPlatform class above channel 3, the
+specification does not); GET RESPONSE follow-ups use the channel too; the C-MAC covers the class byte as
+sent (`Channel::on_logical_channel`, as pySim patches the channel into CLA before the SCP wraps it);
+traces and plans are corrected afterwards by `retarget_channel`. Dry-run plans show the class as it will
+be sent on the channel.
+
+**Not done (scoped out):** DAP. `dap_block` frames bytes, but the signature needs the Security Domain's
+DAP key, which is not in the SCP03 set: DAP signing, PUT KEY and C-DECRYPTION for key data are #115.
+No tokens (delegated management), DELETE [key], other INSTALL kinds or STORE DATA. Replay tests only;
+the wire vectors for DELETE/INSTALL/LOAD and the channel-1 flow come from an independent Python SCP03
+model that first reproduces pySim's `SCP03_Test_AES128_11` and the existing GET STATUS vectors.
+
 ### MCP
 
-`sim-doctor mcp` serves MCP over stdio with nine tools: `scan`, `rules_list`, `rules_explain`, the read-only eUICC queries `euicc_info`, `euicc_profiles` and `euicc_notifications`, and the read-only GlobalPlatform reads `gp_info`, `gp_ara` and `gp_status` (each takes an optional `reader`; they return the `euicc ... --json` / `gp ... --json` envelope unchanged).
+`sim-doctor mcp` serves MCP over stdio with nine tools: `scan`, `rules_list`, `rules_explain`, the read-only eUICC queries `euicc_info`, `euicc_profiles` and `euicc_notifications`, and the read-only GlobalPlatform reads `gp_info`, `gp_ara` and `gp_status` (the `gp` writes are never tools; each takes an optional `reader`; they return the `euicc ... --json` / `gp ... --json` envelope unchanged).
 `scan` runs this binary as `scan --json ...` and returns the doctor/1 envelope **byte for byte**
 (exit 0, 1 and 3 are results; anything else is an error carrying stderr). It accepts every scan
 flag as an argument **except** `tui`, `json` (always forced), `help` and `version`; `baseline`,

@@ -9,8 +9,8 @@
 //! identifier), and the evaluation of the missing-MAC rule over a *recorded*
 //! exchange.
 //!
-//! **Does not own.** A transport. Nothing here sends a byte to a card. The one
-//! live path is `gp status --keys-file/--keys-env` in [`crate::gp`], which is
+//! **Does not own.** A transport. Nothing here sends a byte to a card. The live
+//! paths are `gp status|delete|install --keys-file/--keys-env` in [`crate::gp`], which are
 //! opt-in, makes a single attempt (a wrong EXTERNAL AUTHENTICATE counts toward a
 //! card's retry limit) and checks the card cryptogram with
 //! [`verify_card_cryptogram`] before it sends EXTERNAL AUTHENTICATE. INITIALIZE
@@ -179,6 +179,7 @@ pub fn verify_card_cryptogram(
 pub struct Channel {
     s_mac: [u8; BLOCK],
     chain: [u8; BLOCK],
+    logical: u8,
 }
 
 impl Channel {
@@ -187,7 +188,16 @@ impl Channel {
         Self {
             s_mac: keys.mac,
             chain: [0; BLOCK],
+            logical: 0,
         }
+    }
+
+    /// Wraps for logical channel `channel` (0 to 19): the MAC covers the class
+    /// byte as sent, which carries the channel number (GP Card Spec v2.3.1
+    /// 11.1.4; pySim puts the channel in CLA before the secure channel wraps it).
+    pub fn on_logical_channel(mut self, channel: u8) -> Self {
+        self.logical = channel;
+        self
     }
 
     /// Adds the C-MAC to `command`: sets the secure messaging bit (0x04) in
@@ -203,12 +213,11 @@ impl Channel {
         let data = command.data();
         let lc = u8::try_from(data.len() + MAC_LEN).map_err(|_| Error::TooLong(data.len()))?;
         let h = command.header();
-        let header = Header::new(
-            h.class() | 0x04,
-            h.instruction(),
-            h.parameter_1(),
-            h.parameter_2(),
-        );
+        let class = crate::apdu::class_on_channel(h.class(), self.logical)
+            .map_or(h.class() | 0x04, |c| {
+                c | if c & 0x40 != 0 { 0x20 } else { 0x04 }
+            });
+        let header = Header::new(class, h.instruction(), h.parameter_1(), h.parameter_2());
         let full = cmac(&self.s_mac, &[&self.chain, &header.to_bytes(), &[lc], data]);
         self.chain = full;
         let mut body = data.to_vec();
@@ -619,6 +628,38 @@ mod tests {
             let wrapped = ch.wrap(&get(plain)).unwrap();
             assert_eq!(hex::encode(wrapped.encode().unwrap()), wire, "{plain}");
         }
+    }
+
+    #[test]
+    fn wrap_on_a_logical_channel_macs_the_class_byte_as_sent() {
+        // GP Card Spec v2.3.1 11.1.4: channel 5 is the further interindustry
+        // coding, GlobalPlatform + secure messaging = E1. Expected bytes come from
+        // an independent Python model of Amendment D 6.2.4 (it reproduces the
+        // basic-channel vectors of this file) with that class byte.
+        let keys = derive_session_keys(
+            &<[u8; 16]>::try_from(hex::decode("000102030405060708090A0B0C0D0E0F").unwrap())
+                .unwrap(),
+            &<[u8; 16]>::try_from(hex::decode("101112131415161718191A1B1C1D1E1F").unwrap())
+                .unwrap(),
+            &[0xB1, 0x3E, 0x5F, 0x93, 0x8F, 0xC1, 0x08, 0xC4],
+            &[0x3E, 0xB5, 0x10, 0x47, 0x49, 0x5B, 0x24, 0x9F],
+        );
+        let delete = Command::case4(
+            Header::new(0x80, 0xE4, 0, 0),
+            hex::decode("4F07A0000000620001").unwrap(),
+            crate::apdu::Le::Short(0),
+        );
+        let wrapped = Channel::new(&keys)
+            .on_logical_channel(5)
+            .wrap(&delete)
+            .unwrap();
+        assert_eq!(
+            hex::encode_upper(wrapped.encode().unwrap()),
+            "E1E40000114F07A00000006200019F185F2324F5F3A900"
+        );
+        // the basic channel is unchanged: 84
+        let basic = Channel::new(&keys).wrap(&delete).unwrap();
+        assert_eq!(basic.header().class(), 0x84);
     }
 
     #[test]

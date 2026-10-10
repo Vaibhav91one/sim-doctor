@@ -2372,3 +2372,150 @@ fn gp_status_refuses_bad_keys_without_a_reader_and_never_echoes_them() {
         assert_eq!(run.code(), 129, "{args:?}: {}", run.stderr);
     }
 }
+
+/// A synthetic CAP (package A0000000770100, one applet A000000077010001) written
+/// to a temp file; the components are the minimum `cap::Cap::parse` accepts.
+fn write_test_cap(name: &str) -> std::path::PathBuf {
+    use std::io::Write;
+    let comp = |tag: u8, body: &[u8]| {
+        let mut v = vec![tag];
+        v.extend((body.len() as u16).to_be_bytes());
+        v.extend(body);
+        v
+    };
+    let mut header = vec![0xDE, 0xCA, 0xFF, 0xED, 1, 2, 0, 0, 1, 7];
+    header.extend([0xA0, 0, 0, 0, 0x77, 0x01, 0x00]);
+    let mut applet = vec![1, 8];
+    applet.extend([0xA0, 0, 0, 0, 0x77, 0x01, 0x00, 0x01, 0x00, 0x10]);
+    let entries = [
+        ("Header", comp(1, &header)),
+        ("Directory", comp(2, &[0x20])),
+        ("Import", comp(4, &[0x40])),
+        ("Applet", comp(3, &applet)),
+        ("Class", comp(6, &[0x60])),
+        ("Method", comp(7, &[0x70])),
+        ("StaticField", comp(8, &[0x80])),
+        ("ConstantPool", comp(5, &[0x50])),
+        ("RefLocation", comp(9, &[0x90])),
+    ];
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    for (n, bytes) in entries {
+        w.start_file(format!("pkg/javacard/{n}.cap"), opts).unwrap();
+        w.write_all(&bytes).unwrap();
+    }
+    let path = std::env::temp_dir().join(format!("sim-doctor-{}-{name}.cap", std::process::id()));
+    std::fs::write(&path, w.finish().unwrap().into_inner()).unwrap();
+    path
+}
+
+/// `gp delete` and `gp install` without keys are an OFFLINE dry run: the exact
+/// APDUs and the target, exit 0, no reader opened (none exists in this test) and
+/// nothing sent. A write needs `--yes` AND keys; `--yes` alone, a key on the
+/// command line, or bad keys are refused before any card is involved.
+#[test]
+fn gp_writes_are_offline_dry_runs_and_need_yes_and_keys() {
+    let _guard = spawn_lock();
+    let cap = write_test_cap("dry");
+    let cap_arg = cap.to_str().unwrap();
+
+    let out = run(
+        &["gp", "delete", "--aid", "A0000000620001", "--json"],
+        Stdio::piped(),
+    );
+    assert_eq!(out.code(), 0, "{}", out.stderr);
+    let env = assert_exactly_one_envelope(&out.stdout, contract::ExitCode::Success);
+    let data = env.payload().data();
+    assert_eq!(data["card_touched"], false);
+    assert_eq!(data["dry_run"], true);
+    assert_eq!(data["sent"], false);
+    assert_eq!(
+        data["plan"]["apdus"][0]["apdu"],
+        "80E40000094F07A000000062000100".replace(' ', "")
+    );
+
+    let out = run(
+        &["gp", "install", "--load", cap_arg, "--json"],
+        Stdio::piped(),
+    );
+    assert_eq!(out.code(), 0, "{}", out.stderr);
+    let env = assert_exactly_one_envelope(&out.stdout, contract::ExitCode::Success);
+    let data = env.payload().data();
+    assert_eq!(data["card_touched"], false);
+    assert_eq!(data["target"]["load_file_aid"], "A0000000770100");
+    assert_eq!(data["target"]["module_aid"], "A000000077010001");
+    assert_eq!(data["target"]["app_aid"], "A000000077010001");
+    let apdus = data["plan"]["apdus"].as_array().unwrap();
+    assert!(apdus.first().unwrap()["apdu"]
+        .as_str()
+        .unwrap()
+        .starts_with("80E60200"));
+    assert!(apdus.last().unwrap()["apdu"]
+        .as_str()
+        .unwrap()
+        .starts_with("80E60C00"));
+
+    // --yes without keys, a key value on the command line, both key sources: usage errors
+    for args in [
+        &["gp", "delete", "--aid", "A0000000620001", "--yes"][..],
+        &["gp", "delete", "--aid", "A0000000620001", "--key", "00"],
+        &["gp", "install", "--load", cap_arg, "--yes"],
+        &[
+            "gp",
+            "install",
+            "--load",
+            cap_arg,
+            "--keys-file",
+            "a",
+            "--keys-env",
+            "B",
+        ],
+        &["gp", "channel", "close"],
+        &["gp", "channel", "close", "--channel", "0"],
+        &["gp", "status", "--channel", "20"],
+    ] {
+        let r = run(args, Stdio::piped());
+        assert_eq!(r.code(), 129, "{args:?}: {}", r.stderr);
+    }
+
+    // bad keys are refused before a reader is opened, and never echoed
+    let secret = "DEADBEEFDEADBEEFDEADBEEFDEADBEEFXX";
+    let output = Command::new(binary())
+        .args([
+            "gp",
+            "delete",
+            "--aid",
+            "A0000000620001",
+            "--yes",
+            "--json",
+            "--keys-env",
+            "SIM_DOCTOR_TEST_KEYS",
+        ])
+        .env("SIM_DOCTOR_TEST_KEYS", secret)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let env = assert_exactly_one_envelope(&stdout, contract::ExitCode::Findings);
+    assert_eq!(env.payload().data()["error"]["kind"], "keys-unusable");
+    assert!(!stdout.contains(secret));
+
+    // bad AIDs and a module that is not in the CAP
+    let r = run(&["gp", "delete", "--aid", "ZZ", "--json"], Stdio::piped());
+    assert_eq!(r.code(), 1);
+    let r = run(
+        &[
+            "gp",
+            "install",
+            "--load",
+            cap_arg,
+            "--module",
+            "A000000077019999",
+            "--json",
+        ],
+        Stdio::piped(),
+    );
+    assert_eq!(r.code(), 1);
+    let _ = std::fs::remove_file(cap);
+}
