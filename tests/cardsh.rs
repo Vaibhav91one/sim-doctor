@@ -272,3 +272,95 @@ fn files_and_decode_work_without_a_card() {
     assert_eq!(r[0]["data"]["decoded"]["name"], "ABS");
     assert!(r[1]["data"]["count"].as_u64().unwrap() >= 2);
 }
+
+fn card_chv(fixture: &str, secrets: &str, args: &[&str]) -> Output {
+    let log = format!("{}/tests/corpus/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .arg("card")
+        .args(args)
+        .env("SIM_DOCTOR_TEST_REPLAY", log)
+        .env("SIMDOC_TEST_CHV", secrets)
+        .output()
+        .expect("the binary runs")
+}
+
+#[test]
+fn verify_chv_takes_its_value_from_the_environment_and_never_prints_it() {
+    let secrets = "pin1=1234; pin2=0000; puk1=12345678; new-pin1=4321";
+    let out = card_chv(
+        "cardsh_chv.jsonl",
+        secrets,
+        &[
+            "--json",
+            "--yes",
+            "--chv-env",
+            "SIMDOC_TEST_CHV",
+            "-c",
+            "verify_chv; verify_chv --pin-nr 2; verify_chv --pin-nr 2",
+        ],
+    );
+    // PIN1 verifies; PIN2 is wrong twice (2, then 1 try left): two failures.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[0]["data"]["verified"], true);
+    assert!(r[1]["error"].as_str().unwrap().contains("2 tries left"));
+    assert!(r[2]["error"].as_str().unwrap().contains("1 tries left"));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for secret in ["1234", "0000", "31323334", "30303030"] {
+        assert!(!all.contains(secret), "{secret} leaked:\n{all}");
+    }
+
+    // Without --yes: a dry run, and the replay log is never touched (an empty one is enough).
+    let empty = std::env::temp_dir().join("cardsh-chv-empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "card",
+            "--json",
+            "--chv-env",
+            "SIMDOC_TEST_CHV",
+            "-c",
+            "verify_chv",
+        ])
+        .env("SIM_DOCTOR_TEST_REPLAY", &empty)
+        .env("SIMDOC_TEST_CHV", secrets)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(lines(&out)[0]["data"]["sent"], false);
+}
+
+#[test]
+fn a_bad_pin_source_is_exit_two_before_any_reader_is_opened() {
+    for args in [
+        vec!["--chv-file", "/nonexistent/chv.txt"],
+        vec!["--chv-env", "SIMDOC_NO_SUCH_VAR"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+            .arg("card")
+            .args(&args)
+            .args(["-c", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+    let out = card_chv(
+        "cardsh_chv.jsonl",
+        "pin1=12",
+        &["--chv-env", "SIMDOC_TEST_CHV", "-c", "status"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("pin1=12"),
+        "the value is not quoted"
+    );
+}

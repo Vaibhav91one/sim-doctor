@@ -448,7 +448,7 @@ _sim__doctor() {
             return 0
             ;;
         sim__subcmd__doctor__subcmd__card)
-            opts="-c -h --reader --profile --dialect --script --json --yes --help"
+            opts="-c -h --reader --profile --dialect --script --json --chv-file --chv-env --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -471,6 +471,14 @@ _sim__doctor() {
                     return 0
                     ;;
                 --script)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --chv-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --chv-env)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

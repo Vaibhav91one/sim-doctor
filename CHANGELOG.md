@@ -24,6 +24,9 @@ All notable changes to this project are documented here. The format follows
   standard EF names (284 entries by directory: MF, DF.GSM, DF.TELECOM + sub-DFs, ADF.USIM, ADF.ISIM, DF.5GS, DF.WLAN, DF.HNB, DF.ProSe,
   DF.SNPN, ...) with identifier, structure and description, cross-checked against pySim; `select` takes the names; reads are decoded by the
   file's standard name and place (27 field decoders, BER-TLV files as a tag tree; the remaining files show their hex, labelled so).
+- `card`: `verify_chv [--pin-nr N | --universal | --adm-nr N | --key-ref HEX]` and the PIN source `--chv-file` / `--chv-env` (#188).
+  PIN1, PIN2, universal PIN and ADM keys; the value comes from the source (optionally per ICCID), never an argument or output.
+  Dry run unless `--yes`; the tries are asked first (free), the last try needs `--allow-last-attempt`, one attempt per command.
 
 ## [0.4.0]
 

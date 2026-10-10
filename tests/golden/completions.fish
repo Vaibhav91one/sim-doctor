@@ -331,6 +331,8 @@ sim\t''"
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -l dialect -d 'Which FCP tag table the card answers SELECT with (see `scan --help`)' -r
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -s c -d 'Run these `;`-separated commands and exit' -r
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -l script -d 'Run the commands in this file, one per line (`#` starts a comment), and exit' -r -F
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -l chv-file -d 'File holding PINs, PUKs and ADM keys for `verify_chv` / `unblock_chv` (`pin1=1234` per line; keep it chmod 600). Never a value on the command line: it would land in shell history' -r -F
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -l chv-env -d 'Environment variable holding the same text (entries separated by `;` or newlines)' -r
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -l json -d 'Print every reply as one JSON record (for agents)'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -l yes -d 'Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand card" -s h -l help -d 'Print help (see more with \'--help\')'
