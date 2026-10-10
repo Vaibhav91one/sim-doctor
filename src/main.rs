@@ -3634,7 +3634,7 @@ fn run_fix(args: &FixArgs) -> contract::ExitCode {
         );
         return contract::ExitCode::Success;
     }
-    let agent = fix::AGENTS
+    let agent = doctor_kit::fix::AGENTS
         .iter()
         .find(|a| a.name == name)
         .expect("clap restricts --agent to the table");
