@@ -19,7 +19,7 @@ const targets = {
   "linux-arm64": "aarch64-unknown-linux-gnu",
 };
 const target = targets[`${process.platform}-${process.arch}`];
-const REPO = "https://github.com/Vaibhav91one/sim-doctor";
+const REPO = "https://github.com/doctor-labs/sim-doctor";
 
 // Release asset names, as published by .github/workflows/release.yml. Exported for the tests.
 const assetName = (t) => `sim-doctor-${t}.tar.gz`;

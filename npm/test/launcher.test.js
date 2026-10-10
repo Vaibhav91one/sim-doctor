@@ -24,7 +24,7 @@ test("linux/arm64 maps to the aarch64 Linux asset", () => {
 test("asset url is the tagged GitHub release download", () => {
   assert.strictEqual(
     assetUrl("x86_64-unknown-linux-gnu", version),
-    `https://github.com/Vaibhav91one/sim-doctor/releases/download/v${version}/sim-doctor-x86_64-unknown-linux-gnu.tar.gz`,
+    `https://github.com/doctor-labs/sim-doctor/releases/download/v${version}/sim-doctor-x86_64-unknown-linux-gnu.tar.gz`,
   );
 });
 

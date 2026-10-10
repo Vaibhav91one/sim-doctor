@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Vaibhav91one/sim-doctor/actions/workflows/ci.yml"><img src="https://github.com/Vaibhav91one/sim-doctor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/doctor-labs/sim-doctor/actions/workflows/ci.yml"><img src="https://github.com/doctor-labs/sim-doctor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.npmjs.com/package/sim-doctor"><img src="https://img.shields.io/npm/v/sim-doctor?style=flat&color=000000&labelColor=000000&label=npm" alt="npm"></a>
   <a href="https://crates.io/crates/sim-doctor"><img src="https://img.shields.io/crates/v/sim-doctor?style=flat&color=000000&labelColor=000000&label=crates.io" alt="crates.io"></a>
   <img src="https://img.shields.io/badge/Rust-1.82%2B-000000?style=flat&color=000000&labelColor=000000" alt="Rust 1.82+">
@@ -129,7 +129,7 @@ against an in-memory backend; the interactive loop is **not** tested against a r
 | --- | --- |
 | npx | `npx sim-doctor <args>` downloads the matching release binary once into `~/.cache/sim-doctor` and checks its SHA-256 |
 | cargo | `cargo install sim-doctor` |
-| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/Vaibhav91one/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
+| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/doctor-labs/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
 
 The npm package, the crate and the binaries are all published by the tagged-release workflow.
 From a checkout, `cargo build --release` builds the same binary.
@@ -541,13 +541,13 @@ simply absent on most cards). Every rule is gated by the corpus precision/recall
 (`tests/corpus.rs`). `auth/scp03-missing-mac` is registered, but no scan path records SCP03, so it
 has no evidence on a real card. Not validated on a real card yet: the new
 rules are gated on generated cards and cross-checked against swSIM in CI, which does not reproduce a
-real card's access conditions ([#40](https://github.com/Vaibhav91one/sim-doctor/issues/40)). Not
+real card's access conditions ([#40](https://github.com/doctor-labs/sim-doctor/issues/40)). Not
 possible from a read-only scan: COMP128 v1/v2 and Milenage configuration (the algorithm and the
 key material are not in any readable EF; telling them apart needs AUTHENTICATE, issue #105), and
 anything that needs PIN, ADM or SCP keys. eUICC/SGP.22 rules need the eUICC read path, which is
 separate work. The MSL 0 check runs on a real
 card, but a card that answers every ENVELOPE with `6F00` gives an inconclusive result
-([#98](https://github.com/Vaibhav91one/sim-doctor/issues/98)). The eUICC stack (SCP03t, BPP, ES10x,
+([#98](https://github.com/doctor-labs/sim-doctor/issues/98)). The eUICC stack (SCP03t, BPP, ES10x,
 ES9+) is library code with no card or network path from the CLI yet; the HTTPS transport for ES9+ exists (see Privacy and telemetry) but no command calls it.
 See [CONTEXT.md](CONTEXT.md) for the plan.
 
@@ -568,7 +568,7 @@ permissions:
   security-events: write
 steps:
   - uses: actions/checkout@v5
-  - uses: Vaibhav91one/sim-doctor@<tag> # a release tag, e.g. v0.3.0
+  - uses: doctor-labs/sim-doctor@<tag> # a release tag, e.g. v0.3.0
     with:
       swsim: "true"   # build the pinned software card; omit when the runner has a real reader
 ```
@@ -650,7 +650,7 @@ verification off; this tool does not.
 
 `SIM_DOCTOR_HTTP` = `https` (default) or `stdio` (lpac's JSON-lines protocol, the host does the
 HTTP) mirrors lpac's `LPAC_HTTP`. Both variables take effect once a command uses ES9+
-([#118](https://github.com/Vaibhav91one/sim-doctor/issues/118)); no shipped command reads them
+([#118](https://github.com/doctor-labs/sim-doctor/issues/118)); no shipped command reads them
 today. There is no APDU selector: `euicc` commands open a PC/SC reader directly. lpac's
 AT/QMI/MBIM/curl/WinHTTP backends are not supported.
 
