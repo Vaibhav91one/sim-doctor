@@ -1595,7 +1595,7 @@ fn dispatch(d: &kit::SimDoctor, command: Command) -> contract::ExitCode {
             EuiccAction::Reset(a) => run_euicc_reset(&a),
         },
         Command::Trace(args) => run_trace(&args),
-        Command::Mcp => run_mcp(),
+        Command::Mcp => run_mcp(d),
         Command::Fuzz(args) => match args.action {
             FuzzAction::Apdu(args) => run_fuzz_apdu(args),
             FuzzAction::Ota(args) => run_fuzz_ota(args),
@@ -3393,7 +3393,7 @@ fn emit_rules(json: bool, data: serde_json::Value, text: String) -> contract::Ex
 }
 
 /// `sim-doctor mcp`: the stdio server, handed the real clap `scan` command.
-fn run_mcp() -> contract::ExitCode {
+fn run_mcp(d: &kit::SimDoctor) -> contract::ExitCode {
     // main() installed the SIGINT/SIGTERM flag handler, which this server never polls
     // and which would swallow Ctrl-C and `kill`; restore the default for both so either
     // ends the server (chosen deliberately for SIGTERM: no cleanup is owed). Each child
@@ -3403,9 +3403,7 @@ fn run_mcp() -> contract::ExitCode {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
-    let cli = <Cli as CommandFactory>::command();
-    let scan = cli.find_subcommand("scan").expect("scan subcommand exists");
-    match sim_doctor::mcp::serve(scan) {
+    match doctor_kit::mcp::serve(d) {
         Ok(()) => contract::ExitCode::Success,
         Err(err) => {
             eprintln!("sim-doctor: mcp: {err}");
