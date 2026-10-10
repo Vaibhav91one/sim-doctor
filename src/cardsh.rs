@@ -539,7 +539,127 @@ fn parse_segment(word: &str) -> Result<Seg, CmdErr> {
     })
 }
 
+enum Which {
+    Binary,
+    Record(u8),
+    All,
+}
+
+/// The standard file entry a decoded read is about, from the channel's path and selected file.
+fn std_ef_of(chan: &Chan) -> Option<names::StdEf> {
+    let fid = chan.file.as_ref().and_then(|f| f.fid)?;
+    names::find(&names::scopes_of(&chan.dir, chan.adf.as_deref()), fid)
+}
+
+fn decoded_reply(std: Option<names::StdEf>, records: &[Vec<u8>], extra: Value) -> Reply {
+    let (name, scope, kind) = std.map_or(("", "", "hex"), |e| (e.name, e.scope, e.kind));
+    let fields = decode::decode_ef(kind, name, records);
+    let mut data = json!({
+        "ef": std.map(|e| e.name),
+        "scope": std.map(|e| e.scope),
+        "description": std.map(|e| e.desc),
+        "decoder": kind,
+        "structured": std.is_some() && decode::is_structured(kind),
+        "decoded": fields,
+    });
+    if let (Some(a), Some(b)) = (data.as_object_mut(), extra.as_object()) {
+        a.extend(b.clone());
+    }
+    let head = if name.is_empty() {
+        "unknown file (no standard name here): raw hex".to_owned()
+    } else {
+        format!("{name} ({scope}): {}", std.map_or("", |e| e.desc))
+    };
+    Reply::ok(
+        format!(
+            "{head}\n{}",
+            serde_json::to_string_pretty(&data["decoded"]).unwrap_or_default()
+        ),
+        data,
+    )
+}
+
+/// `decode NAME HEX...`: offline.
+fn cmd_decode(args: &clap::ArgMatches) -> CmdResult {
+    let name = args.get_one::<String>("name").expect("required");
+    let std = names::all()
+        .find(|e| {
+            e.name.eq_ignore_ascii_case(name)
+                || e.name
+                    .split_once('.')
+                    .is_some_and(|(_, r)| r.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| {
+            CmdErr::new(format!(
+                "`{name}` is not a standard file name (see `files`)"
+            ))
+        })?;
+    let records = args
+        .get_many::<String>("hex")
+        .expect("required")
+        .map(|h| parse_hex(h))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CmdErr::new)?;
+    Ok(decoded_reply(Some(std), &records, Value::Null))
+}
+
+/// `files [TEXT]`: the standard files by name.
+fn cmd_files(filter: Option<&str>) -> Reply {
+    let f = filter.map(str::to_ascii_lowercase);
+    let rows: Vec<names::StdEf> = names::all()
+        .filter(|e| {
+            f.as_deref().is_none_or(|t| {
+                e.name.to_ascii_lowercase().contains(t) || e.desc.to_ascii_lowercase().contains(t)
+            })
+        })
+        .collect();
+    let text = rows
+        .iter()
+        .map(|e| format!("{:<14} {:<10} {}  {}", e.scope, e.fid, e.name, e.desc))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let data = json!({ "count": rows.len(), "files": rows.iter().map(|e| json!({
+        "scope": e.scope, "name": e.name, "fid": e.fid.to_string(), "structure": e.structure.to_string(),
+        "decoder": e.kind, "description": e.desc })).collect::<Vec<_>>() });
+    Reply::ok(text, data)
+}
+
 impl Shell {
+    fn cmd_read_decoded(&mut self, which: Which) -> CmdResult {
+        let card = self.equipped()?;
+        let ef = card.ef()?;
+        let std = std_ef_of(&card.chans[&card.channel]);
+        let path = card.chans[&card.channel].path();
+        let records: Vec<Vec<u8>> = match which {
+            Which::Binary => {
+                if ef.structure.is_some_and(|st| st != "transparent") {
+                    return Err(CmdErr::new("the selected file is record-structured: use read_record_decoded / read_records_decoded"));
+                }
+                vec![card.read_binary(0, ef.size.unwrap_or(256))?]
+            }
+            Which::Record(n) => {
+                if ef.structure == Some("transparent") {
+                    return Err(CmdErr::new(
+                        "the selected file is transparent: use read_binary_decoded",
+                    ));
+                }
+                vec![card.read(0xB2, n, 0x04, u32::from(ef.record_length.unwrap_or(256)))?]
+            }
+            Which::All => {
+                if ef.structure == Some("transparent") {
+                    return Err(CmdErr::new(
+                        "the selected file is transparent: use read_binary_decoded",
+                    ));
+                }
+                let le = u32::from(ef.record_length.unwrap_or(256));
+                (1..=ef.records.unwrap_or(0).min(254) as u8)
+                    .map(|n| card.read(0xB2, n, 0x04, le))
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        Ok(decoded_reply(std, &records, json!({ "path": path })))
+    }
+
     fn cmd_read_binary(&mut self, args: &clap::ArgMatches) -> CmdResult {
         let card = self.equipped()?;
         let ef = card.ef()?;
@@ -1047,6 +1167,24 @@ pub fn grammar() -> clap::Command {
                 .arg(Arg::new("from").long("from").value_name("N").default_value("1").value_parser(clap::value_parser!(u8).range(1..=254)))
                 .arg(Arg::new("to").long("to").value_name("N").value_parser(clap::value_parser!(u8).range(1..=254))),
         )
+        .subcommand(C::new("read_binary_decoded").about("Read the selected transparent EF whole and decode it by its standard name (EF.IMSI, EF.UST ...)"))
+        .subcommand(
+            C::new("read_record_decoded")
+                .about("READ RECORD N of the selected EF and decode it by its standard name")
+                .arg(Arg::new("record").required(true).value_name("N").value_parser(clap::value_parser!(u8).range(1..=254))),
+        )
+        .subcommand(C::new("read_records_decoded").about("Read every record of the selected EF and decode them by its standard name"))
+        .subcommand(
+            C::new("decode")
+                .about("Decode HEX as the standard file NAME, offline (no card needed): decode EF.IMSI 0809...")
+                .arg(Arg::new("name").required(true))
+                .arg(Arg::new("hex").required(true).num_args(1..).help("one record per argument")),
+        )
+        .subcommand(
+            C::new("files")
+                .about("List the standard files this shell knows by name (optionally those whose name contains TEXT)")
+                .arg(Arg::new("filter").value_name("TEXT")),
+        )
         .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
@@ -1146,6 +1284,15 @@ impl Shell {
             "read_binary" => self.cmd_read_binary(args),
             "read_record" => self.cmd_read_record(args),
             "read_records" => self.cmd_read_records(args),
+            "read_binary_decoded" => self.cmd_read_decoded(Which::Binary),
+            "read_record_decoded" => self.cmd_read_decoded(Which::Record(
+                *args.get_one::<u8>("record").expect("required"),
+            )),
+            "read_records_decoded" => self.cmd_read_decoded(Which::All),
+            "decode" => cmd_decode(args),
+            "files" => Ok(cmd_files(
+                args.get_one::<String>("filter").map(String::as_str),
+            )),
             "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
             "select_path" => {
                 self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
@@ -1432,6 +1579,8 @@ pub fn read_fcp(body: &[u8], dialect: &TagSet) -> FileInfo {
     info
 }
 
+pub mod decode;
+mod efs;
 pub mod names;
 
 #[cfg(test)]
@@ -1710,6 +1859,69 @@ mod tests {
         assert!(!r.ok && r.text.contains("read_binary"), "{}", r.text);
         assert!(sh.exec("select 3F00").ok);
         assert!(!sh.exec("read_binary").ok, "a directory is selected");
+    }
+
+    #[test]
+    fn decoded_reads_name_the_file_and_decode_it() {
+        let (mut sh, _) = shell_log();
+        assert!(sh.exec("select ADF.USIM").ok);
+        assert!(sh.exec("select EF.IMSI").ok);
+        let r = sh.exec("read_binary_decoded");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["ef"], "EF.IMSI");
+        assert_eq!(r.data["scope"], "ADF.USIM");
+        assert_eq!(r.data["decoded"]["imsi"], "001010123456789", "{}", r.text);
+        assert!(sh.exec("select EF.AD").ok);
+        assert_eq!(sh.exec("read_binary_decoded").data["decoded"]["mnc_len"], 2);
+        // The same identifier under DF.GSM is the GSM file of that name.
+        assert!(sh.exec("select 3F00/7F20/6F07").ok);
+        let r = sh.exec("read_binary_decoded");
+        assert_eq!(r.data["scope"], "DF.GSM");
+        // Records: EF.ADN under DF.TELECOM.
+        assert!(sh.exec("select 3F00/7F10/6F3A").ok);
+        let r = sh.exec("read_record_decoded 1");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["ef"], "EF.ADN");
+        assert_eq!(r.data["decoded"]["records"][0]["alpha"], "Ann");
+        assert_eq!(r.data["decoded"]["records"][0]["number"], "0123456789");
+        let r = sh.exec("read_records_decoded");
+        assert_eq!(r.data["decoded"]["records"].as_array().unwrap().len(), 3);
+        assert_eq!(r.data["decoded"]["records"][1]["empty"], true);
+        // EF.ICCID at the MF, and a file the table does not know says so.
+        assert!(sh.exec("select 3F00/2FE2").ok);
+        assert_eq!(
+            sh.exec("read_binary_decoded").data["decoded"]["iccid"],
+            "89010123456789012345"
+        );
+        assert!(sh.exec("select 3F00/7F10/6F99").ok);
+        let r = sh.exec("read_binary_decoded");
+        assert!(
+            r.ok && r.data["ef"].is_null() && r.text.contains("unknown file"),
+            "{}",
+            r.text
+        );
+        assert!(!sh.exec("read_record_decoded 1").ok, "transparent file");
+    }
+
+    #[test]
+    fn decode_and_files_need_no_card() {
+        let mut sh = Shell::new(
+            Box::new(|_| Err("no reader".into())),
+            Opts {
+                yes: false,
+                dialect: TagSet::ts_102_221(),
+            },
+        );
+        let r = sh.exec("decode EF.SPN 01414253FFFF");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["decoded"]["name"], "ABS");
+        let r = sh.exec("decode UST 0501");
+        assert_eq!(r.data["decoded"]["enabled"], json!([1, 3, 9]));
+        assert!(!sh.exec("decode EF.NOPE 00").ok);
+        let r = sh.exec("files FPLMN");
+        assert!(r.data["count"].as_u64().unwrap() >= 2, "{}", r.text);
+        let r = sh.exec("files");
+        assert!(r.data["count"].as_u64().unwrap() >= 250);
     }
 
     #[test]

@@ -20,6 +20,10 @@ All notable changes to this project are documented here. The format follows
   the FCP is decoded in the reply, and `--profile sim` selects by FID with GSM 11.11 responses.
 - `card`: `read_binary [--offset] [--length]`, `read_record N` and `read_records [--from] [--to]` (#167): generic reads of the
   selected EF with offset, length and record number, chunked past 256 bytes, one `6C xx` correction, empty records marked.
+- `card`: `read_binary_decoded`, `read_record_decoded`, `read_records_decoded`, `decode NAME HEX`, `files` (#168): a table of 212
+  standard EF names (284 entries by directory: MF, DF.GSM, DF.TELECOM + sub-DFs, ADF.USIM, ADF.ISIM, DF.5GS, DF.WLAN, DF.HNB, DF.ProSe,
+  DF.SNPN, ...) with identifier, structure and description, cross-checked against pySim; `select` takes the names; reads are decoded by the
+  file's standard name and place (27 field decoders, BER-TLV files as a tag tree; the remaining files show their hex, labelled so).
 
 ## [0.4.0]
 
