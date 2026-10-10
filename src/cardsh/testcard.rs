@@ -353,7 +353,34 @@ impl CardSession for TestCard {
         };
         let ins = c[1];
         Ok(match ins {
-            0xA4 => self.select(ch, c[2], c[3], data),
+            0xA4 => {
+                let r = self.select(ch, c[2], c[3], data);
+                if c[0] == 0xA0 && r[0] == 0x61 {
+                    // GSM 11.11 answers with its own layout and 9F xx.
+                    let file = self.cur[ch]
+                        .1
+                        .clone()
+                        .unwrap_or_else(|| self.cur[ch].0.clone());
+                    let f = self.find(&file).cloned().unwrap();
+                    let size: usize = f.content.iter().map(Vec::len).sum();
+                    let mut body = vec![0u8; 22];
+                    body[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+                    body[4..6].copy_from_slice(&file.last().unwrap().to_be_bytes());
+                    body[6] = if f.df {
+                        if file.len() == 1 {
+                            1
+                        } else {
+                            2
+                        }
+                    } else {
+                        4
+                    };
+                    self.queued = VecDeque::from([body]);
+                    vec![0x9F, 22]
+                } else {
+                    r
+                }
+            }
             0xC0 => match self.queued.pop_front() {
                 Some(mut r) => {
                     r.extend_from_slice(&[0x90, 0x00]);
@@ -379,6 +406,34 @@ impl CardSession for TestCard {
                 }
             }
             0xF2 => vec![0x90, 0x00],
+            // RUN GSM ALGORITHM (SIM, CLA A0) / INTERNAL AUTHENTICATE in the GSM context (USIM, P2 80).
+            // Not COMP128: SRES and Kc are fixed mixes of RAND, enough to tell a stateless card apart.
+            0x88 if c[3] == 0x00 && c[0] == 0xA0 || c[3] == 0x80 && c[0] & 0xFC == 0 => {
+                let rand = if c[3] == 0x80 {
+                    data.get(1..)
+                } else {
+                    Some(data)
+                };
+                match rand.filter(|r| r.len() == 16) {
+                    None => vec![0x67, 0x00],
+                    Some(_) if c[0] == 0xA0 && self.cur[0].0 != [0x3F00, 0x7F20] => {
+                        vec![0x6F, 0x00]
+                    }
+                    Some(r) => {
+                        let sres: Vec<u8> = (0..4).map(|i| r[i] ^ r[i + 4]).collect();
+                        let kc: Vec<u8> = (0..8).map(|i| r[i] ^ r[i + 8].rotate_left(1)).collect();
+                        let mut body = if c[3] == 0x80 { vec![0x04] } else { vec![] };
+                        body.extend(&sres);
+                        if c[3] == 0x80 {
+                            body.push(0x08);
+                        }
+                        body.extend(&kc);
+                        let n = body.len() as u8;
+                        self.queued = VecDeque::from([body]);
+                        vec![if c[0] == 0xA0 { 0x9F } else { 0x61 }, n]
+                    }
+                }
+            }
             // VERIFY: no data asks how many tries are left; a wrong code costs one.
             0x20 => match self.chv.get_mut(&c[3]) {
                 None => vec![0x6A, 0x88],
@@ -558,6 +613,11 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         "cardsh_unblock.jsonl",
         true,
         "unblock_chv; verify_chv",
+    ),
+    (
+        "cardsh_gsm.jsonl",
+        true,
+        "run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f --repeat 2",
     ),
 ];
 

@@ -675,6 +675,22 @@ fn key_target(args: &clap::ArgMatches) -> Result<KeyTarget, CmdErr> {
     })
 }
 
+/// `--rand HEX` (16 octets) or a fresh random one.
+fn rand_arg(args: &clap::ArgMatches) -> Result<[u8; 16], CmdErr> {
+    match args.get_one::<String>("rand") {
+        Some(h) => {
+            let b = parse_hex(h).map_err(CmdErr::new)?;
+            <[u8; 16]>::try_from(b.as_slice())
+                .map_err(|_| CmdErr::new("--rand is 16 octets (32 hex digits)"))
+        }
+        None => {
+            let mut r = [0u8; 16];
+            rand::fill(&mut r);
+            Ok(r)
+        }
+    }
+}
+
 /// How many tries a `63 Cx` leaves.
 fn tries_left(sw: Option<StatusWord>) -> Option<u8> {
     sw.filter(|s| s.sw1() == 0x63 && s.sw2() & 0xF0 == 0xC0)
@@ -776,6 +792,95 @@ impl Shell {
             (None, _) if !is_verify => Ok(None),
             (None, s) => Err(refuse(format!("cannot ask {}: {}", target.label, sw_text(s)))),
         }
+    }
+
+    fn cmd_run_gsm(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let rand = rand_arg(args)?;
+        let repeat = *args.get_one::<u8>("repeat").expect("default");
+        let send = self.may_change_card(args);
+        let dialect = self.opts.dialect.clone();
+        let card = self.equipped()?;
+        let sim = card.profile == Profile::Sim;
+        // USIM: INTERNAL AUTHENTICATE in the GSM security context (TS 31.102 7.1.1: P2 = 80). SIM: RUN
+        // GSM ALGORITHM (TS 51.011 9.2.16), which needs DF.GSM selected.
+        let wire_head = if sim {
+            "A0 88 00 00 10"
+        } else {
+            "00 88 00 80 11 10"
+        };
+        if !send {
+            return Ok(Reply::ok(
+                format!("dry run: would send {wire_head} {} (authentication is not a read; add --yes to send)", hex_upper(&rand)),
+                json!({ "sent": false, "rand": hex_upper(&rand), "apdu": format!("{wire_head} {}", hex_upper(&rand)) }),
+            ));
+        }
+        if sim
+            && card.chans[&card.channel].dir
+                != [FileId::MASTER_FILE, FileId::from_bytes([0x7F, 0x20])]
+        {
+            for id in [FileId::MASTER_FILE, FileId::from_bytes([0x7F, 0x20])] {
+                let by = SelectBy::Fid(id);
+                let info = card.select(&by, &dialect)?;
+                card.land(&by, info);
+            }
+        }
+        let mut answers: Vec<(String, String)> = Vec::new();
+        let mut last = None;
+        for _ in 0..repeat {
+            let cla = card.cla();
+            let command = if sim {
+                Command::case3(apdu::Header::new(cla, 0x88, 0x00, 0x00), rand.to_vec())
+            } else {
+                Command::case3(
+                    apdu::Header::new(cla, 0x88, 0x00, 0x80),
+                    [&[0x10][..], &rand[..]].concat(),
+                )
+            };
+            let ex = card.send(&command)?;
+            let sw = ex.status();
+            if !sw.is_some_and(StatusWord::is_normal_processing) {
+                return Err(CmdErr {
+                    message: format!("the card refused the GSM authentication: {}", sw_text(sw)),
+                    data: json!({ "sent": true, "rand": hex_upper(&rand), "sw": sw.map(|s| s.to_string()) }),
+                });
+            }
+            let d = ex.data();
+            let (sres, kc) = match (sim, d) {
+                (false, [0x04, sres @ .., 0x08, _, _, _, _, _, _, _, _]) if sres.len() == 4 => {
+                    (&d[1..5], &d[6..14])
+                }
+                (true, d) if d.len() == 12 => (&d[..4], &d[4..12]),
+                _ => {
+                    return Err(CmdErr {
+                        message: format!(
+                            "the GSM authentication answer has an unexpected shape ({} octets)",
+                            d.len()
+                        ),
+                        data: json!({ "sent": true, "sw": sw.map(|s| s.to_string()), "data": hex::encode(d) }),
+                    })
+                }
+            };
+            answers.push((hex_upper(sres), hex_upper(kc)));
+            last = sw;
+        }
+        let deterministic = answers.windows(2).all(|w| w[0] == w[1]);
+        let (sres, kc) = answers[0].clone();
+        let mut text = format!("RAND {}\nSRES {sres}\nKc   {kc}", hex_upper(&rand));
+        if repeat > 1 {
+            text.push_str(&format!(
+                "\nthe card answered {repeat} times: {}",
+                if deterministic {
+                    "identical answers"
+                } else {
+                    "DIFFERENT answers for one RAND"
+                }
+            ));
+        }
+        Ok(Reply::ok(
+            text,
+            json!({ "sent": true, "context": if sim { "run-gsm-algorithm" } else { "gsm" }, "rand": hex_upper(&rand), "sres": sres, "kc": kc,
+                    "attempts": answers.len(), "deterministic": deterministic, "sw": last.map(|s| s.to_string()) }),
+        ))
     }
 
     fn cmd_unblock_chv(&mut self, args: &clap::ArgMatches) -> CmdResult {
@@ -1463,6 +1568,14 @@ pub fn grammar() -> clap::Command {
                 .arg(yes_arg()),
         )
         .subcommand(
+            C::new("run_gsm_algorithm")
+                .visible_alias("run_gsm")
+                .about("GSM authentication probe: send a RAND, read SRES and Kc (USIM: GSM security context; sim profile: RUN GSM ALGORITHM). A dry run unless --yes")
+                .arg(Arg::new("rand").long("rand").value_name("HEX").help("16 octets of hex (default: random)"))
+                .arg(Arg::new("repeat").long("repeat").value_name("N").default_value("1").value_parser(clap::value_parser!(u8).range(1..=16)).help("send the same RAND N times and report whether the answers agree"))
+                .arg(yes_arg()),
+        )
+        .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
                 .about("Leave the shell"),
@@ -1573,6 +1686,7 @@ impl Shell {
             )),
             "verify_chv" => self.cmd_verify_chv(args),
             "unblock_chv" => self.cmd_unblock_chv(args),
+            "run_gsm_algorithm" => self.cmd_run_gsm(args),
             "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
             "select_path" => {
                 self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
@@ -2353,6 +2467,52 @@ mod tests {
         let (mut sh, _) = shell_with("pin1=1234", true);
         let r = sh.exec("unblock_chv");
         assert!(!r.ok && r.text.contains("`puk1`"), "{}", r.text);
+    }
+
+    #[test]
+    fn run_gsm_algorithm_is_a_dry_run_and_reports_sres_kc_and_repeatability() {
+        let (mut sh, log) = shell_log();
+        let r = sh.exec("run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f");
+        assert!(r.ok && r.data["sent"] == false, "{}", r.text);
+        assert!(
+            r.text
+                .contains("00 88 00 80 11 10 000102030405060708090A0B0C0D0E0F"),
+            "{}",
+            r.text
+        );
+        assert!(log.borrow().is_empty());
+        let (mut sh, log) = shell_log();
+        sh.opts.yes = true;
+        let r = sh.exec("run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f --repeat 2");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["sres"], "04040404");
+        assert_eq!(r.data["kc"].as_str().unwrap().len(), 16);
+        assert_eq!(r.data["deterministic"], true);
+        assert_eq!(r.data["attempts"], 2);
+        assert_eq!(log.borrow().iter().filter(|c| c[1] == 0x88).count(), 2);
+        // A random RAND by default; the wrong length is refused before anything is sent.
+        let r = sh.exec("run_gsm");
+        assert!(
+            r.ok && r.data["rand"].as_str().unwrap().len() == 32,
+            "{}",
+            r.text
+        );
+        assert!(!sh.exec("run_gsm_algorithm --rand 00").ok);
+    }
+
+    #[test]
+    fn run_gsm_algorithm_on_a_sim_profile_selects_df_gsm_first() {
+        let (mut sh, log) = shell_log();
+        sh.opts.yes = true;
+        assert!(sh.equip(None, Profile::Sim).is_ok());
+        let r = sh.exec("run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["context"], "run-gsm-algorithm");
+        assert_eq!(sh.pwd(), "3F00/7F20", "RUN GSM ALGORITHM needs DF.GSM");
+        let sent = log.borrow().clone();
+        assert!(sent
+            .iter()
+            .any(|c| c[0] == 0xA0 && c[1] == 0x88 && c[2..4] == [0, 0]));
     }
 
     #[test]

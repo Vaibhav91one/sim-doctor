@@ -29,6 +29,8 @@ All notable changes to this project are documented here. The format follows
   Dry run unless `--yes`; the tries are asked first (free), the last try needs `--allow-last-attempt`, one attempt per command.
 - `card`: `unblock_chv [--pin-nr N | --universal]` (#189): UNBLOCK PIN with the PUK and the new PIN from the PIN source, same safety
   pattern as `verify_chv` (dry run unless `--yes`, values masked, last PUK try needs `--allow-last-attempt`, one attempt).
+- `card`: `run_gsm_algorithm [--rand HEX] [--repeat N]` (#190): the GSM authentication probe, SRES and Kc, USIM GSM context or
+  RUN GSM ALGORITHM (`--profile sim`), determinism check with `--repeat`; a dry run unless `--yes`.
 
 ## [0.4.0]
 
