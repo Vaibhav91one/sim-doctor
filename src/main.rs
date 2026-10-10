@@ -691,9 +691,13 @@ enum GpAction {
     /// one authentication attempt, a registry pre-read that refuses a load file or
     /// application AID that is already on the card, every command sent once and
     /// in order, stopping at the first refusal, and a registry re-read to confirm.
-    /// DAP signing and tokens are not supported (PUT KEY and DAP keys are issue
-    /// #115): a card that demands a DAP block refuses the load. Not available over
-    /// MCP.
+    /// For a Security Domain that verifies a DAP, --dap-key-file/--dap-key-env
+    /// (one AES key, hex, optionally KEY/KCV) sign the Load File Data Block Hash
+    /// with AES-CMAC and send the DAP block in front of the load file (GP Card Spec
+    /// v2.3.1 C.2, C.3, B.2.2); the Security Domain must be in the registry with
+    /// the DAP Verification privilege, else nothing is sent. The DAP key is never
+    /// printed. DES, RSA and ECC DAP keys and tokens are not supported. Not
+    /// available over MCP.
     ///
     /// Exit 0 for a dry run or a verified install, 1 otherwise.
     Install {
@@ -715,6 +719,46 @@ enum GpAction {
         /// Terminate are refused.
         #[arg(long, value_name = "HEX", default_value = "000000")]
         privileges: String,
+        #[command(flatten)]
+        dap: GpDapArgs,
+        #[command(flatten)]
+        write: GpWriteFlags,
+    },
+    /// Add or replace an SCP03 key set (ENC, MAC, DEK; AES-128) in the issuer
+    /// security domain over an SCP03 channel (PUT KEY, GlobalPlatform Card Spec
+    /// v2.3.1 11.8). CAN PERMANENTLY LOCK THE CARD'S ADMINISTRATIVE ACCESS.
+    ///
+    /// Replacing the card's own SCP03 keys with values you do not hold, or have
+    /// mistyped, locks administrative access for good. A dry run unless --yes
+    /// (--yes needs --keys-file/--keys-env, the CURRENT keys with their DEK).
+    /// The new key set is read from --new-keys-file/--new-keys-env, never the
+    /// command line: three AES-128 keys `ENC MAC DEK`, each optionally KEY/KCV; a
+    /// wrong KCV refuses the run before the card is touched. The key check value
+    /// of each new key is shown; the keys are never printed, and the PUT KEY data
+    /// (the keys encrypted under the DEK) is withheld from the plan and the
+    /// trace. The command refuses to add, replace or overwrite the key version it
+    /// authenticated with unless --replace-current-keyset is given. After 90 00
+    /// the card's returned key check values and its key information are checked
+    /// against the request. One authentication attempt, not available over MCP.
+    ///
+    /// Exit 0 for a dry run or a verified key change, 1 otherwise.
+    PutKey {
+        /// The Key Version Number of the new keys, 01 to 7F.
+        #[arg(long, value_name = "HEX", value_parser = parse_hex_byte)]
+        new_key_version: u8,
+        /// P1: 00 (default) adds the key set; 01 to 7F replaces the key set with that
+        /// version.
+        #[arg(long, value_name = "HEX", default_value = "00", value_parser = parse_hex_byte)]
+        replace_key_version: u8,
+        /// The Key Identifier of the first key (the other two follow at +1 and +2).
+        #[arg(long, value_name = "HEX", default_value = "01", value_parser = parse_hex_byte)]
+        key_id: u8,
+        #[command(flatten)]
+        new_keys: GpNewKeyArgs,
+        /// Allow the request to add, replace or overwrite the key version this
+        /// session authenticated with. Without it such a request is refused.
+        #[arg(long)]
+        replace_current_keyset: bool,
         #[command(flatten)]
         write: GpWriteFlags,
     },
@@ -809,6 +853,51 @@ struct GpKeyArgs {
     #[arg(long, value_name = "HEX", default_value = "00", requires = "key_source",
           value_parser = parse_hex_byte)]
     key_version: u8,
+}
+
+/// Where `gp put-key` gets the NEW key set. Never a value on the command line.
+/// Text: `ENC MAC DEK`, 32 hex digits each, optionally `KEY/KCV`.
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("new_key_source").required(true)
+    .args(["new_keys_file", "new_keys_env"])))]
+struct GpNewKeyArgs {
+    /// File holding the new keys (keep it chmod 600).
+    #[arg(long, value_name = "PATH")]
+    new_keys_file: Option<std::path::PathBuf>,
+    /// Environment variable holding the new keys.
+    #[arg(long, value_name = "VAR")]
+    new_keys_env: Option<String>,
+}
+
+/// The DAP key of `gp install`. Never a value on the command line.
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("dap_key_source").args(["dap_key_file", "dap_key_env"])))]
+struct GpDapArgs {
+    /// File holding the AES DAP key (hex, optionally KEY/KCV; chmod 600).
+    #[arg(long, value_name = "PATH")]
+    dap_key_file: Option<std::path::PathBuf>,
+    /// Environment variable holding the AES DAP key.
+    #[arg(long, value_name = "VAR")]
+    dap_key_env: Option<String>,
+    /// The Security Domain that verifies the DAP, 5 to 16 bytes of hex (default:
+    /// the issuer security domain being authenticated).
+    #[arg(long, value_name = "HEX", requires = "dap_key_source")]
+    dap_sd: Option<String>,
+    /// The Load File Data Block Hash the DAP signs.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "sha256",
+        requires = "dap_key_source"
+    )]
+    dap_hash: DapHash,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DapHash {
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
 fn parse_hex_byte(text: &str) -> Result<u8, String> {
@@ -1471,8 +1560,24 @@ fn main() -> process::ExitCode {
                 app,
                 params,
                 privileges,
+                dap,
                 write,
-            } => run_gp_install(&load, module, app, &params, &privileges, &write),
+            } => run_gp_install(&load, module, app, &params, &privileges, &dap, &write),
+            GpAction::PutKey {
+                new_key_version,
+                replace_key_version,
+                key_id,
+                new_keys,
+                replace_current_keyset,
+                write,
+            } => run_gp_put_key(
+                new_key_version,
+                replace_key_version,
+                key_id,
+                &new_keys,
+                replace_current_keyset,
+                &write,
+            ),
         },
         Command::Euicc(args) => match args.action {
             EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
@@ -2461,6 +2566,7 @@ fn run_gp_install(
     app: Option<String>,
     params: &str,
     privileges: &str,
+    dap: &GpDapArgs,
     w: &GpWriteFlags,
 ) -> contract::ExitCode {
     let refuse = |kind: &str, message: String| {
@@ -2521,6 +2627,10 @@ fn run_gp_install(
     let (Ok(params), Ok(privileges)) = (hex::decode(params), hex::decode(privileges)) else {
         return refuse("bad-hex", "--params and --privileges must be hex".into());
     };
+    let dap = match load_dap(dap) {
+        Ok(dap) => dap,
+        Err((kind, message)) => return refuse(kind, message),
+    };
     let req = gp::InstallRequest {
         load_file: cap.load_file(),
         load_file_aid: package,
@@ -2528,6 +2638,7 @@ fn run_gp_install(
         app_aid,
         privileges,
         params,
+        dap,
     };
     let keys = match load_gp_keys(&w.keys, w.json) {
         Ok(keys) => keys,
@@ -2553,6 +2664,112 @@ fn run_gp_install(
         w.trace,
         w.channel.channel,
         |s, t| gp::install(s, t, &req, &auth, w.yes),
+    )
+}
+
+/// Reads and checks the DAP key and Security Domain of `gp install`, before a
+/// reader is opened. `Err` is `(kind, message)`; the message never holds the key.
+fn load_dap(args: &GpDapArgs) -> Result<Option<gp::DapRequest>, (&'static str, String)> {
+    let source = match (&args.dap_key_file, &args.dap_key_env) {
+        (Some(path), _) => gp::KeySource::File(path),
+        (None, Some(name)) => gp::KeySource::Env(name),
+        (None, None) => return Ok(None),
+    };
+    let key = gp::DapKey::load(source).map_err(|e| {
+        let kind = match e {
+            gp::KeyError::Kcv { .. } => "key-kcv-mismatch",
+            _ => "keys-unusable",
+        };
+        (kind, format!("DAP key: {e}"))
+    })?;
+    let security_domain = match &args.dap_sd {
+        Some(text) => Some(parse_aid(text).ok_or((
+            "bad-aid",
+            "--dap-sd must be 5 to 16 bytes of hex".to_string(),
+        ))?),
+        None => None,
+    };
+    let hash = match args.dap_hash {
+        DapHash::Sha256 => gp::Lfdbh::Sha256,
+        DapHash::Sha384 => gp::Lfdbh::Sha384,
+        DapHash::Sha512 => gp::Lfdbh::Sha512,
+    };
+    Ok(Some(gp::DapRequest {
+        key,
+        security_domain,
+        hash,
+    }))
+}
+
+/// `sim-doctor gp put-key`: a dry run unless `--yes`, offline without keys. The
+/// new key set is read and checked (format, stated KCVs) before a reader is opened.
+fn run_gp_put_key(
+    new_key_version: u8,
+    replace_key_version: u8,
+    key_id: u8,
+    new: &GpNewKeyArgs,
+    replace_current: bool,
+    w: &GpWriteFlags,
+) -> contract::ExitCode {
+    let refuse = |kind: &str, message: String| {
+        let data = serde_json::json!({ "error": { "kind": kind, "message": message } });
+        report_refusal("gp", &message, data, w.json)
+    };
+    let source = match (&new.new_keys_file, &new.new_keys_env) {
+        (Some(path), _) => gp::KeySource::File(path),
+        (None, Some(name)) => gp::KeySource::Env(name),
+        (None, None) => unreachable!("clap requires one of the two"),
+    };
+    let new_keys = match gp::Keys::load(source) {
+        Ok(keys) if keys.is_key_set() => keys,
+        Ok(_) => {
+            return refuse(
+                "keys-unusable",
+                "the new key set is three keys, ENC MAC DEK".into(),
+            )
+        }
+        Err(e) => {
+            let kind = match e {
+                gp::KeyError::Kcv { .. } => "key-kcv-mismatch",
+                _ => "keys-unusable",
+            };
+            return refuse(kind, format!("new keys: {e}"));
+        }
+    };
+    let req = gp::PutKeyRequest {
+        new_version: new_key_version,
+        replace_version: replace_key_version,
+        key_id,
+        new_keys,
+        replace_current,
+    };
+    let keys = match load_gp_keys(&w.keys, w.json) {
+        Ok(keys) => keys,
+        Err(code) => return code,
+    };
+    let Some(keys) = keys else {
+        return match gp::put_key_dry_run(&req) {
+            Ok(mut data) => {
+                if w.channel.channel != 0 {
+                    data["logical_channel"] = serde_json::json!(w.channel.channel);
+                    gp::retarget_channel(&mut data, w.channel.channel);
+                }
+                emit_gp("gp put-key", data, w.json)
+            }
+            Err(e) => bad_gp_request(&e, w.json),
+        };
+    };
+    if !keys.has_dek() {
+        return bad_gp_request(&gp::BuildError::DekMissing, w.json);
+    }
+    let auth = gp_auth(&keys, &w.keys, w.channel.channel);
+    run_gp(
+        "gp put-key",
+        w.reader.as_deref(),
+        w.json,
+        w.trace,
+        w.channel.channel,
+        |s, t| gp::put_key(s, t, &req, &auth, w.yes),
     )
 }
 

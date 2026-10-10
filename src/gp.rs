@@ -45,11 +45,25 @@
 //! again and must show the intended result (`verify-failed` otherwise); (6) not
 //! exposed over MCP. Without keys a dry run is fully offline (no reader).
 //!
-//! **Does not own, and never sends.** STORE DATA, PUT KEY, SET STATUS, INSTALL
-//! [for extradition / registry update / personalization], DELETE [key], and any
-//! token or DAP signature. DAP needs DAP keys that are not the SCP03 set, so DAP
-//! signing and PUT KEY (with C-DECRYPTION for the key data) belong to issue #115;
-//! [`dap_block`] still only frames bytes. [`info`], [`ara`], [`status`] and
+//! **PUT KEY and DAP (issue #115).** `gp put-key` ([`put_key`]) adds or replaces
+//! an SCP03 AES-128 key set (ENC, MAC, DEK) in the ISD over the same channel: PUT
+//! KEY, GP Card Spec v2.3.1 11.8, with every key encrypted under the current
+//! static DEK (Amendment D v1.1.2 6.2.8) and a KCV (B.6) for each. The dry run
+//! states that replacing the card's own SCP03 keys with values the operator
+//! does not hold permanently locks administrative access, and the command
+//! refuses to touch the key version it authenticated with unless
+//! `--replace-current-keyset` is given. The new keys come only from a file or
+//! environment variable, appear in no output (the plan and the trace withhold
+//! the encrypted key blocks too; KCVs are shown) and the card's returned KCVs
+//! and the key information are read back. `gp install --dap-key-*` signs the
+//! Load File Data Block Hash with a symmetric AES DAP key ([`dap_signature`]:
+//! AES-CMAC, C.3 and B.2.2) and puts the DAP block in front of the load file.
+//!
+//! **Does not own, and never sends.** STORE DATA, SET STATUS, INSTALL
+//! [for extradition / registry update / personalization], DELETE [key], PUT KEY
+//! for anything but an SCP03 AES-128 key set (RSA/ECC/DES keys, a lone DAP
+//! verification key), any token, and DAP signatures other than the AES scheme
+//! (DES, RSA and ECC DAP keys are not implemented). [`info`], [`ara`], [`status`] and
 //! [`select`] send only SELECT, GET DATA and GET STATUS, plus, only when keys are
 //! supplied, one INITIALIZE UPDATE and at most one EXTERNAL AUTHENTICATE (and the
 //! GET RESPONSE that [`session::send`] adds for a `61 xx`). A `91 xx` is
@@ -510,9 +524,17 @@ fn read_policy() -> Policy {
 
 fn push_steps(steps: &mut Vec<Value>, label: &str, ex: &session::Exchange) {
     for s in ex.steps() {
-        steps.push(
-            json!({"step": label, "command": hex_of(s.command()), "response": hex_of(s.response())}),
-        );
+        // PUT KEY carries the new keys encrypted under the DEK: wire bytes, but
+        // key material all the same, so the trace keeps the header only.
+        let command = match (label, s.command()) {
+            (PUT_KEY_STEP, c) if c.len() > 5 => Value::String(format!(
+                "{}<{} data bytes withheld>",
+                hex::encode_upper(&c[..5]),
+                c.len() - 5
+            )),
+            (_, c) => hex_of(c),
+        };
+        steps.push(json!({"step": label, "command": command, "response": hex_of(s.response())}));
     }
 }
 
@@ -866,6 +888,9 @@ pub enum KeyError {
     /// A token is not 32 hex digits, optionally `/` and 6 hex digits of KCV.
     #[error("key {0} is not 32 hex digits (AES-128), optionally followed by /KCV of 6 hex digits")]
     Format(usize),
+    /// A DAP key that is not 16, 24 or 32 bytes of hex.
+    #[error("the DAP key is not 32, 48 or 64 hex digits (AES-128, -192 or -256), optionally followed by /KCV of 6 hex digits")]
+    DapFormat,
     /// The stated KCV is not the KCV of the key.
     #[error(
         "key {index}: its key check value is {computed} but {stated} was stated, so the key or \
@@ -881,13 +906,16 @@ pub enum KeyError {
     },
 }
 
-/// The static AES-128 keys of the ISD's SCP03 key set. The DEK, if given, is
-/// checked and dropped: no command here uses it.
+/// The static AES-128 keys of an SCP03 key set. The DEK is kept (one key means
+/// ENC = MAC = DEK, as GlobalPlatformPro's `--key`): PUT KEY encrypts the new
+/// keys under it, and as the new key set the text must name all three keys.
 ///
 /// `Debug` is redacted. Not `Clone`, not `Serialize`.
 pub struct Keys {
     enc: [u8; 16],
     mac: [u8; 16],
+    dek: Option<[u8; 16]>,
+    count: usize,
     stated: [bool; 2],
 }
 
@@ -954,6 +982,11 @@ impl Keys {
         Ok(Self {
             enc: keys[0],
             mac: keys.get(1).copied().unwrap_or(keys[0]),
+            dek: keys
+                .get(2)
+                .copied()
+                .or((keys.len() == 1).then_some(keys[0])),
+            count: keys.len(),
             stated,
         })
     }
@@ -964,22 +997,107 @@ impl Keys {
     ///
     /// [`KeyError`].
     pub fn load(source: KeySource<'_>) -> Result<Self, KeyError> {
-        use std::io::Read;
-        let text = match source {
-            KeySource::Env(name) => std::env::var(name)
-                .map_err(|_| KeyError::Unreadable(format!("environment variable {name}")))?,
-            KeySource::File(path) => {
-                let mut text = String::new();
-                std::fs::File::open(path)
-                    .and_then(|f| f.take(KEY_TEXT_MAX + 1).read_to_string(&mut text))
-                    .map_err(|_| KeyError::Unreadable(format!("file {}", path.display())))?;
-                text
-            }
-        };
-        if text.len() as u64 > KEY_TEXT_MAX {
-            return Err(KeyError::TooLong);
+        Self::parse(&read_key_text(source)?)
+    }
+
+    /// Whether a DEK is known: the third key, or the single key.
+    pub fn has_dek(&self) -> bool {
+        self.dek.is_some()
+    }
+
+    /// Whether the text named ENC, MAC and DEK as three keys, which is what a
+    /// new key set for PUT KEY has to be.
+    pub fn is_key_set(&self) -> bool {
+        self.count == 3
+    }
+}
+
+/// Reads the key text of `source`, capped at [`KEY_TEXT_MAX`].
+fn read_key_text(source: KeySource<'_>) -> Result<String, KeyError> {
+    use std::io::Read;
+    let text = match source {
+        KeySource::Env(name) => std::env::var(name)
+            .map_err(|_| KeyError::Unreadable(format!("environment variable {name}")))?,
+        KeySource::File(path) => {
+            let mut text = String::new();
+            std::fs::File::open(path)
+                .and_then(|f| f.take(KEY_TEXT_MAX + 1).read_to_string(&mut text))
+                .map_err(|_| KeyError::Unreadable(format!("file {}", path.display())))?;
+            text
         }
-        Self::parse(&text)
+    };
+    if text.len() as u64 > KEY_TEXT_MAX {
+        return Err(KeyError::TooLong);
+    }
+    Ok(text)
+}
+
+/// A symmetric AES DAP key (16, 24 or 32 bytes): the Security Domain's DAP
+/// verification key, used to sign the Load File Data Block Hash. Text form is
+/// one key, hex, optionally `KEY/KCV` (a wrong KCV is an error before the card
+/// is touched). `Debug` is redacted; the bytes appear in no output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DapKey(Vec<u8>);
+
+impl std::fmt::Debug for DapKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DapKey { .. }")
+    }
+}
+
+impl DapKey {
+    /// Parses one key from `text` (`#` lines skipped).
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError`], whose text never contains the input.
+    pub fn parse(text: &str) -> Result<Self, KeyError> {
+        let tokens: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .flat_map(|l| l.split(|c: char| c.is_whitespace() || c == ','))
+            .filter(|t| !t.is_empty())
+            .collect();
+        let [token] = tokens.as_slice() else {
+            return Err(KeyError::Count(tokens.len()));
+        };
+        let (key_hex, kcv_hex) = match token.split_once('/') {
+            Some((k, c)) => (k, Some(c)),
+            None => (*token, None),
+        };
+        let key = hex::decode(key_hex)
+            .ok()
+            .filter(|k| matches!(k.len(), 16 | 24 | 32))
+            .ok_or(KeyError::DapFormat)?;
+        if let Some(kcv_hex) = kcv_hex {
+            let want = hex::decode(kcv_hex)
+                .ok()
+                .and_then(|v| <[u8; 3]>::try_from(v).ok())
+                .ok_or(KeyError::DapFormat)?;
+            let got = aes_kcv(&key).expect("16, 24 or 32 bytes");
+            if got != want {
+                return Err(KeyError::Kcv {
+                    index: 1,
+                    computed: hex::encode_upper(got),
+                    stated: hex::encode_upper(want),
+                });
+            }
+        }
+        Ok(Self(key))
+    }
+
+    /// Reads and parses the key from `source`.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError`].
+    pub fn load(source: KeySource<'_>) -> Result<Self, KeyError> {
+        Self::parse(&read_key_text(source)?)
+    }
+
+    /// The key check value (public, 24 bits).
+    pub fn kcv(&self) -> [u8; 3] {
+        aes_kcv(&self.0).expect("16, 24 or 32 bytes")
     }
 }
 
@@ -1614,6 +1732,9 @@ fn render_write(out: &mut Vec<String>, op: &Value, data: &Value) {
         (false, false) => "refused, nothing was sent",
     };
     out.push(format!("{}: {state}", s(op).to_uppercase()));
+    if let Some(w) = data["warning"].as_str() {
+        out.push(format!("  WARNING: {}", crate::contract::sanitize(w)));
+    }
     if let Some(t) = data["target"].as_object() {
         for (k, v) in t {
             let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
@@ -1624,7 +1745,16 @@ fn render_write(out: &mut Vec<String>, op: &Value, data: &Value) {
         out.push(format!("  {}", crate::contract::sanitize(note)));
     }
     for a in data["plan"]["apdus"].as_array().into_iter().flatten() {
-        out.push(format!("  APDU {}: {}", s(&a["step"]), s(&a["apdu"])));
+        if a["apdu"].is_null() {
+            out.push(format!(
+                "  APDU {}: {} ({})",
+                s(&a["step"]),
+                s(&a["header"]),
+                s(&a["data"])
+            ));
+        } else {
+            out.push(format!("  APDU {}: {}", s(&a["step"]), s(&a["apdu"])));
+        }
     }
     if let Some(note) = data["plan"]["note"].as_str() {
         out.push(format!("  ({})", crate::contract::sanitize(note)));
@@ -1681,6 +1811,12 @@ pub enum BuildError {
     /// The Install Parameters field does not hold the mandatory C9 tag.
     #[error("install parameters must be TLV that holds the mandatory C9 tag (C900 for none)")]
     InstallParameters,
+    /// A PUT KEY parameter outside what GP Card Spec v2.3.1 11.8.2.1 to 11.8.2.3 allow.
+    #[error("{0}")]
+    PutKey(&'static str),
+    /// The supplied authentication keys have no DEK to encrypt the new keys with.
+    #[error("PUT KEY encrypts the new keys under the current DEK, and the supplied keys have none: give ENC MAC DEK (or one key for all three)")]
+    DekMissing,
 }
 
 /// Default LOAD block size: pySim's, the old GlobalPlatformPro default, leaves
@@ -1756,9 +1892,9 @@ fn ber_len(len: usize) -> Vec<u8> {
 
 /// The structure of a DAP block, `E2 { 4F <security domain AID>, C3
 /// <signature> }`, to put in front of the load file data block. This only
-/// frames bytes the caller already has: computing the signature (DAP signing)
-/// is out of scope and belongs to issue #115. GP Card Spec v2.3.1 section
-/// 11.6.2.3.
+/// frames bytes the caller already has; [`dap_signature`] computes the
+/// signature. GP Card Spec v2.3.1 section 11.6.2.3, Table 11-58; the same
+/// framing as GlobalPlatformPro `GPSession.loadCapFile`.
 pub fn dap_block(security_domain_aid: &[u8], signature: &[u8]) -> Result<Vec<u8>, BuildError> {
     aid_ok("DAP security domain", security_domain_aid, false)?;
     let mut body = vec![0x4F];
@@ -2116,6 +2252,75 @@ pub struct InstallRequest {
     pub privileges: Vec<u8>,
     /// The Install Parameters field, with its `C9` tag; `C9 00` for none.
     pub params: Vec<u8>,
+    /// Sign the Load File Data Block Hash and send a DAP block, if set.
+    pub dap: Option<DapRequest>,
+}
+
+/// Which hash is the Load File Data Block Hash when a DAP block is sent (GP Card
+/// Spec v2.3.1 C.2 and Table C-3). SHA-1 is not offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lfdbh {
+    /// SHA-256 (Table C-3: the minimum for an AES-128 scheme).
+    Sha256,
+    /// SHA-384.
+    Sha384,
+    /// SHA-512.
+    Sha512,
+}
+
+impl Lfdbh {
+    /// The name shown in output.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    /// The digest of the Load File Data Block, without tag `C4` and its length
+    /// (C.2).
+    pub fn digest(self, load_file: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        match self {
+            Self::Sha256 => sha2::Sha256::digest(load_file).to_vec(),
+            Self::Sha384 => sha2::Sha384::digest(load_file).to_vec(),
+            Self::Sha512 => sha2::Sha512::digest(load_file).to_vec(),
+        }
+    }
+}
+
+/// A DAP block for `gp install`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DapRequest {
+    /// The Security Domain's DAP verification key.
+    pub key: DapKey,
+    /// The Security Domain that verifies the DAP (the `4F` of the block); the
+    /// authenticated ISD when `None`.
+    pub security_domain: Option<Vec<u8>>,
+    /// The Load File Data Block Hash algorithm.
+    pub hash: Lfdbh,
+}
+
+/// The Load File Data Block Signature of an AES DAP key: AES-CMAC of the Load
+/// File Data Block Hash, 16 bytes. GP Card Spec v2.3.1 C.3 ("If the signing key
+/// is an AES key, the Load File Data Block Signature is generated according to
+/// section B.2.2") and B.2.2 (CMAC, NIST SP 800-38B, 16 byte result).
+pub fn dap_signature(key: &DapKey, lfdbh: &[u8]) -> [u8; 16] {
+    use cmac::{Cmac, Mac};
+    macro_rules! mac {
+        ($cipher:ty) => {{
+            let mut m = <Cmac<$cipher> as KeyInit>::new_from_slice(&key.0)
+                .expect("DapKey holds 16, 24 or 32 bytes");
+            m.update(lfdbh);
+            m.finalize().into_bytes().into()
+        }};
+    }
+    match key.0.len() {
+        16 => mac!(aes::Aes128),
+        24 => mac!(aes::Aes192),
+        _ => mac!(aes::Aes256),
+    }
 }
 
 /// One APDU of a write, as built (before secure messaging).
@@ -2142,11 +2347,22 @@ fn install_plan_steps(req: &InstallRequest, sd_aid: &[u8]) -> Result<Vec<Planned
             "Card Lock and Card Terminate are not granted by gp install",
         ));
     }
+    // With a DAP the Load File Data Block Hash is mandatory (11.5.2.3.1) and is
+    // what the DAP signs; the block precedes the C4 block in the Load File (11.6.2.3).
+    let (lfdbh, dap_blocks) = match &req.dap {
+        Some(d) => {
+            let hash = d.hash.digest(&req.load_file);
+            let signature = dap_signature(&d.key, &hash);
+            let block = dap_block(d.security_domain.as_deref().unwrap_or(sd_aid), &signature)?;
+            (hash, vec![block])
+        }
+        None => (Vec::new(), Vec::new()),
+    };
     let mut plan = vec![Planned {
         step: "install_for_load",
-        command: install_for_load(&req.load_file_aid, sd_aid, &[], &[], &[])?,
+        command: install_for_load(&req.load_file_aid, sd_aid, &lfdbh, &[], &[])?,
     }];
-    for command in load_commands(&req.load_file, &[], DEFAULT_LOAD_BLOCK)? {
+    for command in load_commands(&req.load_file, &dap_blocks, DEFAULT_LOAD_BLOCK)? {
         plan.push(Planned {
             step: "load",
             command,
@@ -2177,6 +2393,15 @@ fn plan_json(plan: &[Planned]) -> Value {
         plan.iter()
             .map(|p| {
                 let wire = p.command.encode().expect("a built command encodes");
+                if p.step == PUT_KEY_STEP {
+                    // The data is the new keys encrypted under the DEK: withheld.
+                    return json!({
+                        "step": p.step,
+                        "apdu": null,
+                        "header": hex::encode_upper(&wire[..4]),
+                        "data": format!("{} bytes withheld: the new key version and the new keys encrypted under the DEK", wire.len() - 6),
+                    });
+                }
                 json!({ "step": p.step, "apdu": hex_of(&wire) })
             })
             .collect(),
@@ -2236,14 +2461,25 @@ pub fn install_dry_run(req: &InstallRequest) -> Result<Value, BuildError> {
 }
 
 fn install_target(req: &InstallRequest) -> Value {
-    json!({
+    let mut target = json!({
         "load_file_aid": hex_of(&req.load_file_aid),
         "module_aid": hex_of(&req.module_aid),
         "app_aid": hex_of(&req.app_aid),
         "privileges": hex_of(&req.privileges),
         "install_parameters": hex_of(&req.params),
         "load_file_bytes": req.load_file.len(),
-    })
+    });
+    if let Some(d) = &req.dap {
+        target["dap"] = json!({
+            "scheme": "AES-CMAC over the Load File Data Block Hash (C.3, B.2.2)",
+            "hash": d.hash.name(),
+            "load_file_data_block_hash": hex_of(&d.hash.digest(&req.load_file)),
+            "security_domain": d.security_domain.as_deref().map_or_else(
+                || json!("the authenticated security domain"), hex_of),
+            "key_kcv": hex::encode_upper(d.key.kcv()),
+        });
+    }
+    target
 }
 
 /// The entry for `aid_hex` in a [`read_registry`] result, with its scope name.
@@ -2268,6 +2504,30 @@ fn registry_complete(registry: &[Value]) -> bool {
     })
 }
 
+/// `dap_verification` or `mandated_dap_verification`, whichever the registry
+/// entry shows (Table 11-7), or `None`.
+fn dap_privilege(entry: &Value) -> Option<&'static str> {
+    let names = entry["privilege_names"].as_array()?;
+    ["mandated_dap_verification", "dap_verification"]
+        .into_iter()
+        .find(|p| names.iter().any(|n| n == p))
+}
+
+/// The registry entries that can verify a DAP, `{aid, privilege}`. Informational
+/// in `data.pre_read`: a card that mandates a DAP (GP 11.6.2.3: a DAP block
+/// shall be present when a Security Domain with Mandated DAP Verification
+/// exists) refuses a load without one, and this shows which AID to name with
+/// `--dap-sd`.
+fn dap_security_domains(registry: &[Value]) -> Value {
+    Value::Array(
+        registry
+            .iter()
+            .flat_map(|s| s["entries"].as_array().into_iter().flatten())
+            .filter_map(|e| dap_privilege(e).map(|p| json!({ "aid": e["aid"], "privilege": p })))
+            .collect(),
+    )
+}
+
 /// A selected and authenticated ISD, with the registry read over the channel.
 struct Prepared {
     channel: scp03::Channel,
@@ -2275,6 +2535,10 @@ struct Prepared {
     registry: Vec<Value>,
     steps: Vec<Value>,
     data: Value,
+    /// The key information template read before authenticating, if it decoded.
+    card_keys: Option<Value>,
+    /// The key version the channel was authenticated with (from INITIALIZE UPDATE).
+    current_kvn: u8,
 }
 
 /// SELECT the ISD, the ONE authentication attempt of [`authenticate`], then
@@ -2323,10 +2587,10 @@ fn prepare_write<S: CardSession + ?Sized>(
     } else {
         None
     };
-    let mut channel = match authenticate(session, &mut steps, auth)? {
+    let (mut channel, current_kvn) = match authenticate(session, &mut steps, auth)? {
         Ok(est) => {
             data["secure_channel"] = channel_report(auth, &est, card_keys.as_ref());
-            est.channel
+            (est.channel, est.iur.key_version)
         }
         Err(stop) => {
             data["secure_channel"] = json!({
@@ -2346,6 +2610,8 @@ fn prepare_write<S: CardSession + ?Sized>(
         registry,
         steps,
         data,
+        card_keys,
+        current_kvn,
     }))
 }
 
@@ -2381,6 +2647,7 @@ where
         registry,
         mut steps,
         mut data,
+        ..
     } = match prepare_write(session, trace, auth)? {
         Ok(p) => p,
         Err(report) => return Ok(report),
@@ -2560,7 +2827,37 @@ pub fn install<S: CardSession + ?Sized>(
                     format!("{app_hex} is already in the registry; delete it first with gp delete; nothing was sent"),
                 ));
             }
-            Ok(json!({ "load_file_present": false, "app_present": false }))
+            // A DAP block from a Security Domain that cannot verify one would be
+            // refused by the card only after INSTALL [for load] went through.
+            if let Some(d) = &req.dap {
+                let sd = match &d.security_domain {
+                    Some(aid) => registry_entry(registry, &hex::encode_upper(aid)).map(|(_, e)| e),
+                    None => registry
+                        .iter()
+                        .find(|s| s["scope"] == "isd")
+                        .and_then(|s| s["entries"].get(0)),
+                };
+                match sd {
+                    None => {
+                        return Err((
+                            "dap-sd-not-present",
+                            "the security domain named for the DAP is not in the registry; nothing was sent".into(),
+                        ))
+                    }
+                    Some(e) if dap_privilege(e).is_none() => {
+                        return Err((
+                            "dap-sd-without-dap-privilege",
+                            "the security domain named for the DAP has neither the DAP Verification nor the Mandated DAP Verification privilege, so it cannot verify one; nothing was sent".into(),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+            Ok(json!({
+                "load_file_present": false,
+                "app_present": false,
+                "dap_security_domains": dap_security_domains(registry),
+            }))
         },
         |after| {
             matches!(registry_entry(after, &load_hex), Some((s, _)) if s.starts_with("load_files"))
@@ -2569,6 +2866,359 @@ pub fn install<S: CardSession + ?Sized>(
                 })
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// PUT KEY (issue #115)
+// ---------------------------------------------------------------------------
+
+/// The step label of PUT KEY in plans, traces and results. [`push_steps`] and
+/// [`plan_json`] withhold the data of a step with this label.
+const PUT_KEY_STEP: &str = "put_key";
+
+/// Said in every PUT KEY output, dry run or not.
+pub const PUT_KEY_WARNING: &str = "replacing the card's own SCP03 keys with values you do not hold, or have mistyped, permanently locks administrative access to this security domain: there is no recovery and no retry. Check the key check values shown against your records before adding --yes";
+
+/// What `gp put-key` writes: a complete SCP03 AES-128 key set (ENC, MAC, DEK)
+/// under the key identifiers `key_id`, `key_id + 1` and `key_id + 2`.
+#[derive(Debug)]
+pub struct PutKeyRequest {
+    /// The Key Version Number of the new keys (data field, `01` to `7F`).
+    pub new_version: u8,
+    /// P1: `00` adds a new key set; non-zero replaces the key set with that
+    /// version (`01` to `7F`). GP Card Spec v2.3.1 11.8.2.1.
+    pub replace_version: u8,
+    /// P2: the Key Identifier of the first key (`00` to `7D`; the others follow
+    /// at +1 and +2, 11.8.2.2).
+    pub key_id: u8,
+    /// The new key set; all three keys must have been given ([`Keys::is_key_set`]).
+    pub new_keys: Keys,
+    /// Allow touching the key version the session authenticated with.
+    pub replace_current: bool,
+}
+
+/// Checks the parameters against GP Card Spec v2.3.1 11.8.2.1 to 11.8.2.3.
+fn put_key_params(req: &PutKeyRequest) -> Result<[[u8; 16]; 3], BuildError> {
+    if !(1..=0x7F).contains(&req.new_version) {
+        return Err(BuildError::PutKey(
+            "the new key version number is coded from 01 to 7F (11.8.2.3)",
+        ));
+    }
+    if req.replace_version > 0x7F {
+        return Err(BuildError::PutKey(
+            "the replaced key version number is 00 (add) or 01 to 7F (11.8.2.1)",
+        ));
+    }
+    if req.key_id > 0x7D {
+        return Err(BuildError::PutKey(
+            "the first key identifier is 00 to 7D so that the second and third key identifiers stay within 7F (11.8.2.2)",
+        ));
+    }
+    match (req.new_keys.is_key_set(), req.new_keys.dek) {
+        (true, Some(dek)) => Ok([req.new_keys.enc, req.new_keys.mac, dek]),
+        _ => Err(BuildError::PutKey(
+            "a new key set is three keys, ENC MAC DEK",
+        )),
+    }
+}
+
+/// AES-ECB of one block. For a 16 byte key this is also AES-CBC with a zero ICV,
+/// the encryption Amendment D v1.1.2 6.2.8 prescribes, because it is one block.
+fn dek_encrypt(dek: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
+    let mut block = (*key).into();
+    aes::Aes128::new_from_slice(dek)
+        .expect("16-byte key")
+        .encrypt_block(&mut block);
+    block.into()
+}
+
+/// Builds, and does not send, PUT KEY for a new SCP03 key set: `80 D8 <P1> <P2
+/// | 80> Lc <KVN> (88 10 <key encrypted under the DEK> 03 <KCV>) x3 00`.
+///
+/// GP Card Spec v2.3.1 11.8 (Table 11-64 command, 11.8.2.1/11.8.2.2 P1/P2, Table
+/// 11-67 data field: the new Key Version Number then one key data field per
+/// key), Table 11-68 Basic Format (key type `88` AES from 11.1.8, BER length of
+/// the Key Component Block, one byte KCV length, KCV), 11.8.2.3.2 Table 11-71
+/// (a key whose length is a multiple of the block size needs no padding and no
+/// length prefix, so the block is the 16 encrypted bytes), B.6 (KCV: first 3
+/// bytes of AES of 16 bytes of `01`). The keys are encrypted with the current
+/// static Key-DEK, AES-CBC with a zero ICV (Amendment D v1.1.2 6.2.8, "no
+/// padding is required" for 16 byte AES keys). Byte-for-byte what pySim's
+/// `ADF_SD.AddlShellCommands.build_put_key_data` produces for `aes` keys;
+/// GlobalPlatformPro `GPSession.putKeys` writes the same key with the Table
+/// 11-70 length prefix (`88 11 10 ...`), which 11.8.2.3.3 also lets a card
+/// accept. P2 has b8 set (multiple keys), as both do.
+///
+/// # Errors
+///
+/// [`BuildError`] for a parameter outside what the specification allows.
+pub fn put_key_command(req: &PutKeyRequest, current_dek: &[u8; 16]) -> Result<Command, BuildError> {
+    let keys = put_key_params(req)?;
+    let mut data = vec![req.new_version];
+    for key in &keys {
+        data.extend([0x88, 0x10]);
+        data.extend(dek_encrypt(current_dek, key));
+        data.push(0x03);
+        data.extend(aes_kcv(key).expect("16-byte key"));
+    }
+    Ok(Command::case4(
+        Header::new(0x80, 0xD8, req.replace_version, 0x80 | req.key_id),
+        data,
+        Le::Short(0),
+    ))
+}
+
+/// The Key Version Number then the three KCVs, which is what the card returns
+/// (11.8.3.1: "the Key Version Number followed by the key check value(s) not
+/// preceded by a length").
+fn put_key_expected_response(req: &PutKeyRequest, keys: &[[u8; 16]; 3]) -> Vec<u8> {
+    let mut out = vec![req.new_version];
+    for k in keys {
+        out.extend(aes_kcv(k).expect("16-byte key"));
+    }
+    out
+}
+
+fn put_key_target(req: &PutKeyRequest, keys: &[[u8; 16]; 3]) -> Value {
+    let kcv = |k: &[u8; 16]| json!({ "kcv": hex::encode_upper(aes_kcv(k).expect("16-byte key")) });
+    json!({
+        "new_key_version": format!("{:02X}", req.new_version),
+        "replace_key_version": format!("{:02X}", req.replace_version),
+        "key_id": format!("{:02X}", req.key_id),
+        "key_type": "AES-128 (88), SCP03 key set ENC, MAC, DEK",
+        "new_keys": { "enc": kcv(&keys[0]), "mac": kcv(&keys[1]), "dek": kcv(&keys[2]) },
+        "replace_current_keyset": req.replace_current,
+    })
+}
+
+/// `gp put-key` without authentication keys: validates the request and shows
+/// the target and the warning. The APDU cannot be built offline (the new keys
+/// are encrypted under the current DEK), so the plan lists none. Sends nothing
+/// and does not touch a card.
+///
+/// # Errors
+///
+/// [`BuildError`] for a parameter outside what the specification allows.
+pub fn put_key_dry_run(req: &PutKeyRequest) -> Result<Value, BuildError> {
+    let keys = put_key_params(req)?;
+    let mut data = offline_dry_run(
+        "put-key",
+        put_key_target(req, &keys),
+        &[],
+        "no keys were given, so the card was not contacted, whether this replaces the keys in use was not checked and no APDU was built (it needs the current DEK); add --keys-file or --keys-env to check against the card, and --yes to send",
+    );
+    data["plan"]["note"] = json!("the PUT KEY APDU holds the new keys encrypted under the current DEK; it is built, and shown with its data withheld, only once the keys are given");
+    data["warning"] = json!(PUT_KEY_WARNING);
+    Ok(data)
+}
+
+/// What the card's key information says about the request, or the refusal
+/// `(kind, message)`. Nothing has been sent when this refuses.
+fn put_key_checks(
+    req: &PutKeyRequest,
+    current_kvn: u8,
+    card_keys: Option<&Value>,
+) -> Result<Value, (&'static str, String)> {
+    let touches = req.new_version == current_kvn
+        || (req.replace_version != 0 && req.replace_version == current_kvn);
+    if touches && !req.replace_current {
+        return Err((
+            "refusing-current-keyset",
+            format!(
+                "this session authenticated with key version {current_kvn:02X}, and the request would replace or overwrite it. Replacing the keys in use with values you do not hold locks administrative access for good. Nothing was sent; if you mean it, add --replace-current-keyset"
+            ),
+        ));
+    }
+    let Some(list) = card_keys.and_then(Value::as_array) else {
+        return Err((
+            "key-information-unreadable",
+            "the card's key information (GET DATA E0) could not be read, so the key versions it holds are unknown; nothing was sent".into(),
+        ));
+    };
+    let has = |v: u8| {
+        list.iter()
+            .any(|k| k["key_version"].as_u64() == Some(u64::from(v)))
+    };
+    if req.replace_version != 0 && !has(req.replace_version) {
+        return Err((
+            "replace-target-absent",
+            format!(
+                "--replace-key-version {:02X} names a key version the card does not hold; nothing was sent",
+                req.replace_version
+            ),
+        ));
+    }
+    if has(req.new_version) && req.new_version != req.replace_version {
+        return Err((
+            "key-version-exists",
+            format!(
+                "key version {:02X} is already on the card; replace it explicitly with --replace-key-version {:02X} (or choose another new version); nothing was sent",
+                req.new_version, req.new_version
+            ),
+        ));
+    }
+    Ok(json!({
+        "authenticated_key_version": current_kvn,
+        "key_versions_on_card": list.iter().filter_map(|k| k["key_version"].as_u64()).collect::<Vec<_>>(),
+        "touches_authenticated_keyset": touches,
+    }))
+}
+
+/// `gp put-key` over SCP03: authenticate once, read the registry as every write
+/// does, refuse (nothing sent) a request that would overwrite the key set in use
+/// without `replace_current` (`refusing-current-keyset`), name a key version the
+/// card lacks (`replace-target-absent`) or collide with one it holds
+/// (`key-version-exists`), or when the key information is unreadable; a dry run
+/// unless `yes`; otherwise PUT KEY once, MAC'd, every status word reported under
+/// its own kind. After `90 00` the KVN and KCVs the card returned must equal the
+/// ones computed (`card-kcv-mismatch`), and GET DATA E0 over the channel must
+/// list the three new keys (`verify-failed`).
+///
+/// # Errors
+///
+/// Only transport and encoding failures; refusals are `data.error`.
+pub fn put_key<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+    req: &PutKeyRequest,
+    auth: &Auth<'_>,
+    yes: bool,
+) -> Result<Report, session::Error> {
+    let Prepared {
+        mut channel,
+        mut steps,
+        mut data,
+        card_keys,
+        current_kvn,
+        ..
+    } = match prepare_write(session, trace, auth)? {
+        Ok(p) => p,
+        Err(report) => return Ok(report),
+    };
+    let finish = |mut data: Value, steps: Vec<Value>| {
+        if trace {
+            data["trace"] = Value::Array(steps);
+        }
+        Ok(Report {
+            isd_found: true,
+            data,
+        })
+    };
+    data["operation"] = json!("put-key");
+    data["dry_run"] = json!(!yes);
+    data["sent"] = json!(false);
+    data["warning"] = json!(PUT_KEY_WARNING);
+    let keys = match put_key_params(req) {
+        Ok(keys) => keys,
+        Err(e) => {
+            data["error"] = json!({ "kind": "unbuildable", "message": e.to_string() });
+            return finish(data, steps);
+        }
+    };
+    data["target"] = put_key_target(req, &keys);
+    let command = match auth
+        .keys
+        .dek
+        .ok_or(BuildError::DekMissing)
+        .and_then(|dek| put_key_command(req, &dek))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            data["error"] = json!({ "kind": "unbuildable", "message": e.to_string() });
+            return finish(data, steps);
+        }
+    };
+    let plan = [Planned {
+        step: PUT_KEY_STEP,
+        command,
+    }];
+    data["plan"] = json!({ "apdus": plan_json(&plan) });
+    match put_key_checks(req, current_kvn, card_keys.as_ref()) {
+        Ok(pre_read) => data["pre_read"] = pre_read,
+        Err((kind, message)) => {
+            data["error"] = json!({ "kind": kind, "message": message });
+            return finish(data, steps);
+        }
+    }
+    if !yes {
+        data["note"] = json!(
+            "dry run: the key information was checked over the secure channel, nothing was written; add --yes to send the plan"
+        );
+        return finish(data, steps);
+    }
+    let wrapped = match channel.wrap(&plan[0].command) {
+        Ok(w) => w,
+        Err(e) => {
+            data["error"] = json!({ "kind": "unbuildable", "message": e.to_string() });
+            return finish(data, steps);
+        }
+    };
+    let ex = session::send(session, &wrapped, &read_policy())?;
+    push_steps(&mut steps, PUT_KEY_STEP, &ex);
+    data["sent"] = json!(true);
+    data["result"] = json!({ "steps": [{ "step": PUT_KEY_STEP, "status": sw_hex(&ex) }] });
+    if !ex.is_success() {
+        let mut err = refused("PUT KEY", &ex);
+        err["step"] = json!(PUT_KEY_STEP);
+        err["advice"] = json!(
+            "nothing was retried; the card's key sets are unchanged unless it said otherwise, check with gp status"
+        );
+        data["error"] = err;
+        return finish(data, steps);
+    }
+    let expected = put_key_expected_response(req, &keys);
+    let returned = ex.data();
+    data["result"]["card_kcv_check"] = json!(if returned.is_empty() {
+        "the card returned no key check values"
+    } else if returned == expected.as_slice() {
+        "match"
+    } else {
+        "MISMATCH"
+    });
+    if !returned.is_empty() && returned != expected.as_slice() {
+        data["error"] = json!({
+            "kind": "card-kcv-mismatch",
+            "message": "the card answered 9000 but the key version and key check values it returned are not the ones computed for the new keys: it may hold different keys than intended. Do not rely on the new key set; check with gp status",
+        });
+        return finish(data, steps);
+    }
+    // Read back the key information over the channel (MAC'd, once).
+    let read = Command::case2(Header::new(0x80, 0xCA, 0x00, 0xE0), Le::Short(0));
+    let ex = send_secure(
+        session,
+        &mut steps,
+        &mut channel,
+        "key_information_after",
+        &read,
+    )?;
+    let listed = ex
+        .is_success()
+        .then(|| decode_key_information(ex.data()).ok())
+        .flatten();
+    let verified = listed
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|list| {
+            (0..3u8).all(|i| {
+                list.iter().any(|k| {
+                    k["key_id"].as_u64() == Some(u64::from(req.key_id + i))
+                        && k["key_version"].as_u64() == Some(u64::from(req.new_version))
+                        && k["key_type"] == "88"
+                        && k["key_length"] == 16
+                })
+            })
+        });
+    data["result"]["verified"] = json!(verified);
+    if !verified {
+        data["error"] = json!({
+            "kind": "verify-failed",
+            "message": format!(
+                "the card answered 9000 to PUT KEY but its key information (read back with status {}) does not list the three new AES-128 keys at the requested version and identifiers",
+                sw_hex(&ex).as_deref().unwrap_or("none")
+            ),
+        });
+    }
+    finish(data, steps)
 }
 
 #[cfg(test)]
@@ -3690,6 +4340,7 @@ mod tests {
             app_aid: hex::decode(APP).unwrap(),
             privileges: vec![0, 0, 0],
             params: vec![0xC9, 0x00],
+            dap: None,
         }
     }
 
@@ -4210,5 +4861,637 @@ mod tests {
         assert!(!out.contains(&hex::encode(keys.enc)) && !out.contains(&hex::encode(keys.mac)));
         // the ENC key is never exercised by a C-MAC-only write
         assert_eq!(r.data["secure_channel"]["enc_key_exercised"], false);
+    }
+
+    // ---- PUT KEY and DAP (issue #115) ------------------------------------
+    //
+    // Every wire vector below was produced by pySim itself, not by this crate:
+    // `pySim.global_platform.scp.SCP03` (the very SCP03_Test_AES128_11 handshake
+    // used above, with the DEK 202122..2F of its KEYSET_AES128) wrapped the
+    // commands, and `ADF_SD.AddlShellCommands.build_put_key_data` built the PUT KEY
+    // data field with `aes` keys. The GET STATUS pre-read bytes it produces are
+    // the GS_* constants above, which also pins the chain. The DAP signature was
+    // computed twice, with python `cryptography` AES-CMAC and with
+    // `openssl mac -cipher AES-128-CBC CMAC`.
+
+    const DEK_HEX: &str = "202122232425262728292A2B2C2D2E2F";
+    const NEW_ENC: &str = "404142434445464748494A4B4C4D4E4F";
+    const NEW_MAC: &str = "505152535455565758595A5B5C5D5E5F";
+    const NEW_DEK: &str = "606162636465666768696A6B6C6D6E6F";
+    const NEW_KCVS: [&str; 3] = ["504A77", "F2A8DF", "D7D0E4"];
+    // The encrypted key blocks of the PUT KEY data (AES-CBC, zero ICV, key DEK).
+    const NEW_ENC_CT: &str = "859469C07743C7E45B318D151D3D87E9";
+    const NEW_MAC_CT: &str = "B05159C3643927E54547E8A14721D1EB";
+    const NEW_DEK_CT: &str = "2602F2F0A58CFBD1CD1A16CFD98BEE32";
+    const PLAIN_PUT_ADD: &str = "80D8008143318810859469C07743C7E45B318D151D3D87E903504A778810B05159C3643927E54547E8A14721D1EB03F2A8DF88102602F2F0A58CFBD1CD1A16CFD98BEE3203D7D0E400";
+    const PUT_ADD: &str = "84D800814B318810859469C07743C7E45B318D151D3D87E903504A778810B05159C3643927E54547E8A14721D1EB03F2A8DF88102602F2F0A58CFBD1CD1A16CFD98BEE3203D7D0E44893A527EF64D12600";
+    const KI_AFTER_ADD: &str = "84CA00E008C750F0D28C7839F800";
+    const PUT_REPLACE: &str = "84D830814B308810859469C07743C7E45B318D151D3D87E903504A778810B05159C3643927E54547E8A14721D1EB03F2A8DF88102602F2F0A58CFBD1CD1A16CFD98BEE3203D7D0E41BC7095719BB1A1D00";
+    const KI_AFTER_REPLACE: &str = "84CA00E008234A7E0FD26799B800";
+
+    fn current_keys() -> Keys {
+        Keys::parse(&format!("{ENC_HEX} {MAC_HEX} {DEK_HEX}")).unwrap()
+    }
+
+    fn put_request(new_version: u8, replace_version: u8, replace_current: bool) -> PutKeyRequest {
+        PutKeyRequest {
+            new_version,
+            replace_version,
+            key_id: 1,
+            new_keys: Keys::parse(&format!("{NEW_ENC} {NEW_MAC} {NEW_DEK}")).unwrap(),
+            replace_current,
+        }
+    }
+
+    /// GET DATA E0 listing key sets `versions`, three AES-128 keys each.
+    fn key_info(versions: &[u8]) -> String {
+        let mut inner = String::new();
+        for v in versions {
+            for id in 1..=3 {
+                inner += &format!("C004{id:02X}{v:02X}8810");
+            }
+        }
+        tlv("E0", &inner) + "9000"
+    }
+
+    fn card_for_put_key(after: &[u8]) -> Card {
+        let mut card = secure_card("9000");
+        set(&mut card, PUT_ADD, &format!("31{}9000", NEW_KCVS.concat()));
+        set(
+            &mut card,
+            PUT_REPLACE,
+            &format!("30{}9000", NEW_KCVS.concat()),
+        );
+        set(&mut card, KI_AFTER_ADD, &key_info(after));
+        set(&mut card, KI_AFTER_REPLACE, &key_info(after));
+        card
+    }
+
+    fn assert_no_put_key_secrets(out: &str) {
+        for secret in [
+            ENC_HEX, MAC_HEX, DEK_HEX, NEW_ENC, NEW_MAC, NEW_DEK, NEW_ENC_CT, NEW_MAC_CT,
+            NEW_DEK_CT,
+        ] {
+            assert!(
+                !out.contains(&secret.to_lowercase()),
+                "key material {} in the output",
+                &secret[..4]
+            );
+        }
+        // the ciphertext is withheld in the middle of the data too
+        assert!(!out.contains(&PLAIN_PUT_ADD[10..60].to_lowercase()));
+    }
+
+    fn put_everything(r: &Report) -> String {
+        format!(
+            "{}\n{}\n{:?}",
+            serde_json::to_string(&r.data).unwrap(),
+            render_text(&r.data),
+            r.data
+        )
+        .to_lowercase()
+    }
+
+    #[test]
+    fn put_key_command_is_byte_exact_with_pysim() {
+        let dek = <[u8; 16]>::try_from(hex::decode(DEK_HEX).unwrap()).unwrap();
+        let c = put_key_command(&put_request(0x31, 0, false), &dek).unwrap();
+        assert_eq!(hex::encode_upper(c.encode().unwrap()), PLAIN_PUT_ADD);
+        let c = put_key_command(&put_request(0x30, 0x30, true), &dek).unwrap();
+        assert_eq!(c.encode().unwrap()[..5], [0x80, 0xD8, 0x30, 0x81, 0x43]);
+        // KCVs: first 3 bytes of AES of 16 x 01 (B.6)
+        for (k, kcv) in [NEW_ENC, NEW_MAC, NEW_DEK].iter().zip(NEW_KCVS) {
+            let k = hex::decode(k).unwrap();
+            assert_eq!(hex::encode_upper(aes_kcv(&k).unwrap()), kcv);
+        }
+        // parameter ranges (11.8.2.1 to 11.8.2.3)
+        for bad in [
+            put_request(0, 0, false),
+            put_request(0x80, 0, false),
+            put_request(0x31, 0x80, false),
+        ] {
+            assert!(matches!(
+                put_key_command(&bad, &dek),
+                Err(BuildError::PutKey(_))
+            ));
+        }
+        let mut r = put_request(0x31, 0, false);
+        r.key_id = 0x7E;
+        assert!(put_key_command(&r, &dek).is_err());
+        // a new key set is three keys
+        let mut r = put_request(0x31, 0, false);
+        r.new_keys = Keys::parse(&format!("{NEW_ENC} {NEW_MAC}")).unwrap();
+        assert!(put_key_command(&r, &dek).is_err());
+        r.new_keys = Keys::parse(NEW_ENC).unwrap();
+        assert!(put_key_command(&r, &dek).is_err());
+    }
+
+    #[test]
+    fn new_key_kcv_is_checked_and_a_wrong_one_is_refused() {
+        let ok = Keys::parse(&format!(
+            "{NEW_ENC}/{} {NEW_MAC}/{} {NEW_DEK}/{}",
+            NEW_KCVS[0], NEW_KCVS[1], NEW_KCVS[2]
+        ));
+        assert!(ok.unwrap().is_key_set());
+        let bad = Keys::parse(&format!("{NEW_ENC}/000000 {NEW_MAC} {NEW_DEK}"));
+        match bad {
+            Err(KeyError::Kcv {
+                index: 1,
+                computed,
+                stated,
+            }) => {
+                assert_eq!((computed.as_str(), stated.as_str()), ("504A77", "000000"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // the third key's KCV is checked as well
+        assert!(matches!(
+            Keys::parse(&format!("{NEW_ENC} {NEW_MAC} {NEW_DEK}/504A77")),
+            Err(KeyError::Kcv { index: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn put_key_offline_dry_run_warns_shows_kcvs_and_no_keys() {
+        let r = put_key_dry_run(&put_request(0x31, 0, false)).unwrap();
+        assert_eq!(r["card_touched"], false);
+        assert_eq!(r["dry_run"], true);
+        assert_eq!(r["sent"], false);
+        assert_eq!(r["target"]["new_keys"]["enc"]["kcv"], NEW_KCVS[0]);
+        assert_eq!(r["target"]["new_keys"]["dek"]["kcv"], NEW_KCVS[2]);
+        assert_eq!(r["plan"]["apdus"].as_array().unwrap().len(), 0);
+        let warning = r["warning"].as_str().unwrap();
+        assert!(warning.contains("permanently locks administrative access"));
+        let text = render_text(&r);
+        assert!(
+            text.contains("WARNING") && text.contains("DRY RUN"),
+            "{text}"
+        );
+        assert_no_put_key_secrets(&format!("{r}\n{text}").to_lowercase());
+    }
+
+    #[test]
+    fn put_key_dry_run_with_keys_sends_no_put_key_and_withholds_the_data() {
+        let keys = current_keys();
+        let mut card = card_for_put_key(&[0x30, 0x31]);
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            false,
+        )
+        .unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(sent_ins(&card, "D8"), 0);
+        assert_eq!(wire(&card), pre_read_wire());
+        assert_eq!(r.data["dry_run"], true);
+        assert_eq!(r.data["pre_read"]["authenticated_key_version"], 0x30);
+        assert_eq!(r.data["pre_read"]["touches_authenticated_keyset"], false);
+        let apdu = &r.data["plan"]["apdus"][0];
+        assert_eq!(apdu["header"], "80D80081");
+        assert!(apdu["apdu"].is_null());
+        assert!(apdu["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("67 bytes withheld"));
+        assert!(r.data["warning"]
+            .as_str()
+            .unwrap()
+            .contains("locks administrative access"));
+        let out = put_everything(&r);
+        assert_no_put_key_secrets(&out);
+        assert!(out.contains("dry run"));
+    }
+
+    #[test]
+    fn put_key_yes_sends_the_exact_bytes_then_checks_the_card_and_hides_everything() {
+        let keys = current_keys();
+        // the card ends up with the old set 30 and the new set 31
+        let mut card = card_for_put_key(&[0x30, 0x31]);
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(
+            wire(&card),
+            [pre_read_wire(), vec![PUT_ADD, KI_AFTER_ADD]].concat()
+        );
+        assert_eq!(r.data["sent"], true);
+        assert_eq!(r.data["result"]["card_kcv_check"], "match");
+        assert_eq!(r.data["result"]["verified"], true);
+        assert_eq!(sent_ins(&card, "50"), 1);
+        assert_eq!(sent_ins(&card, "82"), 1);
+        // the trace keeps the PUT KEY header and drops its data
+        let trace = r.data["trace"].as_array().unwrap();
+        let step = trace.iter().find(|s| s["step"] == "put_key").unwrap();
+        assert_eq!(step["command"], "84D800814B<76 data bytes withheld>");
+        assert_eq!(step["response"], format!("31{}9000", NEW_KCVS.concat()));
+        assert_no_put_key_secrets(&put_everything(&r));
+        assert_no_key_material(&everything(&r, &keys));
+    }
+
+    #[test]
+    fn put_key_refuses_the_current_keyset_unless_told_to() {
+        let keys = current_keys();
+        // replacing 30 with 30, and adding a set that reuses the number 30
+        for (new, replace) in [(0x30, 0x30), (0x30, 0x00), (0x31, 0x30)] {
+            let mut card = card_for_put_key(&[0x30]);
+            let r = put_key(
+                &mut card,
+                true,
+                &put_request(new, replace, false),
+                &auth(&keys),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                r.data["error"]["kind"], "refusing-current-keyset",
+                "{new:02X} {replace:02X}"
+            );
+            assert_eq!(r.data["sent"], false);
+            assert_eq!(sent_ins(&card, "D8"), 0);
+            assert!(r.data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--replace-current-keyset"));
+            assert_no_put_key_secrets(&put_everything(&r));
+        }
+        // a request that does not touch it needs no flag, and the flag allows one that does
+        let mut card = card_for_put_key(&[0x30, 0x31]);
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x30, 0x30, true),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(
+            wire(&card),
+            [pre_read_wire(), vec![PUT_REPLACE, KI_AFTER_REPLACE]].concat()
+        );
+        assert_eq!(r.data["pre_read"]["touches_authenticated_keyset"], true);
+        assert_eq!(r.data["result"]["verified"], true);
+    }
+
+    #[test]
+    fn put_key_replace_of_the_current_set_verifies_when_the_card_lists_it() {
+        let keys = current_keys();
+        let mut card = card_for_put_key(&[0x30]);
+        let r = put_key(
+            &mut card,
+            false,
+            &put_request(0x30, 0x30, true),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(r.data["result"]["verified"], true);
+    }
+
+    #[test]
+    fn put_key_checks_the_card_key_versions_before_sending() {
+        let keys = current_keys();
+        let cases = [
+            // add a version that is already there
+            (
+                put_request(0x31, 0, false),
+                "key-version-exists",
+                &[0x30, 0x31][..],
+            ),
+            // replace one that is not
+            (
+                put_request(0x31, 0x32, false),
+                "replace-target-absent",
+                &[0x30][..],
+            ),
+            // replace 31 with a number that is taken
+            (
+                put_request(0x32, 0x31, false),
+                "key-version-exists",
+                &[0x30, 0x31, 0x32][..],
+            ),
+        ];
+        for (req, kind, versions) in cases {
+            let mut card = card_for_put_key(versions);
+            set(&mut card, KI, &key_info(versions));
+            let r = put_key(&mut card, true, &req, &auth(&keys), true).unwrap();
+            assert_eq!(r.data["error"]["kind"], kind);
+            assert_eq!(sent_ins(&card, "D8"), 0);
+            assert_eq!(r.data["sent"], false);
+        }
+        // unreadable key information
+        let mut card = card_for_put_key(&[0x30]);
+        set(&mut card, KI, "6A88");
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "key-information-unreadable");
+        assert_eq!(sent_ins(&card, "D8"), 0);
+    }
+
+    #[test]
+    fn put_key_without_a_dek_in_the_authentication_keys_is_unbuildable() {
+        let keys = keys(); // ENC MAC only
+        let mut card = card_for_put_key(&[0x30]);
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "unbuildable");
+        assert_eq!(sent_ins(&card, "D8"), 0);
+        // one key means ENC = MAC = DEK
+        assert!(Keys::parse(ENC_HEX).unwrap().has_dek());
+        assert!(!keys.has_dek());
+    }
+
+    #[test]
+    fn put_key_status_words_each_have_a_kind_and_nothing_is_retried() {
+        let keys = current_keys();
+        for (sw, kind) in [
+            ("6982", "security-status-not-satisfied"),
+            ("6A80", "incorrect-command-data"),
+            ("6A84", "not-enough-memory-space"),
+            ("6A88", "referenced-data-not-found"),
+            ("6581", "memory-failure"),
+        ] {
+            let mut card = card_for_put_key(&[0x30, 0x31]);
+            set(&mut card, PUT_ADD, sw);
+            let r = put_key(
+                &mut card,
+                true,
+                &put_request(0x31, 0, false),
+                &auth(&keys),
+                true,
+            )
+            .unwrap();
+            assert_eq!(r.data["error"]["kind"], kind, "{sw}");
+            assert_eq!(sent_ins(&card, "D8"), 1, "{sw}: no retry");
+            assert_eq!(r.data["sent"], true);
+            assert_no_put_key_secrets(&put_everything(&r));
+        }
+    }
+
+    #[test]
+    fn put_key_flags_key_check_values_the_card_did_not_echo() {
+        let keys = current_keys();
+        let mut card = card_for_put_key(&[0x30, 0x31]);
+        set(&mut card, PUT_ADD, &format!("31{}9000", "00".repeat(9)));
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "card-kcv-mismatch");
+        assert_eq!(r.data["result"]["card_kcv_check"], "MISMATCH");
+        // a card that returns no data is noted, not blamed, and the read-back decides
+        let mut card = card_for_put_key(&[0x30, 0x31]);
+        set(&mut card, PUT_ADD, "9000");
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(
+            r.data["result"]["card_kcv_check"],
+            "the card returned no key check values"
+        );
+        // and a read-back that does not list the keys is verify-failed
+        let mut card = card_for_put_key(&[0x30]);
+        let r = put_key(
+            &mut card,
+            true,
+            &put_request(0x31, 0, false),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "verify-failed");
+    }
+
+    // ---- DAP ----------------------------------------------------------
+
+    const DAP_KEY_HEX: &str = "707172737475767778797A7B7C7D7E7F";
+    const DAP_KCV: &str = "DCC3AC";
+    const DAP_LFDBH: &str = "0F18A2E0DEE3487F7033FF88871236DF0AA4AE20FC2435320920284672E5DD56";
+    const DAP_SIG: &str = "6C51D10DDB1990D9DD682AF93DD09F79";
+    const DAP_BLOCK: &str = "E21C4F08A000000151000000C3106C51D10DDB1990D9DD682AF93DD09F79";
+    const DAP_IFL: &str = "84E602003C07A000000077010008A000000151000000200F18A2E0DEE3487F7033FF88871236DF0AA4AE20FC2435320920284672E5DD5600000C31A1A9E546378D00";
+    const DAP_LOAD_0_PREFIX: &str =
+        "84E80000F8E21C4F08A000000151000000C3106C51D10DDB1990D9DD682AF93DD09F79C481FA030A1118";
+    const DAP_LOAD_0: &str = "84E80000F8E21C4F08A000000151000000C3106C51D10DDB1990D9DD682AF93DD09F79C481FA030A11181F262D343B424950575E656C737A81888F969DA4ABB2B9C0C7CED5DCE3EAF1F8FF060D141B222930373E454C535A61686F767D848B9299A0A7AEB5BCC3CAD1D8DFE6EDF4FB020910171E252C333A41484F565D646B727980878E959CA3AAB1B8BFC6CDD4DBE2E9F0F7FE050C131A21282F363D444B525960676E757C838A91989FA6ADB4BBC2C9D0D7DEE5ECF3FA01080F161D242B323940474E555C636A71787F868D949BA2A9B0B7BEC5CCD3DAE1E8EFF6FD040B121920272E353C434A51585F666D747B828990979EA56304F0F850D25EF100";
+    const DAP_LOAD_1: &str = "84E8800133ACB3BAC1C8CFD6DDE4EBF2F900070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2257B813B0E99947700";
+    const DAP_IFI: &str = "84E60C002A07A000000077010008A00000007701000108A0000000770100020300000002C900006840A943E9471AC800";
+    const DAP_POST_ISD: &str = "84F280020A4F00E2B90CE8EA2A620800";
+    const DAP_POST_APPS: &str = "84F240020A4F004185D89803F426E000";
+    const DAP_POST_LF: &str = "84F220020A4F0061765B3D8A56A30500";
+    const DAP_POST_LFM: &str = "84F210020A4F001DC7ED2DB83A618B00";
+
+    fn dap_key() -> DapKey {
+        DapKey::parse(&format!("{DAP_KEY_HEX}/{DAP_KCV}")).unwrap()
+    }
+
+    fn dap_request(sd: Option<&str>) -> InstallRequest {
+        InstallRequest {
+            dap: Some(DapRequest {
+                key: dap_key(),
+                security_domain: sd.map(|s| hex::decode(s).unwrap()),
+                hash: Lfdbh::Sha256,
+            }),
+            ..install_request()
+        }
+    }
+
+    /// A card whose ISD has the DAP Verification privilege (C5 DE0000).
+    fn card_for_dap_install() -> Card {
+        let mut card = secure_card("9000");
+        let isd = entry("A000000151000000", "0F", "DE0000");
+        set(&mut card, GS_ISD, &(isd.clone() + "9000"));
+        for (c, r) in [
+            (DAP_IFL, "9000"),
+            (DAP_LOAD_0, "9000"),
+            (DAP_LOAD_1, "9000"),
+            (DAP_IFI, "9000"),
+        ] {
+            set(&mut card, c, r);
+        }
+        set(&mut card, DAP_POST_ISD, &(isd + "9000"));
+        let apps = entry(APP1, "07", "180000") + &entry(APP, "07", "000000");
+        set(&mut card, DAP_POST_APPS, &(apps + "9000"));
+        set(
+            &mut card,
+            DAP_POST_LF,
+            &(tlv("E3", &(tlv("4F", PKG) + &tlv("9F70", "01"))) + "9000"),
+        );
+        let lfm = tlv(
+            "E3",
+            &(tlv("4F", PKG) + &tlv("9F70", "01") + &tlv("84", MODULE)),
+        );
+        set(&mut card, DAP_POST_LFM, &(lfm + "9000"));
+        card
+    }
+
+    #[test]
+    fn dap_signature_is_aes_cmac_of_the_load_file_data_block_hash() {
+        let load = load_file_250();
+        let hash = Lfdbh::Sha256.digest(&load);
+        assert_eq!(hex::encode_upper(&hash), DAP_LFDBH);
+        // C.3 -> B.2.2: CMAC, 16 bytes; reproduced with python cryptography and openssl
+        assert_eq!(hex::encode_upper(dap_signature(&dap_key(), &hash)), DAP_SIG);
+        assert_eq!(hex::encode_upper(dap_key().kcv()), DAP_KCV);
+        // the block frames it with the Security Domain AID (Table 11-58)
+        let block = dap_block(
+            &hex::decode("A000000151000000").unwrap(),
+            &hex::decode(DAP_SIG).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hex::encode_upper(block), DAP_BLOCK);
+        // 192 and 256 bit AES keys are accepted; other lengths and wrong KCVs are not
+        assert!(DapKey::parse(&"11".repeat(24)).is_ok());
+        assert!(DapKey::parse(&"11".repeat(32)).is_ok());
+        assert_eq!(
+            DapKey::parse(&"11".repeat(8)).unwrap_err(),
+            KeyError::DapFormat
+        );
+        assert_eq!(DapKey::parse("zz").unwrap_err(), KeyError::DapFormat);
+        assert!(matches!(
+            DapKey::parse(&format!("{DAP_KEY_HEX}/000000")),
+            Err(KeyError::Kcv { .. })
+        ));
+        assert_eq!(DapKey::parse("").unwrap_err(), KeyError::Count(0));
+        assert_eq!(format!("{:?}", dap_key()), "DapKey { .. }");
+    }
+
+    #[test]
+    fn dap_plan_matches_the_pysim_wrapped_vectors() {
+        let plan = install_plan_steps(
+            &dap_request(None),
+            &hex::decode("A000000151000000").unwrap(),
+        )
+        .unwrap();
+        let plain: Vec<String> = plan
+            .iter()
+            .map(|p| hex::encode_upper(p.command.encode().unwrap()))
+            .collect();
+        // INSTALL [for load] carries the hash (11.5.2.3.1, mandatory with a DAP)
+        assert_eq!(
+            plain[0],
+            format!("80E602003407A000000077010008A00000015100000020{DAP_LFDBH}000000")
+        );
+        // the DAP block comes first in the first LOAD block, then C4
+        assert!(
+            plain[1].starts_with(&format!("80E80000F0{DAP_BLOCK}C481FA")),
+            "{}",
+            plain[1]
+        );
+        assert_eq!(plan.iter().filter(|p| p.step == "load").count(), 2);
+        assert!(DAP_LOAD_0.starts_with(DAP_LOAD_0_PREFIX));
+    }
+
+    #[test]
+    fn install_with_a_dap_sends_the_pysim_vectors_in_order_and_verifies() {
+        let keys = keys();
+        let mut card = card_for_dap_install();
+        let r = install(&mut card, true, &dap_request(None), &auth(&keys), true).unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(
+            wire(&card),
+            [
+                pre_read_wire(),
+                vec![
+                    DAP_IFL,
+                    DAP_LOAD_0,
+                    DAP_LOAD_1,
+                    DAP_IFI,
+                    DAP_POST_ISD,
+                    DAP_POST_APPS,
+                    DAP_POST_LF,
+                    DAP_POST_LFM
+                ]
+            ]
+            .concat()
+        );
+        assert_eq!(r.data["result"]["verified"], true);
+        assert_eq!(r.data["target"]["dap"]["hash"], "sha256");
+        assert_eq!(
+            r.data["target"]["dap"]["load_file_data_block_hash"],
+            DAP_LFDBH
+        );
+        assert_eq!(r.data["target"]["dap"]["key_kcv"], DAP_KCV);
+        // the DAP key itself is nowhere in the output (its KCV and the signature are)
+        let shown = everything(&r, &keys);
+        assert!(
+            !shown.contains(&DAP_KEY_HEX.to_lowercase()),
+            "DAP key in output"
+        );
+        assert!(shown.contains(&DAP_SIG.to_lowercase()));
+    }
+
+    #[test]
+    fn a_dap_from_a_security_domain_that_cannot_verify_one_is_refused_before_sending() {
+        let keys = keys();
+        // the ISD of the default fixture has no DAP privilege (9E0000)
+        let mut card = secure_card("9000");
+        let r = install(&mut card, true, &dap_request(None), &auth(&keys), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "dap-sd-without-dap-privilege");
+        assert_eq!(sent_ins(&card, "E6"), 0);
+        assert_eq!(r.data["sent"], false);
+        // a Security Domain that is not in the registry
+        let mut card = card_for_dap_install();
+        let r = install(
+            &mut card,
+            true,
+            &dap_request(Some("A0000000629999")),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "dap-sd-not-present");
+        assert_eq!(sent_ins(&card, "E6"), 0);
+        // a registry that lists DAP-capable domains says so without a DAP request
+        let mut card = card_for_dap_install();
+        let r = install(&mut card, false, &install_request(), &auth(&keys), false).unwrap();
+        assert_eq!(
+            r.data["pre_read"]["dap_security_domains"][0]["privilege"],
+            "dap_verification"
+        );
+    }
+
+    #[test]
+    fn dap_dry_run_without_keys_is_offline_and_shows_no_dap_key() {
+        let d = install_dry_run(&dap_request(None)).unwrap();
+        assert_eq!(d["card_touched"], false);
+        assert_eq!(
+            d["plan"]["apdus"][0]["apdu"].as_str().unwrap().len() / 2,
+            5 + 0x34 + 1
+        );
+        assert_eq!(d["target"]["dap"]["key_kcv"], DAP_KCV);
+        let out = format!("{d}\n{}", render_text(&d)).to_lowercase();
+        assert!(!out.contains(&DAP_KEY_HEX.to_lowercase()));
+        assert!(out.contains(&DAP_LFDBH.to_lowercase()));
     }
 }

@@ -157,7 +157,8 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `gp select --aid HEX [--json] [--reader NAME] [--trace]` | SELECT an application by AID, see below |
 | `gp channel open\|close --channel N [--json] [--reader NAME] [--trace]` | MANAGE CHANNEL; every `gp` command takes `--channel N` (0 to 19) to run on that channel, see below |
 | `gp delete --aid HEX [--related] [--keys-file PATH \| --keys-env VAR] [--yes]` | DELETE over SCP03, **changes the card**, dry run unless `--yes`, see below |
-| `gp install --load CAP [--module HEX] [--app HEX] [--params HEX] [--privileges HEX] [--keys-file PATH \| --keys-env VAR] [--yes]` | INSTALL [for load] + LOAD + INSTALL [for install and make selectable] over SCP03, **changes the card**, dry run unless `--yes`, see below |
+| `gp install --load CAP [--module HEX] [--app HEX] [--params HEX] [--privileges HEX] [--dap-key-file PATH \| --dap-key-env VAR] [--dap-sd HEX] [--dap-hash H] [--keys-file PATH \| --keys-env VAR] [--yes]` | INSTALL [for load] + LOAD + INSTALL [for install and make selectable] over SCP03, **changes the card**, dry run unless `--yes`, see below |
+| `gp put-key --new-key-version HEX (--new-keys-file PATH \| --new-keys-env VAR) [--replace-key-version HEX] [--key-id HEX] [--replace-current-keyset] [--keys-file PATH \| --keys-env VAR] [--yes]` | PUT KEY of an SCP03 AES-128 key set over SCP03, **changes the card and can permanently lock administrative access**, dry run unless `--yes`, see below |
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 | `euicc enable\|disable ICCID\|AID [--yes] [...]` | enable or disable a profile; a dry run unless `--yes`, see below |
@@ -287,7 +288,7 @@ validation before a reader is opened, each SGP.22 result code its own error kind
 
 ### `gp`
 
-Read-only GlobalPlatform reads: SELECT, GET DATA and GET STATUS only (the writes `gp delete` and `gp install`
+Read-only GlobalPlatform reads: SELECT, GET DATA and GET STATUS only (the writes `gp delete`, `gp install` and `gp put-key`
 are described after the authenticated-read section).
 `gp info` reads the ISD, CPLC, card data, key information and counters. `gp ara` selects the ARA-M
 (`A00000015141434C00`) and reads every access rule (GET DATA `FF40`), decoding applet AID, device
@@ -325,7 +326,7 @@ counter attempt. A refused EXTERNAL AUTHENTICATE is reported (`data.error`, exit
 The card cryptogram proves the MAC key; the ENC key is not exercised at C-MAC level
 (`enc_key_exercised: false`).
 
-**Card writes: `gp channel`, `gp delete`, `gp install` (issues #133, #19).** These change the card.
+**Card writes: `gp channel`, `gp delete`, `gp install`, `gp put-key` (issues #133, #19, #115).** These change the card.
 
 ```
 sim-doctor gp channel open                                    # the card picks N and it is printed
@@ -363,13 +364,36 @@ attempt, local cryptogram check, file/environment only, never printed. **None of
 MCP.** A partial install (a loaded package without the application) is reported with the step that
 failed; `gp status` shows what the card now holds and `gp delete --aid <package>` removes it.
 
-**Not done:** DAP (Data Authentication Pattern) signing. A DAP block is signed with the Security
-Domain's DAP key, which is not part of the SCP03 set, so it belongs with PUT KEY and key management
-(issue #115); a card that demands a DAP block refuses the LOAD and that status word is reported. The
-channel is C-MAC only (no C-DECRYPTION), which INSTALL, LOAD and DELETE do not need. Tokens
-(delegated management), DELETE [key], other INSTALL kinds, STORE DATA and PUT KEY are not sent.
-Verified by replay against byte vectors from an independent SCP03 model (see `src/gp.rs` tests), not
-on a live card.
+**DAP.** `gp install --dap-key-file PATH | --dap-key-env VAR` signs the Load File Data Block Hash
+(SHA-256 by default, `--dap-hash sha384|sha512`) with a symmetric AES DAP key (16, 24 or 32 bytes of hex,
+optionally `KEY/KCV`) as AES-CMAC (GlobalPlatform Card Spec v2.3.1 C.3 and B.2.2), puts the hash in
+INSTALL [for load] and the `E2` DAP block in front of the load file. `--dap-sd HEX` names the Security
+Domain that verifies it (default: the ISD being authenticated). The registry must show that Security
+Domain with the DAP Verification or Mandated DAP Verification privilege or nothing is sent; the dry run
+lists the DAP-capable domains in `data.pre_read.dap_security_domains` and the plan shows the block.
+The DAP key is never printed. **Not done:** DES, RSA and ECC DAP keys, SHA-1, several DAP blocks, tokens
+(delegated management), DELETE [key], other INSTALL kinds and STORE DATA. The channel is C-MAC only (no
+C-DECRYPTION), which INSTALL, LOAD, DELETE and PUT KEY do not need. Verified by replay against byte
+vectors produced by pySim's own SCP03 implementation and the AES-CMAC checked with openssl (see
+`src/gp.rs` tests), not on a live card.
+
+**`gp put-key`** adds or replaces the ISD's SCP03 key set (three AES-128 keys: ENC, MAC, DEK) with
+PUT KEY (Card Spec v2.3.1 11.8) over the same channel. **It can permanently lock administrative access
+to the card**: replacing the card's own SCP03 keys with values you do not hold, or have mistyped, cannot
+be undone, and every output says so. The new keys come only from `--new-keys-file`/`--new-keys-env`
+(`ENC MAC DEK`, each optionally `KEY/KCV`; a wrong KCV is refused before any card is touched), never the
+command line, and are never printed; the PUT KEY data (the keys encrypted under the current DEK,
+Amendment D 6.2.8) is withheld from the plan and `--trace` too. The KCV of each new key is shown. It
+needs the current keys with their DEK (`--keys-file`: `ENC MAC DEK`, or one key for all three) and is a
+dry run unless `--yes`; without keys the dry run is offline and builds no APDU. `--new-key-version`
+(`01`-`7F`), `--replace-key-version` (P1: `00` adds, otherwise replaces that version) and `--key-id`
+(first key identifier, default `01`) address the key set. **A request that would add, replace or
+overwrite the key version the session authenticated with is refused (`refusing-current-keyset`) unless
+`--replace-current-keyset` is given**; the card's key information must also hold the version being
+replaced (`replace-target-absent`) and not the one being added (`key-version-exists`). After `90 00`
+the key version and KCVs the card returns must equal the computed ones (`card-kcv-mismatch`) and GET DATA
+E0 must list the three new keys (`verify-failed`). Not exposed over MCP; RSA/ECC/DES keys and a lone DAP
+verification key are not supported. Replay tests only, against pySim-generated vectors.
 
 `data.secure_channel` gives the key version, the KCV of each supplied key (public, 24 bits), whether
 you stated it, and the card's own key-information entry for that version (type and length). The card
@@ -379,8 +403,8 @@ there is no card-side KCV to compare. `data.registry_findings` lists `gp/weak-se
 `gp/app-excess-privilege` (a non-security-domain application holding Card Lock, Card Terminate, Card
 Reset, Global Delete, Global Lock or Global Registry). They are entries in the lpac `gp` envelope's
 `data`, not doctor/1 findings: `gp` is not a findings command. Not done: logical channels from the CLI,
-sensitive-data encryption (belongs with PUT KEY, issue #115), SCP02/SCP11, a secure channel to a
-supplementary security domain, C-DECRYPTION and R-MAC, and the writes (#115, #133). Replay tests only
+SCP02/SCP11, a secure channel to a
+supplementary security domain, C-DECRYPTION and R-MAC. Replay tests only
 (pySim and GlobalPlatformPro vectors); no live card has been authenticated yet.
 
 ### `trace`
