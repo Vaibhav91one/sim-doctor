@@ -1,0 +1,8 @@
+{
+  "cwe": "CWE-20",
+  "description": "the card answered success to an APDU its specification says to reject (an unassigned INS, a reserved SELECT P1, a SELECT whose data length disagrees with Lc, or a GET RESPONSE with parameters)",
+  "id": "fuzz/malformed-command-accepted",
+  "reference": "ISO/IEC 7816-4 clauses 5.1, 7.1, 7.2.4; ETSI TS 102 221 clause 10",
+  "remediation": "report the exchange to the card vendor; a card that accepts malformed input is not validating it, and the same parser sees OTA-delivered commands",
+  "severity": "medium"
+}

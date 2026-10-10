@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::aot::generate;
 use sim_doctor::{
-    access, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, notif, rules, sarif, scan,
-    session, signals, skill, tar, trace,
+    access, apdu_fuzz, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, notif, rules,
+    sarif, scan, session, signals, skill, tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -455,6 +455,54 @@ enum FuzzAction {
     /// The OTA/SMS fuzz sweep: TAR x keyset x mechanism, built on the TAR
     /// scanner's ENVELOPE builder.
     Ota(FuzzOtaArgs),
+
+    /// Allowlist-only APDU mutation fuzzer, against a replay log or the
+    /// built-in mock card only (no reader).
+    ///
+    /// Generates malformed variations of SELECT, READ BINARY, READ RECORD,
+    /// STATUS, GET DATA, GET RESPONSE and unassigned INS values; nothing else
+    /// can be generated. Every APDU and status word is in the report; a card
+    /// answering success to a command the spec says to reject is a
+    /// fuzz/malformed-command-accepted finding. --dry-run prints the plan and
+    /// sends nothing. Running this against a real reader is not implemented.
+    Mutate(FuzzMutateArgs),
+}
+
+/// Everything `sim-doctor fuzz mutate` takes.
+#[derive(Args)]
+struct FuzzMutateArgs {
+    /// Answer from a recorded exchange log (one {"command","response"} JSON
+    /// object per line, as SIM_DOCTOR_RECORD writes) instead of a card.
+    #[arg(long, value_name = "FILE", conflicts_with = "mock")]
+    replay: Option<std::path::PathBuf>,
+
+    /// Answer from the built-in strict mock card.
+    #[arg(long)]
+    mock: bool,
+
+    /// Cases to send (1 to 10000).
+    #[arg(long, default_value_t = apdu_fuzz::DEFAULT_MAX_CASES, value_name = "N")]
+    max_cases: usize,
+
+    /// Stop sending after this many seconds.
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
+
+    /// PRNG seed. The same seed gives the same APDUs.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// Print the planned APDUs and the allowlist/denylist; send nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Stop after the first finding.
+    #[arg(long)]
+    stop_on_first_finding: bool,
+
+    /// Emit one JSON envelope on stdout, and nothing else.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Flags every `fuzz` subcommand shares: the safety interlock and the reader.
@@ -1446,6 +1494,7 @@ fn main() -> process::ExitCode {
         Command::Fuzz(args) => match args.action {
             FuzzAction::Apdu(args) => run_fuzz_apdu(args),
             FuzzAction::Ota(args) => run_fuzz_ota(args),
+            FuzzAction::Mutate(args) => run_fuzz_mutate(args),
         },
     })
 }
@@ -3159,6 +3208,97 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
             args.safety.json,
         )
     }
+}
+
+/// Runs `sim-doctor fuzz mutate`: replay log or mock card only.
+fn run_fuzz_mutate(args: FuzzMutateArgs) -> contract::ExitCode {
+    let config = match apdu_fuzz::Config::new(
+        args.seed,
+        args.max_cases,
+        args.timeout.map(Duration::from_secs),
+        args.stop_on_first_finding,
+    ) {
+        Ok(config) => config,
+        Err(message) => {
+            return report_refusal(
+                apdu_fuzz::KIND,
+                &message,
+                serde_json::json!({ "error": { "kind": "bad-max-cases" } }),
+                args.json,
+            )
+        }
+    };
+    if args.dry_run && !args.json {
+        let plan = apdu_fuzz::plan_json(&config);
+        let mut text = String::from("fuzz mutate dry run: nothing is sent\n");
+        text.push_str(&format!("allowed INS: {}\n", plan["allowed_ins"]));
+        for case in plan["planned"].as_array().into_iter().flatten() {
+            text.push_str(&format!(
+                "{} {} {}\n",
+                case["index"], case["kind"], case["command"]
+            ));
+        }
+        return match emit_stdout(text.trim_end_matches('\n'), "the fuzz plan") {
+            Ok(()) => contract::ExitCode::Success,
+            Err(message) => {
+                eprintln!("sim-doctor: {message}");
+                contract::ExitCode::Findings
+            }
+        };
+    }
+    if args.dry_run {
+        return emit_fuzz_report(
+            apdu_fuzz::KIND,
+            "(dry run)",
+            apdu_fuzz::plan_json(&config),
+            &[],
+            args.json,
+        );
+    }
+    let run = if args.mock {
+        apdu_fuzz::run(&mut apdu_fuzz::MockCard::strict(), &config, &mut || {
+            signals::interrupted()
+        })
+    } else if let Some(path) = &args.replay {
+        let log = match std::fs::read_to_string(path) {
+            Ok(log) => log,
+            Err(err) => {
+                return report_refusal(
+                    apdu_fuzz::KIND,
+                    &format!("cannot read {}: {err}", path.display()),
+                    serde_json::json!({ "error": { "kind": "bad-replay" } }),
+                    args.json,
+                )
+            }
+        };
+        let mut replay = match replay::Replay::from_log(&log) {
+            Ok(replay) => replay,
+            Err(err) => {
+                return report_refusal(
+                    apdu_fuzz::KIND,
+                    &err,
+                    serde_json::json!({ "error": { "kind": "bad-replay" } }),
+                    args.json,
+                )
+            }
+        };
+        apdu_fuzz::run(&mut replay, &config, &mut || signals::interrupted())
+    } else {
+        return report_refusal(
+            apdu_fuzz::KIND,
+            "fuzz mutate needs --replay FILE, --mock or --dry-run; it has no real-reader path",
+            serde_json::json!({ "error": { "kind": "no-source" } }),
+            args.json,
+        );
+    };
+    let findings = apdu_fuzz::findings(&run);
+    emit_fuzz_report(
+        apdu_fuzz::KIND,
+        if args.mock { "mock" } else { "replay" },
+        run.to_json(),
+        &findings,
+        args.json,
+    )
 }
 
 /// Runs `sim-doctor fuzz ota`: the TAR x keyset x mechanism sweep, behind the
