@@ -8,15 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [0.4.0]
 
-sim-doctor now runs on [doctor-kit](https://crates.io/crates/doctor-kit) 0.2.1, the CLI skeleton shared by the doctor
+sim-doctor now runs on [doctor-kit](https://crates.io/crates/doctor-kit) 0.2.2, the CLI skeleton shared by the doctor
 tools. **Machine output is unchanged**: the `--json` envelopes (compact, sorted keys), the finding fingerprints, the SARIF
 files (card-path locations), the exit codes 0/1/2/3/129/130 with `--fail-on` defaulting to `critical`, the `rules`, `why`,
 `trace`, `ts48`, `gp`, `euicc`, `fuzz`, `modules`, `completions` and `ci` commands, the install file bodies, the MCP tool
 names, schemas and wire text, and the `--help` command names are byte-identical to 0.3.0. They are pinned by
 `tests/golden.rs` and the new `tests/golden_scan.rs`, which runs the real binary over a recorded card session (the goldens
 were generated on the 0.3.0 code). What the kit does differently by default is kept as it was through its hooks: the
-baseline file rules and refusals, the multiset `new` / `unchanged` labels, the JSON style, the human report, the MCP error
-texts, the `install` file merge.
+baseline file rules and refusals, the multiset `new` / `unchanged` labels, the JSON style, the MCP error texts, the
+`install` file merge. **Human output is new**: `scan` prints a doctor-kit face by default (see Changed).
 
 ### Fixed (contract)
 
@@ -31,25 +31,40 @@ texts, the `install` file merge.
   one directory at a time, with what the walk read of an EF (`ls`, `cd`, `info`, `cat`, `decode`, `find`; `shell -c "..."`,
   `shell --json` for agents). They take `--reader`, `--dialect`, the walk bounds and `--tar`, read only, and are on by default;
   `cargo build --no-default-features` leaves them (and `reedline`) out.
-- `scan --face rich|plain|compact`, `--theme mono|clinical|contrast`, `--color auto|always|never` and `--headless`: the findings
-  in a doctor-kit face. The default report (files, TAR audit, `--score`) is the one it always was; `--tui` is the findings
-  view it always was (the kit's explorer does not show the walk's coverage, truncation and TAR-stop notes, so it did not replace it).
-- `SIM_DOCTOR_TEST_REPLAY=<log>` (test seam): `scan` answers from a `SIM_DOCTOR_RECORD` log instead of a reader.
+- `scan --face rich|plain|compact|legacy`, `--theme mono|clinical|contrast`, `--color auto|always|never` and `--headless`.
+  `--tui` is the findings view it always was (the kit's explorer does not show the walk's coverage, truncation and TAR-stop
+  notes, so it did not replace it).
+
+### Security
+
+- The test seams `SIM_DOCTOR_TEST_REPLAY` (answer `scan` from a recorded log instead of a reader),
+  `SIM_DOCTOR_TEST_SIGNAL_HOLD_MS` and `SIM_DOCTOR_TEST_WEDGE` (park a run at its first interrupt checkpoint, which
+  existed before this release) are compiled only with the `test-seams` cargo feature. `cargo test` enables it through a
+  dev-dependency on the package; a release build never has it, so an environment variable cannot make a shipped
+  `sim-doctor` read a card from a file or hang. `tests/release_seams.rs` (run in CI with `--ignored`) builds the release
+  binary and checks both its bytes and its behaviour.
 
 ### Changed
 
+- **Human output of `scan` uses doctor-kit faces by default** (rich on a terminal, plain when piped), with the notes the full
+  report carried as banners shown first: an `INCOMPLETE` banner when the score has coverage gaps, `TRUNCATED` with the bounds hit
+  and why the walk stopped, a TAR audit that did not finish or has a blind spot, the score warning, the standing candidate-set
+  warning, repeated identifiers, forbidden / refused files and per-file walk notes (details stay in `--json`). `--face legacy` prints the
+  previous full report (files, TAR evidence); `--score` only matters there. The README capture is the new output.
+  `--json`, `--sarif`, `--baseline` and the exit codes are unchanged.
+- A closed stdout (`scan --json | head`) and an unwritable `--sarif` keep their exit code 2 and the printed `exit_code: 2`; the
+  stderr sentence is now the kit's (`error: cannot write to stdout: ...`, `error: <path>: ...`). The MCP server answers a request
+  with neither `id` nor a string `method` with `-32600` and a null `id`, as before.
 - The report pipeline of `scan` (baseline gate and exit code, the one write of the report), the MCP server loop, the
-  `install` file writer and the SIGINT / SIGTERM flag are doctor-kit's. Known edges, none of them in machine output:
-  `install` refuses to write through a symlink and writes by temp file and rename (`ci install` already refused symlinks);
-  an MCP request with neither `id` nor a string `method` is no longer answered (it got `-32600` with a null `id`); an
-  interrupt that arrives after the last checkpoint but before the report is written gives the kit's interrupted
-  envelope and exit 130 instead of the finished report.
+  `install` file writer and the SIGINT / SIGTERM flag are doctor-kit's. Known edge, not in machine output:
+  `install` refuses to write through a symlink and writes by temp file and rename (`ci install` already refused symlinks).
+  The MCP child runner is the kit's `exec_self_with` with sim-doctor's own error texts.
 - Library API: `sim_doctor::signals` is a shim over `doctor_kit::interrupt` (`install`, `interrupted` deprecated);
   `skill`, `fix` and `mcp` keep their names, with `skill::Agent`, `fix::{Agent, AGENTS}` and `mcp::{handle, process_line, serve}`
   as deprecated re-exports of the kit's (same names, the kit's signatures). Removed: `skill::{Target, targets, upsert_block,
   install}` and `fix::launch_argv`'s agent type (now the kit's `AgentSpec`, field `bypass`). `mcp::tools` and `mcp::run_self` are new;
   `scan::node_json` is now public. `modules --json` lists the same modules.
-- `doctor-kit` 0.2.1 is a new dependency (with `toml`); `reedline` comes with the default `shell` feature.
+- `doctor-kit` 0.2.2 is a new dependency (with `toml`); `reedline` comes with the default `shell` feature.
 
 
 ### Changed

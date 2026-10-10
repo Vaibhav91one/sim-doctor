@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use doctor_kit::baseline::Saved;
 use doctor_kit::doctor_core::{BaselineCounts, BaselineState, Envelope, Score, Severity};
+use doctor_kit::face::{Note, NoteLevel};
 use doctor_kit::install::{plan, rendered, write, Agent, AgentFile, FileMode, Overwrite};
 use doctor_kit::output::Color;
 use doctor_kit::{
@@ -53,8 +54,6 @@ struct Outcome {
     /// set them (a multiset match; the kit's is a set match) and the `baseline` counts.
     states: Vec<Option<BaselineState>>,
     counts: Option<BaselineCounts>,
-    /// `--sarif` could not be written: the run is an error (exit 2), the report is still printed.
-    sarif_failed: bool,
 }
 
 impl Outcome {
@@ -83,9 +82,8 @@ struct Run {
     tui: bool,
     baseline: Option<std::path::PathBuf>,
     sarif: Option<std::path::PathBuf>,
-    /// A kit face was asked for (`--face`, `--theme`, `--color`, `--headless`): print it
-    /// instead of the full report.
-    faced: bool,
+    /// `--face legacy`: the full report instead of the kit's face.
+    legacy: bool,
 }
 
 impl Run {
@@ -106,7 +104,7 @@ impl Run {
             tui: false,
             baseline: None,
             sarif: None,
-            faced: false,
+            legacy: false,
         }
     }
 
@@ -124,10 +122,7 @@ impl Run {
             tui: args.tui,
             baseline: args.baseline.clone(),
             sarif: args.sarif.clone(),
-            faced: args.face.is_some()
-                || args.theme.is_some()
-                || args.color.is_some()
-                || args.headless,
+            legacy: args.face.as_deref() == Some("legacy"),
         }
     }
 }
@@ -144,10 +139,6 @@ pub struct SimDoctor {
     /// The baseline `--baseline` named, loaded by `load_baseline`.
     baseline: Mutex<Option<Baseline>>,
     outcome: Mutex<Option<Outcome>>,
-    /// What the kit's render hooks produced for stdout, and what to call it in a write error. The
-    /// kit prints with `print!`, which panics on a closed stdout; sim-doctor reports that as an
-    /// error (exit 2) from [`emit_stdout`], so the hooks hand the text over here instead.
-    stdout: Mutex<Option<(String, &'static str)>>,
 }
 
 impl SimDoctor {
@@ -172,30 +163,18 @@ impl SimDoctor {
     }
 
     /// The run was interrupted at a checkpoint: exit 130, `interrupted` on stderr, and under
-    /// `--json` an empty-`data` failure envelope. Reported once per process (the watchdog of
-    /// `guard_exchange` may be reporting it already).
+    /// `--json` the envelope of [`Doctor::interrupted_envelope`]. Reported once per process (the
+    /// watchdog of `guard_exchange` may be reporting it already).
     fn interrupted(&self) -> ScanFailure {
-        let mut failure = ScanFailure::plain("sim-doctor: interrupted").with_exit(130);
+        let mut failure = doctor_kit::interrupt::failure(self);
+        failure.stderr = "sim-doctor: interrupted\n".into();
         if INTERRUPT_REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             failure.stderr.clear();
-            return failure;
-        }
-        if self.json() {
-            failure.envelope = Some(Box::new(Envelope::new(
-                "sim-doctor",
-                env!("CARGO_PKG_VERSION"),
-                130,
-                Score::new(0, scan::SCORE_MODEL, 1),
-                vec![],
-                contract::interrupted_data(),
-            )));
+            failure.envelope = None;
+        } else if !self.json() {
+            failure.envelope = None;
         }
         failure
-    }
-
-    fn put(&self, text: String, what: &'static str) -> String {
-        *self.stdout.lock().unwrap() = Some((text, what));
-        String::new()
     }
 
     /// The card read. Same steps, same checkpoints, same refusals as ever; the report is built
@@ -306,24 +285,7 @@ impl SimDoctor {
             }
         }
 
-        // SARIF before the envelope is built, because the envelope carries the exit code and a
-        // failed SARIF write is a run error (exit 2). The report is still printed: a SARIF
-        // failure never costs the caller the report.
-        let mut exit_code = verdict.exit_code(args.fail_on);
-        let mut sarif_failed = false;
-        if let Some(path) = &args.sarif {
-            let score = scan::doctor_score(&tree, &context, &verdict, &facts);
-            let doc = sarif::to_sarif(verdict.findings().as_slice(), &scan::specs(), &score);
-            if let Err(error) = sarif::write(path, &doc) {
-                // stderr only: stdout stays one envelope.
-                eprintln!(
-                    "sim-doctor: sarif-unwritable: could not write SARIF to {}: {error}",
-                    path.display()
-                );
-                exit_code = contract::ExitCode::Error;
-                sarif_failed = true;
-            }
-        }
+        let exit_code = verdict.exit_code(args.fail_on);
         let document = scan::doctor_json(&tree, &context, &verdict, &facts, exit_code);
         let envelope: Envelope = serde_json::from_value(document)
             .map_err(|e| ScanFailure::plain(format!("sim-doctor: {e}")))?;
@@ -371,7 +333,6 @@ impl SimDoctor {
             dialect: args.dialect,
             candidates: options.candidates,
             limits: options.limits,
-            sarif_failed,
         });
         Ok(envelope)
     }
@@ -583,44 +544,111 @@ impl Doctor for SimDoctor {
                     .map(|f| f.entry("evidence").or_insert_with(|| json!([])));
             }
         }
-        let sarif_failed = self
-            .outcome
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|o| o.sarif_failed);
-        if sarif_failed {
-            value["exit_code"] = json!(contract::ExitCode::Error.process_code());
-        }
-        let text = serde_json::to_string(&value).expect("an envelope serializes");
-        let what = if self.outcome.lock().unwrap().is_some() {
-            "the scan envelope"
-        } else if env.exit_code == 130 {
-            "the interrupted envelope"
-        } else {
-            "the failure envelope"
-        };
-        self.put(text, what)
+        serde_json::to_string(&value).expect("an envelope serializes") + "\n"
     }
 
-    /// The scan report of `scan::to_human`, the terminal view under `--tui`, or the kit's face
-    /// when one was asked for.
-    fn render_human(
-        &self,
-        env: &Envelope,
-        face: &Face,
-        theme: &doctor_kit::Theme,
-    ) -> Option<String> {
-        if self.run.get().is_some_and(|r| r.faced) {
-            return Some(self.put(
-                doctor_kit::face::render(*face, env, theme),
-                "the scan report",
-            ));
+    /// The SARIF file: card-path logical locations, the same bytes as ever.
+    fn render_sarif(&self, env: &Envelope) -> String {
+        let outcome = self.outcome.lock().unwrap();
+        let findings = outcome.iter().flat_map(|o| o.verdict.findings().as_slice());
+        let score = serde_json::to_value(&env.score).expect("a score serializes");
+        let doc = sarif::to_sarif(
+            &findings.cloned().collect::<Vec<_>>(),
+            &scan::specs(),
+            &score,
+        );
+        serde_json::to_string_pretty(&doc).expect("a SARIF document serializes") + "\n"
+    }
+
+    /// The interrupted envelope of a doctor/1 `scan`: no `data`, score 0 with one gap.
+    fn interrupted_envelope(&self, _: &Envelope) -> Option<Envelope> {
+        Some(Envelope::new(
+            "sim-doctor",
+            env!("CARGO_PKG_VERSION"),
+            130,
+            Score::new(0, scan::SCORE_MODEL, 1),
+            vec![],
+            contract::interrupted_data(),
+        ))
+    }
+
+    /// What the old report put in banners and warnings, for the face to show first: an
+    /// incomplete walk, the standing candidate-set warning, the score warning, a TAR audit that
+    /// did not finish, repeated identifiers, files that were forbidden, refused or noted.
+    fn notes(&self, env: &Envelope) -> Vec<Note> {
+        let d = &env.data;
+        let mut notes = doctor_kit::face::notes_of(env);
+        let mut add = |level: NoteLevel, text: String| notes.push(Note { level, text });
+        if d["complete"] == json!(false) {
+            let mut text = "TRUNCATED: this walk did NOT see the whole card; a file outside it is neither present nor absent here".to_owned();
+            if let Some(first) = d["truncated_by"].as_str() {
+                text.push_str(&format!("; first bound hit: {first}"));
+            }
+            let hit: Vec<&str> = d["limits_hit"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if !hit.is_empty() {
+                text.push_str(&format!("; every bound hit: {}", hit.join(", ")));
+            }
+            if let Some(why) = d["stopped"].as_str() {
+                text.push_str(&format!("; walk stopped: {why}"));
+            }
+            add(NoteLevel::Error, text);
         }
+        if let Some(why) = d["tar"]["stopped"].as_str() {
+            add(
+                NoteLevel::Warn,
+                format!("the TAR scan did not finish, so its findings are partial: {why}"),
+            );
+        }
+        if let Some(blind) = d["tar"]["blind_spot"].as_str() {
+            add(NoteLevel::Warn, format!("TAR blind spot: {blind}"));
+        }
+        if let Some(w) = d["score_detail"]["warning"].as_str() {
+            add(NoteLevel::Warn, format!("score: {w}"));
+        }
+        if let Some(w) = d["candidates"]["warning"].as_str() {
+            add(NoteLevel::Info, w.to_owned());
+        }
+        let count = |key: &str| d["walk"][key].as_u64().unwrap_or(0);
+        if count("repeated_ancestors") > 0 {
+            add(NoteLevel::Warn, format!("{} repeated identifier(s) in the walk (a directory that lists one of its own ancestors)", count("repeated_ancestors")));
+        }
+        for (key, what) in [
+            ("forbidden", "present but not readable by this terminal"),
+            ("refused", "refused for another reason"),
+        ] {
+            if count(key) > 0 {
+                add(
+                    NoteLevel::Info,
+                    format!("{} file(s) {what}; `--json` lists them", count(key)),
+                );
+            }
+        }
+        let noted = d["notes"].as_array().map_or(0, Vec::len);
+        if noted > 0 {
+            add(
+                NoteLevel::Info,
+                format!("{noted} walk note(s) on individual files; `--json` lists them"),
+            );
+        }
+        notes
+            .iter_mut()
+            .for_each(|n| n.text = contract::sanitize(&n.text));
+        notes
+    }
+
+    /// `--face legacy`: the full report (`scan::to_human`); `--tui`: the terminal view. `None`
+    /// (the default) is the kit's face, with [`Doctor::notes`].
+    fn render_human(&self, _: &Envelope, _: &Face, _: &doctor_kit::Theme) -> Option<String> {
+        let run = self.run.get()?;
         let outcome = self.outcome.lock().unwrap();
         let outcome = outcome.as_ref()?;
         let context = outcome.context();
-        let tui = self.run.get().is_some_and(|a| a.tui)
+        let tui = run.tui
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
         if tui {
@@ -633,8 +661,8 @@ impl Doctor for SimDoctor {
             }
             return Some(String::new());
         }
-        let report = scan::to_human(&outcome.tree, &context, &outcome.verdict);
-        Some(self.put(report, "the scan report"))
+        run.legacy
+            .then(|| scan::to_human(&outcome.tree, &context, &outcome.verdict) + "\n")
     }
 }
 
@@ -705,12 +733,19 @@ pub fn scan(d: &SimDoctor, args: ScanArgs) -> contract::ExitCode {
     let run = d.run.get_or_init(|| Run::scan(&args));
     super::guard_exchange(scan::KIND, run.json);
     let fail_on = Severity::parse(run.fail_on.id()).expect("the same five names");
-    // Without a face flag the report is sim-doctor's own (`render_human`); with one, the kit's.
+    // The kit's face, plain when stdout is not a terminal; `--face legacy` is the old report.
+    let face = match args.face.as_deref() {
+        Some("rich") => Face::Rich,
+        Some("plain") => Face::Plain,
+        Some("compact") => Face::Compact,
+        _ if std::io::IsTerminal::is_terminal(&std::io::stdout()) => Face::Rich,
+        _ => Face::Plain,
+    };
     let o = OutputArgs {
         json: run.json,
         score: false,
         headless: args.headless,
-        face: args.face.unwrap_or(Face::Rich),
+        face,
         theme: args.theme.clone(),
         theme_file: None,
         color: args.color.unwrap_or(Color::Auto),
@@ -723,39 +758,10 @@ pub fn scan(d: &SimDoctor, args: ScanArgs) -> contract::ExitCode {
     // Read the baseline before a reader is opened, and refuse before one is: a --baseline that
     // names a file that is not there, is not a doctor/1 envelope or is over a bound has an
     // answer before a card exists.
-    let mut code = match preflight(d, &o) {
-        // The kit writes no SARIF: it is written in `scan_card`, after the comparison and before
-        // the report, so a failed write is part of the report's exit_code.
-        Ok(pre) => finish(
-            d,
-            pre,
-            d.try_scan(&ctx),
-            &OutputArgs {
-                sarif: None,
-                ..o.clone()
-            },
-        ),
+    let code = match preflight(d, &o) {
+        Ok(pre) => finish(d, pre, d.try_scan(&ctx), &o),
         Err(failure) => doctor_kit::output::report_failure(d, &failure),
     };
-    let ran = d.outcome.lock().unwrap().is_some();
-    if d.outcome
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|o| o.sarif_failed)
-    {
-        code = 2;
-    }
-    // The report, assembled and written once. A write that fails is an error of the run, unless
-    // the run had already failed.
-    if let Some((text, what)) = d.stdout.lock().unwrap().take() {
-        if let Err(message) = emit_stdout(text.trim_end_matches('\n'), what) {
-            eprintln!("sim-doctor: {message}");
-            if ran {
-                code = 2;
-            }
-        }
-    }
     exit_code(code)
 }
 
@@ -827,13 +833,6 @@ fn shell(d: &SimDoctor, own: &ArgMatches) -> Result<u8, String> {
 #[cfg(feature = "shell")]
 fn explore(d: &SimDoctor, own: &ArgMatches) -> Result<u8, String> {
     let args = ExploreArgs::from_arg_matches(own).map_err(|e| e.to_string())?;
-    // The kit's explorer cannot start without a terminal (it panics); say so before the card is read.
-    if !(std::io::IsTerminal::is_terminal(&std::io::stdin())
-        && std::io::IsTerminal::is_terminal(&std::io::stdout()))
-    {
-        eprintln!("sim-doctor: explore needs a terminal; use `shell -c` for scripts");
-        return Ok(2);
-    }
     match open_session(d, &args.card) {
         Ok(ctx) => doctor_kit::tui::run(d, ctx).map(|()| 0),
         Err(code) => Ok(code),
@@ -931,7 +930,6 @@ pub fn run() -> ExitCode {
             first: Mutex::new(None),
             baseline: Mutex::new(None),
             outcome: Mutex::new(None),
-            stdout: Mutex::new(None),
         })
     })
 }
@@ -949,7 +947,6 @@ mod tests {
             first: Mutex::new(None),
             baseline: Mutex::new(None),
             outcome: Mutex::new(None),
-            stdout: Mutex::new(None),
         }
     }
 
@@ -982,12 +979,11 @@ mod tests {
             vec![finding()],
             json!({"b": 1, "a": 2}),
         );
-        assert_eq!(d.render_json(&env), "");
-        let (text, what) = d.stdout.lock().unwrap().take().unwrap();
-        assert_eq!(what, "the failure envelope");
+        let text = d.render_json(&env);
         assert_eq!(
             text,
-            r#"{"data":{"a":2,"b":1},"exit_code":1,"findings":[{"category":"gsma","evidence":[],"fingerprint":"0123456789abcdef","id":"gsma/x","location":{"kind":"card-path","ref":"3F00"},"message":"m","remedy":null,"severity":"high"}],"schema":"doctor/1","score":{"coverage_gaps":0,"label":"good","model":"sim/1","value":97},"tool":"sim-doctor","version":"1.2.3"}"#
+            r#"{"data":{"a":2,"b":1},"exit_code":1,"findings":[{"category":"gsma","evidence":[],"fingerprint":"0123456789abcdef","id":"gsma/x","location":{"kind":"card-path","ref":"3F00"},"message":"m","remedy":null,"severity":"high"}],"schema":"doctor/1","score":{"coverage_gaps":0,"label":"good","model":"sim/1","value":97},"tool":"sim-doctor","version":"1.2.3"}
+"#
         );
     }
 

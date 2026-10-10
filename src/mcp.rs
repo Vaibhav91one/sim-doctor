@@ -17,12 +17,11 @@
 //! module a leaf with no dependency on `main.rs`.
 //!
 //! Acceptance by agent clients beyond the handshake is unverified.
-use std::io::Read;
-use std::process::{Command as Process, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{ArgAction, Command};
+use doctor_kit::mcp::{exec_self_with, ExecFailure, ExecFailureKind, ExecOpts};
 use doctor_kit::McpTool;
 use serde_json::{json, Map, Value};
 
@@ -50,18 +49,6 @@ const EXCLUDED: &[&str] = &[
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Most bytes kept from each of a child's stdout and stderr.
 const OUTPUT_CAP: usize = 16 * 1024 * 1024;
-
-/// What running one tool as a child process produced.
-pub struct ToolOutcome {
-    /// Exit code, or `None` when the child could not be spawned or was killed.
-    pub code: Option<i32>,
-    /// Captured stdout of the child.
-    pub stdout: String,
-    /// Captured stderr of the child.
-    pub stderr: String,
-    /// Whether stdout or stderr was cut at the capture cap.
-    pub truncated: bool,
-}
 
 /// The scan flags exposed to agents: (long name, help, kind).
 fn scan_flags(scan: &Command) -> Vec<(String, String, &'static str)> {
@@ -221,23 +208,6 @@ fn build_argv(scan: &Command, name: &str, args: &Value) -> Result<Vec<String>, S
     }
 }
 
-/// Map a child's outcome to a tool result. 0, 1 (findings) and 3 (new
-/// findings against a baseline) carry the envelope unchanged; everything else
-/// is an error with the child's stderr (`isError`).
-fn tool_text(out: ToolOutcome) -> Result<String, String> {
-    if out.truncated {
-        return Err(format!(
-            "{}\n[output truncated at {OUTPUT_CAP} bytes]",
-            out.stdout
-        ));
-    }
-    match out.code {
-        Some(0) | Some(1) | Some(3) => Ok(out.stdout),
-        Some(c) => Err(error_text(&format!("exit code {c}"), &out.stderr)),
-        None => Err(error_text("the process did not exit normally", &out.stderr)),
-    }
-}
-
 fn error_text(what: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
         what.to_string()
@@ -247,7 +217,7 @@ fn error_text(what: &str, stderr: &str) -> String {
 }
 
 /// How a tool runs its argv: [`run_self`] in the server, a stand-in in tests.
-pub type Runner = Arc<dyn Fn(&[String]) -> ToolOutcome + Send + Sync>;
+pub type Runner = Arc<dyn Fn(&[String]) -> Result<String, String> + Send + Sync>;
 
 /// The tools `mcp` offers, for the kit's server: [`tool_list`] as [`McpTool`]s whose call checks
 /// the arguments ([`build_argv`]) and runs the argv.
@@ -264,7 +234,7 @@ pub fn tools(scan: &Command, run: Runner) -> Vec<McpTool> {
                 description: tool["description"].as_str().unwrap_or_default().to_owned(),
                 schema: tool["inputSchema"].clone(),
                 call: Box::new(move |args| {
-                    build_argv(&scan, &called, args).and_then(|argv| tool_text(run(&argv)))
+                    build_argv(&scan, &called, args).and_then(|argv| run(&argv))
                 }),
                 name,
             }
@@ -280,90 +250,39 @@ fn timeout_from(var: Option<&str>) -> Duration {
     }
 }
 
-/// Read a pipe to its end, keeping at most `cap` bytes. The rest is read and
-/// dropped so the child never blocks on a full pipe.
-fn capture(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
-    let (mut kept, mut cut, mut buf) = (Vec::new(), false, [0u8; 8192]);
-    while let Ok(n) = pipe.read(&mut buf) {
-        if n == 0 {
-            break;
+/// The text of a failed child, the way this server has always worded it: 0, 1 (findings) and 3
+/// (new findings against a baseline) are results; anything else is an error with the child's
+/// stderr untrimmed, or a plain sentence when it said nothing.
+fn failure_text(f: &ExecFailure) -> String {
+    match f.kind {
+        ExecFailureKind::Spawn => format!(
+            "could not run sim-doctor: {}",
+            f.detail.strip_prefix("cannot start: ").unwrap_or(&f.detail)
+        ),
+        ExecFailureKind::OutputLimit => {
+            format!("{}\n[output truncated at {} bytes]", f.stdout, f.max_bytes)
         }
-        let room = cap - kept.len();
-        kept.extend_from_slice(&buf[..n.min(room)]);
-        cut |= n > room;
-    }
-    (kept, cut)
-}
-
-/// Run `cmd` with captured, capped output and a hard deadline; kill it when
-/// the deadline passes. Stdin is closed so a child can never read the
-/// JSON-RPC stream.
-fn run_with_deadline(mut cmd: Process, timeout: Duration, cap: usize) -> ToolOutcome {
-    let failed = |stderr: String| ToolOutcome {
-        code: None,
-        stdout: String::new(),
-        stderr,
-        truncated: false,
-    };
-    let mut child = match cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return failed(format!("could not run sim-doctor: {e}")),
-    };
-    let out = child.stdout.take().expect("piped");
-    let err = child.stderr.take().expect("piped");
-    let out_t = std::thread::spawn(move || capture(out, cap));
-    let err_t = std::thread::spawn(move || capture(err, cap));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(());
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return failed(format!("could not wait for sim-doctor: {e}")),
-        }
-    };
-    let (stdout, cut_out) = out_t.join().unwrap_or_default();
-    let (stderr, cut_err) = err_t.join().unwrap_or_default();
-    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
-    match status {
-        Ok(status) => ToolOutcome {
-            code: status.code(),
-            stdout: text(stdout),
-            stderr: text(stderr),
-            truncated: cut_out || cut_err,
-        },
-        Err(()) => failed(format!(
+        ExecFailureKind::Timeout => format!(
             "timed out after {} s; the child was killed",
-            timeout.as_secs()
-        )),
+            f.timeout.map_or(0, |t| t.as_secs())
+        ),
+        ExecFailureKind::Signal => error_text("the process did not exit normally", &f.stderr),
+        ExecFailureKind::Exit => error_text(
+            &format!("exit code {}", f.code.map_or(-1, i64::from)),
+            &f.stderr,
+        ),
     }
 }
 
 /// Run this binary with `argv` under the timeout and output cap.
-pub fn run_self(argv: &[String]) -> ToolOutcome {
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let mut cmd = Process::new(exe);
-            cmd.args(argv);
-            let var = std::env::var("SIM_DOCTOR_MCP_TIMEOUT_SECONDS").ok();
-            run_with_deadline(cmd, timeout_from(var.as_deref()), OUTPUT_CAP)
-        }
-        Err(e) => ToolOutcome {
-            code: None,
-            stdout: String::new(),
-            stderr: format!("could not run sim-doctor: {e}"),
-            truncated: false,
-        },
-    }
+pub fn run_self(argv: &[String]) -> Result<String, String> {
+    let var = std::env::var("SIM_DOCTOR_MCP_TIMEOUT_SECONDS").ok();
+    let opts = ExecOpts {
+        ok_codes: vec![0, 1, 3],
+        timeout: Some(timeout_from(var.as_deref())),
+        max_bytes: OUTPUT_CAP,
+    };
+    exec_self_with(argv, &opts, failure_text)
 }
 
 #[cfg(test)]
@@ -402,11 +321,10 @@ mod tests {
         let record = seen.clone();
         let run: Runner = Arc::new(move |argv| {
             *record.lock().unwrap() = Some(argv.to_vec());
-            ToolOutcome {
-                code: Some(code),
-                stdout: "ENVELOPE".into(),
-                stderr: "BOOM".into(),
-                truncated: false,
+            if [0, 1, 3].contains(&code) {
+                Ok("ENVELOPE".into())
+            } else {
+                Err("BOOM".into())
             }
         });
         let all = tools(&fake_scan(), run);
@@ -471,25 +389,43 @@ mod tests {
         assert_eq!(props["reader"]["description"], "The reader.");
     }
 
-    #[test]
-    fn a_timed_out_or_truncated_child_is_an_error() {
-        let t = tool_text(ToolOutcome {
-            code: None,
-            stdout: String::new(),
-            stderr: "timed out after 5 s; the child was killed".into(),
-            truncated: false,
-        });
-        assert!(t.unwrap_err().contains("timed out after 5 s"));
-        let t = tool_text(ToolOutcome {
-            code: Some(0),
+    fn failed(kind: ExecFailureKind) -> ExecFailure {
+        ExecFailure {
+            kind,
             stdout: "x".into(),
-            stderr: String::new(),
-            truncated: true,
-        });
+            stderr: "BOOM\n".into(),
+            code: Some(2),
+            signal: None,
+            timeout: Some(Duration::from_secs(5)),
+            max_bytes: 1000,
+            detail: "cannot start: no such file".into(),
+        }
+    }
+
+    /// The error texts of a failed child, word for word.
+    #[test]
+    fn a_failed_child_is_worded_as_it_always_was() {
+        let text = |k| failure_text(&failed(k));
         assert_eq!(
-            t.unwrap_err(),
-            format!("x\n[output truncated at {OUTPUT_CAP} bytes]")
+            text(ExecFailureKind::Timeout),
+            "timed out after 5 s; the child was killed"
         );
+        assert_eq!(
+            text(ExecFailureKind::OutputLimit),
+            "x\n[output truncated at 1000 bytes]"
+        );
+        assert_eq!(
+            text(ExecFailureKind::Spawn),
+            "could not run sim-doctor: no such file"
+        );
+        // stderr is returned as the child wrote it, trailing newline and all.
+        assert_eq!(text(ExecFailureKind::Exit), "BOOM\n");
+        assert_eq!(text(ExecFailureKind::Signal), "BOOM\n");
+        let mut quiet = failed(ExecFailureKind::Exit);
+        quiet.stderr = "  \n".into();
+        assert_eq!(failure_text(&quiet), "exit code 2");
+        quiet.kind = ExecFailureKind::Signal;
+        assert_eq!(failure_text(&quiet), "the process did not exit normally");
     }
 
     #[test]
@@ -498,33 +434,6 @@ mod tests {
         assert_eq!(timeout_from(Some("0")), DEFAULT_TIMEOUT);
         assert_eq!(timeout_from(Some("abc")), DEFAULT_TIMEOUT);
         assert_eq!(timeout_from(Some("7")), Duration::from_secs(7));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_stalled_child_is_killed_at_the_deadline() {
-        let mut p = Process::new("sleep");
-        p.arg("30");
-        let start = std::time::Instant::now();
-        let out = run_with_deadline(p, Duration::from_millis(300), 1024);
-        assert!(start.elapsed() < Duration::from_secs(10));
-        assert_eq!(out.code, None);
-        assert!(
-            out.stderr.contains("the child was killed"),
-            "{}",
-            out.stderr
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn output_is_capped_and_flagged() {
-        let mut p = Process::new("sh");
-        p.args(["-c", "head -c 100000 /dev/zero | tr '\\0' a"]);
-        let out = run_with_deadline(p, Duration::from_secs(20), 1000);
-        assert_eq!(out.stdout.len(), 1000);
-        assert!(out.truncated);
-        assert_eq!(out.code, Some(0));
     }
 
     #[test]
@@ -628,15 +537,5 @@ mod tests {
                 "code {code}"
             );
         }
-        let spawn_failed = tool_text(ToolOutcome {
-            code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            truncated: false,
-        });
-        assert_eq!(
-            spawn_failed,
-            Err("the process did not exit normally".into())
-        );
     }
 }

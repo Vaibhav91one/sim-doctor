@@ -1,7 +1,151 @@
+# the default face (plain, not a terminal): sim-doctor scan --tar focused
+exit 1
+--- stderr
+--- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
+sim-doctor <VERSION>  score 50/100 critical
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+1 critical
+
+# notes: a truncated walk: sim-doctor scan --tar focused --max-nodes 2
+exit 1
+--- stderr
+sim-doctor: warning: the walk stopped early, so this is not the whole card; bounds hit: maximum number of files
+--- stdout
+WARNING: INCOMPLETE: 10 coverage gap(s); findings may be missing
+ERROR: TRUNCATED: this walk did NOT see the whole card; a file outside it is neither present nor absent here; first bound hit: nodes; every bound hit: nodes
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
+NOTE: 1 walk note(s) on individual files; `--json` lists them
+sim-doctor <VERSION>  score 50/100 critical
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+1 critical
+
+# --face legacy is the full report: sim-doctor scan --tar focused --face legacy
+exit 1
+--- stderr
+--- stdout
+COMPLETE: this walk reached the end of what it was asked to read.
+
+reader           replay
+ATR              (not read)
+FCP dialect      ts-102-221  (ETSI TS 102 221)
+                 file size 80, descriptor 82, file id 83
+addressing       SELECT by path from the master file
+candidates       sim-families (1280 identifiers per directory)
+                 WARNING: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
+bounds           depth 16, children 1280, nodes 16384, directories 64
+
+walk             2561 files, 2 directories, 4 selected, 2557 absent, 0 forbidden, 0 refused, 0 repeated identifiers
+
+SELECTED FILES
+  3F00                     master-file    no size reported directory/unknown        
+  3F00/2FE2                elementary-file 10 octets        elementary/transparent   
+  3F00/7F20                directory      no size reported directory/unknown        
+  3F00/7F20/6F07           elementary-file 4 octets         elementary/transparent   
+
+FORBIDDEN FILES (present, not readable by this terminal)
+  (none)
+
+REFUSED FOR ANOTHER REASON
+  (none)
+
+NOTES
+  (none)
+
+TAR SELECTION: focused at CLA etsi (80)
+  NOTE: the ENVELOPE was sent at CLA 80 (etsi), the only class swSIM dispatches ENVELOPE at; a 2G card routes ENVELOPE at CLA A0 (gsm) and that is not selectable yet, so a scan that found no accepted TAR on a 2G card has not shown the card refuses TARs, only that nothing arrived where this tool sent it
+
+TAR PROBES: 656 (cap 4096, 676 exchange(s))
+  000000  accepted  status 6D00
+  000001  refused  status 9404
+  000002  refused  status 9404
+  000003  refused  status 9404
+  000004  refused  status 9404
+  000005  refused  status 9404
+  000006  refused  status 9404
+  000007  refused  status 9404
+  000008  refused  status 9404
+  000009  refused  status 9404
+  00000A  refused  status 9404
+  00000B  refused  status 9404
+  00000C  refused  status 9404
+  00000D  refused  status 9404
+  00000E  refused  status 9404
+  00000F  refused  status 9404
+  000010  refused  status 9404
+  000011  refused  status 9404
+  000012  refused  status 9404
+  000013  refused  status 9404
+  000014  refused  status 9404
+  000015  refused  status 9404
+  000016  refused  status 9404
+  000017  refused  status 9404
+  000018  refused  status 9404
+  000019  refused  status 9404
+  00001A  refused  status 9404
+  00001B  refused  status 9404
+  00001C  refused  status 9404
+  00001D  refused  status 9404
+  00001E  refused  status 9404
+  00001F  refused  status 9404
+  000020  refused  status 9404
+  000021  refused  status 9404
+  000022  refused  status 9404
+  000023  refused  status 9404
+  000024  refused  status 9404
+  000025  refused  status 9404
+  000026  refused  status 9404
+  000027  refused  status 9404
+  000028  refused  status 9404
+  000029  refused  status 9404
+  00002A  refused  status 9404
+  00002B  refused  status 9404
+  00002C  refused  status 9404
+  00002D  refused  status 9404
+  00002E  refused  status 9404
+  00002F  refused  status 9404
+  000030  refused  status 9404
+  000031  refused  status 9404
+  000032  refused  status 9404
+  000033  refused  status 9404
+  000034  refused  status 9404
+  000035  refused  status 9404
+  000036  refused  status 9404
+  000037  refused  status 9404
+  000038  refused  status 9404
+  000039  refused  status 9404
+  00003A  refused  status 9404
+  00003B  refused  status 9404
+  00003C  refused  status 9404
+  00003D  refused  status 9404
+  00003E  refused  status 9404
+  00003F  refused  status 9404
+  ... and 592 more; a report lists at most 64 of them
+
+TAR BASELINE: 9404 (19/20 calibration probes)
+  from 20 calibration probe(s): this is the answer a TAR the card has no opinion about gets
+
+TARs ACCEPTED: 1
+  000000
+
+MSL 0 (TAR 000000 accepted): yes
+
+FINDINGS: 1 (no severity filter)
+  [critical] gsma/msl-zero-allowed at tar:00000000: TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification [accepted=6D00 baseline=9404] (partial (the TAR scan did not finish, so this TAR is known to be accepted but the card may hold
+     others this scan never probed; this report is a list of what was found, not of everything
+     there is))
+  coverage: partial (the TAR scan did not finish, so this TAR is known to be accepted but the card may hold
+     others this scan never probed; this report is a list of what was found, not of everything
+     there is)
+
+
 # --face plain: sim-doctor scan --tar focused --face plain
 exit 1
 --- stderr
 --- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 sim-doctor <VERSION>  score 50/100 critical
 critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
 1 critical
@@ -10,6 +154,8 @@ critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card
 exit 1
 --- stderr
 --- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 sim-doctor <VERSION> | 50/100 critical | 1 findings: 1 critical
 SEV       RULE                   LOCATION      MESSAGE
 critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D…
@@ -19,6 +165,9 @@ exit 1
 --- stderr
 --- stdout
 ╭─ sim-doctor <VERSION> ───────────────────────────────────────────────────────────╮
+│ WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing              │
+│ NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 ide… │
+├──────────────────────────────────────────────────────────────────────────────┤
 │ Score  ███████████████░░░░░░░░░░░░░░░  50/100  critical                      │
 │ 1 critical                                                                   │
 ├──────────────────────────────────────────────────────────────────────────────┤
@@ -32,6 +181,8 @@ exit 1
 exit 1
 --- stderr
 --- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 sim-doctor <VERSION>  score 50/100 critical
 critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
 1 critical
@@ -40,20 +191,18 @@ critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card
 exit 1
 --- stderr
 --- stdout
-╭─ sim-doctor <VERSION> ───────────────────────────────────────────────────────────╮
-│ Score  ███████████████░░░░░░░░░░░░░░░  50/100  critical                      │
-│ 1 critical                                                                   │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ gsma (1)                                                                     │
-│ ● critical gsma/msl-zero-allowed  tar:00000000                               │
-│     TAR 000000 was accepted: the card answered this TAR with 6D00, which is… │
-│     → raise MSL and load the card's TAR allow-list, then re-scan; a card at… │
-╰──────────────────────────────────────────────────────────────────────────────╯
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
+sim-doctor <VERSION>  score 50/100 critical
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+1 critical
 
 # --face plain on a clean card: sim-doctor scan --tar focused --face plain
 exit 0
 --- stderr
 --- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 sim-doctor <VERSION>  score 100/100 incomplete
 no findings
 
@@ -62,6 +211,8 @@ exit 3
 --- stderr
 sim-doctor: compared against the baseline: 1 new, 0 fixed, 0 persisting
 --- stdout
+WARNING: INCOMPLETE: 9 coverage gap(s); findings may be missing
+NOTE: the default candidate set (SimFamilies) probes the five GSM 11.11 identifier families 2Fxx/4Fxx/5Fxx/6Fxx/7Fxx only; a file whose identifier starts outside those families is INVISIBLE to this scan rather than reported missing, so a clean result is not proof the card holds nothing else
 sim-doctor <VERSION>  score 50/100 critical
 critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
 1 critical

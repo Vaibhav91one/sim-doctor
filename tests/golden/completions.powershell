@@ -60,7 +60,7 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('--fail-on', '--fail-on', [CompletionResultType]::ParameterName, 'Exit 1 (3 under --baseline) when a finding is at or above this severity')
             [CompletionResult]::new('--sarif', '--sarif', [CompletionResultType]::ParameterName, 'Also write the findings to FILE as SARIF 2.1.0')
             [CompletionResult]::new('--tar', '--tar', [CompletionResultType]::ParameterName, 'Which TARs to probe for MSL 0, and how many')
-            [CompletionResult]::new('--face', '--face', [CompletionResultType]::ParameterName, 'Print the findings with a doctor-kit face instead of the full report')
+            [CompletionResult]::new('--face', '--face', [CompletionResultType]::ParameterName, 'The human report: a doctor-kit face (rich, plain or compact), or the full legacy report')
             [CompletionResult]::new('--theme', '--theme', [CompletionResultType]::ParameterName, 'The face''s colours: mono, clinical or contrast (default: the tool''s own)')
             [CompletionResult]::new('--color', '--color', [CompletionResultType]::ParameterName, 'Colour the face: auto (a terminal and no NO_COLOR), always or never')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope on stdout, and nothing else')

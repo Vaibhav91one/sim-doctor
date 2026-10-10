@@ -175,9 +175,11 @@ the same session (`hjkl`, enter, `/` filter, `d` decode, `w` why, `x` export, ta
 `--dialect`, the walk bounds and `--tar`; both read only (SELECT, READ BINARY, READ RECORD), come from doctor-kit and are
 on by default (build with `--no-default-features` to leave them out).
 
-`scan` prints its own report by default. `--face rich|plain|compact`, `--theme mono|clinical|contrast`, `--color
-auto|always|never` and `--headless` print the findings with a doctor-kit face instead; `--json`, `--sarif`,
-`--baseline` and the exit codes do not change. `scan --tui` is still the findings view described above.
+`scan` prints the findings with a doctor-kit face by default (rich on a terminal, plain when piped), preceded by notes for
+everything that makes the result partial (a truncated walk, an unfinished TAR audit, the candidate-set warning).
+`--face rich|plain|compact`, `--theme mono|clinical|contrast`, `--color auto|always|never` and `--headless` choose the
+look; `--face legacy` prints the full report with the files and the TAR evidence. `--json`, `--sarif`, `--baseline` and the
+exit codes do not change. `scan --tui` is still the findings view described above.
 
 ## CLI reference
 

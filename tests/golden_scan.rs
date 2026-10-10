@@ -947,6 +947,8 @@ fn mcp_answers_and_tool_results() {
         r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":7}"#,
         r#"{"jsonrpc":"2.0","id":"abc"}"#,
+        r#"{"jsonrpc":"2.0"}"#,
+        r#"{"jsonrpc":"2.0","method":5}"#,
         r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#,
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         r#"{"jsonrpc":"2.0","method":"no/such/notification"}"#,
@@ -971,40 +973,6 @@ fn mcp_answers_and_tool_results() {
         ],
     );
     check("proc_mcp_timeout.txt", &text);
-}
-
-/// The one place the kit's server answers differently from the one it replaced: a request with
-/// neither an `id` nor a string `method` used to get a -32600 error with a null `id`; the kit
-/// treats a request without an `id` as a notification and answers nothing. (Pinned from the
-/// kit's side; every other case is in `proc_mcp.txt`, generated on the previous server.)
-#[test]
-fn mcp_a_request_with_no_id_and_no_method_is_silent() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    {
-        use std::io::Write as _;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(
-                b"{\"jsonrpc\":\"2.0\"}\n{\"jsonrpc\":\"2.0\",\"method\":5}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
-            )
-            .unwrap();
-    }
-    let out = child.wait_with_output().unwrap();
-    check(
-        "proc_mcp_changed.txt",
-        &format!(
-            "-> {{\"jsonrpc\":\"2.0\"}}\n-> {{\"jsonrpc\":\"2.0\",\"method\":5}}\n-> ping (id 1)\n<- (only this)\n{}",
-            String::from_utf8(out.stdout).unwrap()
-        ),
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,6 +1067,19 @@ fn scan_with_a_kit_face() {
     std::fs::write(&msl0, log(true, Limits::default(), &Selection::focused())).unwrap();
     let clean = tmp.join("clean.log");
     std::fs::write(&clean, log(false, Limits::default(), &Selection::focused())).unwrap();
+    let small = tmp.join("small.log");
+    std::fs::write(
+        &small,
+        log(
+            true,
+            Limits {
+                max_nodes: 2,
+                ..Limits::default()
+            },
+            &Selection::focused(),
+        ),
+    )
+    .unwrap();
     let saved = tmp.join("clean.json");
     std::fs::write(
         &saved,
@@ -1107,6 +1088,13 @@ fn scan_with_a_kit_face() {
     .unwrap();
     let mut text = String::new();
     for (label, extra, log) in [
+        ("the default face (plain, not a terminal)", vec![], &msl0),
+        ("notes: a truncated walk", vec!["--max-nodes", "2"], &small),
+        (
+            "--face legacy is the full report",
+            vec!["--face", "legacy"],
+            &msl0,
+        ),
         ("--face plain", vec!["--face", "plain"], &msl0),
         ("--face compact", vec!["--face", "compact"], &msl0),
         (

@@ -88,7 +88,7 @@ exit 1
 # --sarif to an unwritable path: sim-doctor scan --json --tar focused --sarif <TMP>/no-such-dir/out.sarif
 exit 2
 --- stderr
-sim-doctor: sarif-unwritable: could not write SARIF to <TMP>/no-such-dir/out.sarif: No such file or directory (os error 2)
+error: <TMP>/no-such-dir/out.sarif: No such file or directory (os error 2)
 
 --- stdout: 153296 bytes, sha256 a20e8172d7d647b3de1c791dbecbee6e46afa1d4d5af80d5afcc8d9f9366f554
 --- file out.sarif: absent

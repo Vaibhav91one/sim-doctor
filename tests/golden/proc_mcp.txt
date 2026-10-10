@@ -16,6 +16,10 @@
 <- {"error":{"code":-32600,"message":"invalid request: no string method"},"id":4,"jsonrpc":"2.0"}
 -> {"jsonrpc":"2.0","id":"abc"}
 <- {"error":{"code":-32600,"message":"invalid request: no string method"},"id":"abc","jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0"}
+<- {"error":{"code":-32600,"message":"invalid request: no string method"},"id":null,"jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","method":5}
+<- {"error":{"code":-32600,"message":"invalid request: no string method"},"id":null,"jsonrpc":"2.0"}
 -> {"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}
 <- {"id":5,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"sim-doctor","version":"<VERSION>"}}}
 -> {"jsonrpc":"2.0","method":"notifications/initialized"}

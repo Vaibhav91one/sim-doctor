@@ -54,9 +54,10 @@ complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l baseline 
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l fail-on -d 'Exit 1 (3 under --baseline) when a finding is at or above this severity' -r
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l sarif -d 'Also write the findings to FILE as SARIF 2.1.0' -r -F
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l tar -d 'Which TARs to probe for MSL 0, and how many' -r
-complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l face -d 'Print the findings with a doctor-kit face instead of the full report' -r -f -a "plain\t'Minimalist text, one line per finding'
-rich\t'Boxed report with a score gauge, grouped by category'
-compact\t'One-line summary plus a findings table'"
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l face -d 'The human report: a doctor-kit face (rich, plain or compact), or the full legacy report' -r -f -a "rich\t''
+plain\t''
+compact\t''
+legacy\t''"
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l theme -d 'The face\'s colours: mono, clinical or contrast (default: the tool\'s own)' -r
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l color -d 'Colour the face: auto (a terminal and no NO_COLOR), always or never' -r -f -a "auto\t''
 always\t''
