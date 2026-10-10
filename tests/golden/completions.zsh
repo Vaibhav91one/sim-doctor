@@ -899,6 +899,8 @@ _arguments "${_arguments_options[@]}" : \
 '--dialect=[Which FCP tag table the card answers SELECT with (see \`scan --help\`)]:TABLE:_default' \
 '(--script)-c+[Run these \`;\`-separated commands and exit]:COMMANDS:_default' \
 '--script=[Run the commands in this file, one per line (\`#\` starts a comment), and exit]:PATH:_files' \
+'(--chv-env)--chv-file=[File holding PINs, PUKs and ADM keys for \`verify_chv\` / \`unblock_chv\` (\`pin1=1234\` per line; keep it chmod 600). Never a value on the command line\: it would land in shell history]:PATH:_files' \
+'--chv-env=[Environment variable holding the same text (entries separated by \`;\` or newlines)]:VAR:_default' \
 '--json[Print every reply as one JSON record (for agents)]' \
 '--yes[Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them]' \
 '-h[Print help (see more with '\''--help'\'')]' \

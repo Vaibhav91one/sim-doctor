@@ -2132,4 +2132,28 @@ fn card_shell_drives_a_real_card() {
     );
     assert_eq!(records[2]["data"]["decoded"]["name"], "ABS");
     println!("card shell: decoded EF.ICCID of {} digits", iccid.len());
+
+    // verify_chv: never against the live card's counters in CI. A dry run must reach nothing and show nothing.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "card",
+            "--json",
+            "--reader",
+            reader.as_str(),
+            "--chv-env",
+            "SIMDOC_FIXTURE_CHV",
+            "-c",
+            "verify_chv",
+        ])
+        .env("SIMDOC_FIXTURE_CHV", "pin1=4321")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("\"sent\":false") && !text.contains("4321"),
+        "{text}"
+    );
+    println!("card shell: verify_chv was a dry run and masked the value");
 }

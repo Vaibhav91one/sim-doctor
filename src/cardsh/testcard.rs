@@ -34,6 +34,24 @@ pub struct TestCard {
     queued: VecDeque<Vec<u8>>,
     open: BTreeSet<u8>,
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// Key reference -> (code, tries left, tries at most, verified).
+    pub chv: std::collections::BTreeMap<u8, Chv>,
+    /// Key reference of the PIN -> (unblock code, tries left, tries at most).
+    pub puk: std::collections::BTreeMap<u8, (Vec<u8>, u8, u8)>,
+}
+
+#[derive(Clone)]
+pub struct Chv {
+    pub code: Vec<u8>,
+    pub left: u8,
+    pub max: u8,
+    pub verified: bool,
+}
+
+fn pad(code: &str) -> Vec<u8> {
+    let mut v = code.as_bytes().to_vec();
+    v.resize(8, 0xFF);
+    v
 }
 
 fn f(path: &[u16], df: bool, rec_len: Option<usize>, content: Vec<Vec<u8>>) -> File {
@@ -132,6 +150,29 @@ impl TestCard {
             queued: VecDeque::new(),
             open: BTreeSet::from([0]),
             sent: Rc::default(),
+            chv: [
+                (0x01, "1234"),
+                (0x81, "5678"),
+                (0x11, "9999"),
+                (0x0A, "77777777"),
+            ]
+            .into_iter()
+            .map(|(k, c)| {
+                (
+                    k,
+                    Chv {
+                        code: pad(c),
+                        left: 3,
+                        max: 3,
+                        verified: false,
+                    },
+                )
+            })
+            .collect(),
+            puk: [(0x01, "12345678"), (0x81, "87654321")]
+                .into_iter()
+                .map(|(k, c)| (k, (pad(c), 10, 10)))
+                .collect(),
         }
     }
 
@@ -338,6 +379,55 @@ impl CardSession for TestCard {
                 }
             }
             0xF2 => vec![0x90, 0x00],
+            // VERIFY: no data asks how many tries are left; a wrong code costs one.
+            0x20 => match self.chv.get_mut(&c[3]) {
+                None => vec![0x6A, 0x88],
+                Some(k) if k.left == 0 => vec![0x69, 0x83],
+                Some(k) if data.is_empty() => {
+                    if k.verified {
+                        vec![0x90, 0x00]
+                    } else {
+                        vec![0x63, 0xC0 | k.left]
+                    }
+                }
+                Some(k) if data == k.code => {
+                    k.left = k.max;
+                    k.verified = true;
+                    vec![0x90, 0x00]
+                }
+                Some(k) => {
+                    k.left -= 1;
+                    if k.left == 0 {
+                        vec![0x69, 0x83]
+                    } else {
+                        vec![0x63, 0xC0 | k.left]
+                    }
+                }
+            },
+            // UNBLOCK PIN: PUK (8) + new PIN (8).
+            0x2C => match (self.puk.get_mut(&c[3]), self.chv.get_mut(&c[3])) {
+                (Some((_, 0, _)), _) => vec![0x69, 0x83],
+                (Some((_, left, _)), Some(_)) if data.is_empty() => vec![0x63, 0xC0 | *left],
+                (Some((code, left, max)), Some(k))
+                    if data.len() == 16 && &data[..8] == code.as_slice() =>
+                {
+                    *left = *max;
+                    k.code = data[8..].to_vec();
+                    k.left = k.max;
+                    k.verified = false;
+                    vec![0x90, 0x00]
+                }
+                (Some((_, left, _)), Some(_)) if data.len() == 16 => {
+                    *left -= 1;
+                    if *left == 0 {
+                        vec![0x69, 0x83]
+                    } else {
+                        vec![0x63, 0xC0 | *left]
+                    }
+                }
+                (Some(_), Some(_)) => vec![0x67, 0x00],
+                _ => vec![0x6A, 0x88],
+            },
             _ => vec![0x6D, 0x00],
         })
     }
@@ -365,9 +455,18 @@ pub fn shell_log() -> (Shell, Rc<RefCell<Vec<Vec<u8>>>>) {
         Opts {
             yes: false,
             dialect: TagSet::ts_102_221(),
+            secrets: None,
         },
     );
     sh.equip(None, Profile::Uicc).unwrap();
+    (sh, log)
+}
+
+/// Like [`shell_log`] with a PIN source and `--yes` as given.
+pub fn shell_with(secrets: &str, yes: bool) -> (Shell, Rc<RefCell<Vec<Vec<u8>>>>) {
+    let (mut sh, log) = shell_log();
+    sh.opts.secrets = Some(crate::cardsh::secrets::Secrets::parse(secrets).unwrap());
+    sh.opts.yes = yes;
     (sh, log)
 }
 
@@ -406,6 +505,7 @@ pub fn record(script: &str, yes: bool) -> (String, Vec<Reply>) {
         Opts {
             yes,
             dialect: TagSet::ts_102_221(),
+            secrets: Some(crate::cardsh::secrets::Secrets::parse(FIXTURE_SECRETS).unwrap()),
         },
     );
     sh.equip(None, Profile::Uicc).unwrap();
@@ -416,6 +516,9 @@ pub fn record(script: &str, yes: bool) -> (String, Vec<Reply>) {
 
 /// The scripts whose recordings are committed under `tests/corpus/` for the process tests:
 /// (file name, `--yes`, script).
+/// The PIN source the recorded scripts run with (and `tests/cardsh.rs` hands the binary).
+pub const FIXTURE_SECRETS: &str = "pin1=1234; pin2=0000; puk1=12345678; new-pin1=4321";
+
 pub const FIXTURES: &[(&str, bool, &str)] = &[
     (
         "cardsh_channels.jsonl",
@@ -445,6 +548,11 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         false,
         "select ADF.USIM; select EF.IMSI; read_binary_decoded; select EF.AD; read_binary_decoded; \
          select 3F00/7F10/6F3A; read_records_decoded; select 3F00/2FE2; read_binary_decoded",
+    ),
+    (
+        "cardsh_chv.jsonl",
+        true,
+        "verify_chv; verify_chv --pin-nr 2; verify_chv --pin-nr 2",
     ),
 ];
 

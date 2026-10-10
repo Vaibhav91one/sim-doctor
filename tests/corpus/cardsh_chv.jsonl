@@ -1,0 +1,6 @@
+{"command":"00200001","response":"63c3"}
+{"command":"002000010831323334ffffffff","response":"9000"}
+{"command":"00200081","response":"63c3"}
+{"command":"002000810830303030ffffffff","response":"63c2"}
+{"command":"00200081","response":"63c2"}
+{"command":"002000810830303030ffffffff","response":"63c1"}

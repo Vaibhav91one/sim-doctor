@@ -673,6 +673,8 @@ Options:
   -c <COMMANDS>            Run these `;`-separated commands and exit
       --script <PATH>      Run the commands in this file, one per line (`#` starts a comment), and exit
       --json               Print every reply as one JSON record (for agents)
+      --chv-file <PATH>    File holding PINs, PUKs and ADM keys for `verify_chv` / `unblock_chv` (`pin1=1234` per line; keep it chmod 600). Never a value on the command line: it would land in shell history
+      --chv-env <VAR>      Environment variable holding the same text (entries separated by `;` or newlines)
       --yes                Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them
   -h, --help               Print help (see more with '--help')
 

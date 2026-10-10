@@ -672,6 +672,8 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('--dialect', '--dialect', [CompletionResultType]::ParameterName, 'Which FCP tag table the card answers SELECT with (see `scan --help`)')
             [CompletionResult]::new('-c', '-c', [CompletionResultType]::ParameterName, 'Run these `;`-separated commands and exit')
             [CompletionResult]::new('--script', '--script', [CompletionResultType]::ParameterName, 'Run the commands in this file, one per line (`#` starts a comment), and exit')
+            [CompletionResult]::new('--chv-file', '--chv-file', [CompletionResultType]::ParameterName, 'File holding PINs, PUKs and ADM keys for `verify_chv` / `unblock_chv` (`pin1=1234` per line; keep it chmod 600). Never a value on the command line: it would land in shell history')
+            [CompletionResult]::new('--chv-env', '--chv-env', [CompletionResultType]::ParameterName, 'Environment variable holding the same text (entries separated by `;` or newlines)')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print every reply as one JSON record (for agents)')
             [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...). Without it they print what they would send and the card is not touched by them')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')

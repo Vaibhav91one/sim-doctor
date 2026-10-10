@@ -38,6 +38,15 @@ pub struct CardShellArgs {
     #[arg(long)]
     json: bool,
 
+    /// File holding PINs, PUKs and ADM keys for `verify_chv` / `unblock_chv` (`pin1=1234` per line;
+    /// keep it chmod 600). Never a value on the command line: it would land in shell history.
+    #[arg(long, value_name = "PATH", conflicts_with = "chv_env")]
+    chv_file: Option<std::path::PathBuf>,
+
+    /// Environment variable holding the same text (entries separated by `;` or newlines).
+    #[arg(long, value_name = "VAR")]
+    chv_env: Option<String>,
+
     /// Send the commands that change the card (APDUs outside the read-only set, PIN checks, ...).
     /// Without it they print what they would send and the card is not touched by them.
     #[arg(long)]
@@ -45,6 +54,23 @@ pub struct CardShellArgs {
 }
 
 pub fn run(args: CardShellArgs) -> contract::ExitCode {
+    // Read and checked before a reader is opened, so a typo costs the card nothing.
+    let source = match (&args.chv_file, &args.chv_env) {
+        (Some(path), _) => Some(cardsh::secrets::Source::File(path.clone())),
+        (None, Some(name)) => Some(cardsh::secrets::Source::Env(name.clone())),
+        (None, None) => None,
+    };
+    let secrets = match source
+        .as_ref()
+        .map(cardsh::secrets::Secrets::load)
+        .transpose()
+    {
+        Ok(s) => s,
+        Err(message) => {
+            eprintln!("sim-doctor: {message}");
+            return contract::ExitCode::Error;
+        }
+    };
     let opener: cardsh::Opener = Box::new(|requested| {
         let (session, reader, atr) = super::open_scan_session(requested).map_err(|f| f.message)?;
         Ok((session, reader.as_str().to_owned(), atr))
@@ -54,6 +80,7 @@ pub fn run(args: CardShellArgs) -> contract::ExitCode {
         Opts {
             yes: args.yes,
             dialect: args.dialect.tag_set(),
+            secrets,
         },
     );
     let profile = if args.profile == "sim" {

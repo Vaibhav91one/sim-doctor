@@ -71,6 +71,8 @@ pub struct Opts {
     pub yes: bool,
     /// Which FCP tag table the card answers SELECT with.
     pub dialect: TagSet,
+    /// The PIN / PUK / ADM values `verify_chv` and `unblock_chv` use (from a file or an environment variable).
+    pub secrets: Option<secrets::Secrets>,
 }
 
 /// What `select` learned about a file from its FCP.
@@ -222,6 +224,8 @@ struct Equipped {
     profile: Profile,
     chans: BTreeMap<u8, Chan>,
     channel: u8,
+    /// Key references verified in this session (no secret is kept).
+    verified: std::collections::BTreeSet<u8>,
 }
 
 impl Equipped {
@@ -624,7 +628,174 @@ fn cmd_files(filter: Option<&str>) -> Reply {
     Reply::ok(text, data)
 }
 
+/// A key reference (TS 102 221 table 9.3) and the names it goes by.
+struct KeyTarget {
+    key_ref: u8,
+    label: String,
+    secret: String,
+}
+
+fn key_target(args: &clap::ArgMatches) -> Result<KeyTarget, CmdErr> {
+    if let Some(n) = args.get_one::<u8>("adm_nr") {
+        return Ok(KeyTarget {
+            key_ref: 0x0A + n - 1,
+            label: format!("ADM{n}"),
+            secret: format!("adm{n}"),
+        });
+    }
+    if args.get_flag("universal") {
+        return Ok(KeyTarget {
+            key_ref: 0x11,
+            label: "universal PIN".into(),
+            secret: "universal".into(),
+        });
+    }
+    if let Some(h) = args.get_one::<String>("key_ref") {
+        let b = parse_hex(h).map_err(CmdErr::new)?;
+        let [k] = b[..] else {
+            return Err(CmdErr::new("--key-ref is one octet of hex"));
+        };
+        return Ok(KeyTarget {
+            key_ref: k,
+            label: format!("key {k:02X}"),
+            secret: format!("key-{k:02x}"),
+        });
+    }
+    let n = args.get_one::<u8>("pin_nr").copied().unwrap_or(1);
+    Ok(KeyTarget {
+        key_ref: if n == 2 { 0x81 } else { n },
+        label: format!("PIN{n}"),
+        secret: format!("pin{n}"),
+    })
+}
+
+/// How many tries a `63 Cx` leaves.
+fn tries_left(sw: Option<StatusWord>) -> Option<u8> {
+    sw.filter(|s| s.sw1() == 0x63 && s.sw2() & 0xF0 == 0xC0)
+        .map(|s| s.sw2() & 0x0F)
+}
+
 impl Shell {
+    /// Puts the card's selection back to `saved` after a lookup that had to select something else.
+    fn restore_selection(&mut self, saved: Chan) {
+        let dialect = self.opts.dialect.clone();
+        if let Ok(card) = self.equipped() {
+            card.chans.insert(card.channel, saved);
+            if let Some(by) = Self::reselect(&card.chans[&card.channel]) {
+                let _ = card.select(&by, &dialect);
+            }
+        }
+    }
+
+    /// The ICCID, read from EF.ICCID; the selection is put back.
+    fn iccid(&mut self) -> Result<String, CmdErr> {
+        let dialect = self.opts.dialect.clone();
+        let card = self.equipped()?;
+        let saved = card.chans[&card.channel].clone();
+        let sel = card.select(
+            &SelectBy::AbsPath(vec![FileId::from_bytes([0x2F, 0xE2])]),
+            &dialect,
+        );
+        let read = sel.and_then(|_| card.read_binary(0, 10));
+        self.restore_selection(saved);
+        let bytes = read?;
+        crate::ef::decode_iccid(&bytes)
+            .map(|d| d.as_str().to_owned())
+            .map_err(|e| CmdErr::new(format!("EF.ICCID: {e}")))
+    }
+
+    /// The secret `name` from the provider (`--chv-file` / `--chv-env`).
+    fn secret(&mut self, name: &str) -> Result<[u8; 8], CmdErr> {
+        let Some(sec) = self.opts.secrets.clone() else {
+            return Err(CmdErr::new(
+                "no PIN source: start `card` with --chv-file PATH or --chv-env VAR",
+            ));
+        };
+        let iccid = if sec.needs_iccid() {
+            Some(self.iccid()?)
+        } else {
+            None
+        };
+        sec.get(name, iccid.as_deref())
+            .ok_or_else(|| CmdErr::new(format!("the PIN source has no `{name}` entry")))
+    }
+
+    /// Asks how many tries a key has left without spending one (a VERIFY or UNBLOCK with no data).
+    fn tries_of(
+        &mut self,
+        ins: u8,
+        p1: u8,
+        key_ref: u8,
+    ) -> Result<(Option<u8>, Option<StatusWord>), CmdErr> {
+        let card = self.equipped()?;
+        let cla = card.cla();
+        let ex = card.send(&Command::case1(apdu::Header::new(cla, ins, p1, key_ref)))?;
+        Ok((tries_left(ex.status()), ex.status()))
+    }
+
+    fn cmd_verify_chv(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let target = key_target(args)?;
+        let value = self.secret(&target.secret)?;
+        let send = self.may_change_card(args);
+        let allow_last = args.get_flag("allow_last");
+        let key_ref = target.key_ref;
+        let masked = format!("00 20 00 {key_ref:02X} 08 <{} redacted>", target.label);
+        if !send {
+            return Ok(Reply::ok(
+                format!(
+                    "dry run: would send {masked} (a wrong value costs a try; add --yes to send)"
+                ),
+                json!({ "sent": false, "key_reference": format!("{key_ref:02X}"), "apdu": masked }),
+            ));
+        }
+        let (left, sw) = self.tries_of(0x20, 0x00, key_ref)?;
+        let refuse = |msg: String| CmdErr {
+            message: msg,
+            data: json!({ "sent": false, "sw": sw.map(|s| s.to_string()), "tries_left": left }),
+        };
+        if sw.is_some_and(StatusWord::is_success) {
+            let card = self.equipped()?;
+            card.verified.insert(key_ref);
+            return Ok(Reply::ok(
+                format!("{} is already verified; nothing sent", target.label),
+                json!({ "sent": false, "verified": true, "key_reference": format!("{key_ref:02X}") }),
+            ));
+        }
+        match (left, sw) {
+            (Some(1), _) if !allow_last => {
+                return Err(refuse(format!("only one try left on {}: a wrong value blocks it. Check the value, then add --allow-last-attempt", target.label)))
+            }
+            (Some(0), _) => return Err(refuse(format!("{} is blocked", target.label))),
+            (None, Some(s)) if s.to_bytes() == [0x69, 0x83] => return Err(refuse(format!("{} is blocked", target.label))),
+            (Some(_), _) => {}
+            (None, s) => return Err(refuse(format!("cannot VERIFY {}: {}", target.label, sw_text(s)))),
+        }
+        // One attempt, never retried.
+        let card = self.equipped()?;
+        let cla = card.cla();
+        let ex = card.send(&Command::case3(
+            apdu::Header::new(cla, 0x20, 0x00, key_ref),
+            value.to_vec(),
+        ))?;
+        let sw = ex.status();
+        let data = json!({ "sent": true, "key_reference": format!("{key_ref:02X}"), "sw": sw.map(|s| s.to_string()), "tries_left": tries_left(sw) });
+        if sw.is_some_and(StatusWord::is_success) {
+            card.verified.insert(key_ref);
+            return Ok(Reply::ok(
+                format!("{} verified", target.label),
+                json!({ "verified": true, "sent": true, "key_reference": format!("{key_ref:02X}"), "sw": "9000" }),
+            ));
+        }
+        let why = match (tries_left(sw), sw) {
+            (Some(n), _) => format!("wrong value for {}: {n} tries left", target.label),
+            (None, Some(s)) if s.to_bytes() == [0x69, 0x83] => {
+                format!("{} is now blocked", target.label)
+            }
+            (None, s) => format!("VERIFY {} refused: {}", target.label, sw_text(s)),
+        };
+        Err(CmdErr { message: why, data })
+    }
+
     fn cmd_read_decoded(&mut self, which: Which) -> CmdResult {
         let card = self.equipped()?;
         let ef = card.ef()?;
@@ -1186,6 +1357,17 @@ pub fn grammar() -> clap::Command {
                 .arg(Arg::new("filter").value_name("TEXT")),
         )
         .subcommand(
+            C::new("verify_chv")
+                .about("VERIFY a PIN (default PIN1) with the value from --chv-file / --chv-env; a dry run unless --yes")
+                .arg(Arg::new("pin_nr").long("pin-nr").value_name("N").value_parser(clap::value_parser!(u8).range(1..=8)).help("PIN number: 1 is PIN1, 2 is PIN2 (key reference 81), 3-8 application PINs"))
+                .arg(Arg::new("universal").long("universal").action(clap::ArgAction::SetTrue).help("the universal PIN (key reference 11)"))
+                .arg(Arg::new("adm_nr").long("adm-nr").value_name("N").value_parser(clap::value_parser!(u8).range(1..=5)).help("administrative key N (key reference 0A..0E)"))
+                .arg(Arg::new("key_ref").long("key-ref").value_name("HEX").help("a raw key reference, one octet of hex"))
+                .group(clap::ArgGroup::new("which").args(["pin_nr", "universal", "adm_nr", "key_ref"]))
+                .arg(Arg::new("allow_last").long("allow-last-attempt").action(clap::ArgAction::SetTrue).help("send even when only one try is left (a wrong value then blocks the PIN)"))
+                .arg(yes_arg()),
+        )
+        .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
                 .about("Leave the shell"),
@@ -1222,6 +1404,7 @@ impl Shell {
             profile,
             chans,
             channel: 0,
+            verified: std::collections::BTreeSet::new(),
         });
         Ok(())
     }
@@ -1293,6 +1476,7 @@ impl Shell {
             "files" => Ok(cmd_files(
                 args.get_one::<String>("filter").map(String::as_str),
             )),
+            "verify_chv" => self.cmd_verify_chv(args),
             "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
             "select_path" => {
                 self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
@@ -1446,6 +1630,7 @@ impl Shell {
                 "path": chan.path(),
                 "file": file,
                 "send_state_changing": yes,
+                "verified_key_references": card.verified.iter().map(|k| format!("{k:02X}")).collect::<Vec<_>>(),
             }),
         ))
     }
@@ -1582,6 +1767,7 @@ pub fn read_fcp(body: &[u8], dialect: &TagSet) -> FileInfo {
 pub mod decode;
 mod efs;
 pub mod names;
+pub mod secrets;
 
 #[cfg(test)]
 pub(crate) mod testcard;
@@ -1910,6 +2096,7 @@ mod tests {
             Opts {
                 yes: false,
                 dialect: TagSet::ts_102_221(),
+                secrets: None,
             },
         );
         let r = sh.exec("decode EF.SPN 01414253FFFF");
@@ -1922,6 +2109,100 @@ mod tests {
         assert!(r.data["count"].as_u64().unwrap() >= 2, "{}", r.text);
         let r = sh.exec("files");
         assert!(r.data["count"].as_u64().unwrap() >= 250);
+    }
+
+    fn shown(r: &Reply) -> String {
+        format!("{} {}", r.text, r.data)
+    }
+
+    #[test]
+    fn verify_chv_is_a_dry_run_that_never_shows_the_value() {
+        let (mut sh, log) = shell_with("pin1=1234", false);
+        let r = sh.exec("verify_chv");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["sent"], false);
+        assert!(
+            r.text.contains("00 20 00 01 08 <PIN1 redacted>"),
+            "{}",
+            r.text
+        );
+        assert!(!shown(&r).contains("1234") && !shown(&r).contains("31323334"));
+        assert!(log.borrow().is_empty(), "nothing reached the card");
+        let (mut sh, _) = shell_log();
+        let r = sh.exec("verify_chv");
+        assert!(!r.ok && r.text.contains("--chv-file"), "{}", r.text);
+        let (mut sh, _) = shell_with("pin1=1234", true);
+        assert!(!sh.exec("verify_chv --pin-nr 2").ok, "no pin2 entry");
+        assert!(
+            !sh.exec("verify_chv --pin-nr 1 --universal").ok,
+            "one selector at most"
+        );
+    }
+
+    #[test]
+    fn verify_chv_asks_the_tries_first_sends_once_and_remembers() {
+        let (mut sh, log) = shell_with("pin1=1234; pin2=5678; universal=9999; adm1=77777777", true);
+        let r = sh.exec("verify_chv");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["verified"], true);
+        let sent = log.borrow().clone();
+        assert_eq!(sent.len(), 2, "the tries query, then the VERIFY");
+        assert_eq!(sent[0], [0x00, 0x20, 0x00, 0x01]);
+        assert_eq!(sent[1][..5], [0x00, 0x20, 0x00, 0x01, 0x08]);
+        assert!(!shown(&r).contains("1234"));
+        // Verified already: nothing more is sent.
+        let r = sh.exec("verify_chv");
+        assert!(r.ok && r.data["sent"] == false, "{}", r.text);
+        assert_eq!(log.borrow().len(), 3, "only the tries query");
+        assert!(sh.exec("verify_chv --pin-nr 2").ok);
+        assert!(sh.exec("verify_chv --universal").ok);
+        assert!(sh.exec("verify_chv --adm-nr 1").ok);
+        let keys = sh.exec("status").data["verified_key_references"].clone();
+        assert_eq!(keys, json!(["01", "0A", "11", "81"]));
+    }
+
+    #[test]
+    fn a_wrong_value_costs_exactly_one_try_and_the_last_try_needs_a_flag() {
+        let (mut sh, log) = shell_with("pin1=0000", true);
+        let r = sh.exec("verify_chv");
+        assert!(!r.ok && r.text.contains("2 tries left"), "{}", r.text);
+        assert_eq!(r.data["tries_left"], 2);
+        let r = sh.exec("verify_chv");
+        assert!(!r.ok && r.text.contains("1 tries left"), "{}", r.text);
+        log.borrow_mut().clear();
+        let r = sh.exec("verify_chv");
+        assert!(
+            !r.ok && r.text.contains("--allow-last-attempt"),
+            "{}",
+            r.text
+        );
+        assert_eq!(
+            log.borrow().len(),
+            1,
+            "only the tries query went out: the last try was not spent"
+        );
+        let r = sh.exec("verify_chv --allow-last-attempt");
+        assert!(!r.ok && r.text.contains("now blocked"), "{}", r.text);
+        let r = sh.exec("verify_chv --allow-last-attempt");
+        assert!(!r.ok && r.text.contains("is blocked"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_secret_bound_to_an_iccid_is_chosen_by_the_cards_iccid_and_the_selection_is_kept() {
+        let (mut sh, _) = shell_with("89010123456789012345:pin1=1234; pin1=0000", true);
+        assert!(sh.exec("select 3F00/7F10").ok);
+        let r = sh.exec("verify_chv");
+        assert!(r.ok, "the entry for this card's ICCID is used: {}", r.text);
+        assert_eq!(
+            sh.pwd(),
+            "3F00/7F10",
+            "reading EF.ICCID did not move the shell"
+        );
+        let (mut sh, _) = shell_with("89999:pin1=1234; pin1=0000", true);
+        assert!(
+            !sh.exec("verify_chv").ok,
+            "another card's entry is not used"
+        );
     }
 
     #[test]
