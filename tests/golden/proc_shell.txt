@@ -1,0 +1,73 @@
+# files: sim-doctor shell -c pwd; ls; cd card; ls; cd 3F00; ls; cd 7F20; ls; pwd; cat 6F07; info 6F07; decode 6F07; cd /; find 6F07
+exit 0
+--- stderr
+sim-doctor: warning: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+--- stdout
+/
+card           card      the card's files
+3F00           MF        master file
+2FE2           EF        transparent EF, 10 bytes, EF.ICCID
+7F20           DF        directory
+6F07           EF        transparent EF, 4 bytes, EF.IMSI
+/card/3F00/7F20
+6F07 (EF) transparent EF, 4 bytes, EF.IMSI
+{
+  "access": null,
+  "ef": "EF.IMSI",
+  "path": "3F00/7F20/6F07",
+  "read": "refused",
+  "status": "6D00"
+}
+6F07 (EF) transparent EF, 4 bytes, EF.IMSI
+container: false
+contents: {"access":null,"ef":"EF.IMSI","path":"3F00/7F20/6F07","read":"refused","status":"6D00"}
+descriptor: {"state":"reported","value":{"data_coding":"21","file_type":"elementary","octets":"09 21","shareable":false,"structure":"transparent"}}
+file_kind: EF
+kind: elementary-file
+life_cycle: {"state":"not-reported"}
+name: {"state":"not-reported"}
+path: 3F00/7F20/6F07
+reported_file_id: {"state":"reported","value":"6F 07"}
+size: {"state":"reported","value":{"octets":4}}
+state: selected
+unknown_tags: []
+children: 0
+{
+  "access": null,
+  "ef": "EF.IMSI",
+  "path": "3F00/7F20/6F07",
+  "read": "refused",
+  "status": "6D00"
+}
+/card/3F00/7F20/6F07         EF        transparent EF, 4 bytes, EF.IMSI
+
+# files as json records: sim-doctor shell --json -c ls; cd card; ls; cd 3F00; ls; info 2FE2
+exit 0
+--- stderr
+sim-doctor: warning: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+--- stdout
+{"command":"ls","cwd":"/","data":[{"actions":0,"children":0,"kind":"card","name":"card","summary":"the card's files"}],"error":null,"ok":true,"schema":"doctor-shell/1","tool":"sim-doctor"}
+{"command":"cd card","cwd":"/card","data":{"cwd":"/card"},"error":null,"ok":true,"schema":"doctor-shell/1","tool":"sim-doctor"}
+{"command":"ls","cwd":"/card","data":[{"actions":0,"children":0,"kind":"MF","name":"3F00","summary":"master file"}],"error":null,"ok":true,"schema":"doctor-shell/1","tool":"sim-doctor"}
+{"command":"cd 3F00","cwd":"/card/3F00","data":{"cwd":"/card/3F00"},"error":null,"ok":true,"schema":"doctor-shell/1","tool":"sim-doctor"}
+{"command":"ls","cwd":"/card/3F00","data":[{"actions":0,"children":0,"kind":"EF","name":"2FE2","summary":"transparent EF, 10 bytes, EF.ICCID"},{"actions":0,"children":0,"kind":"DF","name":"7F20","summary":"directory"}],"error":null,"ok":true,"schema":"doctor-shell/1","tool":"sim-doctor"}
+{"command":"info 2FE2","cwd":"/card/3F00","data":{"actions":[],"children":0,"kind":"EF","meta":{"container":false,"contents":{"access":null,"ef":"EF.ICCID","path":"3F00/2FE2","read":"refused","status":"6D00"},"descriptor":{"state":"reported","value":{"data_coding":"21","file_type":"elementary","octets":"09 21","shareable":false,"structure":"transparent"}},"file_kind":"EF","kind":"elementary-file","life_cycle":{"state":"not-reported"},"name":{"state":"not-reported"},"path":"3F00/2FE2","reported_file_id":{"state":"reported","value":"2F E2"},"size":{"state":"reported","value":{"octets":10}},"state":"selected","unknown_tags":[]},"name":"2FE2","raw_hex":null,"summary":"transparent EF, 10 bytes, EF.ICCID"},"error":null,"ok":true,"schema":"doctor-shell/1","tool":"sim-doctor"}
+
+# findings (a TAR audit asked for): sim-doctor shell --tar focused -c ls; ls gsma; why 1
+exit 0
+--- stderr
+--- stdout
+gsma           category  1 findings
+card           card      the card's files
+1              finding   critical  gsma/msl-zero-allowed  tar:00000000
+gsma/msl-zero-allowed (critical): TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+fix: raise MSL and load the card's TAR allow-list, then re-scan; a card at MSL 0 accepts any command under any TAR with no cryptographic verification
+advice: none
+
+# no reader: exit 2
+--- stdout
+
+# explore without a terminal: exit 2
+--- stderr
+sim-doctor: explore needs a terminal; use `shell -c` for scripts
+

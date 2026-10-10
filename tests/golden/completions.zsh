@@ -48,10 +48,16 @@ _arguments "${_arguments_options[@]}" : \
 '--fail-on=[Exit 1 (3 under --baseline) when a finding is at or above this severity]:LEVEL:_default' \
 '--sarif=[Also write the findings to FILE as SARIF 2.1.0]:FILE:_files' \
 '--tar=[Which TARs to probe for MSL 0, and how many]:SELECTION:_default' \
+'(--json --tui)--face=[Print the findings with a doctor-kit face instead of the full report]:FACE:((plain\:"Minimalist text, one line per finding"
+rich\:"Boxed report with a score gauge, grouped by category"
+compact\:"One-line summary plus a findings table"))' \
+'(--json --tui)--theme=[The face'\''s colours\: mono, clinical or contrast (default\: the tool'\''s own)]:THEME:_default' \
+'(--json --tui)--color=[Colour the face\: auto (a terminal and no NO_COLOR), always or never]:COLOR:(auto always never)' \
 '--json[Emit one JSON envelope on stdout, and nothing else]' \
 '(--json)--tui[Show the findings in an interactive terminal view instead of the report]' \
 '--score[Add one quality score for this card, for CI gating]' \
 '--terminal-profile[Send a TERMINAL PROFILE to the card before the TAR audit]' \
+'(--json --tui --face)--headless[A face in plain text without colour, for CI and pipes]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0

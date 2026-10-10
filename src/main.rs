@@ -1289,6 +1289,74 @@ struct ScanArgs {
     /// is reported as data.tar.terminal_profile.
     #[arg(long)]
     terminal_profile: bool,
+
+    /// Print the findings with a doctor-kit face instead of the full report.
+    ///
+    /// rich (colour and a score bar), plain (text, for pipes) or compact. Without
+    /// --face, --theme, --color or --headless the report is the one described above, which
+    /// also lists the files and the TAR audit. --json and --tui have their own output.
+    #[arg(long, value_enum, conflicts_with_all = ["json", "tui"])]
+    face: Option<doctor_kit::Face>,
+
+    /// The face's colours: mono, clinical or contrast (default: the tool's own).
+    #[arg(long, value_name = "THEME", conflicts_with_all = ["json", "tui"])]
+    theme: Option<String>,
+
+    /// Colour the face: auto (a terminal and no NO_COLOR), always or never.
+    #[arg(long, value_enum, conflicts_with_all = ["json", "tui"])]
+    color: Option<doctor_kit::output::Color>,
+
+    /// A face in plain text without colour, for CI and pipes.
+    #[arg(long, conflicts_with_all = ["json", "tui", "face"])]
+    headless: bool,
+}
+
+// What `shell` and `explore` read from the card: a scan's reader, dialect and bounds.
+#[derive(Args)]
+struct CardArgs {
+    /// The reader to use, matched against the driver's own name.
+    ///
+    /// Defaults to the first reader PC/SC reports.
+    #[arg(long, value_name = "NAME")]
+    reader: Option<String>,
+
+    /// Which FCP tag table this card answers SELECT with (see `scan --help`).
+    #[arg(
+        long,
+        value_name = "TABLE",
+        default_value_t = scan::Dialect::Ts102221,
+        value_parser = parse_dialect
+    )]
+    dialect: scan::Dialect,
+
+    #[command(flatten)]
+    walk_limits: WalkLimitArgs,
+
+    /// Which TARs to probe for MSL 0 before the session opens (default: none; see `scan --help`).
+    #[arg(long, value_name = "SELECTION", default_value_t = tar::Selection::default())]
+    tar: tar::Selection,
+}
+
+// `shell`: a REPL over the card (its about line is set where the command is mounted).
+#[derive(Args)]
+struct ShellArgs {
+    #[command(flatten)]
+    card: CardArgs,
+
+    /// Run these `;`-separated commands and exit.
+    #[arg(short = 'c', value_name = "COMMANDS")]
+    command: Option<String>,
+
+    /// Print every reply as one JSON record (for agents).
+    #[arg(long)]
+    json: bool,
+}
+
+// `explore`: the full-screen version of `shell`.
+#[derive(Args)]
+struct ExploreArgs {
+    #[command(flatten)]
+    card: CardArgs,
 }
 
 /// Everything `sim-doctor rules` takes.

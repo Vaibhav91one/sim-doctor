@@ -51,9 +51,9 @@
 -> {"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"gp_status","arguments":{"trace":true}}}
 <- {"id":31,"jsonrpc":"2.0","result":{"content":[{"text":"unknown argument \"trace\"","type":"text"}],"isError":true}}
 -> {"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"scan","arguments":{"tar":"focused"}}}
-<- 180807 bytes, sha256 5c00fa5a98bf99f7780ee7389bc1df66c557c3247c0af839b7b59ab8c252ca29
+<- 180811 bytes, sha256 f20a91a12eb05b8e4e3b749239de9a621af107ddbfe76bef678ef12d141bf410
 -> {"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"scan","arguments":{"tar":"focused","severity":"high","score":true}}}
-<- 180815 bytes, sha256 dcaf1ddd05b779494c99be980828dcdf553a84c9c76e9c9bfd8a7b9595f6609b
+<- 180819 bytes, sha256 a5e26ceb735f6b7de6f0ef082975f96167b34dd9236bd369276d527565672d85
 -> {"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"scan","arguments":{"baseline":"/nonexistent/golden.json"}}}
 <- {"id":34,"jsonrpc":"2.0","result":{"content":[{"text":"sim-doctor: the baseline file could not be read: /nonexistent/golden.json: No such file or directory (os error 2)\n","type":"text"}],"isError":true}}
 -> {"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"scan","arguments":{"terminal-profile":true}}}

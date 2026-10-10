@@ -22,18 +22,20 @@ use doctor_kit::install::{plan, rendered, write, Agent, AgentFile, FileMode, Ove
 use doctor_kit::output::Color;
 use doctor_kit::{
     failure_envelope, finish, preflight, Check, Config, Ctx, Doctor, ExtCommand, Extensions, Face,
-    McpTexts, McpTool, Meta, OutputArgs, PreflightKind, ScanFailure, TargetKind,
+    McpTexts, McpTool, Meta, Node, OutputArgs, PreflightKind, ScanFailure, TargetKind,
 };
 use serde_json::{json, Value};
 use sim_doctor::baseline::{Baseline, Diff};
 use sim_doctor::transport::CardSession;
 use sim_doctor::walk::{Candidates, Limits, Tree};
-use sim_doctor::{access, ef, sarif, scan, session, tar, walk};
+use sim_doctor::{access, ef, rules, sarif, scan, session, tar, walk};
 
 use super::{
     checkpoint, contract, dispatch, emit_stdout, limits_from, open_scan_session, Cli, InstallArgs,
     ScanArgs, INTERRUPT_REPORTED,
 };
+#[cfg(feature = "shell")]
+use super::{CardArgs, ExploreArgs, ShellArgs};
 
 /// The skill body shared by every agent file.
 const SKILL_BODY: &str = include_str!("skill_body.md");
@@ -67,13 +69,78 @@ impl Outcome {
     }
 }
 
+/// What one card read is told: the `scan` flags, or the card part of `shell` and `explore`.
+struct Run {
+    reader: Option<String>,
+    dialect: scan::Dialect,
+    limits: Limits,
+    tar: tar::Selection,
+    terminal_profile: bool,
+    severity: Option<rules::Severity>,
+    score: bool,
+    fail_on: rules::Severity,
+    json: bool,
+    tui: bool,
+    baseline: Option<std::path::PathBuf>,
+    sarif: Option<std::path::PathBuf>,
+    /// A kit face was asked for (`--face`, `--theme`, `--color`, `--headless`): print it
+    /// instead of the full report.
+    faced: bool,
+}
+
+impl Run {
+    /// The card part of `shell` / `explore`: no TAR audit unless asked, nothing is compared or
+    /// written.
+    #[cfg(feature = "shell")]
+    fn session(card: &CardArgs) -> Run {
+        Run {
+            reader: card.reader.clone(),
+            dialect: card.dialect,
+            limits: limits_from(&card.walk_limits),
+            tar: card.tar.clone(),
+            terminal_profile: false,
+            severity: None,
+            score: false,
+            fail_on: rules::Severity::Critical,
+            json: false,
+            tui: false,
+            baseline: None,
+            sarif: None,
+            faced: false,
+        }
+    }
+
+    fn scan(args: &ScanArgs) -> Run {
+        Run {
+            reader: args.reader.clone(),
+            dialect: args.dialect,
+            limits: limits_from(&args.walk_limits),
+            tar: args.tar.clone(),
+            terminal_profile: args.terminal_profile,
+            severity: args.severity,
+            score: args.score,
+            fail_on: args.fail_on,
+            json: args.json,
+            tui: args.tui,
+            baseline: args.baseline.clone(),
+            sarif: args.sarif.clone(),
+            faced: args.face.is_some()
+                || args.theme.is_some()
+                || args.color.is_some()
+                || args.headless,
+        }
+    }
+}
+
 /// The doctor the kit's pipeline runs. It holds the parsed command line (the kit hands each
 /// mounted command only its own matches, and the handlers want the whole `Cli`) and what the
 /// `scan` command passes between the kit's hooks.
 pub struct SimDoctor {
     root: ArgMatches,
-    /// The `scan` command line, once `scan` runs.
-    args: OnceLock<ScanArgs>,
+    /// What the card read is told, once `scan` / `shell` / `explore` runs.
+    run: OnceLock<Run>,
+    /// The session's first read, handed to the kit's own (so `shell` opens on the card it checked).
+    first: Mutex<Option<Envelope>>,
     /// The baseline `--baseline` named, loaded by `load_baseline`.
     baseline: Mutex<Option<Baseline>>,
     outcome: Mutex<Option<Outcome>>,
@@ -85,7 +152,7 @@ pub struct SimDoctor {
 
 impl SimDoctor {
     fn json(&self) -> bool {
-        self.args.get().is_some_and(|a| a.json)
+        self.run.get().is_some_and(|r| r.json)
     }
 
     /// A `scan` that could not run: one sentence on stderr, and under `--json` the doctor/1
@@ -133,7 +200,7 @@ impl SimDoctor {
 
     /// The card read. Same steps, same checkpoints, same refusals as ever; the report is built
     /// here, the kit prints it.
-    fn scan_card(&self, args: &ScanArgs) -> Result<Envelope, ScanFailure> {
+    fn scan_card(&self, args: &Run) -> Result<Envelope, ScanFailure> {
         if checkpoint() {
             return Err(self.interrupted());
         }
@@ -152,7 +219,7 @@ impl SimDoctor {
             // Only 6A 82 is classified. Nothing else is, because this repository has
             // read no other table; see walk::StatusMeaning and CONTEXT.md section 3.
             meaning: walk::StatusMeaning::default(),
-            limits: limits_from(&args.walk_limits),
+            limits: args.limits,
             ..walk::Options::default()
         };
         let mut tree = walk::walk(session, &args.dialect.tag_set(), &options)
@@ -397,10 +464,61 @@ impl Doctor for SimDoctor {
         }
     }
 
+    /// The findings by category (the kit's tree) and the card's files under `card`: the master
+    /// file, then each directory's files as it is entered (`expand`).
+    fn tree(&self, env: &Envelope, ctx: &Ctx) -> Node {
+        let mut root = doctor_kit::session::default_tree(env, ctx);
+        root.meta.retain(|_, v| !v.is_null());
+        let text = |key: &str| clean(env.data[key].clone());
+        root.meta.insert("target".into(), text("reader"));
+        let mut card = Node::new("card", "card", "the card's files")
+            .meta("reader", text("reader"))
+            .meta("atr", text("atr"))
+            .meta("dialect", clean(env.data["dialect"]["id"].clone()))
+            .meta("complete", env.data["complete"].clone());
+        card.children = vec![];
+        root.children.push(card);
+        root
+    }
+
+    /// The files of one directory, read from the walk that is already in memory.
+    fn expand(&self, _: &Envelope, _: &Ctx, path: &[String], _: &Node) -> Option<Vec<Node>> {
+        let outcome = self.outcome.lock().unwrap();
+        let tree = &outcome.as_ref()?.tree;
+        let (first, rest) = path.split_first()?;
+        if first != "card" {
+            return None;
+        }
+        let entries = ef::entries(tree);
+        let ids: Vec<walk::NodeId> = if rest.is_empty() {
+            vec![tree.root()]
+        } else {
+            let at = rest.join("/");
+            let parent = tree.nodes().iter().find(|n| n.path().to_string() == at)?;
+            parent.children().to_vec()
+        };
+        let nodes: Vec<Node> = ids
+            .into_iter()
+            .filter_map(|id| tree.node(id))
+            .filter(|n| !matches!(n.state(), walk::NodeState::Absent))
+            .map(|n| file_node(tree, n, &entries))
+            .collect();
+        (!nodes.is_empty()).then_some(nodes)
+    }
+
+    /// An elementary file's decoded contents, when the walk read and recognised it.
+    fn decode(&self, node: &Node) -> Option<String> {
+        let contents = node.meta.get("contents")?;
+        serde_json::to_string_pretty(contents).ok()
+    }
+
     fn try_scan(&self, _: &Ctx) -> Result<Envelope, ScanFailure> {
-        match self.args.get() {
-            Some(args) => self.scan_card(args),
-            None => Err(ScanFailure::new("`scan` is the only command that scans")),
+        if let Some(env) = self.first.lock().unwrap().take() {
+            return Ok(env);
+        }
+        match self.run.get() {
+            Some(run) => self.scan_card(run),
+            None => Err(ScanFailure::new("this command does not read a card")),
         }
     }
 
@@ -423,12 +541,12 @@ impl Doctor for SimDoctor {
     /// `--sarif` and `--baseline` name one file. A baseline that cannot be read is reported first,
     /// as it always was.
     fn preflight_error(&self, kind: PreflightKind, msg: String) -> ScanFailure {
-        if let Some(path) = self.args.get().and_then(|a| a.baseline.as_deref()) {
+        if let Some(path) = self.run.get().and_then(|a| a.baseline.as_deref()) {
             if let Err(err) = Baseline::load(path) {
                 return self.refuse(&scan::Failure::new(err.kind(), err.to_string()));
             }
         }
-        let (tag, msg) = match (kind, self.args.get().and_then(|a| a.sarif.as_deref())) {
+        let (tag, msg) = match (kind, self.run.get().and_then(|a| a.sarif.as_deref())) {
             (PreflightKind::SarifIsBaseline, Some(sarif)) => (
                 "sarif-baseline-same-path",
                 format!(
@@ -485,12 +603,24 @@ impl Doctor for SimDoctor {
         self.put(text, what)
     }
 
-    /// The scan report of `scan::to_human`, or the terminal view under `--tui`.
-    fn render_human(&self, _: &Envelope, _: &Face, _: &doctor_kit::Theme) -> Option<String> {
+    /// The scan report of `scan::to_human`, the terminal view under `--tui`, or the kit's face
+    /// when one was asked for.
+    fn render_human(
+        &self,
+        env: &Envelope,
+        face: &Face,
+        theme: &doctor_kit::Theme,
+    ) -> Option<String> {
+        if self.run.get().is_some_and(|r| r.faced) {
+            return Some(self.put(
+                doctor_kit::face::render(*face, env, theme),
+                "the scan report",
+            ));
+        }
         let outcome = self.outcome.lock().unwrap();
         let outcome = outcome.as_ref()?;
         let context = outcome.context();
-        let tui = self.args.get().is_some_and(|a| a.tui)
+        let tui = self.run.get().is_some_and(|a| a.tui)
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
         if tui {
@@ -508,6 +638,63 @@ impl Doctor for SimDoctor {
     }
 }
 
+/// Strips what a card could use to move a terminal (control, escape, bidi, zero-width
+/// characters) from every string of `value`.
+fn clean(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(contract::sanitize(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(clean).collect()),
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, clean(v))).collect()),
+        other => other,
+    }
+}
+
+/// One walked file as a shell node: its identifier, what the card said about it, and for an
+/// elementary file the bytes the walk read (`cat`, `raw`) and what they decode to.
+fn file_node(tree: &Tree, file: &walk::Node, entries: &[ef::Entry]) -> Node {
+    let path = file.path();
+    let id = path.to_string();
+    let name = id.rsplit('/').next().unwrap_or(&id).to_owned();
+    let info = clean(scan::node_json(file));
+    let state = info["state"].as_str().unwrap_or_default().to_owned();
+    let kind = info["file_kind"].as_str().unwrap_or(&state).to_owned();
+    let octets = info.pointer("/size/value/octets").and_then(Value::as_u64);
+    let entry = entries.iter().find(|e| e.path == *path);
+    let mut summary = match kind.as_str() {
+        "MF" => "master file".to_owned(),
+        "DF" => "directory".to_owned(),
+        "EF" => format!(
+            "{} EF",
+            info["descriptor"]["value"]["structure"]
+                .as_str()
+                .unwrap_or("elementary")
+        ),
+        other => other.to_owned(),
+    };
+    if let Some(octets) = octets {
+        summary.push_str(&format!(", {octets} bytes"));
+    }
+    if let Some(entry) = entry {
+        summary.push_str(&format!(", {}", entry.ef.name()));
+    }
+    if let Some(status) = info["status"].as_str() {
+        summary.push_str(&format!(" ({status})"));
+    }
+    let mut node = Node::new(&name, &kind, summary).meta("path", id);
+    for (key, value) in info.as_object().into_iter().flatten() {
+        if key != "path" {
+            node = node.meta(key, value.clone());
+        }
+    }
+    if let Some(entry) = entry {
+        node = node.meta("contents", clean(entry.to_json()));
+    }
+    if let Some(walk::ContentRead::Records(records)) = tree.content_read(path) {
+        node = node.raw(records.concat());
+    }
+    node
+}
+
 /// `scan`, on the kit's pipeline.
 pub fn scan(d: &SimDoctor, args: ScanArgs) -> contract::ExitCode {
     // A flag's own shape is refused before a reader is opened, as clap would.
@@ -515,19 +702,20 @@ pub fn scan(d: &SimDoctor, args: ScanArgs) -> contract::ExitCode {
         eprintln!("sim-doctor: --terminal-profile is only meaningful with --tar other than off");
         return contract::ExitCode::Error;
     }
-    let args = d.args.get_or_init(|| args);
-    super::guard_exchange(scan::KIND, args.json);
-    let fail_on = Severity::parse(args.fail_on.id()).expect("the same five names");
+    let run = d.run.get_or_init(|| Run::scan(&args));
+    super::guard_exchange(scan::KIND, run.json);
+    let fail_on = Severity::parse(run.fail_on.id()).expect("the same five names");
+    // Without a face flag the report is sim-doctor's own (`render_human`); with one, the kit's.
     let o = OutputArgs {
-        json: args.json,
+        json: run.json,
         score: false,
-        headless: false,
-        face: Face::Plain,
-        theme: None,
+        headless: args.headless,
+        face: args.face.unwrap_or(Face::Rich),
+        theme: args.theme.clone(),
         theme_file: None,
-        color: Color::Never,
-        sarif: args.sarif.clone(),
-        baseline: args.baseline.clone(),
+        color: args.color.unwrap_or(Color::Auto),
+        sarif: run.sarif.clone(),
+        baseline: run.baseline.clone(),
         fail_on,
         theme_root: None,
     };
@@ -607,6 +795,51 @@ pub fn install(d: &SimDoctor, args: InstallArgs) -> contract::ExitCode {
     contract::ExitCode::Success
 }
 
+/// Reads the card once for `shell` and `explore`, so a missing reader or card is an error (exit 2
+/// and the sentence), not an empty session. The read is handed to the kit's own session.
+#[cfg(feature = "shell")]
+fn open_session(d: &SimDoctor, card: &CardArgs) -> Result<Ctx, u8> {
+    d.run.get_or_init(|| Run::session(card));
+    let ctx = Ctx::detached(Config::default(), Severity::Critical);
+    match d.try_scan(&ctx) {
+        Ok(env) => *d.first.lock().unwrap() = Some(env),
+        Err(failure) => return Err(doctor_kit::output::report_failure(d, &failure)),
+    }
+    // An interactive session ends on Ctrl-C and on `kill`: the flag handler `main` installed is
+    // for the scan's checkpoints, and nothing here polls it (as in `mcp`).
+    // SAFETY: SIG_DFL is a valid disposition for these signals; no handler pointer is involved.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
+    Ok(ctx)
+}
+
+#[cfg(feature = "shell")]
+fn shell(d: &SimDoctor, own: &ArgMatches) -> Result<u8, String> {
+    let args = ShellArgs::from_arg_matches(own).map_err(|e| e.to_string())?;
+    match open_session(d, &args.card) {
+        Ok(ctx) => doctor_kit::repl::run(d, ctx, args.command.as_deref(), args.json),
+        Err(code) => Ok(code),
+    }
+}
+
+#[cfg(feature = "shell")]
+fn explore(d: &SimDoctor, own: &ArgMatches) -> Result<u8, String> {
+    let args = ExploreArgs::from_arg_matches(own).map_err(|e| e.to_string())?;
+    // The kit's explorer cannot start without a terminal (it panics); say so before the card is read.
+    if !(std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout()))
+    {
+        eprintln!("sim-doctor: explore needs a terminal; use `shell -c` for scripts");
+        return Ok(2);
+    }
+    match open_session(d, &args.card) {
+        Ok(ctx) => doctor_kit::tui::run(d, ctx).map(|()| 0),
+        Err(code) => Ok(code),
+    }
+}
+
 /// The contract exit code a process code stands for.
 fn exit_code(code: u8) -> contract::ExitCode {
     contract::ExitCode::ALL
@@ -653,7 +886,8 @@ pub fn run() -> ExitCode {
         fail_on: Severity::Critical,
         target: TargetKind::Detached,
     };
-    let commands = cli
+    #[allow(unused_mut)]
+    let mut commands: Vec<ExtCommand<SimDoctor>> = cli
         .get_subcommands()
         .cloned()
         .enumerate()
@@ -663,6 +897,28 @@ pub fn run() -> ExitCode {
             run: run_cli,
         })
         .collect();
+    // After the commands above in `--help`, and replacing the kit's own `shell` / `explore`.
+    #[cfg(feature = "shell")]
+    {
+        use clap::Args;
+        let n = commands.len();
+        commands.push(ExtCommand {
+            command: ShellArgs::augment_args(
+                clap::Command::new("shell")
+                    .about("Interactive shell over the card: its findings and its files")
+                    .display_order(n),
+            ),
+            run: shell,
+        });
+        commands.push(ExtCommand {
+            command: ExploreArgs::augment_args(
+                clap::Command::new("explore")
+                    .about("Full-screen explorer over the card: its findings and its files")
+                    .display_order(n + 1),
+            ),
+            run: explore,
+        });
+    }
     let ext = Extensions {
         commands,
         global_args: vec![],
@@ -671,7 +927,8 @@ pub fn run() -> ExitCode {
     doctor_kit::run_with(meta, ext, |root| {
         Ok(SimDoctor {
             root: root.clone(),
-            args: OnceLock::new(),
+            run: OnceLock::new(),
+            first: Mutex::new(None),
             baseline: Mutex::new(None),
             outcome: Mutex::new(None),
             stdout: Mutex::new(None),
@@ -688,7 +945,8 @@ mod tests {
     fn doctor() -> SimDoctor {
         SimDoctor {
             root: Cli::command().get_matches_from(["sim-doctor", "modules"]),
-            args: OnceLock::new(),
+            run: OnceLock::new(),
+            first: Mutex::new(None),
             baseline: Mutex::new(None),
             outcome: Mutex::new(None),
             stdout: Mutex::new(None),
@@ -744,7 +1002,7 @@ mod tests {
         let Command::Scan(args) = Cli::from_arg_matches(&a).unwrap().command else {
             unreachable!()
         };
-        d.args.set(args).ok().unwrap();
+        d.run.set(Run::scan(&args)).ok().unwrap();
         let refusal = d.refuse(&f);
         assert_eq!(refusal.exit, 2);
         let env = refusal.envelope.unwrap();

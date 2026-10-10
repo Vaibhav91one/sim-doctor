@@ -54,10 +54,18 @@ complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l baseline 
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l fail-on -d 'Exit 1 (3 under --baseline) when a finding is at or above this severity' -r
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l sarif -d 'Also write the findings to FILE as SARIF 2.1.0' -r -F
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l tar -d 'Which TARs to probe for MSL 0, and how many' -r
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l face -d 'Print the findings with a doctor-kit face instead of the full report' -r -f -a "plain\t'Minimalist text, one line per finding'
+rich\t'Boxed report with a score gauge, grouped by category'
+compact\t'One-line summary plus a findings table'"
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l theme -d 'The face\'s colours: mono, clinical or contrast (default: the tool\'s own)' -r
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l color -d 'Colour the face: auto (a terminal and no NO_COLOR), always or never' -r -f -a "auto\t''
+always\t''
+never\t''"
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l json -d 'Emit one JSON envelope on stdout, and nothing else'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l tui -d 'Show the findings in an interactive terminal view instead of the report'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l score -d 'Add one quality score for this card, for CI gating'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l terminal-profile -d 'Send a TERMINAL PROFILE to the card before the TAR audit'
+complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -l headless -d 'A face in plain text without colour, for CI and pipes'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand scan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand ts48; and not __fish_seen_subcommand_from compare help" -s h -l help -d 'Print help'
 complete -c sim-doctor -n "__fish_sim_doctor_using_subcommand ts48; and not __fish_seen_subcommand_from compare help" -f -a "compare" -d 'Walk the card and diff its file system against the GSMA TS.48 test profile'

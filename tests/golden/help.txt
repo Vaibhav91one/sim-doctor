@@ -21,6 +21,8 @@ Commands:
   trace        Decode a captured APDU trace offline (no card, no reader)
   fuzz         APDU discovery and the OTA/SMS fuzz sweep
   euicc        eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes
+  shell        The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
+  explore      The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -57,6 +59,10 @@ Options:
       --sarif <FILE>         Also write the findings to FILE as SARIF 2.1.0
       --tar <SELECTION>      Which TARs to probe for MSL 0, and how many [default: off]
       --terminal-profile     Send a TERMINAL PROFILE to the card before the TAR audit
+      --face <FACE>          Print the findings with a doctor-kit face instead of the full report [possible values: plain, rich, compact]
+      --theme <THEME>        The face's colours: mono, clinical or contrast (default: the tool's own)
+      --color <COLOR>        Colour the face: auto (a terminal and no NO_COLOR), always or never [possible values: auto, always, never]
+      --headless             A face in plain text without colour, for CI and pipes
   -h, --help                 Print help (see more with '--help')
 
 $ sim-doctor ts48 -h [exit 0]
@@ -653,4 +659,36 @@ Options:
       --aid <HEX>            ISD-R AID as hex (default A0000005591010FFFFFFFF8900000100)
       --max-segment <BYTES>  Most data bytes in one STORE DATA block, 1 to 255 (default 120, as lpac; 255 is the short-APDU Lc limit). Some eUICCs reject full 255-byte blocks [default: 120]
   -h, --help                 Print help
+
+$ sim-doctor shell -h [exit 0]
+The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
+
+Usage: sim-doctor shell [OPTIONS]
+
+Options:
+      --reader <NAME>        The reader to use, matched against the driver's own name
+      --dialect <TABLE>      Which FCP tag table this card answers SELECT with (see `scan --help`) [default: ts-102-221]
+      --max-depth <N>        Deepest path below the master file the walk descends into
+      --max-children <N>     Identifiers probed per directory
+      --max-nodes <N>        Files the card selected across the whole walk (default 16384)
+      --max-directories <N>  Directories whose children are enumerated
+      --tar <SELECTION>      Which TARs to probe for MSL 0 before the session opens (default: none; see `scan --help`) [default: off]
+  -c <COMMANDS>              Run these `;`-separated commands and exit
+      --json                 Print every reply as one JSON record (for agents)
+  -h, --help                 Print help (see more with '--help')
+
+$ sim-doctor explore -h [exit 0]
+The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
+
+Usage: sim-doctor explore [OPTIONS]
+
+Options:
+      --reader <NAME>        The reader to use, matched against the driver's own name
+      --dialect <TABLE>      Which FCP tag table this card answers SELECT with (see `scan --help`) [default: ts-102-221]
+      --max-depth <N>        Deepest path below the master file the walk descends into
+      --max-children <N>     Identifiers probed per directory
+      --max-nodes <N>        Files the card selected across the whole walk (default 16384)
+      --max-directories <N>  Directories whose children are enumerated
+      --tar <SELECTION>      Which TARs to probe for MSL 0 before the session opens (default: none; see `scan --help`) [default: off]
+  -h, --help                 Print help (see more with '--help')
 

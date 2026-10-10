@@ -1,6 +1,6 @@
 {
   "name": "sim-doctor",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "CLI-first SIM/UICC security testing tool. Runs the prebuilt sim-doctor binary matching this version.",
   "license": "MIT",
   "repository": {

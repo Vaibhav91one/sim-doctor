@@ -1,0 +1,84 @@
+# --face plain: sim-doctor scan --tar focused --face plain
+exit 1
+--- stderr
+--- stdout
+sim-doctor <VERSION>  score 50/100 critical
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+1 critical
+
+# --face compact: sim-doctor scan --tar focused --face compact
+exit 1
+--- stderr
+--- stdout
+sim-doctor <VERSION> | 50/100 critical | 1 findings: 1 critical
+SEV       RULE                   LOCATION      MESSAGE
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D…
+
+# --face rich --color never: sim-doctor scan --tar focused --face rich --color never
+exit 1
+--- stderr
+--- stdout
+╭─ sim-doctor <VERSION> ───────────────────────────────────────────────────────────╮
+│ Score  ███████████████░░░░░░░░░░░░░░░  50/100  critical                      │
+│ 1 critical                                                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ gsma (1)                                                                     │
+│ ● critical gsma/msl-zero-allowed  tar:00000000                               │
+│     TAR 000000 was accepted: the card answered this TAR with 6D00, which is… │
+│     → raise MSL and load the card's TAR allow-list, then re-scan; a card at… │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+# --headless: sim-doctor scan --tar focused --headless
+exit 1
+--- stderr
+--- stdout
+sim-doctor <VERSION>  score 50/100 critical
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+1 critical
+
+# --theme mono (a face, plain colours): sim-doctor scan --tar focused --theme mono --color never
+exit 1
+--- stderr
+--- stdout
+╭─ sim-doctor <VERSION> ───────────────────────────────────────────────────────────╮
+│ Score  ███████████████░░░░░░░░░░░░░░░  50/100  critical                      │
+│ 1 critical                                                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ gsma (1)                                                                     │
+│ ● critical gsma/msl-zero-allowed  tar:00000000                               │
+│     TAR 000000 was accepted: the card answered this TAR with 6D00, which is… │
+│     → raise MSL and load the card's TAR allow-list, then re-scan; a card at… │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+# --face plain on a clean card: sim-doctor scan --tar focused --face plain
+exit 0
+--- stderr
+--- stdout
+sim-doctor <VERSION>  score 100/100 incomplete
+no findings
+
+# --face plain under a baseline (exit 3): sim-doctor scan --tar focused --face plain --baseline <TMP>/clean.json
+exit 3
+--- stderr
+sim-doctor: compared against the baseline: 1 new, 0 fixed, 0 persisting
+--- stdout
+sim-doctor <VERSION>  score 50/100 critical
+critical  gsma/msl-zero-allowed  tar:00000000  TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification
+1 critical
+
+# an unknown --theme: sim-doctor scan --tar focused --face plain --theme bogus
+exit 2
+--- stderr
+error: unknown theme `bogus` (mono|clinical|contrast)
+--- stdout
+
+# --face with --json is a usage error: sim-doctor scan --tar focused --face plain --json
+exit 2
+--- stderr
+error: the argument '--face <FACE>' cannot be used with '--json'
+
+Usage: sim-doctor scan --tar <SELECTION> --face <FACE>
+
+For more information, try '--help'.
+--- stdout
+
