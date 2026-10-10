@@ -399,3 +399,43 @@ fn unblock_chv_sends_the_puk_once_and_masks_it() {
         assert!(!all.contains(secret), "{secret} leaked:\n{all}");
     }
 }
+
+#[test]
+fn run_gsm_algorithm_reports_sres_and_kc_and_whether_the_card_repeats_itself() {
+    let rand = "000102030405060708090a0b0c0d0e0f";
+    let out = card(
+        "cardsh_gsm.jsonl",
+        &[
+            "--json",
+            "--yes",
+            "-c",
+            &format!("run_gsm_algorithm --rand {rand} --repeat 2"),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[0]["data"]["sres"], "04040404");
+    assert_eq!(r[0]["data"]["deterministic"], true);
+    assert_eq!(r[0]["data"]["rand"], rand.to_uppercase());
+
+    // Without --yes: a dry run (an empty log would fail any exchange).
+    let empty = std::env::temp_dir().join("cardsh-gsm-empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "card",
+            "--json",
+            "-c",
+            &format!("run_gsm_algorithm --rand {rand}"),
+        ])
+        .env("SIM_DOCTOR_TEST_REPLAY", &empty)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(lines(&out)[0]["data"]["sent"], false);
+}

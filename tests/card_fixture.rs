@@ -2180,4 +2180,39 @@ fn card_shell_drives_a_real_card() {
         "{text}"
     );
     println!("card shell: unblock_chv was a dry run and masked both values");
+
+    // run_gsm_algorithm: a dry run first, then --yes against the software card. What a card answers to a GSM
+    // authentication differs (swSIM may refuse the context), so the answer is reported and its SHAPE checked.
+    let (code, records) = run("run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f");
+    assert_eq!(code, Some(0), "{records:?}");
+    assert_eq!(records[0]["data"]["sent"], false);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "card",
+            "--json",
+            "--yes",
+            "--reader",
+            reader.as_str(),
+            "-c",
+            "run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f --repeat 2",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    let record: serde_json::Value = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str(l).ok())
+        .expect("one record");
+    if record["ok"] == true {
+        assert_eq!(record["data"]["sres"].as_str().map(str::len), Some(8));
+        assert_eq!(record["data"]["kc"].as_str().map(str::len), Some(16));
+        println!(
+            "card shell: run_gsm_algorithm answered, deterministic={}",
+            record["data"]["deterministic"]
+        );
+    } else {
+        assert!(record["error"].is_string(), "{record}");
+        println!("card shell: run_gsm_algorithm refused: {}", record["error"]);
+    }
 }
