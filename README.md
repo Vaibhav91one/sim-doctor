@@ -22,14 +22,14 @@ clean result.**
 
 ```text
 # from CI swSIM job, run https://github.com/doctor-labs/sim-doctor/actions/runs/38048133006/job/114201696687
-[36;1mgrep -q 'scan: using reader' "$log"[0m
-[36;1mgrep -q 'scan: walked .* nodes, .* selected, .* absent' "$log"[0m
-[36;1mgrep -q 'severity/score: --score emitted value .* penalty .* rules_run' "$log"[0m
-[36;1mgrep -q 'security-rules: filesystem/config-ef-updatable-always expected' "$log"[0m
-[36;1mgrep -q 'security-rules: identity/readable-without-pin expected' "$log"[0m
+scan: using reader swICC PC/SC IFD Driver v1.2.0 00 00
+scan: walked 42210 nodes, 251 selected, 41959 absent, 0 forbidden, bounds hit [Depth]
+severity/score: --score emitted value 0 penalty 1224 over 62 finding(s) with rules_run 10
+security-rules: filesystem/config-ef-updatable-always expected 12 finding(s), reported 12
+security-rules: identity/readable-without-pin expected 4 finding(s), reported 4
 security-rules: filesystem/ef-updatable-always reported 1 finding(s)
-[36;1mgrep -q 'security-rules: privacy/suci-not-provisioned expected' "$log"[0m
-[36;1mgrep -q 'security-rules: privacy/suci-null-scheme expected' "$log"[0m
+security-rules: privacy/suci-not-provisioned expected 0 finding(s), reported 0
+security-rules: privacy/suci-null-scheme expected 0 finding(s), reported 0
 ```
 
 These are the log lines of the CI swSIM job (the software SIM, see [docs/swsim-fixture.md](docs/swsim-fixture.md)), verbatim apart from the timestamp; the job does not print the tool's human report. Findings need a card or this software SIM, see [Get started](#get-started).
