@@ -21,13 +21,18 @@ SUCI privacy, and not yet crypto or eUICC weaknesses: see [Status](#status) befo
 clean result.**
 
 ```text
-$ sim-doctor scan
-sim-doctor: no PC/SC reader is attached. Start pcscd and attach a card, or see docs/swsim-fixture.md for the software SIM this project tests against
-$ echo $?
-2
+# from CI swSIM job, run https://github.com/doctor-labs/sim-doctor/actions/runs/38048133006/job/114201696687
+[36;1mgrep -q 'scan: using reader' "$log"[0m
+[36;1mgrep -q 'scan: walked .* nodes, .* selected, .* absent' "$log"[0m
+[36;1mgrep -q 'severity/score: --score emitted value .* penalty .* rules_run' "$log"[0m
+[36;1mgrep -q 'security-rules: filesystem/config-ef-updatable-always expected' "$log"[0m
+[36;1mgrep -q 'security-rules: identity/readable-without-pin expected' "$log"[0m
+security-rules: filesystem/ef-updatable-always reported 1 finding(s)
+[36;1mgrep -q 'security-rules: privacy/suci-not-provisioned expected' "$log"[0m
+[36;1mgrep -q 'security-rules: privacy/suci-null-scheme expected' "$log"[0m
 ```
 
-(That is the real output with no reader attached; findings need a card, see [Get started](#get-started).)
+These are the log lines of the CI swSIM job (the software SIM, see [docs/swsim-fixture.md](docs/swsim-fixture.md)), verbatim apart from the timestamp; the job does not print the tool's human report. Findings need a card or this software SIM, see [Get started](#get-started).
 
 
 ## Install
