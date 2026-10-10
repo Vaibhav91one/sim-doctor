@@ -31,6 +31,7 @@
 //! layer 1  es9         ES9+: the JSON-over-HTTPS messages to an SM-DP+, behind a transport trait
 //! layer 1  es9_https   the verified HTTPS (and lpac stdio) ES9+ transport; the only socket in the crate
 //! layer 1  backend     SIM_DOCTOR_HTTP / SIM_DOCTOR_CA_BUNDLE selection, after lpac
+//! layer 1  notif      dumped eUICC notifications read back from a file and replayed over ES9+ HandleNotification (dry run unless told to send)
 //! layer 1  tar         TAR scanning: the value space, the bounded ENVELOPE
 //!                probe, and the baseline a TAR is judged against
 //! layer 1  walk        the DF-tree walk: probe, descend, bound, report
@@ -124,6 +125,7 @@ pub mod fs;
 pub mod fuzz;
 pub mod gp;
 pub mod mcp;
+pub mod notif;
 pub mod rules;
 pub mod sarif;
 pub mod scan;
