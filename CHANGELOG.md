@@ -27,6 +27,8 @@ All notable changes to this project are documented here. The format follows
 - `card`: `verify_chv [--pin-nr N | --universal | --adm-nr N | --key-ref HEX]` and the PIN source `--chv-file` / `--chv-env` (#188).
   PIN1, PIN2, universal PIN and ADM keys; the value comes from the source (optionally per ICCID), never an argument or output.
   Dry run unless `--yes`; the tries are asked first (free), the last try needs `--allow-last-attempt`, one attempt per command.
+- `card`: `unblock_chv [--pin-nr N | --universal]` (#189): UNBLOCK PIN with the PUK and the new PIN from the PIN source, same safety
+  pattern as `verify_chv` (dry run unless `--yes`, values masked, last PUK try needs `--allow-last-attempt`, one attempt).
 
 ## [0.4.0]
 

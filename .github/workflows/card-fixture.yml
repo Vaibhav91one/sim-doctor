@@ -391,6 +391,7 @@ jobs:
           grep -q 'card shell: read_binary 10 octets' "$log"
           grep -q 'card shell: decoded EF.ICCID of' "$log"
           grep -q 'card shell: verify_chv was a dry run' "$log"
+          grep -q 'card shell: unblock_chv was a dry run' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job

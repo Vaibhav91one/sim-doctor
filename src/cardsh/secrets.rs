@@ -13,7 +13,7 @@
 //! ```
 //!
 //! A value is 4 to 8 ASCII digits (padded with `FF` to 8 octets as the card expects) or `hex:` and
-//! exactly 8 octets. Names: `pinN` (1-8), `pukN`, `admN` (1-5), `universal`, `upuk`, `new-pinN` (the
+//! exactly 8 octets. Names: `pinN` (1-8), `pukN`, `admN` (1-5), `universal`, `upuk`, `new-pinN` and `new-universal` (the
 //! PIN `unblock_chv` sets), `key-XX` (a raw key reference). `#` starts a comment.
 
 use std::fmt;
@@ -161,7 +161,7 @@ fn known(name: &str) -> bool {
         || n("puk", 1, 8)
         || n("adm", 1, 5)
         || n("new-pin", 1, 8)
-        || matches!(name, "universal" | "upuk")
+        || matches!(name, "universal" | "upuk" | "new-universal")
         || name
             .strip_prefix("key-")
             .is_some_and(|h| h.len() == 2 && h.bytes().all(|b| b.is_ascii_hexdigit()))

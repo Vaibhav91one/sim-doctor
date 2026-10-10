@@ -554,6 +554,11 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         true,
         "verify_chv; verify_chv --pin-nr 2; verify_chv --pin-nr 2",
     ),
+    (
+        "cardsh_unblock.jsonl",
+        true,
+        "unblock_chv; verify_chv",
+    ),
 ];
 
 fn fixture_path(name: &str) -> std::path::PathBuf {

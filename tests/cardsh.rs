@@ -364,3 +364,38 @@ fn a_bad_pin_source_is_exit_two_before_any_reader_is_opened() {
         "the value is not quoted"
     );
 }
+
+#[test]
+fn unblock_chv_sends_the_puk_once_and_masks_it() {
+    let secrets = "pin1=1234; pin2=0000; puk1=12345678; new-pin1=4321";
+    let out = card_chv(
+        "cardsh_unblock.jsonl",
+        secrets,
+        &[
+            "--json",
+            "--yes",
+            "--chv-env",
+            "SIMDOC_TEST_CHV",
+            "-c",
+            "unblock_chv; verify_chv",
+        ],
+    );
+    // The PUK works and sets PIN1 to 4321, so verifying with the old 1234 fails: exit 1, one failure.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[0]["data"]["unblocked"], true);
+    assert_eq!(r[1]["ok"], false);
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for secret in ["12345678", "4321", "3132333435363738", "34333231"] {
+        assert!(!all.contains(secret), "{secret} leaked:\n{all}");
+    }
+}
