@@ -1,20 +1,18 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img src="docs/assets/logo-light.svg" alt="sim-doctor" width="360">
-  </picture>
-</p>
+<p align="center"><img src="docs/assets/hero.svg" alt="sim-doctor illustration" width="100%"></p>
 
-<p align="center">
+<h1><img src="docs/assets/logo.svg" width="36" height="36" alt="" align="absmiddle"> sim-doctor</h1>
+
+<p>
   <a href="https://github.com/doctor-labs/sim-doctor/actions/workflows/ci.yml"><img src="https://github.com/doctor-labs/sim-doctor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://www.npmjs.com/package/sim-doctor"><img src="https://img.shields.io/npm/v/sim-doctor?style=flat&color=000000&labelColor=000000&label=npm" alt="npm"></a>
-  <a href="https://crates.io/crates/sim-doctor"><img src="https://img.shields.io/crates/v/sim-doctor?style=flat&color=000000&labelColor=000000&label=crates.io" alt="crates.io"></a>
-  <img src="https://img.shields.io/badge/Rust-1.82%2B-000000?style=flat&color=000000&labelColor=000000" alt="Rust 1.82+">
-  <img src="https://img.shields.io/badge/license-MIT-000000?style=flat&color=000000&labelColor=000000" alt="license MIT">
-  <img src="https://img.shields.io/badge/telemetry-none-000000?style=flat&color=000000&labelColor=000000" alt="telemetry none">
+  <a href="https://www.npmjs.com/package/sim-doctor"><img src="https://img.shields.io/npm/v/sim-doctor?label=npm" alt="npm"></a>
+  <a href="https://crates.io/crates/sim-doctor"><img src="https://img.shields.io/crates/v/sim-doctor?label=crates.io" alt="crates.io"></a>
+  <img src="https://img.shields.io/badge/Rust-1.82%2B-8aa0ad" alt="Rust 1.82+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8aa0ad" alt="license MIT"></a>
+  <img src="https://img.shields.io/badge/contract-doctor%2F1-19c3ab" alt="contract doctor/1">
+  <img src="https://img.shields.io/badge/telemetry-none-2fd27a" alt="telemetry none">
 </p>
 
-CLI-first SIM/UICC/eUICC security testing tool.
+**CLI-first SIM / UICC / eUICC security doctor: what does this card expose?**
 
 `sim-doctor` examines a card over PC/SC and reports what it found through both a
 terminal table and one stable JSON envelope with a meaningful exit code, so the same
@@ -22,16 +20,55 @@ binary serves an operator and an automated agent. **Its rules cover access condi
 SUCI privacy, and not yet crypto or eUICC weaknesses: see [Status](#status) before you trust a
 clean result.**
 
-```sh
-npx sim-doctor scan --json
-sim-doctor scan --json --score --tar focused
-sim-doctor install
+```text
+# from CI swSIM job, run https://github.com/doctor-labs/sim-doctor/actions/runs/38048133006/job/114201696687
+scan: using reader swICC PC/SC IFD Driver v1.2.0 00 00
+scan: walked 42210 nodes, 251 selected, 41959 absent, 0 forbidden, bounds hit [Depth]
+severity/score: --score emitted value 0 penalty 1224 over 62 finding(s) with rules_run 10
+security-rules: filesystem/config-ef-updatable-always expected 12 finding(s), reported 12
+security-rules: identity/readable-without-pin expected 4 finding(s), reported 4
+security-rules: filesystem/ef-updatable-always reported 1 finding(s)
+security-rules: privacy/suci-not-provisioned expected 0 finding(s), reported 0
+security-rules: privacy/suci-null-scheme expected 0 finding(s), reported 0
 ```
+
+These are the log lines of the CI swSIM job (the software SIM, see [docs/swsim-fixture.md](docs/swsim-fixture.md)), verbatim apart from the timestamp; the job does not print the tool's human report. Findings need a card or this software SIM, see [Get started](#get-started).
+
+
+## Install
+
+| Way | Command |
+| --- | --- |
+| npx | `npx sim-doctor <args>` downloads the matching release binary once into `~/.cache/sim-doctor` and checks its SHA-256 |
+| cargo | `cargo install sim-doctor` |
+| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/doctor-labs/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
+
+The npm package, the crate and the binaries are all published by the tagged-release workflow.
+From a checkout, `cargo build --release` builds the same binary.
+
+Linux needs `libpcsclite` (build: `libpcsclite-dev`, run: `pcscd`). macOS uses the
+built-in PCSC framework.
+
+Raspberry Pi 4/5 (Debian 13 trixie, aarch64): `sudo apt install pcscd libccid`, then download the
+`aarch64-unknown-linux-gnu` binary or run `npx sim-doctor`. The Linux binaries are built on Ubuntu 24.04,
+so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, build from source there).
+
+## Use
+
+| Command | What it does |
+| --- | --- |
+| `sim-doctor scan` | walk the card and report; `--json` for the doctor/1 envelope, `--sarif FILE` for SARIF, `--tui` for the terminal view, `--baseline FILE` to gate on new findings |
+| `sim-doctor mcp` | serve the scan and rules to agents over stdio ([MCP server](#mcp-server)) |
+| `sim-doctor fix <rule-id> --from FILE` | print (or launch an agent with) a prompt for one finding |
+| `sim-doctor install` | write the agent skill and rules into a project |
+
+The rest (`ts48`, `gp`, `euicc`, `trace`, `rules`, `why`) is in the [CLI reference](#cli-reference).
 
 ## Contents
 
 - [Get started](#get-started)
 - [Install](#install)
+- [Use](#use)
 - [CLI reference](#cli-reference)
 - [Machine output and exit codes](#machine-output-doctor1)
 - [GitHub Action](#github-action)
@@ -122,24 +159,6 @@ It is a view over the data `--json` carries and never shows anything the envelop
 with `--json` (usage error, exit 2). When stdin or stdout is not a terminal it prints the normal report and
 writes `sim-doctor: --tui needs a terminal; showing the plain report` to stderr. The rendering is unit-tested
 against an in-memory backend; the interactive loop is **not** tested against a real terminal in CI.
-
-## Install
-
-| Way | Command |
-| --- | --- |
-| npx | `npx sim-doctor <args>` downloads the matching release binary once into `~/.cache/sim-doctor` and checks its SHA-256 |
-| cargo | `cargo install sim-doctor` |
-| Prebuilt binary | download `sim-doctor-<target>.tar.gz` (and its `.sha256`) from [Releases](https://github.com/doctor-labs/sim-doctor/releases): `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
-
-The npm package, the crate and the binaries are all published by the tagged-release workflow.
-From a checkout, `cargo build --release` builds the same binary.
-
-Linux needs `libpcsclite` (build: `libpcsclite-dev`, run: `pcscd`). macOS uses the
-built-in PCSC framework.
-
-Raspberry Pi 4/5 (Debian 13 trixie, aarch64): `sudo apt install pcscd libccid`, then download the
-`aarch64-unknown-linux-gnu` binary or run `npx sim-doctor`. The Linux binaries are built on Ubuntu 24.04,
-so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, build from source there).
 
 ## CLI reference
 
@@ -668,3 +687,5 @@ AT/QMI/MBIM/curl/WinHTTP backends are not supported.
 ## License
 
 [MIT](LICENSE)
+
+Part of [doctor·labs](https://github.com/doctor-labs) — offline security doctors.
