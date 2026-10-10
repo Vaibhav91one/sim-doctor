@@ -6,8 +6,10 @@
 //!
 //! **Does not own.** Any algorithm: the crypto is the `milenage` crate's. Does
 //! not talk to a card either. Milenage is the USIM AUTHENTICATE (INS 88)
-//! algorithm and that command is forbidden on a live card, so this module is
-//! exercised by known-answer vectors only.
+//! algorithm; `scan`, `fuzz` and `trace` never send it. The card shell's
+//! `authenticate` does, on request (`--yes`), and uses [`autn`] and
+//! [`open_auts`] to build the challenge and read a resynchronisation answer.
+//! The functions are tested by known-answer vectors.
 //!
 //! Note for readers of issue #22: GlobalPlatform SCP03 does not use Milenage
 //! (it is AES-CMAC based, see [`crate::scp03`]). The two are separate here.
@@ -82,6 +84,36 @@ pub fn compute(
     }
 }
 
+/// The network authentication token a USIM expects: `AUTN = (SQN xor AK) || AMF || MAC-A`
+/// (3GPP TS 33.102 clause 6.3.2).
+pub fn autn(out: &Output, sqn: &[u8; 6], amf: &[u8; 2]) -> [u8; 16] {
+    let mut autn = [0u8; 16];
+    for i in 0..6 {
+        autn[i] = sqn[i] ^ out.ak[i];
+    }
+    autn[6..8].copy_from_slice(amf);
+    autn[8..].copy_from_slice(&out.mac_a);
+    autn
+}
+
+/// Opens the `AUTS` of a synchronisation failure (`AUTS = (SQNms xor AK*) || MAC-S`, TS 33.102 clause
+/// 6.3.3; MAC-S is f1* with AMF `0000`). Returns the card's `SQNms` and whether MAC-S checks out, i.e.
+/// whether the token really came from the card that holds these keys.
+pub fn open_auts(
+    k: [u8; 16],
+    operator: Operator,
+    rand: &[u8; 16],
+    auts: &[u8; 14],
+) -> ([u8; 6], bool) {
+    let first = compute(k, operator, rand, &[0; 6], &[0; 2]);
+    let mut sqn_ms = [0u8; 6];
+    for i in 0..6 {
+        sqn_ms[i] = auts[i] ^ first.ak_star[i];
+    }
+    let check = compute(k, operator, rand, &sqn_ms, &[0; 2]);
+    (sqn_ms, check.mac_s == auts[6..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +142,30 @@ mod tests {
         assert_eq!(o.ik, h::<16>("f769bcd751044604127672711c6d3441"));
         assert_eq!(o.ak, h::<6>("aa689c648370"));
         assert_eq!(o.ak_star, h::<6>("451e8beca43b"));
+    }
+
+    #[test]
+    fn autn_is_sqn_xor_ak_amf_mac_a() {
+        // TS 35.208 test set 1: SQN ff9bb4d0b607 xor AK aa689c648370 = 55f328b43577.
+        let o = compute(h(K), Operator::Op(h(OP)), &h(RAND), &h(SQN), &h(AMF));
+        assert_eq!(
+            autn(&o, &h(SQN), &h(AMF)),
+            h::<16>("55f328b43577b9b94a9ffac354dfafb3")
+        );
+    }
+
+    #[test]
+    fn auts_round_trips_and_a_foreign_one_fails_its_mac() {
+        let op = Operator::Op(h(OP));
+        let o = compute(h(K), op, &h(RAND), &h(SQN), &[0, 0]);
+        let mut auts = [0u8; 14];
+        for (a, (s, k)) in auts.iter_mut().zip(h::<6>(SQN).iter().zip(o.ak_star)) {
+            *a = s ^ k;
+        }
+        auts[6..].copy_from_slice(&o.mac_s);
+        assert_eq!(open_auts(h(K), op, &h(RAND), &auts), (h(SQN), true));
+        auts[13] ^= 1;
+        assert!(!open_auts(h(K), op, &h(RAND), &auts).1);
     }
 
     #[test]

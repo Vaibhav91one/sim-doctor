@@ -439,3 +439,42 @@ fn run_gsm_algorithm_reports_sres_and_kc_and_whether_the_card_repeats_itself() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(lines(&out)[0]["data"]["sent"], false);
 }
+
+#[test]
+fn authenticate_distinguishes_success_sync_failure_and_mac_failure_through_the_binary() {
+    let secrets =
+        "ki=hex:465b5ce8b199b49faa5f0a2ee238a6bc; opc=hex:cd63cb71954a9f4e48a5994e37a02baf";
+    let rand = "23553cbe9637a89d218ae64dae47bf35";
+    let script = format!(
+        "authenticate --rand {rand} --sqn 200; authenticate --rand {rand} --sqn 50 --resync; \
+         authenticate --rand {rand} --autn 00112233445566778899aabbccddeeff"
+    );
+    let out = card_chv(
+        "cardsh_auth.jsonl",
+        secrets,
+        &[
+            "--json",
+            "--yes",
+            "--chv-env",
+            "SIMDOC_TEST_CHV",
+            "-c",
+            &script,
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[0]["data"]["outcome"], "success");
+    assert_eq!(r[0]["data"]["matches_expected"], true);
+    assert_eq!(r[1]["data"]["outcome"], "synchronisation-failure");
+    assert_eq!(r[1]["data"]["sqn_ms"], 200);
+    assert_eq!(r[1]["data"]["resync"]["outcome"], "success");
+    assert_eq!(r[2]["data"]["outcome"], "mac-failure");
+    // The keys never reach the output.
+    let all = String::from_utf8_lossy(&out.stdout);
+    assert!(!all.contains("465b5ce8") && !all.to_lowercase().contains("cd63cb71"));
+}

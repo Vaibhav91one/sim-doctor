@@ -31,6 +31,9 @@ All notable changes to this project are documented here. The format follows
   pattern as `verify_chv` (dry run unless `--yes`, values masked, last PUK try needs `--allow-last-attempt`, one attempt).
 - `card`: `run_gsm_algorithm [--rand HEX] [--repeat N]` (#190): the GSM authentication probe, SRES and Kc, USIM GSM context or
   RUN GSM ALGORITHM (`--profile sim`), determinism check with `--repeat`; a dry run unless `--yes`.
+- `card`: `authenticate [--rand] [--autn | --sqn N [--amf]] [--resync]` (#191): the UMTS AUTHENTICATE probe in the 3G context.
+  Success (RES, CK, IK checked against the host's Milenage when `ki`/`opc` are given), synchronisation failure (AUTS opened:
+  SQNms, MAC-S) and MAC failure are told apart; `--resync` sends once more with SQNms + 1. `aka` gains `autn` and `open_auts`.
 
 ## [0.4.0]
 

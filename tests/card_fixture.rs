@@ -2215,4 +2215,28 @@ fn card_shell_drives_a_real_card() {
         assert!(record["error"].is_string(), "{record}");
         println!("card shell: run_gsm_algorithm refused: {}", record["error"]);
     }
+
+    // authenticate: a token the card cannot verify. A card that checks AUTN answers a MAC failure; one that does
+    // not may answer anything. Either way the shell must report a clean outcome or a clean error.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args(["card", "--json", "--yes", "--reader", reader.as_str(), "-c", "authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --autn 00112233445566778899aabbccddeeff"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    let record: serde_json::Value = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str(l).ok())
+        .expect("one record");
+    if record["ok"] == true {
+        let outcome = record["data"]["outcome"].as_str().expect("an outcome");
+        assert!(
+            ["success", "synchronisation-failure", "mac-failure"].contains(&outcome),
+            "{record}"
+        );
+        println!("card shell: authenticate outcome {outcome}");
+    } else {
+        assert!(record["error"].is_string(), "{record}");
+        println!("card shell: authenticate refused: {}", record["error"]);
+    }
 }
