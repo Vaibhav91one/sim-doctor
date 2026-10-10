@@ -631,3 +631,78 @@ fn baseline_files_through_the_binary() {
     }
     check("proc_scan_baseline_files.txt", &text);
 }
+
+/// stdout that cannot be written is an error of the run (exit 2 for `scan`, a sentence on
+/// stderr naming what it could not write), never a panic (101) and never a silent 0. The kit
+/// prints with `print!`, which panics on a closed pipe, so this is pinned for `scan`.
+#[cfg(unix)]
+#[test]
+fn a_scan_that_cannot_write_its_report_exits_2_and_says_so() {
+    use std::os::unix::io::FromRawFd;
+    let tmp = tmp_dir("closed");
+    let msl0 = tmp.join("msl0.log");
+    std::fs::write(&msl0, log(true, Limits::default(), &Selection::focused())).unwrap();
+    let mut text = String::new();
+    for (label, extra) in [("--json", Some("--json")), ("human report", None)] {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` has room for the two descriptors `pipe` writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // Not inherited by the child: only the write end is handed over, as its stdout.
+        for fd in fds {
+            // SAFETY: a descriptor this test just opened.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        // SAFETY: the read end is ours alone; closing it makes every write fail with EPIPE.
+        unsafe { libc::close(fds[0]) };
+        // SAFETY: the write end is ours alone, so the `Stdio` is its only owner.
+        let stdout = unsafe { Stdio::from_raw_fd(fds[1]) };
+        let mut args = vec!["scan", "--tar", "focused"];
+        args.extend(extra);
+        let out = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+            .args(&args)
+            .env("SIM_DOCTOR_TEST_REPLAY", &msl0)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        writeln!(
+            text,
+            "# {label}: exit {}\n--- stderr\n{}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .unwrap();
+    }
+    check("proc_scan_closed_stdout.txt", &text);
+}
+
+/// The kept contract fix: `--sarif` and `--baseline` naming one file are refused however the
+/// two paths are spelled (before, only identical spellings were), and nothing is written.
+#[test]
+fn sarif_and_baseline_are_one_file_however_spelled() {
+    let tmp = tmp_dir("samefile");
+    let msl0 = tmp.join("msl0.log");
+    std::fs::write(&msl0, log(true, Limits::default(), &Selection::focused())).unwrap();
+    let base = tmp.join("base.json");
+    let saved = run(&["scan", "--json", "--tar", "focused"], Some(&msl0)).stdout;
+    std::fs::write(&base, &saved).unwrap();
+    std::fs::create_dir_all(tmp.join("sub")).unwrap();
+    let respelled = tmp.join("sub").join("..").join("base.json");
+    let args = [
+        "scan",
+        "--json",
+        "--tar",
+        "focused",
+        "--baseline",
+        base.to_str().unwrap(),
+        "--sarif",
+        respelled.to_str().unwrap(),
+    ];
+    let r = run(&args, Some(&msl0));
+    assert_eq!(std::fs::read_to_string(&base).unwrap(), saved);
+    check(
+        "proc_scan_fixed_contract.txt",
+        &show("same file, spelled two ways", &args, &r, &tmp, &[], true),
+    );
+}
