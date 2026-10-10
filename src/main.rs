@@ -509,11 +509,22 @@ enum GpAction {
         trace: bool,
     },
     /// GlobalPlatform registry inventory: GET STATUS for the ISD, applications
-    /// and load files, plus Card Recognition Data (read-only, no keys). A scope
+    /// and load files, plus Card Recognition Data (read-only). A scope
     /// the card only gives over a secure channel is reported as requiring
     /// authentication.
     ///
-    /// Exit 0 when an ISD answered, 1 when none did.
+    /// With --keys-file or --keys-env the registry is read over an SCP03 secure
+    /// channel (C-MAC) opened with ONE authentication attempt.
+    ///
+    /// The key text is `ENC [MAC [DEK]]`, 32 hex digits each (AES-128), split by
+    /// spaces, commas or newlines; one key means ENC = MAC. A key may be written
+    /// KEY/KCV (6 hex digits); a wrong KCV stops the run before the card is
+    /// touched. Keys are never taken from the command line and never printed.
+    /// Failed attempts count toward locking the ISD, so there is no retry, and the
+    /// card cryptogram is checked locally first: wrong keys stop with "keys do not
+    /// match this card" and EXTERNAL AUTHENTICATE is not sent.
+    ///
+    /// Exit 0 when an ISD answered, 1 when none did or authentication stopped.
     Status {
         /// The reader to use, matched against the driver's own name.
         #[arg(long, value_name = "NAME")]
@@ -524,7 +535,59 @@ enum GpAction {
         /// Add every APDU exchange (command and response hex) as data.trace.
         #[arg(long)]
         trace: bool,
+        #[command(flatten)]
+        keys: GpKeyArgs,
     },
+    /// SELECT a GlobalPlatform (or any) application by AID and report the status
+    /// word and the FCI. Read-only, no keys; it only changes the card's current
+    /// selection.
+    ///
+    /// Exit 0 when the application answered 90 00, 1 when it did not.
+    Select {
+        /// The application AID, 5 to 16 bytes of hex.
+        #[arg(long, value_name = "HEX")]
+        aid: String,
+        /// The reader to use, matched against the driver's own name.
+        #[arg(long, value_name = "NAME")]
+        reader: Option<String>,
+        /// Emit one JSON envelope of kind "gp" on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Add every APDU exchange (command and response hex) as data.trace.
+        #[arg(long)]
+        trace: bool,
+    },
+}
+
+/// Where `gp status` gets ISD keys. Never a value on the command line: it would
+/// land in shell history and the process list.
+///
+/// The text is `ENC [MAC [DEK]]`, each 32 hex digits (AES-128),
+/// separated by spaces, commas or newlines; one key means ENC = MAC. A key may
+/// be written `KEY/KCV` (6 hex digits); a wrong KCV stops the run before the
+/// card is touched. The channel is C-MAC only. Exactly ONE authentication attempt
+/// is made per run and it is never retried, because failed attempts count toward
+/// locking the ISD. The card cryptogram is checked locally first: wrong keys stop
+/// with "keys do not match this card" and EXTERNAL AUTHENTICATE is not sent.
+/// Keys are never printed.
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("key_source").args(["keys_file", "keys_env"])))]
+struct GpKeyArgs {
+    /// File holding the keys (keep it chmod 600).
+    #[arg(long, value_name = "PATH")]
+    keys_file: Option<std::path::PathBuf>,
+    /// Environment variable holding the keys.
+    #[arg(long, value_name = "VAR")]
+    keys_env: Option<String>,
+    /// Key version number for INITIALIZE UPDATE, two hex digits; 00 (default) lets
+    /// the card choose its first key set.
+    #[arg(long, value_name = "HEX", default_value = "00", requires = "key_source",
+          value_parser = parse_hex_byte)]
+    key_version: u8,
+}
+
+fn parse_hex_byte(text: &str) -> Result<u8, String> {
+    u8::from_str_radix(text, 16).map_err(|_| "expected one byte as hex, like 30".into())
 }
 
 /// The long description of `sim-doctor scan`.
@@ -1104,7 +1167,26 @@ fn main() -> process::ExitCode {
                 reader,
                 json,
                 trace,
-            } => run_gp("gp status", reader.as_deref(), json, trace, gp::status),
+                keys,
+            } => run_gp_status(reader.as_deref(), json, trace, &keys),
+            GpAction::Select {
+                aid,
+                reader,
+                json,
+                trace,
+            } => match hex::decode(&aid) {
+                Ok(aid) if (5..=16).contains(&aid.len()) => {
+                    run_gp("gp select", reader.as_deref(), json, trace, |s, t| {
+                        gp::select(s, &aid, t)
+                    })
+                }
+                _ => report_refusal(
+                    "gp",
+                    "--aid must be 5 to 16 bytes of hex",
+                    serde_json::json!({ "error": { "kind": "bad-aid" } }),
+                    json,
+                ),
+            },
         },
         Command::Euicc(args) => match args.action {
             EuiccAction::Info(f) => run_euicc(euicc::Query::Info, &f),
@@ -1880,7 +1962,7 @@ fn run_gp(
     reader: Option<&str>,
     json: bool,
     trace: bool,
-    pass: fn(&mut PcscSession, bool) -> Result<gp::Report, session::Error>,
+    pass: impl FnOnce(&mut PcscSession, bool) -> Result<gp::Report, session::Error>,
 ) -> contract::ExitCode {
     const KIND: &str = "gp";
     guard_exchange(KIND, json);
@@ -1910,14 +1992,21 @@ fn run_gp(
     };
     let mut data = report.data;
     data["reader"] = serde_json::json!(reader.as_str());
+    // An error the pass itself recorded (an authentication that stopped) wins.
+    if let Some(message) = data["error"]["message"].as_str().map(str::to_owned) {
+        return report_refusal(KIND, &message, data, json);
+    }
     if !report.isd_found {
-        let (kind, message) = if what == "gp ara" {
-            ("ara-m-not-found", "no ARA-M answered SELECT at its AID")
-        } else {
-            (
+        let (kind, message) = match what {
+            "gp ara" => ("ara-m-not-found", "no ARA-M answered SELECT at its AID"),
+            "gp select" => (
+                "aid-not-found",
+                "no application answered SELECT at that AID",
+            ),
+            _ => (
                 "isd-not-found",
                 "no issuer security domain answered SELECT at either AID",
-            )
+            ),
         };
         data["error"] = serde_json::json!({ "kind": kind, "message": message });
         return report_refusal(KIND, message, data, json);
@@ -1947,6 +2036,47 @@ fn run_gp(
         return contract::ExitCode::Findings;
     }
     contract::ExitCode::Success
+}
+
+/// `sim-doctor gp status [--keys-file PATH | --keys-env VAR]`. The keys are read
+/// and checked (format, stated KCVs) before a reader is opened, so a typo costs
+/// the card nothing. The host challenge is fresh per run.
+fn run_gp_status(
+    reader: Option<&str>,
+    json: bool,
+    trace: bool,
+    args: &GpKeyArgs,
+) -> contract::ExitCode {
+    let source = match (&args.keys_file, &args.keys_env) {
+        (Some(path), _) => Some(gp::KeySource::File(path)),
+        (None, Some(name)) => Some(gp::KeySource::Env(name)),
+        (None, None) => None,
+    };
+    let Some(source) = source else {
+        return run_gp("gp status", reader, json, trace, gp::status);
+    };
+    let keys = match gp::Keys::load(source) {
+        Ok(keys) => keys,
+        Err(err) => {
+            let kind = match err {
+                gp::KeyError::Kcv { .. } => "key-kcv-mismatch",
+                _ => "keys-unusable",
+            };
+            let message = err.to_string();
+            let data = serde_json::json!({ "error": { "kind": kind, "message": message } });
+            return report_refusal("gp", &message, data, json);
+        }
+    };
+    let mut host_challenge = [0u8; 8];
+    rand::fill(&mut host_challenge);
+    let auth = gp::Auth {
+        keys: &keys,
+        key_version: args.key_version,
+        host_challenge,
+    };
+    run_gp("gp status", reader, json, trace, |s, t| {
+        gp::status_authenticated(s, t, &auth)
+    })
 }
 
 /// `sim-doctor euicc <info|profiles|notifications>`: one read-only ES10 query.

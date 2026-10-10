@@ -2326,3 +2326,49 @@ fn euicc_delete_reset_and_remove_validate_before_touching_a_reader() {
         assert_exactly_one_envelope(&run.stdout, contract::ExitCode::Findings);
     }
 }
+
+/// `gp status --keys-env` loads and checks the keys BEFORE any reader is opened,
+/// so no card is involved here: a malformed key and a wrong stated KCV are
+/// refused as one envelope, exit 1, and the refusal never quotes the key text.
+/// Keys come from the environment or a file only; there is no key option that
+/// takes the value.
+#[test]
+fn gp_status_refuses_bad_keys_without_a_reader_and_never_echoes_them() {
+    let _guard = spawn_lock();
+    let secret = "DEADBEEFDEADBEEFDEADBEEFDEADBEEFXX";
+    let enc = "000102030405060708090A0B0C0D0E0F";
+    for (text, kind) in [
+        (secret.to_string(), "keys-unusable"),
+        (format!("{enc}/000000"), "key-kcv-mismatch"),
+    ] {
+        let output = Command::new(binary())
+            .args([
+                "gp",
+                "status",
+                "--json",
+                "--keys-env",
+                "SIM_DOCTOR_TEST_KEYS",
+            ])
+            .env("SIM_DOCTOR_TEST_KEYS", &text)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        let envelope = assert_exactly_one_envelope(&stdout, contract::ExitCode::Findings);
+        assert_eq!(envelope.payload().data()["error"]["kind"], kind);
+        for seen in [&stdout, &stderr] {
+            assert!(!seen.contains(secret) && !seen.contains(enc), "{seen}");
+        }
+    }
+    // A key value is not a command-line option, and the two sources exclude each other.
+    for args in [
+        &["gp", "status", "--key", enc][..],
+        &["gp", "status", "--keys-file", "a", "--keys-env", "B"],
+        &["gp", "status", "--key-version", "30"],
+    ] {
+        let run = run(args, Stdio::piped());
+        assert_eq!(run.code(), 129, "{args:?}: {}", run.stderr);
+    }
+}

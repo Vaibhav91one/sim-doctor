@@ -153,6 +153,8 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
 | `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; `fix` strips zero-width joiners (U+200C/U+200D), the combining grapheme joiner and variation selectors from agent-bound text, so emoji ZWJ sequences and Persian/Indic shaping marks are removed; unassigned code points and some other Cf characters (e.g. U+0600-0605, U+06DD) are NOT stripped. card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent; `SIM_DOCTOR_HANDOFF_SKIP_APPROVALS=1` is the same as `--skip-approvals`; an agent that is not installed exits 1, and one killed by a signal exits 128+signal. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
 | `gp info\|ara\|status [--json] [--reader NAME] [--trace]` | read-only GlobalPlatform reads, see below |
+| `gp status --keys-file PATH \| --keys-env VAR [--key-version HEX]` | registry over an SCP03 secure channel, one authentication attempt, see below |
+| `gp select --aid HEX [--json] [--reader NAME] [--trace]` | SELECT an application by AID, see below |
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 | `euicc enable\|disable ICCID\|AID [--yes] [...]` | enable or disable a profile; a dry run unless `--yes`, see below |
@@ -264,17 +266,54 @@ validation before a reader is opened, each SGP.22 result code its own error kind
 
 ### `gp`
 
-Read-only GlobalPlatform: SELECT, GET DATA and GET STATUS only, no keys, no authentication, no writes.
+Read-only GlobalPlatform: SELECT, GET DATA and GET STATUS only, no writes, no card content changes.
 `gp info` reads the ISD, CPLC, card data, key information and counters. `gp ara` selects the ARA-M
 (`A00000015141434C00`) and reads every access rule (GET DATA `FF40`), decoding applet AID, device
 app hash, APDU filters, NFC rule and permissions; a rule that lets every device app send any APDU to
 every applet is marked `grants_all_apps_all_access`. `gp status` lists the ISD, applications and load
 files (GET STATUS) with lifecycle and privilege names, and decodes Card Recognition Data, listing any
 SCP01/SCP02 offered as `weak_scp`. A card that wants a secure channel (`6982`/`6985`) is reported as
-`requires_authentication`, exit 0. Exit 1 when the ISD (or ARA-M) does not answer SELECT. Human
+`requires_authentication`, exit 0. `gp select --aid HEX` SELECTs any application and reports the
+status word, FCI and DF name. Exit 1 when the ISD (or ARA-M, or the AID) does not answer SELECT. Human
 output is sanitized; `--json` is the lpac envelope of kind `gp`. Tested against synthetic replay
-responses only; not yet checked on a live card with an ARA-M. Not done: authenticated GET STATUS, and
-a `scan` rule for the all-access ARA-M rule (scan does not select the ARA-M).
+responses only; not yet checked on a live card. Not done: a `scan` rule for the all-access ARA-M
+rule (scan does not select the ARA-M).
+
+**Authenticated `gp status` (issue #112, #19).** For a card that refuses GET STATUS without a secure
+channel, give the ISD keys and the registry is read over SCP03 (AES-128, C-MAC only):
+
+```
+SIMDOC_KEYS='404142434445464748494A4B4C4D4E4F' sim-doctor gp status --keys-env SIMDOC_KEYS --json
+sim-doctor gp status --keys-file ./isd.keys --key-version 30
+```
+
+The key text is `ENC [MAC [DEK]]`, 32 hex digits each, split by spaces, commas or newlines (one key
+means ENC = MAC; the DEK is checked and not used). A key may be written `KEY/KCV` (6 hex digits): a
+wrong KCV stops the run before a reader is opened. **Keys come from a file or an environment
+variable only, never the command line** (shell history, process list), and are never printed.
+That is the one exception to full visibility: no key, no session key and no key text appear in the
+table, `--json`, SARIF or `--trace`, and error messages never quote the key text. The `--trace` wire
+bytes hold cryptograms and C-MACs only. Use a `chmod 600` file.
+
+**Lockout safety.** Failed authentications count toward permanently locking the ISD, so a run makes
+exactly ONE attempt, never retries and never tries a second key. The card cryptogram from INITIALIZE
+UPDATE is checked locally first (GP Amendment D 6.2.2); if it does not verify, the run stops with
+"keys do not match this card" and EXTERNAL AUTHENTICATE is **not sent**, so a wrong key costs no
+counter attempt. A refused EXTERNAL AUTHENTICATE is reported (`data.error`, exit 1) and not retried.
+The card cryptogram proves the MAC key; the ENC key is not exercised at C-MAC level
+(`enc_key_exercised: false`).
+
+`data.secure_channel` gives the key version, the KCV of each supplied key (public, 24 bits), whether
+you stated it, and the card's own key-information entry for that version (type and length). The card
+does not expose a KCV in GET DATA (key information carries id, version, type and length only), so
+there is no card-side KCV to compare. `data.registry_findings` lists `gp/weak-secure-channel`
+(SCP01/SCP02 offered), `gp/isd-lifecycle` (ISD not SECURED), `gp/app-locked` and
+`gp/app-excess-privilege` (a non-security-domain application holding Card Lock, Card Terminate, Card
+Reset, Global Delete, Global Lock or Global Registry). They are entries in the lpac `gp` envelope's
+`data`, not doctor/1 findings: `gp` is not a findings command. Not done: logical channels from the CLI,
+sensitive-data encryption (belongs with PUT KEY, issue #115), SCP02/SCP11, a secure channel to a
+supplementary security domain, C-DECRYPTION and R-MAC, and the writes (#115, #133). Replay tests only
+(pySim and GlobalPlatformPro vectors); no live card has been authenticated yet.
 
 ### `trace`
 
@@ -364,12 +403,13 @@ block. `--print-only` shows what would be written.
 - **A card that answers every ENVELOPE `6F 00` (or `6D 00`, `6E 00`, `69 85`, `6A 81`) was not audited.** `data.tar.blind_spot` says so, no baseline is claimed and no sweep is sent. Many UICCs ignore CAT traffic until a TERMINAL PROFILE arrives; `--terminal-profile` sends one and is the only thing here that changes CAT state.
 - **`--tar` is bounded.** The full TAR space is 16 777 216 values; the tool sends at most 4096.
 - Verified against the swSIM software card in CI and against one live operator USIM (read-only, plus a consented `--tar focused` run).
-- **SCP03 never runs against a card.** `src/scp03.rs` is a library (key derivation,
-  cryptograms, C-MAC, INITIALIZE UPDATE / EXTERNAL AUTHENTICATE builders) verified by
-  known-answer vectors. The `auth/scp03-missing-mac` rule is registered, but a scan has no
-  recorded SCP03 exchange to hand it, so it reports no evidence. There is no CLI path; a
-  future one must refuse to run without an explicit opt-in flag. Milenage (`src/aka.rs`) is
-  likewise vector-tested only. SCP02 and SCP11 are not implemented.
+- **SCP03 runs against a card in one place only:** `gp status --keys-file/--keys-env`, opt-in, one
+  attempt, cryptogram checked locally before EXTERNAL AUTHENTICATE (see `gp` above).
+  `src/scp03.rs` stays a library (key derivation, cryptograms, C-MAC, INITIALIZE UPDATE /
+  EXTERNAL AUTHENTICATE builders) verified by known-answer vectors. The `auth/scp03-missing-mac`
+  rule is registered, but a scan has no recorded SCP03 exchange to hand it, so it reports no
+  evidence. Milenage (`src/aka.rs`) is likewise vector-tested only. SCP02 and SCP11 are not
+  implemented.
 
 ## Status
 
@@ -380,7 +420,8 @@ the swSIM fixture in CI and against a live operator USIM. On that card the defau
 about 2 minutes with nothing truncated.
 
 **Full visibility.** As an authorized on-card security tool, sim-doctor shows card values in full
-(IMSI, ICCID, file and key-file contents) with no runtime masking. It never commits real card data to
+(IMSI, ICCID, file and key-file contents) with no runtime masking. The one exception is the keys you
+supply to `gp status`, which are never printed (see `gp`). It never commits real card data to
 a repo; test fixtures are synthetic.
 
 Rules that evaluate today: `auth/pin1-disabled`, `filesystem/sensitive-ef-always` (now including the
