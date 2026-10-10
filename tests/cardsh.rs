@@ -109,3 +109,45 @@ fn help_lists_the_commands() {
         assert!(text.contains(name), "{name} missing:\n{text}");
     }
 }
+
+#[test]
+fn apdu_dry_runs_then_sends_with_yes_and_checks_expectations() {
+    // The recording holds the SELECT, the READ BINARY and the one UPDATE that was sent with --yes: a
+    // dry run reaches the card never, so a replay that diverged would fail the whole run.
+    let out = card(
+        "cardsh_apdu.jsonl",
+        &[
+            "--json",
+            "-c",
+            "apdu 00A4000C022FE2; apdu 00B000000A --expect-response-regex ^9810; apdu 00D6000001AA; \
+             apdu --yes 00D6000001AA --expect-sw 6Dxx",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    assert_eq!(r[1]["data"]["data"], "98101032547698103254");
+    assert_eq!(
+        r[2]["data"]["sent"], false,
+        "a write is a dry run without --yes"
+    );
+    assert_eq!(r[3]["data"]["sw"], "6D00");
+
+    // The same card, a wrong expectation: the command fails, the exit code says so, and the response is kept.
+    let out = card(
+        "cardsh_apdu.jsonl",
+        &[
+            "--json",
+            "-c",
+            "apdu 00A4000C022FE2; apdu 00B000000A --expect-sw 6A82",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let r = lines(&out);
+    assert_eq!(r[1]["ok"], false);
+    assert_eq!(r[1]["data"]["sw"], "9000");
+}

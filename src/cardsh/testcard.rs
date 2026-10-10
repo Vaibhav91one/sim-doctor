@@ -410,11 +410,19 @@ pub fn record(script: &str, yes: bool) -> (String, Vec<Reply>) {
 
 /// The scripts whose recordings are committed under `tests/corpus/` for the process tests:
 /// (file name, `--yes`, script).
-pub const FIXTURES: &[(&str, bool, &str)] = &[(
-    "cardsh_channels.jsonl",
-    false,
-    "open_channel; status; channel 0; status; close_channel 1; status",
-)];
+pub const FIXTURES: &[(&str, bool, &str)] = &[
+    (
+        "cardsh_channels.jsonl",
+        false,
+        "open_channel; status; channel 0; status; close_channel 1; status",
+    ),
+    (
+        "cardsh_apdu.jsonl",
+        false,
+        "apdu 00A4000C022FE2; apdu 00B000000A --expect-response-regex ^9810; apdu 00D6000001AA; \
+         apdu --yes 00D6000001AA --expect-sw 6Dxx",
+    ),
+];
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

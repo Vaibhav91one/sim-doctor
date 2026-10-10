@@ -12,6 +12,9 @@ All notable changes to this project are documented here. The format follows
   selected file between commands; interactive, `-c "a; b"`, `--script FILE` and `--json` (one record per command).
   `equip`, `status`, `open_channel`, `close_channel`, `channel`, `quit`. Reads are sent; commands that change the card are
   dry runs unless `--yes`. The file commands arrive in the issues that follow.
+- `card`: `apdu [--raw] [--expect-sw SW] [--expect-response-regex RE] [--yes] APDU` (#156): one raw APDU with GET RESPONSE
+  followed, the channel applied to the class byte unless `--raw`, pySim's `x` wildcards in `--expect-sw`, and a dry run
+  for any instruction that is not a read unless `--yes`.
 
 ## [0.4.0]
 
