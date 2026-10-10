@@ -538,6 +538,56 @@ _arguments "${_arguments_options[@]}" : \
 '::file -- A trace file; stdin when omitted or "-":_default' \
 && ret=0
 ;;
+(cat)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_sim-doctor__subcmd__cat_commands" \
+"*::: :->cat" \
+&& ret=0
+
+    case $state in
+    (cat)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:sim-doctor-cat-command-$line[1]:"
+        case $line[1] in
+            (decode)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit one JSON envelope of kind "cat" on stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::hex -- Hex of a proactive command, envelope, terminal response or comprehension TLVs (spaces and `0x` allowed); stdin, one per line, when none is given or for "-":_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_sim-doctor__subcmd__cat__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:sim-doctor-cat-help-command-$line[1]:"
+        case $line[1] in
+            (decode)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (fuzz)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1068,6 +1118,26 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(cat)
+_arguments "${_arguments_options[@]}" : \
+":: :_sim-doctor__subcmd__help__subcmd__cat_commands" \
+"*::: :->cat" \
+&& ret=0
+
+    case $state in
+    (cat)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:sim-doctor-help-cat-command-$line[1]:"
+        case $line[1] in
+            (decode)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (fuzz)
 _arguments "${_arguments_options[@]}" : \
 ":: :_sim-doctor__subcmd__help__subcmd__fuzz_commands" \
@@ -1196,11 +1266,43 @@ _sim-doctor_commands() {
 'fix:Hand one finding from a saved scan to a coding agent' \
 'gp:Read-only GlobalPlatform queries' \
 'trace:Decode a captured APDU trace offline (no card, no reader)' \
+'cat:Decode Card Application Toolkit data offline (no card, no reader)' \
 'fuzz:APDU discovery and the OTA/SMS fuzz sweep' \
 'euicc:eUICC queries over ES10 (lpac\: chip info, profile list, notification list), and the profile and notification writes' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'sim-doctor commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__cat_commands] )) ||
+_sim-doctor__subcmd__cat_commands() {
+    local commands; commands=(
+'decode:Decode CAT data given as hex arguments, or one object per line on stdin' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'sim-doctor cat commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__cat__subcmd__decode_commands] )) ||
+_sim-doctor__subcmd__cat__subcmd__decode_commands() {
+    local commands; commands=()
+    _describe -t commands 'sim-doctor cat decode commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__cat__subcmd__help_commands] )) ||
+_sim-doctor__subcmd__cat__subcmd__help_commands() {
+    local commands; commands=(
+'decode:Decode CAT data given as hex arguments, or one object per line on stdin' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'sim-doctor cat help commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__cat__subcmd__help__subcmd__decode_commands] )) ||
+_sim-doctor__subcmd__cat__subcmd__help__subcmd__decode_commands() {
+    local commands; commands=()
+    _describe -t commands 'sim-doctor cat help decode commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__cat__subcmd__help__subcmd__help_commands] )) ||
+_sim-doctor__subcmd__cat__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'sim-doctor cat help help commands' commands "$@"
 }
 (( $+functions[_sim-doctor__subcmd__ci_commands] )) ||
 _sim-doctor__subcmd__ci_commands() {
@@ -1663,11 +1765,24 @@ _sim-doctor__subcmd__help_commands() {
 'fix:Hand one finding from a saved scan to a coding agent' \
 'gp:Read-only GlobalPlatform queries' \
 'trace:Decode a captured APDU trace offline (no card, no reader)' \
+'cat:Decode Card Application Toolkit data offline (no card, no reader)' \
 'fuzz:APDU discovery and the OTA/SMS fuzz sweep' \
 'euicc:eUICC queries over ES10 (lpac\: chip info, profile list, notification list), and the profile and notification writes' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'sim-doctor help commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__help__subcmd__cat_commands] )) ||
+_sim-doctor__subcmd__help__subcmd__cat_commands() {
+    local commands; commands=(
+'decode:Decode CAT data given as hex arguments, or one object per line on stdin' \
+    )
+    _describe -t commands 'sim-doctor help cat commands' commands "$@"
+}
+(( $+functions[_sim-doctor__subcmd__help__subcmd__cat__subcmd__decode_commands] )) ||
+_sim-doctor__subcmd__help__subcmd__cat__subcmd__decode_commands() {
+    local commands; commands=()
+    _describe -t commands 'sim-doctor help cat decode commands' commands "$@"
 }
 (( $+functions[_sim-doctor__subcmd__help__subcmd__ci_commands] )) ||
 _sim-doctor__subcmd__help__subcmd__ci_commands() {

@@ -19,6 +19,7 @@ Commands:
   fix          Hand one finding from a saved scan to a coding agent
   gp           Read-only GlobalPlatform queries
   trace        Decode a captured APDU trace offline (no card, no reader)
+  cat          Decode Card Application Toolkit data offline (no card, no reader)
   fuzz         APDU discovery and the OTA/SMS fuzz sweep
   euicc        eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes
   shell        The walk bounds, shared by `scan` and `ts48 compare` so they cannot drift
@@ -402,6 +403,30 @@ Arguments:
 Options:
       --json  Emit one JSON envelope of kind "trace" on stdout
   -h, --help  Print help (see more with '--help')
+
+$ sim-doctor cat -h [exit 0]
+Decode Card Application Toolkit data offline (no card, no reader)
+
+Usage: sim-doctor cat <COMMAND>
+
+Commands:
+  decode  Decode CAT data given as hex arguments, or one object per line on stdin
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help (see more with '--help')
+
+$ sim-doctor cat decode -h [exit 0]
+Decode CAT data given as hex arguments, or one object per line on stdin
+
+Usage: sim-doctor cat decode [OPTIONS] [HEX]...
+
+Arguments:
+  [HEX]...  Hex of a proactive command, envelope, terminal response or comprehension TLVs (spaces and `0x` allowed); stdin, one per line, when none is given or for "-"
+
+Options:
+      --json  Emit one JSON envelope of kind "cat" on stdout
+  -h, --help  Print help
 
 $ sim-doctor fuzz -h [exit 0]
 APDU discovery and the OTA/SMS fuzz sweep

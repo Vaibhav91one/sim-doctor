@@ -112,6 +112,7 @@ pub mod backend;
 pub mod baseline;
 pub mod bpp;
 pub mod cap;
+pub mod cat;
 pub mod ci;
 pub mod contract;
 pub mod der;
@@ -346,6 +347,11 @@ pub const MODULES: &[ModuleInfo] = &[
             baseline::NAME,
             scp03::NAME,
         ],
+    },
+    ModuleInfo {
+        name: cat::NAME,
+        owns: "The Card Application Toolkit decoder: a proactive command, ENVELOPE, TERMINAL RESPONSE or run of comprehension TLVs named and decoded (44 command types, 14 envelope tags, 90 information elements, result codes, devices); offline, sends nothing.",
+        depends_on: &[],
     },
     ModuleInfo {
         name: ts48::NAME,

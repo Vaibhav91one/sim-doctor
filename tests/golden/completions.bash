@@ -16,6 +16,9 @@ _sim__doctor() {
             ",$1")
                 cmd="sim__doctor"
                 ;;
+            sim__doctor,cat)
+                cmd="sim__doctor__subcmd__cat"
+                ;;
             sim__doctor,ci)
                 cmd="sim__doctor__subcmd__ci"
                 ;;
@@ -60,6 +63,18 @@ _sim__doctor() {
                 ;;
             sim__doctor,why)
                 cmd="sim__doctor__subcmd__why"
+                ;;
+            sim__doctor__subcmd__cat,decode)
+                cmd="sim__doctor__subcmd__cat__subcmd__decode"
+                ;;
+            sim__doctor__subcmd__cat,help)
+                cmd="sim__doctor__subcmd__cat__subcmd__help"
+                ;;
+            sim__doctor__subcmd__cat__subcmd__help,decode)
+                cmd="sim__doctor__subcmd__cat__subcmd__help__subcmd__decode"
+                ;;
+            sim__doctor__subcmd__cat__subcmd__help,help)
+                cmd="sim__doctor__subcmd__cat__subcmd__help__subcmd__help"
                 ;;
             sim__doctor__subcmd__ci,help)
                 cmd="sim__doctor__subcmd__ci__subcmd__help"
@@ -262,6 +277,9 @@ _sim__doctor() {
             sim__doctor__subcmd__gp__subcmd__help__subcmd__channel,open)
                 cmd="sim__doctor__subcmd__gp__subcmd__help__subcmd__channel__subcmd__open"
                 ;;
+            sim__doctor__subcmd__help,cat)
+                cmd="sim__doctor__subcmd__help__subcmd__cat"
+                ;;
             sim__doctor__subcmd__help,ci)
                 cmd="sim__doctor__subcmd__help__subcmd__ci"
                 ;;
@@ -306,6 +324,9 @@ _sim__doctor() {
                 ;;
             sim__doctor__subcmd__help,why)
                 cmd="sim__doctor__subcmd__help__subcmd__why"
+                ;;
+            sim__doctor__subcmd__help__subcmd__cat,decode)
+                cmd="sim__doctor__subcmd__help__subcmd__cat__subcmd__decode"
                 ;;
             sim__doctor__subcmd__help__subcmd__ci,install)
                 cmd="sim__doctor__subcmd__help__subcmd__ci__subcmd__install"
@@ -428,8 +449,78 @@ _sim__doctor() {
 
     case "${cmd}" in
         sim__doctor)
-            opts="-h -V --help --version modules scan ts48 install ci completions mcp rules why fix gp trace fuzz euicc help"
+            opts="-h -V --help --version modules scan ts48 install ci completions mcp rules why fix gp trace cat fuzz euicc help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__cat)
+            opts="-h --help decode help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__cat__subcmd__decode)
+            opts="-h --json --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__cat__subcmd__help)
+            opts="decode help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__cat__subcmd__help__subcmd__decode)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__cat__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1848,8 +1939,36 @@ _sim__doctor() {
             return 0
             ;;
         sim__subcmd__doctor__subcmd__help)
-            opts="modules scan ts48 install ci completions mcp rules why fix gp trace fuzz euicc help"
+            opts="modules scan ts48 install ci completions mcp rules why fix gp trace cat fuzz euicc help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__help__subcmd__cat)
+            opts="decode"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        sim__subcmd__doctor__subcmd__help__subcmd__cat__subcmd__decode)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

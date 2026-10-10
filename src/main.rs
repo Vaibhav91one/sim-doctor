@@ -30,8 +30,8 @@ use clap_complete::aot::generate;
 mod kit;
 
 use sim_doctor::{
-    apdu_fuzz, apdu_scan, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session, tar,
-    trace,
+    apdu_fuzz, apdu_scan, cat, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session,
+    tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -220,6 +220,14 @@ enum Command {
     /// names each command, tracks the selected file and explains each status
     /// word.
     Trace(TraceArgs),
+
+    /// Decode Card Application Toolkit data offline (no card, no reader).
+    ///
+    /// `cat decode` names and decodes a proactive command (a FETCH response, starts with D0), an
+    /// ENVELOPE (D1..DF), a TERMINAL RESPONSE or a bare run of comprehension TLVs: 44 command types,
+    /// 14 envelope tags, 90 information elements, result codes and devices; the fields of the
+    /// elements a review reads are decoded and the rest are shown as hex, named.
+    Cat(CatArgs),
 
     /// APDU discovery and the OTA/SMS fuzz sweep.
     ///
@@ -1389,6 +1397,26 @@ enum RulesAction {
     },
 }
 
+/// Everything `sim-doctor cat` takes.
+#[derive(Args)]
+struct CatArgs {
+    #[command(subcommand)]
+    action: CatAction,
+}
+
+#[derive(Subcommand)]
+enum CatAction {
+    /// Decode CAT data given as hex arguments, or one object per line on stdin.
+    Decode {
+        /// Hex of a proactive command, envelope, terminal response or comprehension TLVs
+        /// (spaces and `0x` allowed); stdin, one per line, when none is given or for "-".
+        hex: Vec<String>,
+        /// Emit one JSON envelope of kind "cat" on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Everything `sim-doctor trace` takes.
 #[derive(Args)]
 struct TraceArgs {
@@ -1530,6 +1558,9 @@ fn dispatch(d: &kit::SimDoctor, command: Command) -> contract::ExitCode {
             Ts48Action::Compare(args) => run_ts48_compare(args),
         },
         Command::Install(args) => kit::install(d, args),
+        Command::Cat(args) => match args.action {
+            CatAction::Decode { hex, json } => run_cat_decode(&hex, json),
+        },
         Command::Completions(args) => run_completions(args),
         Command::Ci(args) => run_ci(args),
         Command::Rules(args) => match args.action {
@@ -2849,6 +2880,71 @@ fn run_trace(args: &TraceArgs) -> contract::ExitCode {
         trace::render(&rows).trim_end().to_owned()
     };
     match emit_stdout(&rendered, "the decoded trace") {
+        Ok(()) => contract::ExitCode::Success,
+        Err(message) => refuse(message),
+    }
+}
+
+/// `sim-doctor cat decode`: offline CAT decoding, text or one `cat` envelope.
+fn run_cat_decode(args: &[String], json: bool) -> contract::ExitCode {
+    use std::io::Read;
+    const KIND: &str = "cat";
+    let refuse = |m: String| report_refusal(KIND, &m, serde_json::json!({ "error": m }), json);
+    let mut items: Vec<String> = args.iter().filter(|a| a.as_str() != "-").cloned().collect();
+    if args.is_empty() || args.iter().any(|a| a == "-") {
+        let mut input = Vec::new();
+        if let Err(err) = io::stdin().take(MAX_WHY_FILE_BYTES).read_to_end(&mut input) {
+            return refuse(format!("cannot read stdin: {err}"));
+        }
+        items.extend(
+            String::from_utf8_lossy(&input)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned),
+        );
+    }
+    if items.is_empty() {
+        return refuse("no CAT data given".to_owned());
+    }
+    let mut decoded = Vec::new();
+    for item in &items {
+        let bytes = match cat::parse_hex(item) {
+            Ok(b) => b,
+            Err(e) => return refuse(format!("`{item}`: {e}")),
+        };
+        match cat::decode(&bytes) {
+            Ok(d) => decoded.push(d),
+            Err(e) => return refuse(format!("`{item}`: {e}")),
+        }
+    }
+    let rendered = if json {
+        let data = serde_json::json!({
+            "card_touched": false,
+            "count": decoded.len(),
+            "objects": decoded.iter().map(|d| d.json.clone()).collect::<Vec<_>>(),
+        });
+        match contract::Envelope::new(
+            KIND,
+            contract::ExitCode::Success,
+            contract::OK_MESSAGE,
+            data,
+        )
+        .to_json()
+        {
+            Ok(line) => line,
+            Err(err) => return refuse(err.to_string()),
+        }
+    } else {
+        decoded
+            .iter()
+            .map(cat::render)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_owned()
+    };
+    match emit_stdout(&rendered, "the decoded CAT data") {
         Ok(()) => contract::ExitCode::Success,
         Err(message) => refuse(message),
     }
