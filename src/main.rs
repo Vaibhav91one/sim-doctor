@@ -30,8 +30,8 @@ use clap_complete::aot::generate;
 mod kit;
 
 use sim_doctor::{
-    apdu_fuzz, apdu_scan, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session, signals,
-    skill, tar, trace,
+    apdu_fuzz, apdu_scan, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session, skill,
+    tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -95,7 +95,7 @@ const WEDGE_ENV: &str = "SIM_DOCTOR_TEST_WEDGE";
 /// before [`guard_exchange`] ends the process (issue #88).
 ///
 /// Long enough for a transmit in flight to return and reach a checkpoint
-/// (the safe order, see `signals::install`), short enough to be "within seconds".
+/// (the safe order, see `doctor_kit::interrupt::install`), short enough to be "within seconds".
 const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
 
 /// Set once an interrupted envelope has been written, so the watchdog and the
@@ -1442,10 +1442,8 @@ fn main() -> process::ExitCode {
 
     // Installed before clap runs, so even a command line this process has not
     // finished reading can be interrupted. A refusal is a diagnostic and not a
-    // failed run: see signals::install.
-    if let Err(err) = signals::install() {
-        eprintln!("sim-doctor: {err}");
-    }
+    // failed run: see doctor_kit::interrupt::install.
+    doctor_kit::interrupt::install();
 
     kit::run()
 }
@@ -1666,7 +1664,7 @@ fn run_modules(args: ModulesArgs) -> contract::ExitCode {
 /// arrives microseconds too late.
 fn checkpoint() -> bool {
     hold_for_the_signal_test();
-    signals::interrupted()
+    doctor_kit::interrupt::interrupted()
 }
 
 /// Parks at the checkpoint so a test can deliver a real SIGINT to a process
@@ -1705,7 +1703,7 @@ fn hold_for_the_signal_test() {
 
     let deadline = Instant::now() + Duration::from_millis(milliseconds);
     while Instant::now() < deadline {
-        if signals::interrupted() {
+        if doctor_kit::interrupt::interrupted() {
             return;
         }
         thread::sleep(Duration::from_millis(1));
@@ -1731,7 +1729,7 @@ fn guard_exchange(kind: &'static str, json: bool) {
     let _ = thread::Builder::new()
         .name("interrupt-watchdog".into())
         .spawn(move || {
-            while !signals::interrupted() {
+            while !doctor_kit::interrupt::interrupted() {
                 thread::sleep(Duration::from_millis(50));
             }
             thread::sleep(INTERRUPT_GRACE);
@@ -3095,7 +3093,7 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
     if let Some(class) = class {
         let audit =
             apdu_scan::ins_discovery(&mut session, class, mode, &mut reconnect, &mut || {
-                signals::interrupted()
+                doctor_kit::interrupt::interrupted()
             });
         let findings = apdu_scan::ins_findings(&audit);
         emit_fuzz_report(
@@ -3107,7 +3105,7 @@ fn run_fuzz_apdu(args: FuzzApduArgs) -> contract::ExitCode {
         )
     } else {
         let audit = apdu_scan::cla_discovery(&mut session, mode, &mut reconnect, &mut || {
-            signals::interrupted()
+            doctor_kit::interrupt::interrupted()
         });
         let findings = apdu_scan::cla_findings(&audit);
         emit_fuzz_report(
@@ -3167,7 +3165,7 @@ fn run_fuzz_mutate(args: FuzzMutateArgs) -> contract::ExitCode {
     }
     let run = if args.mock {
         apdu_fuzz::run(&mut apdu_fuzz::MockCard::strict(), &config, &mut || {
-            signals::interrupted()
+            doctor_kit::interrupt::interrupted()
         })
     } else if let Some(path) = &args.replay {
         let log = match std::fs::read_to_string(path) {
@@ -3192,7 +3190,9 @@ fn run_fuzz_mutate(args: FuzzMutateArgs) -> contract::ExitCode {
                 )
             }
         };
-        apdu_fuzz::run(&mut replay, &config, &mut || signals::interrupted())
+        apdu_fuzz::run(&mut replay, &config, &mut || {
+            doctor_kit::interrupt::interrupted()
+        })
     } else {
         return report_refusal(
             apdu_fuzz::KIND,
@@ -3227,7 +3227,7 @@ fn run_fuzz_ota(args: FuzzOtaArgs) -> contract::ExitCode {
         &mut session,
         sweep,
         &session::Policy::default(),
-        &mut || signals::interrupted(),
+        &mut || doctor_kit::interrupt::interrupted(),
     ) {
         Ok(audit) => audit,
         Err(err) => {

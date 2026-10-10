@@ -394,7 +394,7 @@ pub fn run(data: &Value) -> std::io::Result<()> {
     let mut state = ViewState::default();
     loop {
         terminal.draw(|f| draw(f, data, &mut state))?;
-        if crate::signals::interrupted() {
+        if doctor_kit::interrupt::interrupted() {
             return Ok(());
         }
         if event::poll(Duration::from_millis(250))? {
