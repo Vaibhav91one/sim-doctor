@@ -1,0 +1,8 @@
+# same file, spelled two ways: sim-doctor scan --json --tar focused --baseline <TMP>/base.json --sarif <TMP>/sub/../base.json
+exit 2
+--- stderr
+sim-doctor: --sarif and --baseline both name <TMP>/sub/../base.json; the SARIF file would destroy the baseline
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"sarif-baseline-same-path","message":"--sarif and --baseline both name <TMP>/sub/../base.json; the SARIF file would destroy the baseline"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+

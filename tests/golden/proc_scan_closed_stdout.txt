@@ -1,0 +1,8 @@
+# --json: exit 2
+--- stderr
+sim-doctor: cannot write the scan envelope to stdout: Broken pipe (os error 32)
+
+# human report: exit 2
+--- stderr
+sim-doctor: cannot write the scan report to stdout: Broken pipe (os error 32)
+

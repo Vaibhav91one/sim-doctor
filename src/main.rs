@@ -20,7 +20,7 @@
 //!   See [`report_interrupted`] and `contract::INTERRUPTED_MESSAGE`.
 
 use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,8 +30,8 @@ use clap_complete::aot::generate;
 mod kit;
 
 use sim_doctor::{
-    access, apdu_fuzz, apdu_scan, baseline, ci, contract, ef, euicc, fix, fuzz, gp, notif, rules,
-    sarif, scan, session, signals, skill, tar, trace,
+    apdu_fuzz, apdu_scan, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session, signals,
+    skill, tar, trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -1451,10 +1451,10 @@ fn main() -> process::ExitCode {
 }
 
 /// Runs the parsed command and returns its exit code.
-fn dispatch(command: Command) -> contract::ExitCode {
+fn dispatch(d: &kit::SimDoctor, command: Command) -> contract::ExitCode {
     match command {
         Command::Modules(args) => run_modules(args),
-        Command::Scan(args) => run_scan(args),
+        Command::Scan(args) => kit::scan(d, args),
         Command::Ts48(args) => match args.action {
             Ts48Action::Compare(args) => run_ts48_compare(args),
         },
@@ -1985,323 +1985,6 @@ fn run_completions(args: CompletionsArgs) -> contract::ExitCode {
         Err(message) => {
             eprintln!("sim-doctor: {message}");
             contract::ExitCode::Findings
-        }
-    }
-}
-
-/// Runs `sim-doctor scan` and returns the exit code for it.
-///
-/// **The shape of this function is the whole SIGINT/SIGTERM contract (both exit 130).** Two
-/// checkpoints, both before anything is written to stdout:
-///
-/// 1. before a reader is opened, so an operator who hits Ctrl-C while the tool
-///    is still finding hardware is not made to wait for a card,
-/// 2. after the walk and before the report is rendered, so a walk that
-///    finished is either reported in full or reported as interrupted, never as
-///    half of a tree.
-///
-/// There is no third checkpoint, and that is deliberate: a run that has already
-/// written its envelope has finished. Retroactively converting a complete,
-/// correct answer into "interrupted" would need a second envelope on stdout or
-/// would break the promise that `exit_code` is the value the process exits
-/// with. See [`report_interrupted`] and CONTEXT.md section 3.
-///
-/// **A `--baseline` run reads its baseline before it opens a reader**, so a file
-/// this build cannot read is refused in milliseconds rather than after a walk
-/// it was never going to need. See the comment at the top of the body.
-///
-/// The JSON is the doctor/1 envelope, and its `exit_code` is decided here (see
-/// [`scan::Verdict::exit_code`]) before it is rendered. `--score`, `--severity`,
-/// `--baseline` and `--fail-on` are all implemented. There
-/// is no flag left on the surface whose behaviour is deferred, and the
-/// refusal that used to stand in for them is now reached only by real failures
-/// - no card, an unreadable baseline, an incomparable pair.
-fn run_scan(args: ScanArgs) -> contract::ExitCode {
-    guard_exchange(scan::KIND, args.json);
-    // A flag's own shape is refused before a reader is opened, as clap would.
-    if args.terminal_profile && matches!(args.tar.mode, tar::Mode::Off) {
-        eprintln!("sim-doctor: --terminal-profile is only meaningful with --tar other than off");
-        return contract::ExitCode::Error;
-    }
-    // Read the baseline before a reader is opened, and refuse before one is.
-    // A --baseline naming a file that is not there, is not a doctor/1 envelope,
-    // or is over a bound has an answer before a card exists, and an agent
-    // scripting against this tool deserves it in milliseconds rather than after
-    // a walk it was never going to need. The rules that depend on BOTH runs
-    // necessarily wait, because they cannot be known until there is something to
-    // compare against.
-    let saved = match &args.baseline {
-        Some(path) => match baseline::Baseline::load(path) {
-            Ok(saved) => Some(saved),
-            Err(err) => {
-                return report_scan_failure(
-                    &scan::Failure::new(err.kind(), err.to_string()),
-                    args.json,
-                )
-            }
-        },
-        None => None,
-    };
-
-    if let (Some(a), Some(b)) = (&args.sarif, &args.baseline) {
-        if a == b {
-            return report_scan_failure(
-                &scan::Failure::new(
-                    "sarif-baseline-same-path",
-                    format!(
-                        "--sarif and --baseline both name {}; the SARIF file would destroy the baseline",
-                        a.display()
-                    ),
-                ),
-                args.json,
-            );
-        }
-    }
-
-    if checkpoint() {
-        return report_interrupted(scan::KIND, args.json);
-    }
-
-    let (mut session, reader, atr) = match open_scan_session(args.reader.as_deref()) {
-        Ok(opened) => opened,
-        Err(failure) => return report_scan_failure(&failure, args.json),
-    };
-
-    let options = walk::Options {
-        addressing: walk::Addressing::PathFromMasterFile,
-        // Spelled out rather than inherited: this is the set that can miss a
-        // file, and the line that decides that belongs where the walk is built.
-        candidates: walk::Candidates::SimFamilies,
-        // Only 6A 82 is classified. Nothing else is, because this repository has
-        // read no other table; see walk::StatusMeaning and CONTEXT.md section 3.
-        meaning: walk::StatusMeaning::default(),
-        limits: limits_from(&args.walk_limits),
-        ..walk::Options::default()
-    };
-
-    let mut tree = match walk::walk(&mut *session, &args.dialect.tag_set(), &options) {
-        Ok(tree) => tree,
-        Err(err) => {
-            return report_scan_failure(
-                &scan::Failure::new("walk-failed", err.to_string()),
-                args.json,
-            )
-        }
-    };
-
-    // EF.ARR, read-only (SELECT and READ RECORD), so that the access rules the
-    // FCPs only reference can be decoded by the rules.
-    if let Err(err) = access::resolve(&mut *session, &mut tree, &session::Policy::default()) {
-        return report_scan_failure(
-            &scan::Failure::new("access-rules-failed", err.to_string()),
-            args.json,
-        );
-    }
-
-    // The security-relevant EFs' contents, read-only (SELECT, READ BINARY, READ
-    // RECORD), decoded later and shown in full (key files included).
-    if let Err(err) = ef::read(&mut *session, &mut tree, &session::Policy::default()) {
-        return report_scan_failure(
-            &scan::Failure::new("ef-read-failed", err.to_string()),
-            args.json,
-        );
-    }
-
-    // The second of three checkpoints. Everything the tree knows is still only
-    // in memory here, so stopping now costs the whole run rather than emitting
-    // something a caller could mistake for a result.
-    if checkpoint() {
-        return report_interrupted(scan::KIND, args.json);
-    }
-
-    // The TAR audit, over the same live session. It is the longest part of a
-    // scan after the walk, so `tar::audit` polls signals::interrupted()
-    // before every probe: a Ctrl-C during a full sweep is acted on rather than
-    // queued. A TAR probe is an ENVELOPE, and swSIM answers every one with
-    // `61 Lc` before reading a byte of it, so the default selection is
-    // 592 probes of two exchanges each - see src/tar.rs, which is where the
-    // wire sequence, the bound and the differential are argued.
-    let audit = match tar::audit_with(
-        &mut *session,
-        &args.tar,
-        &session::Policy::default(),
-        args.terminal_profile,
-        &mut || signals::interrupted(),
-    ) {
-        Ok(audit) => audit,
-        Err(err) => {
-            return report_scan_failure(
-                &scan::Failure::new("tar-audit-failed", err.to_string()),
-                args.json,
-            )
-        }
-    };
-
-    // The third and last checkpoint, and it exists because of the line above:
-    // an interrupted TAR scan must be reported as interrupted, never rendered
-    // as a shorter audit. A report that says "8 of 4096 TARs probed" and exits
-    // 0 is a card reported as having passed 4096 probes never made.
-    if checkpoint() {
-        return report_interrupted(scan::KIND, args.json);
-    }
-
-    // The rules, over both halves of the scan: the tree that is still in
-    // memory, and the TAR evidence that was just measured.
-    let found = match scan::findings(&scan::Subject {
-        tree: &tree,
-        tar: &audit,
-        scp03: None,
-    }) {
-        Ok(found) => found,
-        Err(err) => {
-            return report_scan_failure(
-                &scan::Failure::new("rule-misattribution", err.to_string()),
-                args.json,
-            )
-        }
-    };
-
-    // Filtered before it is scored, and the score taken from what is left:
-    // the number in the report is a function of the findings in the report.
-    let mut verdict = scan::Verdict::new(found, scan::rules_run())
-        .tar_audit(audit)
-        .at_least(args.severity)
-        .scored(args.score);
-
-    let context = scan::Context::new(
-        reader.as_str(),
-        atr.as_deref(),
-        args.dialect,
-        options.candidates.clone(),
-        options.limits,
-    );
-
-    // What this run actually did, which is what a baseline has to record and
-    // what a comparison is allowed to assume. Built from the tree and the
-    // verdict rather than from the flags, so it cannot describe a walk that
-    // did not happen.
-    let facts = scan::run_facts(&tree, &context, &verdict);
-
-    // Compared last, and REFUSED rather than reported when the two runs cannot
-    // honestly be compared. Every refusal here is the same shape as "no
-    // reader": data.error, exit 2, no findings and no data.diff.
-    if let Some(saved) = saved {
-        match baseline::Diff::compare(&saved, &facts, verdict.findings().as_slice()) {
-            Ok(diff) => {
-                eprintln!(
-                    "sim-doctor: compared against the baseline: {} new, {} fixed, {} persisting",
-                    diff.new_findings().len(),
-                    diff.fixed().len(),
-                    diff.persisting().len(),
-                );
-                if let Some(warning) = diff.rules_warning() {
-                    eprintln!("sim-doctor: warning: {warning}");
-                }
-                verdict = verdict.compared_against(diff);
-            }
-            Err(incomparable) => {
-                return report_scan_failure(
-                    &scan::Failure::new(incomparable.kind(), incomparable.explain(&saved, &facts)),
-                    args.json,
-                );
-            }
-        }
-    }
-
-    // SARIF first, because the envelope carries the exit code and a failed
-    // SARIF write is a run error (exit 2). The report is still printed below:
-    // a SARIF failure never costs the caller the report.
-    let mut exit_code = verdict.exit_code(args.fail_on);
-    if let Some(path) = &args.sarif {
-        let score = scan::doctor_score(&tree, &context, &verdict, &facts);
-        let doc = sarif::to_sarif(verdict.findings().as_slice(), &scan::specs(), &score);
-        if let Err(error) = sarif::write(path, &doc) {
-            // stderr only: stdout stays one envelope.
-            eprintln!(
-                "sim-doctor: sarif-unwritable: could not write SARIF to {}: {error}",
-                path.display()
-            );
-            exit_code = contract::ExitCode::Error;
-        }
-    }
-
-    // Assembled, then written once, so a failure halfway through cannot put
-    // half an envelope on stdout. See emit_stdout.
-    let mut shown_in_tui = false;
-    let rendered = if args.json {
-        let document = scan::doctor_json(&tree, &context, &verdict, &facts, exit_code);
-        match serde_json::to_string(&document) {
-            Ok(line) => line,
-            Err(err) => {
-                eprintln!("sim-doctor: {err}");
-                return contract::ExitCode::Error;
-            }
-        }
-    } else if args.tui && io::stdin().is_terminal() && io::stdout().is_terminal() {
-        // The view is the output: nothing goes to stdout but the terminal UI.
-        let data = scan::to_json(&tree, &context, &verdict);
-        // A failed view must not skip the stderr warnings below, and must not
-        // change the exit status: say so and carry on.
-        if let Err(err) = sim_doctor::tui::run(&data) {
-            eprintln!("sim-doctor: tui: {err}");
-        }
-        shown_in_tui = true;
-        String::new()
-    } else {
-        if args.tui {
-            eprintln!("sim-doctor: --tui needs a terminal; showing the plain report");
-        }
-        scan::to_human(&tree, &context, &verdict)
-    };
-
-    // One line on stderr for a truncated walk, in BOTH modes, on top of the
-    // banner and the JSON fields. Under --json stdout is the envelope, so this
-    // is where a human watching a CI log learns the answer is partial without
-    // having to pipe the envelope through a formatter first.
-    if !tree.is_complete() {
-        let hit: Vec<String> = tree
-            .limits_hit()
-            .iter()
-            .copied()
-            .map(|limit| limit.to_string())
-            .collect();
-        eprintln!(
-            "sim-doctor: warning: the walk stopped early, so this is not the whole card; \
-             bounds hit: {}",
-            if hit.is_empty() {
-                "none recorded".to_owned()
-            } else {
-                hit.join(", ")
-            }
-        );
-    }
-
-    // One line on stderr for a TAR scan that did not finish, in BOTH modes,
-    // for the same reason the walk has one: under --json stdout is the
-    // envelope, and an agent reading it has to be able to see that the TAR
-    // audit stopped early without piping it through a formatter first.
-    if let Some(reason) = verdict.tar().stopped.as_deref() {
-        eprintln!(
-            "sim-doctor: warning: the TAR scan did not finish, so its findings are partial: {reason}"
-        );
-    }
-
-    let what = if args.json {
-        "the scan envelope"
-    } else {
-        "the scan report"
-    };
-    let emitted = if shown_in_tui {
-        Ok(())
-    } else {
-        emit_stdout(rendered.trim_end_matches('\n'), what)
-    };
-
-    match emitted {
-        Ok(()) => exit_code,
-        Err(message) => {
-            eprintln!("sim-doctor: {message}");
-            contract::ExitCode::Error
         }
     }
 }
@@ -4075,26 +3758,6 @@ fn report_refusal(
     }
 
     contract::ExitCode::Findings
-}
-
-/// Reports a `scan` that could not run: a doctor/1 envelope with no findings and
-/// the reason in `data`, exit 2. (Other commands keep the lpa refusal and exit 1.)
-fn report_scan_failure(failure: &scan::Failure, json: bool) -> contract::ExitCode {
-    eprintln!("sim-doctor: {}", failure.message);
-    if json {
-        let envelope = contract::doctor_failure(contract::ExitCode::Error, failure.data());
-        // A write failure does not change the exit code: the run genuinely
-        // failed, and "could not report the failure" is not a different answer.
-        match serde_json::to_string(&envelope) {
-            Ok(line) => {
-                if let Err(err) = emit_stdout(&line, "the failure envelope") {
-                    eprintln!("sim-doctor: {err}");
-                }
-            }
-            Err(err) => eprintln!("sim-doctor: {err}"),
-        }
-    }
-    contract::ExitCode::Error
 }
 
 #[cfg(test)]
