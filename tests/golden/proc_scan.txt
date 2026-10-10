@@ -1,0 +1,157 @@
+# msl0, default --fail-on (critical): sim-doctor scan --json --tar focused
+exit 1
+--- stderr
+
+--- stdout: 153296 bytes, sha256 d2b3b47be6707af204f0d17c26176888b6aa14e0cf581ed2365717625643cddd
+# clean card: sim-doctor scan --json --tar focused
+exit 0
+--- stderr
+
+--- stdout: 151491 bytes, sha256 3a72d7cf9630ffa6c6ffd8120675182e16e9c3642ae8a9d2aa9958170a3239e9
+# TAR audit off (the default): sim-doctor scan --json
+exit 0
+--- stderr
+sim-doctor: warning: the TAR scan did not finish, so its findings are partial: the operator asked for no TAR probing
+
+--- stdout: 145932 bytes, sha256 f90445c555c2438305cd24b86e68b69972b996255cedd4a2840577bf4603f072
+# --fail-on info: sim-doctor scan --json --tar focused --fail-on info
+exit 1
+--- stderr
+
+--- stdout: 153296 bytes, sha256 d2b3b47be6707af204f0d17c26176888b6aa14e0cf581ed2365717625643cddd
+# --fail-on high: sim-doctor scan --json --tar focused --fail-on high
+exit 1
+--- stderr
+
+--- stdout: 153296 bytes, sha256 d2b3b47be6707af204f0d17c26176888b6aa14e0cf581ed2365717625643cddd
+# --severity high: sim-doctor scan --json --tar focused --severity high
+exit 1
+--- stderr
+
+--- stdout: 153300 bytes, sha256 0812ef9d3f99a3400e88147bef6ca85ae0dd1dc93092ba3ffd9ed82131f0265e
+# --severity critical --fail-on info: sim-doctor scan --json --tar focused --severity critical --fail-on info
+exit 1
+--- stderr
+
+--- stdout: 153308 bytes, sha256 8dfd51bfe2953b864febf45ba8ce8fa42c5b2c434e3c3273e359a5639dc48851
+# --score with --json: sim-doctor scan --json --tar focused --score
+exit 1
+--- stderr
+
+--- stdout: 153296 bytes, sha256 d2b3b47be6707af204f0d17c26176888b6aa14e0cf581ed2365717625643cddd
+# truncated walk (--max-nodes 2): sim-doctor scan --json --tar focused --max-nodes 2
+exit 1
+--- stderr
+sim-doctor: warning: the walk stopped early, so this is not the whole card; bounds hit: maximum number of files
+
+--- stdout: 22907 bytes, sha256 bc2e3b273faf169e433a0a5e73338b06ce07b13a5e7e2f7cea12ec0412c9dd03
+# --terminal-profile needs --tar: sim-doctor scan --json --terminal-profile
+exit 2
+--- stderr
+sim-doctor: --terminal-profile is only meaningful with --tar other than off
+
+--- stdout
+
+# bad --fail-on is a usage error (2 on scan): sim-doctor scan --json --fail-on bogus
+exit 2
+--- stderr
+error: invalid value 'bogus' for '--fail-on <LEVEL>': "bogus" is not a severity; expected one of info, low, medium, high, critical
+
+For more information, try '--help'.
+
+--- stdout
+
+# --tui conflicts with --json (2 on scan): sim-doctor scan --json --tui
+exit 2
+--- stderr
+error: the argument '--json' cannot be used with '--tui'
+
+Usage: sim-doctor scan --json
+
+For more information, try '--help'.
+
+--- stdout
+
+# human report: exit 1
+--- stderr
+
+# --tui without a terminal: exit 1
+--- stderr
+sim-doctor: --tui needs a terminal; showing the plain report
+
+# --sarif: sim-doctor scan --json --tar focused --sarif <TMP>/out.sarif
+exit 1
+--- stderr
+
+--- stdout: 153296 bytes, sha256 d2b3b47be6707af204f0d17c26176888b6aa14e0cf581ed2365717625643cddd
+--- file out.sarif: 9867 bytes, sha256 ea9be6bb81e81038f560242b37355f9e5bd079c309c35f8d46d3744ed5d0c09c
+# --sarif to an unwritable path: sim-doctor scan --json --tar focused --sarif <TMP>/no-such-dir/out.sarif
+exit 2
+--- stderr
+sim-doctor: sarif-unwritable: could not write SARIF to <TMP>/no-such-dir/out.sarif: No such file or directory (os error 2)
+
+--- stdout: 153296 bytes, sha256 a20e8172d7d647b3de1c791dbecbee6e46afa1d4d5af80d5afcc8d9f9366f554
+--- file out.sarif: absent
+# baseline: same findings: sim-doctor scan --json --tar focused --baseline <TMP>/msl0.json
+exit 0
+--- stderr
+sim-doctor: compared against the baseline: 0 new, 0 fixed, 1 persisting
+
+--- stdout: 154255 bytes, sha256 a7a705bba321bbf91761a528929bfa48400794f8394df9e3240d5d439479fee2
+# baseline: a new finding gates (exit 3): sim-doctor scan --json --tar focused --baseline <TMP>/clean.json
+exit 3
+--- stderr
+sim-doctor: compared against the baseline: 1 new, 0 fixed, 0 persisting
+
+--- stdout: 154248 bytes, sha256 c610acd2e2901cdb4b2f5b7d0c6bc019e88e8db1bd0f9d710b439e9b01331be2
+# baseline: the finding is fixed: sim-doctor scan --json --tar focused --baseline <TMP>/msl0.json
+exit 0
+--- stderr
+sim-doctor: compared against the baseline: 0 new, 1 fixed, 0 persisting
+
+--- stdout: 151854 bytes, sha256 a23970e5b23c727d75384f105b7953cbb1a38b8181a93eb3c13117aa7ea81bd4
+# baseline from a truncated walk is refused: sim-doctor scan --json --tar focused --baseline <TMP>/small.json
+exit 2
+--- stderr
+sim-doctor: this baseline was written by a scan whose walk did not finish (nodes); a walk that stopped at a bound did not see the whole card, so almost every finding this run raises would read as new and none as fixed. Save a baseline from a complete scan. The baseline ran as: the walk was TRUNCATED on reader "replay" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run. This run ran as: the walk was complete on reader "replay" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run.
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-truncated","message":"this baseline was written by a scan whose walk did not finish (nodes); a walk that stopped at a bound did not see the whole card, so almost every finding this run raises would read as new and none as fixed. Save a baseline from a complete scan. The baseline ran as: the walk was TRUNCATED on reader \"replay\" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run. This run ran as: the walk was complete on reader \"replay\" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run."},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# baseline with --fail-on info: sim-doctor scan --json --tar focused --baseline <TMP>/clean.json --fail-on info
+exit 3
+--- stderr
+sim-doctor: compared against the baseline: 1 new, 0 fixed, 0 persisting
+
+--- stdout: 154248 bytes, sha256 c610acd2e2901cdb4b2f5b7d0c6bc019e88e8db1bd0f9d710b439e9b01331be2
+# baseline with --severity high: sim-doctor scan --json --tar focused --baseline <TMP>/clean.json --severity high
+exit 2
+--- stderr
+sim-doctor: the baseline was saved at --severity none and this run is at --severity high; the two runs reported different sets, so a finding one of them never held is not new and one the other filtered out is not fixed. Save the baseline at the same level. The baseline ran as: the walk was complete on reader "replay" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run. This run ran as: the walk was complete on reader "replay" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity high, 10 rule(s) run.
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"severity-mismatch","message":"the baseline was saved at --severity none and this run is at --severity high; the two runs reported different sets, so a finding one of them never held is not new and one the other filtered out is not fixed. Save the baseline at the same level. The baseline ran as: the walk was complete on reader \"replay\" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run. This run ran as: the walk was complete on reader \"replay\" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity high, 10 rule(s) run."},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# baseline taken under another --tar: sim-doctor scan --json --baseline <TMP>/msl0.json
+exit 2
+--- stderr
+sim-doctor: the baseline probed --tar focused@etsi and this run probed --tar off@etsi; the MSL 0 rule answers about the TARs it probed, so these are two answers to two questions. Use the same --tar. The baseline ran as: the walk was complete on reader "replay" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run. This run ran as: the walk was complete on reader "replay" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar off@etsi, --severity none, 10 rule(s) run.
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"tar-selection-mismatch","message":"the baseline probed --tar focused@etsi and this run probed --tar off@etsi; the MSL 0 rule answers about the TARs it probed, so these are two answers to two questions. Use the same --tar. The baseline ran as: the walk was complete on reader \"replay\" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar focused@etsi, --severity none, 10 rule(s) run. This run ran as: the walk was complete on reader \"replay\" under the ts-102-221 tag table, probing the sim-families (1280 probed, exhaustive=false) candidate set, --tar off@etsi, --severity none, 10 rule(s) run."},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# --sarif is the --baseline file: sim-doctor scan --json --tar focused --baseline <TMP>/same.json --sarif <TMP>/same.json
+exit 2
+--- stderr
+sim-doctor: --sarif and --baseline both name <TMP>/same.json; the SARIF file would destroy the baseline
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"sarif-baseline-same-path","message":"--sarif and --baseline both name <TMP>/same.json; the SARIF file would destroy the baseline"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# --sarif is the --baseline file (no --json): sim-doctor scan --baseline <TMP>/same.json --sarif <TMP>/same.json
+exit 2
+--- stderr
+sim-doctor: --sarif and --baseline both name <TMP>/same.json; the SARIF file would destroy the baseline
+
+--- stdout
+

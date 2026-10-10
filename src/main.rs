@@ -2060,55 +2060,9 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
         return report_interrupted(scan::KIND, args.json);
     }
 
-    let readers = match Pcsc::readers() {
-        Ok(readers) => readers,
-        Err(err) => {
-            return report_scan_failure(
-                &scan::Failure::new("context-unavailable", err.to_string()),
-                args.json,
-            )
-        }
-    };
-
-    let reader = match pick_reader(&readers, args.reader.as_deref()) {
-        Ok(reader) => reader,
+    let (mut session, reader, atr) = match open_scan_session(args.reader.as_deref()) {
+        Ok(opened) => opened,
         Err(failure) => return report_scan_failure(&failure, args.json),
-    };
-
-    let session = match PcscSession::open(reader) {
-        Ok(session) => session,
-        Err(err) => {
-            let kind = match err {
-                TransportError::NoCard { .. } => "no-card",
-                _ => "reader-unavailable",
-            };
-            return report_scan_failure(&scan::Failure::new(kind, err.to_string()), args.json);
-        }
-    };
-
-    // Best effort. An ATR this transport could not read is a fact about the
-    // session, not a reason to refuse to scan a card that is otherwise
-    // answering, so it is Option rather than an error. A reader that cannot
-    // even be opened has already failed above.
-    let atr = session.atr().ok();
-
-    // Opt-in capture for issue #120: SIM_DOCTOR_RECORD=<path> logs every
-    // exchange of this scan (JSON lines, see transport::replay). The log is
-    // raw card output; it is never written unless the operator asks.
-    let mut session: Box<dyn CardSession> = match std::env::var_os("SIM_DOCTOR_RECORD") {
-        Some(path) => match record_log_file(&path) {
-            Ok(file) => Box::new(replay::Record::new(session, file)),
-            Err(err) => {
-                return report_scan_failure(
-                    &scan::Failure::new(
-                        "record-log-unwritable",
-                        format!("SIM_DOCTOR_RECORD {}: {err}", path.to_string_lossy()),
-                    ),
-                    args.json,
-                )
-            }
-        },
-        None => Box::new(session),
     };
 
     let options = walk::Options {
@@ -2348,6 +2302,60 @@ fn run_scan(args: ScanArgs) -> contract::ExitCode {
             contract::ExitCode::Error
         }
     }
+}
+
+/// What `SIM_DOCTOR_TEST_REPLAY` names: a `SIM_DOCTOR_RECORD` log that `scan`
+/// answers from instead of a reader. Test seam only (tests/golden_scan.rs): it
+/// lets the real binary's whole scan path run, deterministically, on a machine
+/// with no PC/SC service. Unset in every normal invocation.
+const REPLAY_ENV: &str = "SIM_DOCTOR_TEST_REPLAY";
+
+/// What [`open_scan_session`] hands `scan`: the session, its reader and the ATR.
+type ScanSession = (Box<dyn CardSession>, ReaderName, Option<Vec<u8>>);
+
+/// Opens the card session `scan` reads: its reader name, the ATR when the
+/// transport can say, and the session itself (wrapped in the record log when
+/// `SIM_DOCTOR_RECORD` is set).
+fn open_scan_session(requested: Option<&str>) -> Result<ScanSession, scan::Failure> {
+    if let Some(path) = env::var_os(REPLAY_ENV) {
+        let log = std::fs::read_to_string(&path)
+            .map_err(|err| scan::Failure::new("reader-unavailable", err.to_string()))?;
+        let replay = replay::Replay::from_log(&log)
+            .map_err(|err| scan::Failure::new("reader-unavailable", err))?;
+        let reader = replay.reader().clone();
+        return Ok((Box::new(replay), reader, None));
+    }
+    let readers = Pcsc::readers()
+        .map_err(|err| scan::Failure::new("context-unavailable", err.to_string()))?;
+    let reader = pick_reader(&readers, requested)?.clone();
+    let session = PcscSession::open(&reader).map_err(|err| {
+        let kind = match err {
+            TransportError::NoCard { .. } => "no-card",
+            _ => "reader-unavailable",
+        };
+        scan::Failure::new(kind, err.to_string())
+    })?;
+    // Best effort. An ATR this transport could not read is a fact about the
+    // session, not a reason to refuse to scan a card that is otherwise
+    // answering, so it is Option rather than an error.
+    let atr = session.atr().ok();
+
+    // Opt-in capture for issue #120: SIM_DOCTOR_RECORD=<path> logs every
+    // exchange of this scan (JSON lines, see transport::replay). The log is
+    // raw card output; it is never written unless the operator asks.
+    let session: Box<dyn CardSession> = match env::var_os("SIM_DOCTOR_RECORD") {
+        Some(path) => {
+            let file = record_log_file(&path).map_err(|err| {
+                scan::Failure::new(
+                    "record-log-unwritable",
+                    format!("SIM_DOCTOR_RECORD {}: {err}", path.to_string_lossy()),
+                )
+            })?;
+            Box::new(replay::Record::new(session, file))
+        }
+        None => Box::new(session),
+    };
+    Ok((session, reader, atr))
 }
 
 /// 5 to 16 bytes of hex.
