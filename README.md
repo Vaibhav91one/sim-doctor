@@ -389,6 +389,15 @@ closest default that keeps a scan with only lower findings (swSIM can produce no
 passing. The other commands (`rules`, `why`, `fix`, `gp`, `ts48`, `fuzz`, `modules`, ...) keep their lpac-style envelope
 `{type, payload:{code, message, data}}` and the codes 0 / 1 (could not run) / 129 (bad usage) / 130.
 
+**APDU mutation fuzzer.** `sim-doctor fuzz mutate --mock --max-cases 1000 --seed 7 --json` (or
+`--replay LOG`) sends seeded malformed variations of SELECT, READ BINARY, READ RECORD, STATUS,
+GET DATA, GET RESPONSE and unassigned INS values, and nothing else: PIN, write, authenticate,
+key and install commands cannot be generated. `--dry-run` prints the plan and sends nothing;
+`--stop-on-first-finding` and `--timeout SECONDS` end a run early. Every APDU and status word is in
+`data.audit.exchanges` (`jq -c '.payload.data.audit.exchanges[]|{command,response}'` makes a replay log).
+A success answer to an APDU the spec says to reject is a `fuzz/malformed-command-accepted`
+finding. It does not talk to a reader yet.
+
 **Baseline.** Save one (see below), compare with
 `sim-doctor scan --baseline baseline.json`: findings match by `fingerprint`, each gets
 `baseline_state` (`new` or `unchanged`), the envelope gets `baseline: {new, unchanged, fixed}`, and

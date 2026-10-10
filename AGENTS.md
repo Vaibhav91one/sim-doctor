@@ -934,6 +934,17 @@ Distilled from [docs/research-report.md](docs/research-report.md). All `[V]` unl
 Note: `FuzzerFactory.java` is a fuzzer factory, NOT an APDU fuzzer factory. APDU discovery is
 a separate `APDUScanner.java` (`-sa LEVEL 1` CLA via OTA, `-sal2` LEVEL 2 CLA+INS) [V].
 
+`fuzz mutate` (`src/apdu_fuzz.rs`, #134) is sim-doctor's own APDU mutation fuzzer, not a SIMTester
+port. Binding decisions: the generator is allowlist-only by construction (`Case::build` takes a
+`Kind`; the INS is fixed per kind, or one of `UNASSIGNED_INS` `00`/`FF`), `send_guard` re-checks
+before every transmit against the allowlist and `DENIED`, and it is wired only to the replay
+transport and `MockCard`: no real-reader path until a follow-up puts one behind `fuzz_opt_in`.
+Allowlist INS (TS 102 221 V17.4.0 Table 10.5): SELECT `A4`, STATUS `F2`, READ BINARY `B0`, READ
+RECORD `B2`, GET RESPONSE `C0`; GET DATA `CA`/`CB` is ISO/IEC 7816-4 (TS 102 221 has no GET DATA;
+its `CB` is RETRIEVE DATA). STATUS P1 `04` (terminate application) is never generated. Only
+spec-defined rejections are findings (unassigned INS, SELECT P1 `05`-`07`, SELECT data length
+disagreeing with Lc, GET RESPONSE with P1/P2 or data); everything else is logged, not judged.
+
 ### What issue #24 read in SIMTester's TAR scanner [V]
 
 Everything above about the reference is read out of `srlabs/SIMTester` at the
