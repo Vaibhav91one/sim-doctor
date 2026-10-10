@@ -151,3 +151,45 @@ fn apdu_dry_runs_then_sends_with_yes_and_checks_expectations() {
     assert_eq!(r[1]["ok"], false);
     assert_eq!(r[1]["data"]["sw"], "9000");
 }
+
+#[test]
+fn select_keeps_the_path_between_commands_in_one_process() {
+    let out = card(
+        "cardsh_select.jsonl",
+        &[
+            "--json",
+            "-c",
+            "select 3F00; select 7F20; select 6F07; select 3F00; select 3F00/7F10/6F3A; select ADF.USIM; \
+             select EF.IMSI; select_path 6FAD; select 2FE2",
+        ],
+    );
+    // The last SELECT is 2FE2 inside the ADF: the card says 6A82, so one failure and exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = lines(&out);
+    let paths: Vec<&str> = r
+        .iter()
+        .map(|v| v["data"]["path"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "3F00",
+            "3F00/7F20",
+            "3F00/7F20/6F07",
+            "3F00",
+            "3F00/7F10/6F3A",
+            "3F00/ADF:A0000000871002FF49FF0589",
+            "3F00/ADF:A0000000871002FF49FF0589/6F07",
+            "3F00/ADF:A0000000871002FF49FF0589/6FAD",
+            "",
+        ]
+    );
+    assert_eq!(r[2]["data"]["size"], 9);
+    assert_eq!(r[4]["data"]["records"], 3);
+    assert_eq!(r[8]["ok"], false);
+}
