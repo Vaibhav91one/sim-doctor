@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format follows
 - `card`: `apdu [--raw] [--expect-sw SW] [--expect-response-regex RE] [--yes] APDU` (#156): one raw APDU with GET RESPONSE
   followed, the channel applied to the class byte unless `--raw`, pySim's `x` wildcards in `--expect-sw`, and a dry run
   for any instruction that is not a read unless `--yes`.
+- `card`: `select NAME|FID|AID|PATH`, `select_path` and `select_adf` (#157): select by FID, standard file name, AID,
+  absolute or relative path, or application name (`ADF.USIM` through EF.DIR). The selection is kept per logical channel,
+  the FCP is decoded in the reply, and `--profile sim` selects by FID with GSM 11.11 responses.
 
 ## [0.4.0]
 

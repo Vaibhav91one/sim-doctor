@@ -2096,4 +2096,14 @@ fn card_shell_drives_a_real_card() {
     assert_eq!(records[0]["data"]["sw"], "9000");
     assert_eq!(records[2]["data"]["sent"], false);
     println!("card shell: apdu SELECT MF 9000, a write stayed a dry run");
+
+    // select: by FID, then the state (the path) carries into the next command of the same process.
+    let (code, records) = run("select 3F00; select 7F20; select 3F00; select EF.ICCID");
+    assert_eq!(code, Some(0), "{records:?}");
+    assert_eq!(records[0]["data"]["path"], "3F00");
+    assert_eq!(records[1]["data"]["path"], "3F00/7F20");
+    assert_eq!(records[2]["data"]["path"], "3F00");
+    assert_eq!(records[3]["data"]["path"], "3F00/2FE2");
+    assert_eq!(records[3]["data"]["size"], 10, "EF.ICCID is ten octets");
+    println!("card shell: select kept the path across commands, EF.ICCID is 10 octets");
 }

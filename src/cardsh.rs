@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use crate::apdu::{self, Command, StatusWord};
 use crate::fcp::{self, TagSet};
-use crate::fs::FileId;
+use crate::fs::{self, FileId};
 use crate::session::{self, PendingFollowUp, Policy};
 use crate::transport::CardSession;
 
@@ -226,7 +226,6 @@ struct Equipped {
 
 impl Equipped {
     /// The class byte of a command of this profile on the channel in use.
-    #[allow(dead_code)] // the file commands (next change) send with it
     fn cla(&self) -> u8 {
         apdu::class_on_channel(self.profile.cla(), self.channel).unwrap_or(self.profile.cla())
     }
@@ -239,6 +238,417 @@ impl Equipped {
             ..Policy::default()
         };
         Ok(session::send(self.session.as_mut(), command, &policy)?)
+    }
+}
+
+/// One SELECT the shell sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectBy {
+    /// By file identifier, in the current DF (or the MF, its parent, itself).
+    Fid(FileId),
+    /// An application by (possibly partial) AID.
+    Aid(Vec<u8>),
+    /// Absolute from the master file, the MF's own identifier left out.
+    AbsPath(Vec<FileId>),
+    /// Relative to the current DF.
+    RelPath(Vec<FileId>),
+}
+
+/// The placeholder identifier an application sits under in [`Chan::dir`] (ADFs have none).
+const ADF_FID: FileId = FileId::from_bytes([0x7F, 0xFF]);
+
+/// `select_path` takes a path whether or not it starts with `/`; a bare path with no `/` must still
+/// be read as a path, so it gets a leading `./`.
+fn path_arg(path: &str) -> String {
+    if path.contains('/') {
+        path.to_owned()
+    } else {
+        format!("./{path}")
+    }
+}
+
+/// Is this a DF by its identifier alone (3F, 7F, 5F)? Only used when the card sent no FCP.
+fn df_by_fid(fid: FileId) -> bool {
+    matches!(fid.to_bytes()[0], 0x3F | 0x7F | 0x5F)
+}
+
+/// Reads a GSM 11.11 SELECT response (`sim` profile): size, file id, type, structure.
+fn read_gsm_response(body: &[u8]) -> FileInfo {
+    let mut info = FileInfo {
+        fcp: hex_upper(body),
+        ..FileInfo::default()
+    };
+    if body.len() >= 7 {
+        info.size = Some(u32::from(u16::from_be_bytes([body[2], body[3]])));
+        info.fid = Some(FileId::from_bytes([body[4], body[5]]));
+        info.is_df = matches!(body[6], 1 | 2);
+        if !info.is_df && body.len() >= 15 {
+            info.structure = Some(match body[13] {
+                0 => "transparent",
+                1 => "linear-fixed",
+                3 => "cyclic",
+                _ => "unknown",
+            });
+            if body[13] != 0 && body[14] > 0 {
+                let rl = u16::from(body[14]);
+                info.record_length = Some(rl);
+                info.records = info.size.map(|sz| (sz / u32::from(rl)) as u16);
+            }
+        }
+    }
+    info
+}
+
+impl Equipped {
+    /// Sends one SELECT and returns what the card said about the file.
+    fn select(&mut self, by: &SelectBy, dialect: &TagSet) -> Result<FileInfo, CmdErr> {
+        let (header, data) = match (by, self.profile) {
+            (SelectBy::Fid(id), Profile::Uicc) => {
+                (fs::select_capabilities_header(), id.to_bytes().to_vec())
+            }
+            (SelectBy::Fid(id), Profile::Sim) => {
+                (apdu::Header::new(0, 0xA4, 0, 0), id.to_bytes().to_vec())
+            }
+            (SelectBy::Aid(aid), Profile::Uicc) => (fs::select_aid_header(), aid.clone()),
+            (SelectBy::AbsPath(ids), Profile::Uicc) => (fs::select_path_header(), flat(ids)),
+            (SelectBy::RelPath(ids), Profile::Uicc) => {
+                (fs::select_from_current_df_header(), flat(ids))
+            }
+            (_, Profile::Sim) => {
+                return Err(CmdErr::new(
+                    "the sim profile (GSM 11.11) selects by file identifier only",
+                ))
+            }
+        };
+        let h = header;
+        let cla = self.cla();
+        let command = Command::case3(
+            apdu::Header::new(cla, h.instruction(), h.parameter_1(), h.parameter_2()),
+            data,
+        );
+        let ex = self.send(&command)?;
+        let sw = ex.status();
+        if !sw.is_some_and(StatusWord::is_normal_processing) {
+            return Err(CmdErr {
+                message: format!("SELECT {} refused: {}", describe(by), sw_text(sw)),
+                data: json!({ "sw": sw.map(|s| s.to_string()) }),
+            });
+        }
+        Ok(if self.profile == Profile::Sim {
+            read_gsm_response(ex.data())
+        } else {
+            read_fcp(ex.data(), dialect)
+        })
+    }
+
+    /// Moves the channel's selection to where `by` landed.
+    fn land(&mut self, by: &SelectBy, mut info: FileInfo) -> FileInfo {
+        let chan = self
+            .chans
+            .get_mut(&self.channel)
+            .expect("the channel in use is open");
+        let target = match by {
+            SelectBy::Fid(id) => Some(*id),
+            SelectBy::AbsPath(ids) | SelectBy::RelPath(ids) => ids.last().copied(),
+            SelectBy::Aid(_) => None,
+        };
+        if info.fid.is_none() {
+            info.fid = target;
+        }
+        // Without an FCP the identifier decides what it is.
+        if info.fcp.is_empty() {
+            info.is_df = info.fid.is_some_and(df_by_fid);
+        }
+        match by {
+            SelectBy::Aid(aid) => {
+                chan.dir = vec![FileId::MASTER_FILE, ADF_FID];
+                chan.adf = Some(info.name.clone().unwrap_or_else(|| aid.clone()));
+            }
+            SelectBy::Fid(id) if *id == FileId::MASTER_FILE => {
+                chan.dir = vec![FileId::MASTER_FILE];
+                chan.adf = None;
+            }
+            SelectBy::Fid(id) => {
+                if info.is_df {
+                    if chan.dir.len() > 1 && chan.dir[chan.dir.len() - 2] == *id {
+                        chan.dir.pop();
+                        if chan.dir.len() == 1 {
+                            chan.adf = None;
+                        }
+                    } else if chan.dir.last() != Some(id) {
+                        chan.dir.push(*id);
+                    }
+                }
+            }
+            SelectBy::AbsPath(ids) => {
+                chan.adf = None;
+                chan.dir = std::iter::once(FileId::MASTER_FILE)
+                    .chain(ids.iter().copied())
+                    .collect();
+                if !info.is_df {
+                    chan.dir.pop();
+                }
+            }
+            SelectBy::RelPath(ids) => {
+                chan.dir.extend(ids.iter().copied());
+                if !info.is_df {
+                    chan.dir.pop();
+                }
+            }
+        }
+        chan.file = Some(info.clone());
+        info
+    }
+}
+
+fn flat(ids: &[FileId]) -> Vec<u8> {
+    ids.iter().flat_map(|i| i.to_bytes()).collect()
+}
+
+fn describe(by: &SelectBy) -> String {
+    let join = |ids: &[FileId]| {
+        ids.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    match by {
+        SelectBy::Fid(id) => id.to_string(),
+        SelectBy::Aid(aid) => format!("AID {}", hex_upper(aid)),
+        SelectBy::AbsPath(ids) => format!("3F00/{}", join(ids)),
+        SelectBy::RelPath(ids) => format!("./{}", join(ids)),
+    }
+}
+
+/// The AID prefix of a well-known application name.
+fn adf_prefix(name: &str) -> Option<&'static [u8]> {
+    match name.to_ascii_uppercase().as_str() {
+        "ADF.USIM" => Some(&[0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]),
+        "ADF.ISIM" => Some(&[0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04]),
+        "ADF.CSIM" => Some(&[0xA0, 0x00, 0x00, 0x03, 0x43, 0x10, 0x02]),
+        _ => None,
+    }
+}
+
+/// One path segment, resolved.
+enum Seg {
+    Fid(FileId),
+    Aid(Vec<u8>),
+    AdfName(String),
+}
+
+fn parse_segment(word: &str) -> Result<Seg, CmdErr> {
+    let hexish = !word.is_empty() && word.chars().all(|c| c.is_ascii_hexdigit());
+    if hexish && word.len() == 4 {
+        let b = parse_hex(word).map_err(CmdErr::new)?;
+        return Ok(Seg::Fid(FileId::from_bytes([b[0], b[1]])));
+    }
+    if hexish && word.len() % 2 == 0 && (10..=32).contains(&word.len()) {
+        return Ok(Seg::Aid(parse_hex(word).map_err(CmdErr::new)?));
+    }
+    if let Some(aid) = word
+        .strip_prefix("ADF:")
+        .or_else(|| word.strip_prefix("adf:"))
+    {
+        return Ok(Seg::Aid(parse_hex(aid).map_err(CmdErr::new)?));
+    }
+    if adf_prefix(word).is_some() {
+        return Ok(Seg::AdfName(word.to_owned()));
+    }
+    names::fid_of(word).map(Seg::Fid).ok_or_else(|| {
+        CmdErr::new(format!(
+            "`{word}` is not a file identifier, an AID or a known file name"
+        ))
+    })
+}
+
+impl Shell {
+    /// The AID the card lists in EF.DIR for the application called `name`.
+    fn adf_aid(&mut self, name: &str) -> Result<Vec<u8>, CmdErr> {
+        let prefix = adf_prefix(name)
+            .ok_or_else(|| CmdErr::new(format!("`{name}` is not a known application name")))?;
+        let dialect = self.opts.dialect.clone();
+        let card = self.equipped()?;
+        let saved = card.chans[&card.channel].clone();
+        let dir = SelectBy::AbsPath(vec![FileId::from_bytes([0x2F, 0x00])]);
+        let info = card.select(&dir, &dialect)?;
+        let (rl, n) = (info.record_length.unwrap_or(0), info.records.unwrap_or(0));
+        let mut found = None;
+        for rec in 1..=n {
+            let le = apdu::Le::for_byte_count(u32::from(rl))
+                .ok_or_else(|| CmdErr::new("EF.DIR has no record length"))?;
+            let cla = card.cla();
+            let read = card.send(&Command::case2(
+                apdu::Header::new(cla, 0xB2, rec as u8, 0x04),
+                le,
+            ))?;
+            if !read.status().is_some_and(StatusWord::is_normal_processing) {
+                break;
+            }
+            if let Ok(Some(app)) = crate::ef::decode_dir_record(read.data()) {
+                if app.aid.starts_with(prefix) {
+                    found = Some(app.aid);
+                    break;
+                }
+            }
+        }
+        // Listing the directory must not move the shell: put the old selection back on the card.
+        card.chans.insert(card.channel, saved);
+        if let Some(by) = Self::reselect(&card.chans[&card.channel]) {
+            let _ = card.select(&by, &dialect);
+        }
+        found.ok_or_else(|| CmdErr::new(format!("EF.DIR lists no {name}")))
+    }
+
+    /// The SELECT that returns the card to `chan`'s selection (best effort).
+    fn reselect(chan: &Chan) -> Option<SelectBy> {
+        let below: Vec<FileId> = chan
+            .dir
+            .iter()
+            .skip(if chan.adf.is_some() { 2 } else { 1 })
+            .copied()
+            .collect();
+        let mut ids = below;
+        if let Some(f) = chan.file.as_ref().filter(|f| !f.is_df) {
+            ids.extend(f.fid);
+        }
+        match (&chan.adf, ids.is_empty()) {
+            (Some(aid), _) => Some(SelectBy::Aid(aid.clone())),
+            (None, true) if chan.dir.len() == 1 => Some(SelectBy::Fid(FileId::MASTER_FILE)),
+            (None, true) => Some(SelectBy::AbsPath(chan.dir[1..].to_vec())),
+            (None, false) => Some(SelectBy::AbsPath(ids)),
+        }
+    }
+
+    fn cmd_select_adf(&mut self, arg: &str) -> CmdResult {
+        let aid = match parse_segment(arg)? {
+            Seg::Aid(aid) => aid,
+            Seg::AdfName(name) => self.adf_aid(&name)?,
+            Seg::Fid(_) => {
+                return Err(CmdErr::new(
+                    "select_adf takes an AID or an application name",
+                ))
+            }
+        };
+        self.run_select(&[SelectBy::Aid(aid)])
+    }
+
+    fn cmd_select(&mut self, target: &str) -> CmdResult {
+        // Plain word: one segment. With a `/`: a path; a leading 3F00/MF or `/` makes it absolute.
+        let (absolute, words): (bool, Vec<&str>) = if target.contains('/') {
+            let t = target.trim_start_matches("./");
+            let abs = t.starts_with('/');
+            (abs, t.split('/').filter(|w| !w.is_empty()).collect())
+        } else {
+            (false, vec![target])
+        };
+        let mut segs = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            if w.eq_ignore_ascii_case("MF") || w.eq_ignore_ascii_case("3F00") {
+                if i == 0 {
+                    segs.push(Seg::Fid(FileId::MASTER_FILE));
+                    continue;
+                }
+                return Err(CmdErr::new("the master file can only start a path"));
+            }
+            segs.push(parse_segment(w)?);
+        }
+        if segs.is_empty() {
+            return Err(CmdErr::new("nothing to select"));
+        }
+        let mut plan: Vec<SelectBy> = Vec::new();
+        let mut ids: Vec<FileId> = Vec::new();
+        let mut abs = absolute;
+        let mut iter = segs.into_iter().peekable();
+        if matches!(iter.peek(), Some(Seg::Fid(f)) if *f == FileId::MASTER_FILE) && words.len() > 1
+            || absolute
+        {
+            if matches!(iter.peek(), Some(Seg::Fid(f)) if *f == FileId::MASTER_FILE) {
+                iter.next();
+            }
+            abs = true;
+        }
+        for seg in iter {
+            match seg {
+                Seg::Fid(f) => ids.push(f),
+                Seg::Aid(aid) => {
+                    if !ids.is_empty() {
+                        return Err(CmdErr::new("an application can only start a path"));
+                    }
+                    plan.push(SelectBy::Aid(aid));
+                    abs = false;
+                }
+                Seg::AdfName(name) => {
+                    if !ids.is_empty() {
+                        return Err(CmdErr::new("an application can only start a path"));
+                    }
+                    let aid = self.adf_aid(&name)?;
+                    plan.push(SelectBy::Aid(aid));
+                    abs = false;
+                }
+            }
+        }
+        if !ids.is_empty() || plan.is_empty() {
+            let tail = if words.len() == 1 && plan.is_empty() {
+                match ids.as_slice() {
+                    [one] => SelectBy::Fid(*one),
+                    _ => SelectBy::RelPath(ids),
+                }
+            } else if ids.is_empty() {
+                SelectBy::Fid(FileId::MASTER_FILE)
+            } else if abs && plan.is_empty() {
+                SelectBy::AbsPath(ids)
+            } else {
+                SelectBy::RelPath(ids)
+            };
+            plan.push(tail);
+        }
+        self.run_select(&plan)
+    }
+
+    fn run_select(&mut self, plan: &[SelectBy]) -> CmdResult {
+        let dialect = self.opts.dialect.clone();
+        let card = self.equipped()?;
+        let mut info = FileInfo::default();
+        for by in plan {
+            // A refusal names the file; the hint says where a known name lives.
+            info = card.select(by, &dialect).map_err(|mut e| {
+                if let SelectBy::Fid(id) = by {
+                    if let Some(scope) = names::scope_of(*id) {
+                        if e.message.contains("6A82") {
+                            e.message.push_str(&format!(
+                                " (a file of that identifier lives under {scope})"
+                            ));
+                        }
+                    }
+                }
+                e
+            })?;
+            info = card.land(by, info);
+        }
+        let chan = &card.chans[&card.channel];
+        let path = chan.path();
+        let kind = if info.is_df {
+            "directory"
+        } else {
+            "elementary"
+        };
+        let mut text = format!("{path}  {kind}");
+        if let Some(st) = info.structure {
+            text.push_str(&format!(" {st}"));
+        }
+        if let Some(sz) = info.size {
+            text.push_str(&format!(", {sz} bytes"));
+        }
+        if let (Some(rl), Some(n)) = (info.record_length, info.records) {
+            text.push_str(&format!(", {n} records of {rl}"));
+        }
+        if let Some(n) = &info.name {
+            text.push_str(&format!(", AID {}", hex_upper(n)));
+        }
+        let mut data = file_json(&info);
+        data["path"] = json!(path);
+        Ok(Reply::ok(text, data))
     }
 }
 
@@ -427,6 +837,21 @@ pub fn grammar() -> clap::Command {
                 ),
         )
         .subcommand(
+            C::new("select")
+                .about("Select a file: a FID (6F07), a name (EF.IMSI, ADF.USIM, MF), an AID (hex) or a path (3F00/7F20/6F07, ADF.USIM/EF.IMSI)")
+                .arg(Arg::new("target").required(true).value_name("NAME|FID|AID|PATH")),
+        )
+        .subcommand(
+            C::new("select_path")
+                .about("Select by path: absolute from the master file (3F00/..., MF/...), else relative to the current DF")
+                .arg(Arg::new("path").required(true).value_name("PATH")),
+        )
+        .subcommand(
+            C::new("select_adf")
+                .about("Select an application by AID (5 to 16 bytes of hex) or name (ADF.USIM, ADF.ISIM, ADF.CSIM)")
+                .arg(Arg::new("adf").required(true).value_name("AID|NAME")),
+        )
+        .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
                 .about("Leave the shell"),
@@ -522,6 +947,11 @@ impl Shell {
             "equip" => self.cmd_equip(args),
             "status" => self.cmd_status(),
             "apdu" => self.cmd_apdu(args),
+            "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
+            "select_path" => {
+                self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
+            }
+            "select_adf" => self.cmd_select_adf(args.get_one::<String>("adf").expect("required")),
             "open_channel" => self.cmd_open_channel(),
             "close_channel" => self.cmd_close_channel(args),
             "channel" => self.cmd_channel(args),
@@ -803,6 +1233,8 @@ pub fn read_fcp(body: &[u8], dialect: &TagSet) -> FileInfo {
     info
 }
 
+pub mod names;
+
 #[cfg(test)]
 pub(crate) mod testcard;
 
@@ -929,6 +1361,96 @@ mod tests {
             !sh.exec("apdu 00A4000C03AA").ok,
             "an Lc that disagrees with the data"
         );
+    }
+
+    #[test]
+    fn select_by_fid_path_name_and_aid_tracks_the_state() {
+        let (mut sh, _) = shell_log();
+        let r = sh.exec("select 3F00");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(sh.pwd(), "3F00");
+        let r = sh.exec("select 7F20");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["type"], "directory");
+        assert_eq!(sh.pwd(), "3F00/7F20");
+        let r = sh.exec("select 6F07");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["type"], "elementary");
+        assert_eq!(r.data["structure"], "transparent");
+        assert_eq!(r.data["size"], 9);
+        assert_eq!(sh.pwd(), "3F00/7F20/6F07");
+        // The DF is still 7F20: a sibling is reachable, the parent is too.
+        assert!(
+            !sh.exec("select 2FE2").ok,
+            "2FE2 is under the MF, not under 7F20"
+        );
+        assert!(sh.exec("select 3F00").ok);
+        let r = sh.exec("select 3F00/7F10/6F3A");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["records"], 3);
+        assert_eq!(r.data["record_length"], 28);
+        assert_eq!(sh.pwd(), "3F00/7F10/6F3A");
+        // Relative path from the current DF (7F10).
+        assert!(sh.exec("select 6F3A").ok);
+        let r = sh.exec("select MF/DF.GSM/EF.IMSI");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(sh.pwd(), "3F00/7F20/6F07");
+    }
+
+    #[test]
+    fn select_by_aid_and_adf_name_goes_through_ef_dir_and_keeps_the_state() {
+        let (mut sh, log) = shell_log();
+        assert!(sh.exec("select 2FE2").ok);
+        let r = sh.exec("select ADF.USIM");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(sh.pwd(), "3F00/ADF:A0000000871002FF49FF0589");
+        assert_eq!(r.data["name"], "A0000000871002FF49FF0589");
+        let r = sh.exec("select EF.IMSI");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(sh.pwd(), "3F00/ADF:A0000000871002FF49FF0589/6F07");
+        let r = sh.exec("select_adf A0000000871002");
+        assert!(r.ok, "{}", r.text);
+        let r = sh.exec("select_path ADF.USIM/6F07");
+        assert!(r.ok, "{}", r.text);
+        assert!(sh.pwd().ends_with("/6F07"));
+        let r = sh.exec("select_path 6FAD");
+        assert!(r.ok, "{}", r.text);
+        assert!(sh.pwd().ends_with("/6FAD"), "{}", sh.pwd());
+        assert!(!sh.exec("select_adf EF.IMSI").ok);
+        assert!(
+            log.borrow().iter().any(|c| c[1] == 0xA4 && c[2] == 0x04),
+            "an AID select was sent"
+        );
+    }
+
+    #[test]
+    fn a_refused_select_leaves_the_state_and_hints_where_the_file_lives() {
+        let (mut sh, _) = shell_log();
+        assert!(sh.exec("select 7F20").ok);
+        let r = sh.exec("select EF.IMSI");
+        assert!(r.ok, "6F07 exists under 7F20 in the test card: {}", r.text);
+        assert!(sh.exec("select 3F00").ok);
+        let r = sh.exec("select EF.AD");
+        assert!(!r.ok);
+        assert!(
+            r.text.contains("6A82") && r.text.contains("ADF.USIM"),
+            "{}",
+            r.text
+        );
+        assert_eq!(sh.pwd(), "3F00");
+        assert!(!sh.exec("select nonsense").ok);
+        assert!(!sh.exec("select 3F00/7F20/MF").ok);
+    }
+
+    #[test]
+    fn select_on_a_second_channel_does_not_move_the_first() {
+        let (mut sh, _) = shell_log();
+        assert!(sh.exec("select 7F20").ok);
+        assert!(sh.exec("open_channel").ok);
+        assert_eq!(sh.pwd(), "3F00", "a new channel starts at the master file");
+        assert!(sh.exec("select 7F10").ok);
+        assert!(sh.exec("channel 0").ok);
+        assert_eq!(sh.pwd(), "3F00/7F20");
     }
 
     #[test]

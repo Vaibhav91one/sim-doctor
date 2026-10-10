@@ -422,6 +422,12 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         "apdu 00A4000C022FE2; apdu 00B000000A --expect-response-regex ^9810; apdu 00D6000001AA; \
          apdu --yes 00D6000001AA --expect-sw 6Dxx",
     ),
+    (
+        "cardsh_select.jsonl",
+        false,
+        "select 3F00; select 7F20; select 6F07; select 3F00; select 3F00/7F10/6F3A; select ADF.USIM; \
+         select EF.IMSI; select_path 6FAD; select 2FE2",
+    ),
 ];
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
