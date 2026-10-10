@@ -1,0 +1,48 @@
+# a bare array of findings: sim-doctor scan --json --baseline <TMP>/b0.json
+exit 2
+--- stderr
+sim-doctor: this is not a readable sim-doctor baseline: the file is not a doctor/1 envelope; save one with `sim-doctor scan --json`
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-malformed","message":"this is not a readable sim-doctor baseline: the file is not a doctor/1 envelope; save one with `sim-doctor scan --json`"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# an envelope of a failed run (no data.run): sim-doctor scan --json --baseline <TMP>/b1.json
+exit 2
+--- stderr
+sim-doctor: this is not a readable sim-doctor baseline: the envelope carries no data.run; was it saved from a scan that finished?
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-malformed","message":"this is not a readable sim-doctor baseline: the envelope carries no data.run; was it saved from a scan that finished?"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# not the doctor/1 schema: sim-doctor scan --json --baseline <TMP>/b2.json
+exit 2
+--- stderr
+sim-doctor: this is not a readable sim-doctor baseline: the file is not a doctor/1 envelope; save one with `sim-doctor scan --json`
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-malformed","message":"this is not a readable sim-doctor baseline: the file is not a doctor/1 envelope; save one with `sim-doctor scan --json`"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# a string over the bound: sim-doctor scan --json --baseline <TMP>/b3.json
+exit 2
+--- stderr
+sim-doctor: this baseline holds a 2000-character string and the ceiling is 1024;evidence is bounded so that a scan cannot fill a terminal, and the bound applies to abaseline read back as much as to one a rule produces
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-text-too-long","message":"this baseline holds a 2000-character string and the ceiling is 1024;evidence is bounded so that a scan cannot fill a terminal, and the bound applies to abaseline read back as much as to one a rule produces"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# an empty file: sim-doctor scan --json --baseline <TMP>/b4.json
+exit 2
+--- stderr
+sim-doctor: this is not a readable sim-doctor baseline: EOF while parsing a value at line 1 column 0
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-malformed","message":"this is not a readable sim-doctor baseline: EOF while parsing a value at line 1 column 0"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
+# a directory instead of a file: sim-doctor scan --json --baseline <TMP>/b5.json
+exit 2
+--- stderr
+sim-doctor: the baseline file could not be read: <TMP>/b5.json: Is a directory (os error 21)
+
+--- stdout
+{"data":{"card_touched":false,"error":{"kind":"baseline-unreadable","message":"the baseline file could not be read: <TMP>/b5.json: Is a directory (os error 21)"},"scanned":false},"exit_code":2,"findings":[],"schema":"doctor/1","score":{"coverage_gaps":1,"label":"critical","model":"sim/1","value":0},"tool":"sim-doctor","version":"<VERSION>"}
+
