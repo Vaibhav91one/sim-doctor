@@ -21,18 +21,22 @@ SUCI privacy, and not yet crypto or eUICC weaknesses: see [Status](#status) befo
 clean result.**
 
 ```text
-# from CI swSIM job, run https://github.com/doctor-labs/sim-doctor/actions/runs/38048133006/job/114201696687
-scan: using reader swICC PC/SC IFD Driver v1.2.0 00 00
-scan: walked 42210 nodes, 251 selected, 41959 absent, 0 forbidden, bounds hit [Depth]
-severity/score: --score emitted value 0 penalty 1224 over 62 finding(s) with rules_run 10
-security-rules: filesystem/config-ef-updatable-always expected 12 finding(s), reported 12
-security-rules: identity/readable-without-pin expected 4 finding(s), reported 4
-security-rules: filesystem/ef-updatable-always reported 1 finding(s)
-security-rules: privacy/suci-not-provisioned expected 0 finding(s), reported 0
-security-rules: privacy/suci-null-scheme expected 0 finding(s), reported 0
+!! TRUNCATED: this walk did NOT see the whole card.
+reader           swICC PC/SC IFD Driver v1.2.0 00 00
+walk             42210 files, 33 directories, 251 selected, 41959 absent, 0 forbidden, 0 refused, 30 repeated identifiers
+[... lines omitted ...]
+FINDINGS: 62 (no severity filter)
+  [medium] auth/pin1-disabled at file:3F00 selected: PIN Appl 1 (key reference 01) is disabled, so files that need PIN1 are open to anyone holding the card [key reference 01 disabled in 36 of 36 PIN status templates] (partial (the walk stopped at a bound, so this list may be short))
+  [high] filesystem/sensitive-ef-always at file:3F00/ADF:A0000000871002FFFFFFFF8917050000/6F07 selected: EF.IMSI is readable and updatable without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays (IMSI 999990000000001) [read=ALW update=ALW IMSI 999990000000001] (partial (the walk stopped at a bound, so this list may be short))
+  [high] filesystem/sensitive-ef-always at file:3F00/7FFF/5F3B/4F20 selected: EF.Kc is readable and updatable without verification: TS 31.102 gives it a PIN or ADM condition, not ALWays [read=ALW update=ALW] (partial (the walk stopped at a bound, so this list may be short))
+[... lines omitted ...]
+  coverage: partial (the walk stopped at a bound, so this list may be short)
+SCORE 0/100 (penalty 1224)
+  formula: max(0, 100 - sum(penalty[severity] for every finding in this report))
+  from 62 finding(s)
 ```
 
-These are the log lines of the CI swSIM job (the software SIM, see [docs/swsim-fixture.md](docs/swsim-fixture.md)), verbatim apart from the timestamp; the job does not print the tool's human report. Findings need a card or this software SIM, see [Get started](#get-started).
+This is `sim-doctor scan --score` run in the CI swSIM job against the swSIM software SIM, trimmed to the banner, the walk, the first findings and the score ([run](https://github.com/doctor-labs/sim-doctor/actions/runs/38051273478/job/114210725611); the `999990...` IMSI is swSIM's fake test identity, see [docs/swsim-fixture.md](docs/swsim-fixture.md)). Findings need a card or this software SIM, see [Get started](#get-started).
 
 
 ## Install

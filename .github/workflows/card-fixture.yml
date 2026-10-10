@@ -454,6 +454,19 @@ jobs:
           grep -q 'bounds the walk hit: \[' "$log"
           grep -q 'deepest file the card actually holds is' "$log"
 
+      - name: Print the human scan report against the swSIM card
+        # The assertions above read the harness; this prints what a person
+        # sees. Stdout is a pipe, so the report is plain text; NO_COLOR is
+        # belt and braces. Findings make the exit status nonzero by design and
+        # exit 2 is a usage error: both stay visible in the log, neither
+        # fails this step (the assertions above own pass/fail).
+        run: |
+          cargo build --locked
+          set +e
+          sudo env NO_COLOR=1 "$PWD/target/debug/sim-doctor" scan --score 2>&1
+          echo "sim-doctor scan exit status: $?"
+          exit 0
+
       - name: Dump the fixture logs
         # Always, including after a failure: the daemon log says why a reader
         # did or did not appear, and the card log says whether the card
