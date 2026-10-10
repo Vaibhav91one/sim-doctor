@@ -2156,4 +2156,28 @@ fn card_shell_drives_a_real_card() {
         "{text}"
     );
     println!("card shell: verify_chv was a dry run and masked the value");
+
+    // unblock_chv: also only as a dry run against the live card (a PUK try is not spent in CI).
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .args([
+            "card",
+            "--json",
+            "--reader",
+            reader.as_str(),
+            "--chv-env",
+            "SIMDOC_FIXTURE_CHV",
+            "-c",
+            "unblock_chv",
+        ])
+        .env("SIMDOC_FIXTURE_CHV", "puk1=12345678; new-pin1=4321")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary should run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("\"sent\":false") && !text.contains("12345678") && !text.contains("4321"),
+        "{text}"
+    );
+    println!("card shell: unblock_chv was a dry run and masked both values");
 }

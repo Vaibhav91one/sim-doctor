@@ -636,21 +636,27 @@ struct KeyTarget {
 }
 
 fn key_target(args: &clap::ArgMatches) -> Result<KeyTarget, CmdErr> {
-    if let Some(n) = args.get_one::<u8>("adm_nr") {
+    if let Some(n) = args.try_get_one::<u8>("adm_nr").ok().flatten() {
         return Ok(KeyTarget {
             key_ref: 0x0A + n - 1,
             label: format!("ADM{n}"),
             secret: format!("adm{n}"),
         });
     }
-    if args.get_flag("universal") {
+    if args
+        .try_get_one::<bool>("universal")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+    {
         return Ok(KeyTarget {
             key_ref: 0x11,
             label: "universal PIN".into(),
             secret: "universal".into(),
         });
     }
-    if let Some(h) = args.get_one::<String>("key_ref") {
+    if let Some(h) = args.try_get_one::<String>("key_ref").ok().flatten() {
         let b = parse_hex(h).map_err(CmdErr::new)?;
         let [k] = b[..] else {
             return Err(CmdErr::new("--key-ref is one octet of hex"));
@@ -733,6 +739,105 @@ impl Shell {
         Ok((tries_left(ex.status()), ex.status()))
     }
 
+    /// Before a secret is sent: ask the card how many tries are left (free) and refuse a blocked key or
+    /// the last try. For UNBLOCK a card that does not answer the question is not an obstacle (the one
+    /// attempt is made without the check). `Ok(Some(reply))` means there is nothing to send (a PIN that is already verified).
+    fn guard_tries(
+        &mut self,
+        ins: u8,
+        p1: u8,
+        target: &KeyTarget,
+        allow_last: bool,
+        is_verify: bool,
+    ) -> Result<Option<Reply>, CmdErr> {
+        let key_ref = target.key_ref;
+        let (left, sw) = self.tries_of(ins, p1, key_ref)?;
+        let refuse = |msg: String| CmdErr {
+            message: msg,
+            data: json!({ "sent": false, "sw": sw.map(|s| s.to_string()), "tries_left": left }),
+        };
+        if is_verify && sw.is_some_and(StatusWord::is_success) {
+            let card = self.equipped()?;
+            card.verified.insert(key_ref);
+            return Ok(Some(Reply::ok(
+                format!("{} is already verified; nothing sent", target.label),
+                json!({ "sent": false, "verified": true, "key_reference": format!("{key_ref:02X}") }),
+            )));
+        }
+        match (left, sw) {
+            (Some(1), _) if !allow_last => Err(refuse(format!(
+                "only one try left on {}: a wrong value blocks it. Check the value, then add --allow-last-attempt",
+                target.label
+            ))),
+            (Some(0), _) => Err(refuse(format!("{} is blocked", target.label))),
+            (None, Some(s)) if s.to_bytes() == [0x69, 0x83] => Err(refuse(format!("{} is blocked", target.label))),
+            (Some(_), _) => Ok(None),
+            // UNBLOCK with no data is not defined by every card; it then tells nothing and the one attempt is made.
+            (None, _) if !is_verify => Ok(None),
+            (None, s) => Err(refuse(format!("cannot ask {}: {}", target.label, sw_text(s)))),
+        }
+    }
+
+    fn cmd_unblock_chv(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let target = key_target(args)?;
+        let (puk_name, new_name, puk_label) = if target.key_ref == 0x11 {
+            ("upuk".to_owned(), "new-universal".to_owned(), "UPUK")
+        } else {
+            let n = args.get_one::<u8>("pin_nr").copied().unwrap_or(1);
+            (format!("puk{n}"), format!("new-pin{n}"), "PUK")
+        };
+        let puk = self.secret(&puk_name)?;
+        let new_pin = self.secret(&new_name)?;
+        let send = self.may_change_card(args);
+        let key_ref = target.key_ref;
+        let masked = format!(
+            "00 2C 00 {key_ref:02X} 10 <{puk_label} redacted> <new {} redacted>",
+            target.label
+        );
+        if !send {
+            return Ok(Reply::ok(
+                format!("dry run: would send {masked} (a wrong {puk_label} costs a try; add --yes to send)"),
+                json!({ "sent": false, "key_reference": format!("{key_ref:02X}"), "apdu": masked }),
+            ));
+        }
+        if let Some(done) =
+            self.guard_tries(0x2C, 0x00, &target, args.get_flag("allow_last"), false)?
+        {
+            return Ok(done);
+        }
+        // One attempt, never retried.
+        let card = self.equipped()?;
+        let cla = card.cla();
+        let data: Vec<u8> = puk.iter().chain(new_pin.iter()).copied().collect();
+        let ex = card.send(&Command::case3(
+            apdu::Header::new(cla, 0x2C, 0x00, key_ref),
+            data,
+        ))?;
+        let sw = ex.status();
+        if sw.is_some_and(StatusWord::is_success) {
+            // Whether the card also counts the PIN as verified is the card's business: ask with verify_chv.
+            card.verified.remove(&key_ref);
+            return Ok(Reply::ok(
+                format!(
+                    "{} unblocked and set to the new value; its try counter is reset",
+                    target.label
+                ),
+                json!({ "unblocked": true, "sent": true, "key_reference": format!("{key_ref:02X}"), "sw": "9000" }),
+            ));
+        }
+        let why = match (tries_left(sw), sw) {
+            (Some(n), _) => format!("wrong {puk_label} for {}: {n} tries left", target.label),
+            (None, Some(s)) if s.to_bytes() == [0x69, 0x83] => {
+                format!("the {puk_label} of {} is now blocked", target.label)
+            }
+            (None, s) => format!("UNBLOCK {} refused: {}", target.label, sw_text(s)),
+        };
+        Err(CmdErr {
+            message: why,
+            data: json!({ "sent": true, "key_reference": format!("{key_ref:02X}"), "sw": sw.map(|s| s.to_string()), "tries_left": tries_left(sw) }),
+        })
+    }
+
     fn cmd_verify_chv(&mut self, args: &clap::ArgMatches) -> CmdResult {
         let target = key_target(args)?;
         let value = self.secret(&target.secret)?;
@@ -748,27 +853,8 @@ impl Shell {
                 json!({ "sent": false, "key_reference": format!("{key_ref:02X}"), "apdu": masked }),
             ));
         }
-        let (left, sw) = self.tries_of(0x20, 0x00, key_ref)?;
-        let refuse = |msg: String| CmdErr {
-            message: msg,
-            data: json!({ "sent": false, "sw": sw.map(|s| s.to_string()), "tries_left": left }),
-        };
-        if sw.is_some_and(StatusWord::is_success) {
-            let card = self.equipped()?;
-            card.verified.insert(key_ref);
-            return Ok(Reply::ok(
-                format!("{} is already verified; nothing sent", target.label),
-                json!({ "sent": false, "verified": true, "key_reference": format!("{key_ref:02X}") }),
-            ));
-        }
-        match (left, sw) {
-            (Some(1), _) if !allow_last => {
-                return Err(refuse(format!("only one try left on {}: a wrong value blocks it. Check the value, then add --allow-last-attempt", target.label)))
-            }
-            (Some(0), _) => return Err(refuse(format!("{} is blocked", target.label))),
-            (None, Some(s)) if s.to_bytes() == [0x69, 0x83] => return Err(refuse(format!("{} is blocked", target.label))),
-            (Some(_), _) => {}
-            (None, s) => return Err(refuse(format!("cannot VERIFY {}: {}", target.label, sw_text(s)))),
+        if let Some(done) = self.guard_tries(0x20, 0x00, &target, allow_last, true)? {
+            return Ok(done);
         }
         // One attempt, never retried.
         let card = self.equipped()?;
@@ -1368,6 +1454,15 @@ pub fn grammar() -> clap::Command {
                 .arg(yes_arg()),
         )
         .subcommand(
+            C::new("unblock_chv")
+                .about("UNBLOCK PIN with the PUK and the new PIN from --chv-file / --chv-env; a dry run unless --yes")
+                .arg(Arg::new("pin_nr").long("pin-nr").value_name("N").value_parser(clap::value_parser!(u8).range(1..=8)).help("PIN number: 1 is PIN1, 2 is PIN2 (key reference 81), 3-8 application PINs"))
+                .arg(Arg::new("universal").long("universal").action(clap::ArgAction::SetTrue).help("the universal PIN (key reference 11, unblocked with the UPUK)"))
+                .group(clap::ArgGroup::new("which").args(["pin_nr", "universal"]))
+                .arg(Arg::new("allow_last").long("allow-last-attempt").action(clap::ArgAction::SetTrue).help("send even when only one PUK try is left (a wrong PUK then blocks the PIN for good)"))
+                .arg(yes_arg()),
+        )
+        .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
                 .about("Leave the shell"),
@@ -1477,6 +1572,7 @@ impl Shell {
                 args.get_one::<String>("filter").map(String::as_str),
             )),
             "verify_chv" => self.cmd_verify_chv(args),
+            "unblock_chv" => self.cmd_unblock_chv(args),
             "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
             "select_path" => {
                 self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
@@ -2203,6 +2299,60 @@ mod tests {
             !sh.exec("verify_chv").ok,
             "another card's entry is not used"
         );
+    }
+
+    #[test]
+    fn unblock_chv_sends_the_puk_and_the_new_pin_once_and_masks_both() {
+        let (mut sh, log) = shell_with("pin1=0000; puk1=12345678; new-pin1=4321", false);
+        let r = sh.exec("unblock_chv");
+        assert!(r.ok && r.data["sent"] == false, "{}", r.text);
+        assert!(
+            r.text
+                .contains("00 2C 00 01 10 <PUK redacted> <new PIN1 redacted>"),
+            "{}",
+            r.text
+        );
+        assert!(log.borrow().is_empty());
+        for s in ["12345678", "4321", "3132333435363738"] {
+            assert!(!shown(&r).contains(s));
+        }
+        let (mut sh, log) = shell_with("pin1=4321; puk1=12345678; new-pin1=4321", true);
+        let r = sh.exec("unblock_chv");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["unblocked"], true);
+        let sent = log.borrow().clone();
+        assert_eq!(sent.len(), 2, "the tries query, then the UNBLOCK");
+        assert_eq!(sent[1][..5], [0x00, 0x2C, 0x00, 0x01, 0x10]);
+        assert!(!shown(&r).contains("4321"));
+        // The new value is what the card holds now: PIN1 verifies with it.
+        assert!(sh.exec("verify_chv").ok);
+    }
+
+    #[test]
+    fn unblock_chv_wrong_puk_counts_down_and_the_last_try_needs_a_flag() {
+        let (mut sh, _) = shell_with(
+            "puk1=00000000; new-pin1=4321; puk2=87654321; new-pin2=1111",
+            true,
+        );
+        let r = sh.exec("unblock_chv");
+        assert!(!r.ok && r.text.contains("9 tries left"), "{}", r.text);
+        // Burn it down to one try without --allow-last-attempt ever being used.
+        for _ in 0..8 {
+            sh.exec("unblock_chv");
+        }
+        let r = sh.exec("unblock_chv");
+        assert!(
+            !r.ok && r.text.contains("--allow-last-attempt"),
+            "{}",
+            r.text
+        );
+        assert_eq!(r.data["sent"], false);
+        let r = sh.exec("unblock_chv --allow-last-attempt");
+        assert!(!r.ok && r.text.contains("now blocked"), "{}", r.text);
+        assert!(sh.exec("unblock_chv --pin-nr 2").ok, "PIN2 has its own PUK");
+        let (mut sh, _) = shell_with("pin1=1234", true);
+        let r = sh.exec("unblock_chv");
+        assert!(!r.ok && r.text.contains("`puk1`"), "{}", r.text);
     }
 
     #[test]
