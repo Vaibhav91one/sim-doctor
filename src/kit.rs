@@ -22,7 +22,7 @@ use doctor_kit::install::{plan, rendered, write, Agent, AgentFile, FileMode, Ove
 use doctor_kit::output::Color;
 use doctor_kit::{
     failure_envelope, finish, preflight, Check, Config, Ctx, Doctor, ExtCommand, Extensions, Face,
-    Meta, OutputArgs, PreflightKind, ScanFailure, TargetKind,
+    McpTexts, McpTool, Meta, OutputArgs, PreflightKind, ScanFailure, TargetKind,
 };
 use serde_json::{json, Value};
 use sim_doctor::baseline::{Baseline, Diff};
@@ -372,6 +372,28 @@ impl Doctor for SimDoctor {
                     end: "<!-- sim-doctor:end -->".into(),
                 },
             )],
+        }
+    }
+
+    /// The nine tools of `mcp` (scan, the rule catalogue, the read-only eUICC and GlobalPlatform
+    /// queries), which REPLACE the kit's `scan` and `fix`: each runs this binary as a child.
+    fn mcp_tools(&self) -> Option<Vec<McpTool>> {
+        let cli = Cli::command();
+        let scan = cli.find_subcommand("scan")?;
+        Some(sim_doctor::mcp::tools(
+            scan,
+            std::sync::Arc::new(sim_doctor::mcp::run_self),
+        ))
+    }
+
+    /// The texts of the server it replaces. The protocol answers (`ping`, -32600 for a request
+    /// that is not an object, has a bad `id` or no string `method`) are the kit's and were
+    /// already sim-doctor's; only two messages differ from the kit's defaults.
+    fn mcp_texts(&self) -> McpTexts {
+        McpTexts {
+            invalid_request: "invalid request: not an object".into(),
+            invalid_request_method: "invalid request: no string method".into(),
+            ..McpTexts::default()
         }
     }
 

@@ -1,0 +1,62 @@
+-> {"jsonrpc":"2.0","id":1,"method":"ping"}
+<- {"id":1,"jsonrpc":"2.0","result":{}}
+-> 
+<- (no answer)
+->    
+<- (no answer)
+-> [{"jsonrpc":"2.0","id":1,"method":"ping"}]
+<- {"error":{"code":-32600,"message":"invalid request: not an object"},"id":null,"jsonrpc":"2.0"}
+-> 5
+<- {"error":{"code":-32600,"message":"invalid request: not an object"},"id":null,"jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","id":{"a":1},"method":"ping"}
+<- {"error":{"code":-32600,"message":"invalid request: bad id"},"id":null,"jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","id":null,"method":"ping"}
+<- {"error":{"code":-32600,"message":"invalid request: bad id"},"id":null,"jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","id":4,"method":7}
+<- {"error":{"code":-32600,"message":"invalid request: no string method"},"id":4,"jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","id":"abc"}
+<- {"error":{"code":-32600,"message":"invalid request: no string method"},"id":"abc","jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}
+<- {"id":5,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"sim-doctor","version":"<VERSION>"}}}
+-> {"jsonrpc":"2.0","method":"notifications/initialized"}
+<- (no answer)
+-> {"jsonrpc":"2.0","method":"no/such/notification"}
+<- (no answer)
+-> {"jsonrpc":"2.0","id":6,"method":"no/such/method"}
+<- {"error":{"code":-32601,"message":"unknown method no/such/method"},"id":6,"jsonrpc":"2.0"}
+-> {not json
+<- {"error":{"code":-32700,"message":"parse error: key must be a string at line 1 column 2"},"id":null,"jsonrpc":"2.0"}
+-> {"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"rules_list","arguments":{"x":1}}}
+<- {"id":20,"jsonrpc":"2.0","result":{"content":[{"text":"unknown argument \"x\"","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rules_explain","arguments":{}}}
+<- {"id":21,"jsonrpc":"2.0","result":{"content":[{"text":"missing required argument \"id\"","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"rules_explain","arguments":{"id":"--json"}}}
+<- {"id":22,"jsonrpc":"2.0","result":{"content":[{"text":"\"id\" must be a rule id, not a flag","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"rules_explain","arguments":{"id":5}}}
+<- {"id":23,"jsonrpc":"2.0","result":{"content":[{"text":"\"id\" must be a string","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"rules_explain","arguments":{"id":"no/such-rule"}}}
+<- {"id":24,"jsonrpc":"2.0","result":{"content":[{"text":"{\"type\":\"rules\",\"payload\":{\"code\":1,\"message\":\"unknown rule `no/such-rule`\",\"data\":{\"did_you_mean\":null,\"error\":\"unknown rule `no/such-rule`\"}}}\n","type":"text"}],"isError":false}}
+-> {"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"scan","arguments":{"tui":true}}}
+<- {"id":25,"jsonrpc":"2.0","result":{"content":[{"text":"unknown argument \"tui\"","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"scan","arguments":{"json":true}}}
+<- {"id":26,"jsonrpc":"2.0","result":{"content":[{"text":"unknown argument \"json\"","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"scan","arguments":{"reader":"-x"}}}
+<- {"id":27,"jsonrpc":"2.0","result":{"content":[{"text":"\"reader\" must not start with '-'","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"scan","arguments":{"max-depth":"3"}}}
+<- {"id":28,"jsonrpc":"2.0","result":{"content":[{"text":"\"max-depth\" must be of type integer","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":29,"method":"tools/call","params":{"name":"scan","arguments":"not an object"}}
+<- {"id":29,"jsonrpc":"2.0","result":{"content":[{"text":"arguments must be an object","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"euicc_info","arguments":{"aid":"A0"}}}
+<- {"id":30,"jsonrpc":"2.0","result":{"content":[{"text":"unknown argument \"aid\"","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"gp_status","arguments":{"trace":true}}}
+<- {"id":31,"jsonrpc":"2.0","result":{"content":[{"text":"unknown argument \"trace\"","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"scan","arguments":{"tar":"focused"}}}
+<- 180807 bytes, sha256 5c00fa5a98bf99f7780ee7389bc1df66c557c3247c0af839b7b59ab8c252ca29
+-> {"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"scan","arguments":{"tar":"focused","severity":"high","score":true}}}
+<- 180815 bytes, sha256 dcaf1ddd05b779494c99be980828dcdf553a84c9c76e9c9bfd8a7b9595f6609b
+-> {"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"scan","arguments":{"baseline":"/nonexistent/golden.json"}}}
+<- {"id":34,"jsonrpc":"2.0","result":{"content":[{"text":"sim-doctor: the baseline file could not be read: /nonexistent/golden.json: No such file or directory (os error 2)\n","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"scan","arguments":{"terminal-profile":true}}}
+<- {"id":35,"jsonrpc":"2.0","result":{"content":[{"text":"sim-doctor: --terminal-profile is only meaningful with --tar other than off\n","type":"text"}],"isError":true}}
+-> {"jsonrpc":"2.0","id":36,"method":"tools/call","params":{"arguments":{}}}
+<- {"id":36,"jsonrpc":"2.0","result":{"content":[{"text":"unknown tool ","type":"text"}],"isError":true}}

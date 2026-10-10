@@ -1,0 +1,2 @@
+-> {"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"scan","arguments":{}}}
+<- {"id":40,"jsonrpc":"2.0","result":{"content":[{"text":"timed out after 1 s; the child was killed","type":"text"}],"isError":true}}

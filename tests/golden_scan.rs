@@ -836,3 +836,169 @@ fn install_writes_the_same_files_everywhere() {
     writeln!(text, "# --dir is a file: exit {}", r.code).unwrap();
     check("proc_install.txt", &text);
 }
+
+// ---------------------------------------------------------------------------
+// mcp: wire answers and what a tool call returns
+// ---------------------------------------------------------------------------
+
+/// Pipes `lines` into `sim-doctor mcp` and pairs each answer with the line it answers
+/// (notifications and blank lines get none). A long answer is stored as length + sha256.
+fn mcp_session(lines: &[&str], env: &[(&str, &str)]) -> String {
+    let mut input = lines.join("\n");
+    input.push('\n');
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sim-doctor"));
+    cmd.arg("mcp")
+        .env_remove("SIM_DOCTOR_RECORD")
+        .env_remove("SIM_DOCTOR_TEST_REPLAY")
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let mut answers = stdout.lines();
+    let mut text = String::new();
+    for line in lines {
+        let blank = line.trim().is_empty();
+        let notification = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .is_some_and(|o| {
+                !o.contains_key("id") && o.get("method").is_some_and(|m| m.is_string())
+            });
+        writeln!(text, "-> {line}").unwrap();
+        if blank || notification {
+            writeln!(text, "<- (no answer)").unwrap();
+            continue;
+        }
+        let answer = answers.next().expect("one answer per request");
+        if answer.len() > 4000 {
+            let digest = Sha256::digest(answer.as_bytes());
+            writeln!(
+                text,
+                "<- {} bytes, sha256 {}",
+                answer.len(),
+                hex::encode(digest)
+            )
+            .unwrap();
+        } else {
+            writeln!(text, "<- {answer}").unwrap();
+        }
+    }
+    assert!(answers.next().is_none(), "no answer without a request");
+    norm(&text, Path::new("/nonexistent-tmp"))
+}
+
+#[test]
+fn mcp_answers_and_tool_results() {
+    let tmp = tmp_dir("mcp");
+    let msl0 = tmp.join("msl0.log");
+    std::fs::write(&msl0, log(true, Limits::default(), &Selection::focused())).unwrap();
+    let call = |id: u32, name: &str, args: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+        )
+    };
+    let calls = [
+        call(20, "rules_list", r#"{"x":1}"#),
+        call(21, "rules_explain", "{}"),
+        call(22, "rules_explain", r#"{"id":"--json"}"#),
+        call(23, "rules_explain", r#"{"id":5}"#),
+        call(24, "rules_explain", r#"{"id":"no/such-rule"}"#),
+        call(25, "scan", r#"{"tui":true}"#),
+        call(26, "scan", r#"{"json":true}"#),
+        call(27, "scan", r#"{"reader":"-x"}"#),
+        call(28, "scan", r#"{"max-depth":"3"}"#),
+        call(29, "scan", r#""not an object""#),
+        call(30, "euicc_info", r#"{"aid":"A0"}"#),
+        call(31, "gp_status", r#"{"trace":true}"#),
+        call(32, "scan", r#"{"tar":"focused"}"#),
+        call(
+            33,
+            "scan",
+            r#"{"tar":"focused","severity":"high","score":true}"#,
+        ),
+        call(34, "scan", r#"{"baseline":"/nonexistent/golden.json"}"#),
+        call(35, "scan", r#"{"terminal-profile":true}"#),
+        r#"{"jsonrpc":"2.0","id":36,"method":"tools/call","params":{"arguments":{}}}"#.to_owned(),
+    ];
+    let mut lines: Vec<&str> = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        "",
+        "   ",
+        r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+        "5",
+        r#"{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":7}"#,
+        r#"{"jsonrpc":"2.0","id":"abc"}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","method":"no/such/notification"}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"no/such/method"}"#,
+        "{not json",
+    ];
+    lines.extend(calls.iter().map(String::as_str));
+    let text = mcp_session(
+        &lines,
+        &[("SIM_DOCTOR_TEST_REPLAY", msl0.to_str().unwrap())],
+    );
+    check("proc_mcp.txt", &text);
+
+    // A child that outlives SIM_DOCTOR_MCP_TIMEOUT_SECONDS is killed and reported as an error:
+    // the scan child parks at its first checkpoint (the test hold) for far longer.
+    let hang = call(40, "scan", "{}");
+    let text = mcp_session(
+        &[hang.as_str()],
+        &[
+            ("SIM_DOCTOR_MCP_TIMEOUT_SECONDS", "1"),
+            ("SIM_DOCTOR_TEST_SIGNAL_HOLD_MS", "60000"),
+        ],
+    );
+    check("proc_mcp_timeout.txt", &text);
+}
+
+/// The one place the kit's server answers differently from the one it replaced: a request with
+/// neither an `id` nor a string `method` used to get a -32600 error with a null `id`; the kit
+/// treats a request without an `id` as a notification and answers nothing. (Pinned from the
+/// kit's side; every other case is in `proc_mcp.txt`, generated on the previous server.)
+#[test]
+fn mcp_a_request_with_no_id_and_no_method_is_silent() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\"}\n{\"jsonrpc\":\"2.0\",\"method\":5}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+            )
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    check(
+        "proc_mcp_changed.txt",
+        &format!(
+            "-> {{\"jsonrpc\":\"2.0\"}}\n-> {{\"jsonrpc\":\"2.0\",\"method\":5}}\n-> ping (id 1)\n<- (only this)\n{}",
+            String::from_utf8(out.stdout).unwrap()
+        ),
+    );
+}

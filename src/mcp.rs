@@ -1,29 +1,41 @@
-//! A Model Context Protocol server: JSON-RPC 2.0 over stdio, no new crates.
+//! The tools of `sim-doctor mcp`: what an agent can call over the Model Context Protocol.
 //!
-//! `sim-doctor mcp` lets a coding agent call the scan and the rule catalogue as
-//! tools instead of shelling out: `scan`, `rules_list`, `rules_explain` and the
-//! three read-only eUICC queries `euicc_info`, `euicc_profiles` and
-//! `euicc_notifications`. The `euicc nickname` write is deliberately not a tool.
+//! The server loop (JSON-RPC 2.0 over stdio: `initialize`, `ping`, `tools/list`, `tools/call`,
+//! the -32600 / -32601 / -32700 errors) is the kit's (`doctor_kit::mcp::serve`); this module is
+//! the tool list. `scan`, `rules_list`, `rules_explain`, the three read-only eUICC queries
+//! `euicc_info`, `euicc_profiles` and `euicc_notifications`, and the three read-only
+//! GlobalPlatform queries `gp_info`, `gp_ara` and `gp_status`. The `euicc nickname` write is
+//! deliberately not a tool.
 //!
-//! Each call runs this same binary as a subprocess (`scan --json ...`), so the
-//! envelope an agent receives is byte for byte the one the CLI prints, and no
-//! card-handling code lives in this module. The child's stdout is captured and
-//! never inherited: only JSON-RPC lines may reach this process's stdout.
+//! Each call runs this same binary as a subprocess (`scan --json ...`), so the envelope an agent
+//! receives is byte for byte the one the CLI prints, and no card-handling code lives in this
+//! module. The child's stdout is captured and never inherited: only JSON-RPC lines may reach this
+//! process's stdout.
 //!
-//! `handle` and [`process_line`] are pure given a runner, so the protocol is
-//! tested without spawning anything. The clap `scan` command is passed in by
-//! the binary, which keeps this module a leaf with no dependency on `main.rs`.
+//! [`tools`] is pure given a runner, so the argument checks and the exit-code mapping are tested
+//! without spawning anything. The clap `scan` command is passed in by the binary, which keeps this
+//! module a leaf with no dependency on `main.rs`.
 //!
 //! Acceptance by agent clients beyond the handshake is unverified.
-use std::io::{self, BufRead, Read, Write};
+use std::io::Read;
 use std::process::{Command as Process, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Command};
+use doctor_kit::McpTool;
 use serde_json::{json, Map, Value};
 
 /// This module's name in [`crate::MODULES`].
 pub const NAME: &str = "mcp";
+
+/// The server loop moved to the kit. These are the kit's own functions (they take the doctor
+/// first, not a `scan` command and a runner): the names stay for one minor release.
+#[deprecated(
+    since = "0.4.0",
+    note = "use `doctor_kit::mcp::{handle, process_line, serve}`"
+)]
+pub use doctor_kit::mcp::{handle, process_line, serve};
 
 /// `scan` flags an agent cannot reach: `tui` is interactive, `json` is always
 /// forced on, and `help` and `version` make no sense over MCP. `baseline`,
@@ -206,23 +218,21 @@ fn build_argv(scan: &Command, name: &str, args: &Value) -> Result<Vec<String>, S
     }
 }
 
-/// Map a child's outcome to an MCP tool result. 0, 1 (findings) and 3 (new
+/// Map a child's outcome to a tool result. 0, 1 (findings) and 3 (new
 /// findings against a baseline) carry the envelope unchanged; everything else
-/// is an error with the child's stderr.
-fn tool_result(out: ToolOutcome) -> Value {
+/// is an error with the child's stderr (`isError`).
+fn tool_text(out: ToolOutcome) -> Result<String, String> {
     if out.truncated {
-        let text = format!("{}\n[output truncated at {OUTPUT_CAP} bytes]", out.stdout);
-        return json!({ "content": [{ "type": "text", "text": text }], "isError": true });
+        return Err(format!(
+            "{}\n[output truncated at {OUTPUT_CAP} bytes]",
+            out.stdout
+        ));
     }
-    let (text, is_error) = match out.code {
-        Some(0) | Some(1) | Some(3) => (out.stdout, false),
-        Some(c) => (error_text(&format!("exit code {c}"), &out.stderr), true),
-        None => (
-            error_text("the process did not exit normally", &out.stderr),
-            true,
-        ),
-    };
-    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+    match out.code {
+        Some(0) | Some(1) | Some(3) => Ok(out.stdout),
+        Some(c) => Err(error_text(&format!("exit code {c}"), &out.stderr)),
+        None => Err(error_text("the process did not exit normally", &out.stderr)),
+    }
 }
 
 fn error_text(what: &str, stderr: &str) -> String {
@@ -233,78 +243,30 @@ fn error_text(what: &str, stderr: &str) -> String {
     }
 }
 
-fn refused(message: String) -> Value {
-    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-}
+/// How a tool runs its argv: [`run_self`] in the server, a stand-in in tests.
+pub type Runner = Arc<dyn Fn(&[String]) -> ToolOutcome + Send + Sync>;
 
-fn error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-/// Handle one JSON-RPC request; `None` for a notification or a request with no method.
-pub fn handle(
-    req: &Value,
-    scan: &Command,
-    runner: &dyn Fn(&[String]) -> ToolOutcome,
-) -> Option<Value> {
-    let Some(obj) = req.as_object() else {
-        return Some(error(Value::Null, -32600, "invalid request: not an object"));
-    };
-    // Only a string or integer id can be echoed; anything else (null included)
-    // is an invalid request answered with a null id.
-    let id = match obj.get("id") {
-        None => None,
-        Some(v) if v.is_string() || v.is_i64() || v.is_u64() => Some(v.clone()),
-        Some(_) => return Some(error(Value::Null, -32600, "invalid request: bad id")),
-    };
-    let Some(method) = obj.get("method").and_then(Value::as_str) else {
-        return Some(error(
-            id.unwrap_or(Value::Null),
-            -32600,
-            "invalid request: no string method",
-        ));
-    };
-    // A request without an id is a notification and is never answered.
-    let id = id?;
-    let result = match method {
-        "initialize" => json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "sim-doctor", "version": env!("CARGO_PKG_VERSION") },
-        }),
-        "ping" => json!({}),
-        "tools/list" => tool_list(scan),
-        "tools/call" => {
-            let name = req
-                .pointer("/params/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let args = req.pointer("/params/arguments").unwrap_or(&Value::Null);
-            match build_argv(scan, name, args) {
-                Ok(argv) => tool_result(runner(&argv)),
-                Err(message) => refused(message),
+/// The tools `mcp` offers, for the kit's server: [`tool_list`] as [`McpTool`]s whose call checks
+/// the arguments ([`build_argv`]) and runs the argv.
+pub fn tools(scan: &Command, run: Runner) -> Vec<McpTool> {
+    let list = tool_list(scan);
+    list["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            let name = tool["name"].as_str().unwrap_or_default().to_owned();
+            let (scan, run, called) = (scan.clone(), run.clone(), name.clone());
+            McpTool {
+                description: tool["description"].as_str().unwrap_or_default().to_owned(),
+                schema: tool["inputSchema"].clone(),
+                call: Box::new(move |args| {
+                    build_argv(&scan, &called, args).and_then(|argv| tool_text(run(&argv)))
+                }),
+                name,
             }
-        }
-        other => return Some(error(id, -32601, &format!("unknown method {other}"))),
-    };
-    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-}
-
-/// One input line to at most one response line. Malformed JSON is a -32700
-/// with a null id, never a crash, so the loop carries on.
-pub fn process_line(
-    line: &[u8],
-    scan: &Command,
-    runner: &dyn Fn(&[String]) -> ToolOutcome,
-) -> Option<Value> {
-    if line.iter().all(u8::is_ascii_whitespace) {
-        return None;
-    }
-    // Invalid UTF-8 is a parse error like any other malformed line.
-    match serde_json::from_slice::<Value>(line) {
-        Ok(req) => handle(&req, scan, runner),
-        Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
-    }
+        })
+        .collect()
 }
 
 /// `SIM_DOCTOR_MCP_TIMEOUT_SECONDS`, or the default when unset, 0 or not a number.
@@ -384,7 +346,7 @@ fn run_with_deadline(mut cmd: Process, timeout: Duration, cap: usize) -> ToolOut
 }
 
 /// Run this binary with `argv` under the timeout and output cap.
-fn run_self(argv: &[String]) -> ToolOutcome {
+pub fn run_self(argv: &[String]) -> ToolOutcome {
     match std::env::current_exe() {
         Ok(exe) => {
             let mut cmd = Process::new(exe);
@@ -401,29 +363,11 @@ fn run_self(argv: &[String]) -> ToolOutcome {
     }
 }
 
-/// Serve JSON-RPC over stdin/stdout until EOF. Calls are handled one at a time.
-pub fn serve(scan: &Command) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    let mut stdin = io::stdin().lock();
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        // Bytes, not `lines()`: a non-UTF-8 line must be a parse error, not the end of the server.
-        if stdin.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
-        }
-        if let Some(resp) = process_line(&line, scan, &run_self) {
-            writeln!(stdout, "{resp}")?;
-            stdout.flush()?;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{value_parser, Arg};
-    use std::cell::Cell;
+    use std::sync::Mutex;
 
     // A stand-in for main.rs's `scan` subcommand (the binary's Cli is not
     // reachable from the lib). The process test in tests/process_contract.rs
@@ -449,51 +393,34 @@ mod tests {
             .arg(Arg::new("tui").long("tui").action(ArgAction::SetTrue))
     }
 
-    fn call(name: &str, args: Value, code: i32) -> (Value, Option<Vec<String>>) {
-        let seen = Cell::new(None);
-        let runner = |argv: &[String]| {
-            seen.set(Some(argv.to_vec()));
+    /// Calls a tool with a runner that records its argv and answers `code`.
+    fn call(name: &str, args: Value, code: i32) -> (Result<String, String>, Option<Vec<String>>) {
+        let seen = Arc::new(Mutex::new(None));
+        let record = seen.clone();
+        let run: Runner = Arc::new(move |argv| {
+            *record.lock().unwrap() = Some(argv.to_vec());
             ToolOutcome {
                 code: Some(code),
                 stdout: "ENVELOPE".into(),
                 stderr: "BOOM".into(),
                 truncated: false,
             }
-        };
-        let req = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":name,"arguments":args}});
-        let r = handle(&req, &fake_scan(), &runner).unwrap();
-        (r["result"].clone(), seen.take())
+        });
+        let all = tools(&fake_scan(), run);
+        let tool = all.iter().find(|t| t.name == name).expect("a listed tool");
+        let result = (tool.call)(&args);
+        let argv = seen.lock().unwrap().take();
+        (result, argv)
     }
 
-    fn never(_: &[String]) -> ToolOutcome {
-        panic!("runner must not be called")
-    }
-
-    fn req(method: &str, id: Option<i64>) -> Value {
-        match id {
-            Some(i) => json!({"jsonrpc":"2.0","id":i,"method":method}),
-            None => json!({"jsonrpc":"2.0","method":method}),
-        }
+    fn never() -> Runner {
+        Arc::new(|_| panic!("runner must not be called"))
     }
 
     #[test]
-    fn initialize_shape() {
-        let r = handle(&req("initialize", Some(1)), &fake_scan(), &never).unwrap();
-        assert_eq!(r["id"], 1);
-        assert_eq!(r["result"]["protocolVersion"], "2024-11-05");
-        assert!(r["result"]["capabilities"]["tools"].is_object());
-        assert_eq!(r["result"]["serverInfo"]["name"], "sim-doctor");
-        assert_eq!(
-            r["result"]["serverInfo"]["version"],
-            env!("CARGO_PKG_VERSION")
-        );
-    }
-
-    #[test]
-    fn tools_list_has_exactly_the_nine_tools_with_object_schemas() {
-        let r = handle(&req("tools/list", Some(2)), &fake_scan(), &never).unwrap();
-        let tools = r["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    fn tools_are_exactly_the_nine_with_object_schemas() {
+        let all = tools(&fake_scan(), never());
+        let names: Vec<_> = all.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
             [
@@ -508,8 +435,9 @@ mod tests {
                 "gp_status"
             ]
         );
-        for t in tools {
-            assert_eq!(t["inputSchema"]["type"], "object");
+        for t in &all {
+            assert_eq!(t.schema["type"], "object");
+            assert!(!t.description.is_empty());
         }
     }
 
@@ -541,91 +469,24 @@ mod tests {
     }
 
     #[test]
-    fn a_notification_gets_no_response_and_no_method_is_ignored() {
-        assert!(handle(
-            &req("notifications/initialized", None),
-            &fake_scan(),
-            &never
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn invalid_requests_are_32600_and_echo_a_usable_id() {
-        let scan = fake_scan();
-        let code = |v: Value| handle(&v, &scan, &never).unwrap();
-        let r = code(json!([{"jsonrpc":"2.0","id":1,"method":"ping"}]));
-        assert_eq!(
-            (r["error"]["code"].clone(), r["id"].clone()),
-            (json!(-32600), Value::Null)
-        );
-        assert_eq!(code(json!(5))["error"]["code"], -32600);
-        let r = code(json!({"jsonrpc":"2.0","id":4,"method":7}));
-        assert_eq!(
-            (r["error"]["code"].clone(), r["id"].clone()),
-            (json!(-32600), json!(4))
-        );
-        let r = code(json!({"jsonrpc":"2.0","id":"abc"}));
-        assert_eq!(
-            (r["error"]["code"].clone(), r["id"].clone()),
-            (json!(-32600), json!("abc"))
-        );
-        let r = code(json!({"jsonrpc":"2.0","id":null,"method":"ping"}));
-        assert_eq!(
-            (r["error"]["code"].clone(), r["id"].clone()),
-            (json!(-32600), Value::Null)
-        );
-        let r = code(json!({"jsonrpc":"2.0","id":{"a":1},"method":"ping"}));
-        assert_eq!(
-            (r["error"]["code"].clone(), r["id"].clone()),
-            (json!(-32600), Value::Null)
-        );
-    }
-
-    #[test]
-    fn ping_answers_an_empty_result() {
-        let r = handle(&req("ping", Some(9)), &fake_scan(), &never).unwrap();
-        assert_eq!(r["result"], json!({}));
-    }
-
-    #[test]
-    fn non_utf8_input_is_32700_and_the_loop_continues() {
-        let scan = fake_scan();
-        let bad = process_line(b"\xff\xfe", &scan, &never).unwrap();
-        assert_eq!(bad["error"]["code"], -32700);
-        assert!(bad["id"].is_null());
-        let ok = process_line(
-            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
-            &scan,
-            &never,
-        );
-        assert_eq!(ok.unwrap()["result"], json!({}));
-    }
-
-    #[test]
     fn a_timed_out_or_truncated_child_is_an_error() {
-        let t = tool_result(ToolOutcome {
+        let t = tool_text(ToolOutcome {
             code: None,
             stdout: String::new(),
             stderr: "timed out after 5 s; the child was killed".into(),
             truncated: false,
         });
-        assert_eq!(t["isError"], true);
-        assert!(t["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("timed out after 5 s"));
-        let t = tool_result(ToolOutcome {
+        assert!(t.unwrap_err().contains("timed out after 5 s"));
+        let t = tool_text(ToolOutcome {
             code: Some(0),
             stdout: "x".into(),
             stderr: String::new(),
             truncated: true,
         });
-        assert_eq!(t["isError"], true);
-        assert!(t["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("truncated"));
+        assert_eq!(
+            t.unwrap_err(),
+            format!("x\n[output truncated at {OUTPUT_CAP} bytes]")
+        );
     }
 
     #[test]
@@ -664,16 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_method_is_32601() {
-        let r = handle(&req("nope", Some(3)), &fake_scan(), &never).unwrap();
-        assert_eq!(r["error"]["code"], -32601);
-        assert_eq!(r["id"], 3);
-    }
-
-    #[test]
     fn bad_calls_are_errors_and_never_spawn() {
         let cases = [
-            ("nope", json!({})),
             ("scan", json!({"tui": true})),
             ("scan", json!({"json": true})),
             ("scan", json!({"reader": "--sarif"})),
@@ -685,10 +538,10 @@ mod tests {
             ("rules_explain", json!({"id": "--json"})),
             ("rules_explain", json!({"id": 5})),
         ];
+        let all = tools(&fake_scan(), never());
         for (name, args) in cases {
-            let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}});
-            let r = handle(&req, &fake_scan(), &never).unwrap();
-            assert_eq!(r["result"]["isError"], true, "{name} {args}");
+            let tool = all.iter().find(|t| t.name == name).unwrap();
+            assert!((tool.call)(&args).is_err(), "{name} {args}");
         }
     }
 
@@ -731,19 +584,20 @@ mod tests {
                 ["euicc", sub, "--json", "--reader", "R 1"]
             );
         }
+        let all = tools(&fake_scan(), never());
+        let tool = all.iter().find(|t| t.name == "euicc_info").unwrap();
         for args in [
             json!({"aid": "A0"}),
             json!({"reader": "--json"}),
             json!({"reader": 1}),
         ] {
-            let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"euicc_info","arguments":args}});
-            let r = handle(&req, &fake_scan(), &never).unwrap();
-            assert_eq!(r["result"]["isError"], true);
+            assert!((tool.call)(&args).is_err());
         }
     }
 
     #[test]
     fn gp_tools_run_the_read_only_subcommands() {
+        let all = tools(&fake_scan(), never());
         for (tool, sub) in [
             ("gp_info", "info"),
             ("gp_ara", "ara"),
@@ -754,45 +608,32 @@ mod tests {
                 call(tool, json!({"reader": "R 1"}), 1).1.unwrap(),
                 ["gp", sub, "--json", "--reader", "R 1"]
             );
-            let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":{"trace":true}}});
-            let r = handle(&req, &fake_scan(), &never).unwrap();
-            assert_eq!(r["result"]["isError"], true);
+            let t = all.iter().find(|t| t.name == tool).unwrap();
+            assert!((t.call)(&json!({"trace": true})).is_err());
         }
     }
 
     #[test]
     fn exit_codes_map_to_is_error() {
         for code in [0, 1, 3] {
-            let (r, _) = call("rules_list", json!({}), code);
-            assert_eq!(r["isError"], false);
-            assert_eq!(r["content"][0]["text"], "ENVELOPE");
+            assert_eq!(call("rules_list", json!({}), code).0, Ok("ENVELOPE".into()));
         }
         for code in [129, 130, 2, 101] {
-            let (r, _) = call("rules_list", json!({}), code);
-            assert_eq!(r["isError"], true, "code {code}");
-            assert_eq!(r["content"][0]["text"], "BOOM");
+            assert_eq!(
+                call("rules_list", json!({}), code).0,
+                Err("BOOM".into()),
+                "code {code}"
+            );
         }
-        let spawn_failed = tool_result(ToolOutcome {
+        let spawn_failed = tool_text(ToolOutcome {
             code: None,
             stdout: String::new(),
             stderr: String::new(),
             truncated: false,
         });
-        assert_eq!(spawn_failed["isError"], true);
-    }
-
-    #[test]
-    fn a_malformed_line_is_32700_and_the_next_line_still_works() {
-        let scan = fake_scan();
-        let bad = process_line(b"{not json", &scan, &never).unwrap();
-        assert_eq!(bad["error"]["code"], -32700);
-        assert!(bad["id"].is_null());
-        let good = process_line(
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            &scan,
-            &never,
+        assert_eq!(
+            spawn_failed,
+            Err("the process did not exit normally".into())
         );
-        assert!(good.is_some());
-        assert!(process_line(b"   ", &scan, &never).is_none());
     }
 }
