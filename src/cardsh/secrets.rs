@@ -13,7 +13,7 @@
 //! ```
 //!
 //! A value is 4 to 8 ASCII digits (padded with `FF` to 8 octets as the card expects) or `hex:` and
-//! exactly 8 octets. Names: `pinN` (1-8), `pukN`, `admN` (1-5), `universal`, `upuk`, `new-pinN` and `new-universal` (the
+//! octets (8 for a PIN, PUK or ADM key; `ki`, `opc` and `op` are 16 for the authentication commands). Names: `pinN` (1-8), `pukN`, `admN` (1-5), `universal`, `upuk`, `new-pinN` and `new-universal` (the
 //! PIN `unblock_chv` sets), `key-XX` (a raw key reference). `#` starts a comment.
 
 use std::fmt;
@@ -34,7 +34,7 @@ pub const MAX_TEXT: u64 = 4096;
 struct Entry {
     iccid: Option<String>,
     name: String,
-    value: [u8; 8],
+    value: Vec<u8>,
 }
 
 /// The parsed secrets.
@@ -49,16 +49,19 @@ impl fmt::Debug for Secrets {
     }
 }
 
-fn value(text: &str) -> Result<[u8; 8], String> {
+fn value(text: &str) -> Result<Vec<u8>, String> {
     if let Some(h) = text.strip_prefix("hex:") {
         let b = hex::decode(h).map_err(|_| "a hex: value is not hex".to_owned())?;
-        return <[u8; 8]>::try_from(b.as_slice())
-            .map_err(|_| "a hex: value must be 8 octets".to_owned());
+        return if (1..=32).contains(&b.len()) {
+            Ok(b)
+        } else {
+            Err("a hex: value is 1 to 32 octets".to_owned())
+        };
     }
     if !(4..=8).contains(&text.len()) || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("a value is 4 to 8 digits, or hex: and 8 octets".to_owned());
+        return Err("a value is 4 to 8 digits, or hex:".to_owned());
     }
-    let mut out = [0xFF; 8];
+    let mut out = vec![0xFF; 8];
     out[..text.len()].copy_from_slice(text.as_bytes());
     Ok(out)
 }
@@ -125,6 +128,13 @@ impl Secrets {
         Self::parse(&text)
     }
 
+    /// Whether an entry called `name` exists (for any card).
+    pub fn has(&self, name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.name == name.to_ascii_lowercase())
+    }
+
     /// Whether some entry is bound to an ICCID (so the card's ICCID has to be read to choose).
     pub fn needs_iccid(&self) -> bool {
         self.entries.iter().any(|e| e.iccid.is_some())
@@ -132,7 +142,7 @@ impl Secrets {
 
     /// The value for `name` on the card with `iccid` (when known): an entry bound to that ICCID wins
     /// over an unbound one.
-    pub fn get(&self, name: &str, iccid: Option<&str>) -> Option<[u8; 8]> {
+    pub fn get(&self, name: &str, iccid: Option<&str>) -> Option<Vec<u8>> {
         let name = name.to_ascii_lowercase();
         let pick = |bound: bool| {
             self.entries
@@ -145,7 +155,7 @@ impl Secrets {
                             e.iccid.is_none()
                         })
                 })
-                .map(|e| e.value)
+                .map(|e| e.value.clone())
         };
         pick(true).or_else(|| pick(false))
     }
@@ -161,7 +171,10 @@ fn known(name: &str) -> bool {
         || n("puk", 1, 8)
         || n("adm", 1, 5)
         || n("new-pin", 1, 8)
-        || matches!(name, "universal" | "upuk" | "new-universal")
+        || matches!(
+            name,
+            "universal" | "upuk" | "new-universal" | "ki" | "opc" | "op"
+        )
         || name
             .strip_prefix("key-")
             .is_some_and(|h| h.len() == 2 && h.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -177,13 +190,16 @@ mod tests {
             "pin1=1234; puk1=12345678\nadm1=hex:3737373737373737 # comment\n8949001:pin1=9999",
         )
         .unwrap();
-        assert_eq!(s.get("PIN1", None), Some(*b"1234\xFF\xFF\xFF\xFF"));
+        assert_eq!(s.get("PIN1", None), Some(b"1234\xFF\xFF\xFF\xFF".to_vec()));
         assert_eq!(
             s.get("pin1", Some("8949001")),
-            Some(*b"9999\xFF\xFF\xFF\xFF")
+            Some(b"9999\xFF\xFF\xFF\xFF".to_vec())
         );
-        assert_eq!(s.get("pin1", Some("other")), Some(*b"1234\xFF\xFF\xFF\xFF"));
-        assert_eq!(s.get("adm1", None), Some(*b"77777777"));
+        assert_eq!(
+            s.get("pin1", Some("other")),
+            Some(b"1234\xFF\xFF\xFF\xFF".to_vec())
+        );
+        assert_eq!(s.get("adm1", None), Some(b"77777777".to_vec()));
         assert_eq!(s.get("pin2", None), None);
         assert!(s.needs_iccid());
     }
@@ -195,7 +211,7 @@ mod tests {
             "pin1=12",
             "pin9=1234",
             "pin1=12a4",
-            "adm1=hex:00",
+            "adm1=hex:",
             "nonsense=1234",
         ] {
             let e = Secrets::parse(text).unwrap_err();

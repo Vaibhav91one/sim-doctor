@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use crate::aka;
 use crate::apdu::{self, Command, StatusWord};
 use crate::fcp::{self, TagSet};
 use crate::fs::{self, FileId};
@@ -691,6 +692,88 @@ fn rand_arg(args: &clap::ArgMatches) -> Result<[u8; 16], CmdErr> {
     }
 }
 
+/// What the card said to a UMTS AUTHENTICATE.
+enum AuthAnswer {
+    /// `DB`: RES, CK, IK and (when the card sends it) Kc.
+    Success {
+        res: Vec<u8>,
+        ck: Vec<u8>,
+        ik: Vec<u8>,
+        kc: Option<Vec<u8>>,
+    },
+    /// `DC`: the sequence number was not acceptable; AUTS comes back.
+    Sync { auts: Vec<u8> },
+    /// `98 62`: the MAC in AUTN did not verify.
+    MacFailure,
+    /// Any other status word.
+    Refused(Option<StatusWord>),
+    /// A success status with data of no known shape.
+    Malformed(Vec<u8>),
+}
+
+/// Reads the answer of a 3G-context AUTHENTICATE (TS 31.102 7.1.2.1).
+fn parse_auth(sw: Option<StatusWord>, data: &[u8]) -> AuthAnswer {
+    if sw.is_some_and(|s| s.to_bytes() == [0x98, 0x62]) {
+        return AuthAnswer::MacFailure;
+    }
+    if !sw.is_some_and(StatusWord::is_normal_processing) {
+        return AuthAnswer::Refused(sw);
+    }
+    let take = |d: &[u8]| -> Option<(Vec<u8>, usize)> {
+        let (&n, rest) = d.split_first()?;
+        let v = rest.get(..usize::from(n))?;
+        Some((v.to_vec(), 1 + usize::from(n)))
+    };
+    match data {
+        [0xDC, rest @ ..] => match take(rest) {
+            Some((auts, _)) if auts.len() == 14 => AuthAnswer::Sync { auts },
+            _ => AuthAnswer::Malformed(data.to_vec()),
+        },
+        [0xDB, rest @ ..] => {
+            let mut at = 0;
+            let mut parts = Vec::new();
+            while at < rest.len() && parts.len() < 4 {
+                match take(&rest[at..]) {
+                    Some((v, n)) => {
+                        parts.push(v);
+                        at += n;
+                    }
+                    None => return AuthAnswer::Malformed(data.to_vec()),
+                }
+            }
+            match parts.as_slice() {
+                [res, ck, ik] | [res, ck, ik, _]
+                    if (4..=16).contains(&res.len())
+                        && ck.len() == 16
+                        && ik.len() == 16
+                        && at == rest.len() =>
+                {
+                    AuthAnswer::Success {
+                        res: res.clone(),
+                        ck: ck.clone(),
+                        ik: ik.clone(),
+                        kc: parts.get(3).cloned(),
+                    }
+                }
+                _ => AuthAnswer::Malformed(data.to_vec()),
+            }
+        }
+        _ => AuthAnswer::Malformed(data.to_vec()),
+    }
+}
+
+fn parse_sqn(text: &str) -> Result<[u8; 6], CmdErr> {
+    let n = match text.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => text.parse::<u64>(),
+    }
+    .map_err(|_| CmdErr::new("--sqn is a number (decimal or 0x hex)"))?;
+    if n >> 48 != 0 {
+        return Err(CmdErr::new("--sqn is at most 48 bits"));
+    }
+    <[u8; 6]>::try_from(&n.to_be_bytes()[2..]).map_err(|_| CmdErr::new("--sqn"))
+}
+
 /// How many tries a `63 Cx` leaves.
 fn tries_left(sw: Option<StatusWord>) -> Option<u8> {
     sw.filter(|s| s.sw1() == 0x63 && s.sw2() & 0xF0 == 0xC0)
@@ -728,6 +811,17 @@ impl Shell {
 
     /// The secret `name` from the provider (`--chv-file` / `--chv-env`).
     fn secret(&mut self, name: &str) -> Result<[u8; 8], CmdErr> {
+        let v = self.secret_bytes(name)?;
+        <[u8; 8]>::try_from(v.as_slice()).map_err(|_| {
+            CmdErr::new(format!(
+                "`{name}` is {} octets; a PIN, PUK or ADM key is 8",
+                v.len()
+            ))
+        })
+    }
+
+    /// The secret `name` as stored (any length the source gave).
+    fn secret_bytes(&mut self, name: &str) -> Result<Vec<u8>, CmdErr> {
         let Some(sec) = self.opts.secrets.clone() else {
             return Err(CmdErr::new(
                 "no PIN source: start `card` with --chv-file PATH or --chv-env VAR",
@@ -881,6 +975,179 @@ impl Shell {
             json!({ "sent": true, "context": if sim { "run-gsm-algorithm" } else { "gsm" }, "rand": hex_upper(&rand), "sres": sres, "kc": kc,
                     "attempts": answers.len(), "deterministic": deterministic, "sw": last.map(|s| s.to_string()) }),
         ))
+    }
+
+    /// Ki and OP/OPc from the PIN source, when they are there.
+    fn milenage_keys(&mut self) -> Result<Option<([u8; 16], aka::Operator)>, CmdErr> {
+        let Some(sec) = self.opts.secrets.clone() else {
+            return Ok(None);
+        };
+        if !(sec.has("ki") && (sec.has("opc") || sec.has("op"))) {
+            return Ok(None);
+        }
+        let sixteen = |v: Vec<u8>, name: &str| {
+            <[u8; 16]>::try_from(v.as_slice()).map_err(|_| {
+                CmdErr::new(format!("`{name}` is {} octets; Milenage needs 16", v.len()))
+            })
+        };
+        let k = sixteen(self.secret_bytes("ki")?, "ki")?;
+        let op = if sec.has("opc") {
+            aka::Operator::Opc(sixteen(self.secret_bytes("opc")?, "opc")?)
+        } else {
+            aka::Operator::Op(sixteen(self.secret_bytes("op")?, "op")?)
+        };
+        Ok(Some((k, op)))
+    }
+
+    fn auth_once(
+        &mut self,
+        rand: &[u8; 16],
+        autn: &[u8; 16],
+    ) -> Result<(AuthAnswer, Option<StatusWord>), CmdErr> {
+        let card = self.equipped()?;
+        let cla = card.cla();
+        let mut data = vec![0x10];
+        data.extend_from_slice(rand);
+        data.push(0x10);
+        data.extend_from_slice(autn);
+        let ex = card.send(&Command::case3(
+            apdu::Header::new(cla, 0x88, 0x00, 0x81),
+            data,
+        ))?;
+        Ok((parse_auth(ex.status(), ex.data()), ex.status()))
+    }
+
+    fn cmd_authenticate(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let rand = rand_arg(args)?;
+        let keys = self.milenage_keys()?;
+        let sqn = args
+            .get_one::<String>("sqn")
+            .map(|t| parse_sqn(t))
+            .transpose()?;
+        let amf = {
+            let b =
+                parse_hex(args.get_one::<String>("amf").expect("default")).map_err(CmdErr::new)?;
+            <[u8; 2]>::try_from(b.as_slice()).map_err(|_| CmdErr::new("--amf is 2 octets"))?
+        };
+        let build = |sqn: &[u8; 6]| -> Result<[u8; 16], CmdErr> {
+            let (k, op) = keys.ok_or_else(|| CmdErr::new("--sqn needs `ki` and `opc` (or `op`) in the PIN source (--chv-file / --chv-env)"))?;
+            Ok(aka::autn(&aka::compute(k, op, &rand, sqn, &amf), sqn, &amf))
+        };
+        let autn: [u8; 16] = match (args.get_one::<String>("autn"), sqn) {
+            (Some(h), _) => <[u8; 16]>::try_from(parse_hex(h).map_err(CmdErr::new)?.as_slice())
+                .map_err(|_| CmdErr::new("--autn is 16 octets (32 hex digits)"))?,
+            (None, Some(sqn)) => build(&sqn)?,
+            (None, None) => {
+                let mut r = [0u8; 16];
+                rand::fill(&mut r);
+                r
+            }
+        };
+        let head = "00 88 00 81 22 10";
+        if !self.may_change_card(args) {
+            return Ok(Reply::ok(
+                format!("dry run: would send {head} {} 10 {} (authentication is not a read; add --yes to send)", hex_upper(&rand), hex_upper(&autn)),
+                json!({ "sent": false, "rand": hex_upper(&rand), "autn": hex_upper(&autn) }),
+            ));
+        }
+        let (answer, sw) = self.auth_once(&rand, &autn)?;
+        let mut data = json!({ "sent": true, "context": "umts", "rand": hex_upper(&rand), "autn": hex_upper(&autn), "sw": sw.map(|s| s.to_string()) });
+        let mut text = format!("RAND {}\nAUTN {}", hex_upper(&rand), hex_upper(&autn));
+        let expected = keys.map(|(k, op)| aka::compute(k, op, &rand, &sqn.unwrap_or([0; 6]), &amf));
+        let mut ok = true;
+        let mut resync_to = None;
+        match answer {
+            AuthAnswer::Success { res, ck, ik, kc } => {
+                text.push_str(&format!(
+                    "\nauthentication succeeded\nRES {}\nCK  {}\nIK  {}",
+                    hex_upper(&res),
+                    hex_upper(&ck),
+                    hex_upper(&ik)
+                ));
+                data["outcome"] = json!("success");
+                data["res"] = json!(hex_upper(&res));
+                data["ck"] = json!(hex_upper(&ck));
+                data["ik"] = json!(hex_upper(&ik));
+                data["kc"] = json!(kc.as_deref().map(hex_upper));
+                if let Some(e) = expected {
+                    let same = res == e.res && ck == e.ck && ik == e.ik;
+                    data["matches_expected"] = json!(same);
+                    text.push_str(if same {
+                        "\nRES, CK and IK match the Milenage values for these keys"
+                    } else {
+                        "\nRES, CK or IK DIFFER from the Milenage values for these keys"
+                    });
+                    ok = same;
+                }
+            }
+            AuthAnswer::Sync { auts } => {
+                data["outcome"] = json!("synchronisation-failure");
+                data["auts"] = json!(hex_upper(&auts));
+                text.push_str(&format!(
+                    "\nsynchronisation failure: the card holds a newer sequence number\nAUTS {}",
+                    hex_upper(&auts)
+                ));
+                if let Some((k, op)) = keys {
+                    let auts14 =
+                        <[u8; 14]>::try_from(auts.as_slice()).expect("checked by parse_auth");
+                    let (sqn_ms, valid) = aka::open_auts(k, op, &rand, &auts14);
+                    let n = sqn_ms.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b));
+                    data["sqn_ms"] = json!(n);
+                    data["mac_s_valid"] = json!(valid);
+                    text.push_str(&format!(
+                        "\nSQNms {n} (0x{n:012X}); MAC-S {}",
+                        if valid {
+                            "verifies: AUTS is from this card's keys"
+                        } else {
+                            "does NOT verify: not this card's AUTS"
+                        }
+                    ));
+                    if valid && args.get_flag("resync") {
+                        resync_to = Some(n + 1);
+                    }
+                } else {
+                    text.push_str("\n(give ki and opc in the PIN source to open AUTS)");
+                }
+            }
+            AuthAnswer::MacFailure => {
+                data["outcome"] = json!("mac-failure");
+                text.push_str("\nMAC failure (98 62): the card rejected the AUTN");
+            }
+            AuthAnswer::Refused(sw) => {
+                return Err(CmdErr {
+                    message: format!("the card refused AUTHENTICATE: {}", sw_text(sw)),
+                    data,
+                })
+            }
+            AuthAnswer::Malformed(d) => {
+                return Err(CmdErr {
+                    message: format!(
+                        "the AUTHENTICATE answer has an unknown shape: {}",
+                        hex::encode(&d)
+                    ),
+                    data,
+                })
+            }
+        }
+        if let Some(next) = resync_to {
+            let sqn6 = <[u8; 6]>::try_from(&next.to_be_bytes()[2..]).expect("6 octets");
+            let autn2 = build(&sqn6)?;
+            let (again, sw2) = self.auth_once(&rand, &autn2)?;
+            let outcome = match &again {
+                AuthAnswer::Success { .. } => "success",
+                AuthAnswer::Sync { .. } => "synchronisation-failure",
+                AuthAnswer::MacFailure => "mac-failure",
+                _ => "refused",
+            };
+            data["resync"] = json!({ "sqn": next, "autn": hex_upper(&autn2), "outcome": outcome, "sw": sw2.map(|s| s.to_string()) });
+            text.push_str(&format!("\nresynchronised with SQN {next}: {outcome}"));
+            ok &= outcome == "success";
+        }
+        Ok(if ok {
+            Reply::ok(text, data)
+        } else {
+            Reply::failed(text, data)
+        })
     }
 
     fn cmd_unblock_chv(&mut self, args: &clap::ArgMatches) -> CmdResult {
@@ -1576,6 +1843,18 @@ pub fn grammar() -> clap::Command {
                 .arg(yes_arg()),
         )
         .subcommand(
+            C::new("authenticate")
+                .visible_alias("auth")
+                .about("UMTS authentication probe (3G security context): send RAND and AUTN, read RES CK IK, or AUTS after a synchronisation failure. A dry run unless --yes")
+                .arg(Arg::new("rand").long("rand").value_name("HEX").help("16 octets (default: random)"))
+                .arg(Arg::new("autn").long("autn").value_name("HEX").help("16 octets, sent as given (a random AUTN probes how the card treats a token it cannot verify)"))
+                .arg(Arg::new("sqn").long("sqn").value_name("N").help("build AUTN for this sequence number (decimal or 0x hex) from `ki` and `opc`/`op` of the PIN source"))
+                .arg(Arg::new("amf").long("amf").value_name("HEX").default_value("8000").help("the 2-octet AMF for --sqn"))
+                .arg(Arg::new("resync").long("resync").action(clap::ArgAction::SetTrue).requires("sqn").help("after a synchronisation failure whose AUTS checks out, send once more with SQN = SQNms + 1"))
+                .group(clap::ArgGroup::new("token").args(["autn", "sqn"]))
+                .arg(yes_arg()),
+        )
+        .subcommand(
             C::new("quit")
                 .visible_aliases(["exit", "eof"])
                 .about("Leave the shell"),
@@ -1687,6 +1966,7 @@ impl Shell {
             "verify_chv" => self.cmd_verify_chv(args),
             "unblock_chv" => self.cmd_unblock_chv(args),
             "run_gsm_algorithm" => self.cmd_run_gsm(args),
+            "authenticate" => self.cmd_authenticate(args),
             "select" => self.cmd_select(args.get_one::<String>("target").expect("required")),
             "select_path" => {
                 self.cmd_select(&path_arg(args.get_one::<String>("path").expect("required")))
@@ -2513,6 +2793,64 @@ mod tests {
         assert!(sent
             .iter()
             .any(|c| c[0] == 0xA0 && c[1] == 0x88 && c[2..4] == [0, 0]));
+    }
+
+    #[test]
+    fn authenticate_builds_an_autn_and_reads_res_ck_ik() {
+        let (mut sh, log) = shell_with(KEYS, false);
+        let r = sh.exec("authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 200");
+        assert!(r.ok && r.data["sent"] == false, "{}", r.text);
+        assert!(
+            r.text
+                .contains("00 88 00 81 22 10 23553CBE9637A89D218AE64DAE47BF35 10 "),
+            "{}",
+            r.text
+        );
+        assert!(log.borrow().is_empty(), "authentication is not a read");
+        let (mut sh, log) = shell_with(KEYS, true);
+        let r = sh.exec("authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 200");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["outcome"], "success");
+        assert_eq!(
+            r.data["matches_expected"], true,
+            "RES/CK/IK equal the host's Milenage"
+        );
+        assert_eq!(r.data["res"].as_str().unwrap().len(), 16);
+        assert!(log
+            .borrow()
+            .iter()
+            .any(|c| c[1] == 0x88 && c[3] == 0x81 && c.len() == 39));
+    }
+
+    #[test]
+    fn authenticate_tells_a_mac_failure_from_a_sync_failure_and_resyncs() {
+        let (mut sh, _) = shell_with(KEYS, true);
+        // A token the card cannot verify.
+        let r = sh.exec("authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --autn 00112233445566778899aabbccddeeff");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["outcome"], "mac-failure");
+        // A valid MAC but a sequence number the card has passed (SQNms is 100).
+        let r = sh.exec("authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 50");
+        assert_eq!(r.data["outcome"], "synchronisation-failure", "{}", r.text);
+        assert_eq!(r.data["sqn_ms"], 100);
+        assert_eq!(r.data["mac_s_valid"], true);
+        assert!(r.data["auts"].as_str().unwrap().len() == 28);
+        // --resync: one more try with SQNms + 1.
+        let r = sh.exec("authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 50 --resync");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["resync"]["sqn"], 101);
+        assert_eq!(r.data["resync"]["outcome"], "success");
+        // The card now holds 101; the same SQN 101 is stale again.
+        let r = sh.exec("authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 101");
+        assert_eq!(r.data["outcome"], "synchronisation-failure");
+        // Without the keys AUTS cannot be opened, and --sqn cannot build a token.
+        let (mut sh, _) = shell_with("pin1=1234", true);
+        let r = sh.exec("authenticate --autn 00112233445566778899aabbccddeeff");
+        assert!(r.ok && r.data["outcome"] == "mac-failure");
+        let r = sh.exec("authenticate --sqn 5");
+        assert!(!r.ok && r.text.contains("`ki`"), "{}", r.text);
+        assert!(!sh.exec("authenticate --autn 00").ok);
+        assert!(!sh.exec("authenticate --resync").ok, "--resync needs --sqn");
     }
 
     #[test]

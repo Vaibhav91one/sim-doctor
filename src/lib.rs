@@ -183,7 +183,7 @@ pub const MODULES: &[ModuleInfo] = &[
     },
     ModuleInfo {
         name: aka::NAME,
-        owns: "Milenage f1, f1*, f2, f3, f4, f5 and f5* in one call over the milenage crate; known-answer tested, never run against a card.",
+        owns: "Milenage f1, f1*, f2, f3, f4, f5 and f5* in one call over the milenage crate; known-answer tested; the AUTN builder and AUTS opener are the host side of the card shell's authenticate.",
         depends_on: &[],
     },
     ModuleInfo {
@@ -356,7 +356,7 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         name: cardsh::NAME,
         owns: "The card shell: a pySim-shell style command interpreter that keeps the equipped card, the logical channel and the selected file between commands; reads are sent, anything that changes the card is a dry run unless --yes.",
-        depends_on: &[apdu::NAME, fcp::NAME, fs::NAME, session::NAME, trace::NAME, transport::NAME],
+        depends_on: &[aka::NAME, apdu::NAME, fcp::NAME, fs::NAME, session::NAME, trace::NAME, transport::NAME],
     },
 ];
 

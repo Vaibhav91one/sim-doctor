@@ -14,6 +14,14 @@ pub const USIM_AID: [u8; 12] = [
     0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0x49, 0xFF, 0x05, 0x89,
 ];
 
+/// The Milenage keys of the test card (TS 35.208 test set 1).
+pub const TEST_K: [u8; 16] = [
+    0x46, 0x5b, 0x5c, 0xe8, 0xb1, 0x99, 0xb4, 0x9f, 0xaa, 0x5f, 0x0a, 0x2e, 0xe2, 0x38, 0xa6, 0xbc,
+];
+pub const TEST_OPC: [u8; 16] = [
+    0xcd, 0x63, 0xcb, 0x71, 0x95, 0x4a, 0x9f, 0x4e, 0x48, 0xa5, 0x99, 0x4e, 0x37, 0xa0, 0x2b, 0xaf,
+];
+
 /// A pseudo file identifier for "the application": ADFs have none of their own.
 const ADF: u16 = 0x7FFF;
 
@@ -38,6 +46,8 @@ pub struct TestCard {
     pub chv: std::collections::BTreeMap<u8, Chv>,
     /// Key reference of the PIN -> (unblock code, tries left, tries at most).
     pub puk: std::collections::BTreeMap<u8, (Vec<u8>, u8, u8)>,
+    /// The highest sequence number the card has accepted (SQNms).
+    pub sqn_ms: u64,
 }
 
 #[derive(Clone)]
@@ -150,6 +160,7 @@ impl TestCard {
             queued: VecDeque::new(),
             open: BTreeSet::from([0]),
             sent: Rc::default(),
+            sqn_ms: 100,
             chv: [
                 (0x01, "1234"),
                 (0x81, "5678"),
@@ -406,6 +417,45 @@ impl CardSession for TestCard {
                 }
             }
             0xF2 => vec![0x90, 0x00],
+            // INTERNAL AUTHENTICATE, 3G context: 10 RAND 10 AUTN. Real Milenage with a sequence-number check.
+            0x88 if c[3] == 0x81 && c[0] & 0xFC == 0 => match data {
+                [0x10, rest @ ..] if rest.len() == 33 && rest[16] == 0x10 => {
+                    let rand: [u8; 16] = rest[..16].try_into().unwrap();
+                    let autn: [u8; 16] = rest[17..].try_into().unwrap();
+                    let op = crate::aka::Operator::Opc(TEST_OPC);
+                    let ak = crate::aka::compute(TEST_K, op, &rand, &[0; 6], &[0; 2]).ak;
+                    let mut sqn = [0u8; 6];
+                    for i in 0..6 {
+                        sqn[i] = autn[i] ^ ak[i];
+                    }
+                    let amf: [u8; 2] = autn[6..8].try_into().unwrap();
+                    let o = crate::aka::compute(TEST_K, op, &rand, &sqn, &amf);
+                    let n = sqn.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b));
+                    let body = if o.mac_a != autn[8..] {
+                        return Ok(vec![0x98, 0x62]);
+                    } else if n <= self.sqn_ms {
+                        let ms: [u8; 6] = self.sqn_ms.to_be_bytes()[2..].try_into().unwrap();
+                        let so = crate::aka::compute(TEST_K, op, &rand, &ms, &[0; 2]);
+                        let mut b = vec![0xDC, 0x0E];
+                        b.extend((0..6).map(|i| ms[i] ^ so.ak_star[i]));
+                        b.extend(so.mac_s);
+                        b
+                    } else {
+                        self.sqn_ms = n;
+                        let mut b = vec![0xDB, 0x08];
+                        b.extend(o.res);
+                        b.push(0x10);
+                        b.extend(o.ck);
+                        b.push(0x10);
+                        b.extend(o.ik);
+                        b
+                    };
+                    let len = body.len() as u8;
+                    self.queued = VecDeque::from([body]);
+                    vec![0x61, len]
+                }
+                _ => vec![0x67, 0x00],
+            },
             // RUN GSM ALGORITHM (SIM, CLA A0) / INTERNAL AUTHENTICATE in the GSM context (USIM, P2 80).
             // Not COMP128: SRES and Kc are fixed mixes of RAND, enough to tell a stateless card apart.
             0x88 if c[3] == 0x00 && c[0] == 0xA0 || c[3] == 0x80 && c[0] & 0xFC == 0 => {
@@ -517,6 +567,10 @@ pub fn shell_log() -> (Shell, Rc<RefCell<Vec<Vec<u8>>>>) {
     (sh, log)
 }
 
+/// The PIN source text that also gives the test card's Milenage keys.
+pub const KEYS: &str =
+    "ki=hex:465b5ce8b199b49faa5f0a2ee238a6bc; opc=hex:cd63cb71954a9f4e48a5994e37a02baf";
+
 /// Like [`shell_log`] with a PIN source and `--yes` as given.
 pub fn shell_with(secrets: &str, yes: bool) -> (Shell, Rc<RefCell<Vec<Vec<u8>>>>) {
     let (mut sh, log) = shell_log();
@@ -572,7 +626,8 @@ pub fn record(script: &str, yes: bool) -> (String, Vec<Reply>) {
 /// The scripts whose recordings are committed under `tests/corpus/` for the process tests:
 /// (file name, `--yes`, script).
 /// The PIN source the recorded scripts run with (and `tests/cardsh.rs` hands the binary).
-pub const FIXTURE_SECRETS: &str = "pin1=1234; pin2=0000; puk1=12345678; new-pin1=4321";
+pub const FIXTURE_SECRETS: &str = "pin1=1234; pin2=0000; puk1=12345678; new-pin1=4321; \
+     ki=hex:465b5ce8b199b49faa5f0a2ee238a6bc; opc=hex:cd63cb71954a9f4e48a5994e37a02baf";
 
 pub const FIXTURES: &[(&str, bool, &str)] = &[
     (
@@ -618,6 +673,13 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         "cardsh_gsm.jsonl",
         true,
         "run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f --repeat 2",
+    ),
+    (
+        "cardsh_auth.jsonl",
+        true,
+        "authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 200; \
+         authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 50 --resync; \
+         authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --autn 00112233445566778899aabbccddeeff",
     ),
 ];
 
