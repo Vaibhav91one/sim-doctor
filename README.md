@@ -161,6 +161,8 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `euicc delete ICCID\|AID [--yes] [...]` | delete a disabled profile permanently; a dry run unless `--yes`, see below |
 | `euicc reset [--operational] [--test] [--smdp-address] [--confirm-eid EID] [--yes] [...]` | eUICC memory reset; needs `--yes` and `--confirm-eid`, see below |
 | `euicc notifications remove SEQ [--yes] [...]` | remove a notification from the list; a dry run unless `--yes`, see below |
+| `euicc notifications dump [--seq N] [-o FILE] [...]` | read the full signed pending notifications into a re-loadable JSON file; read-only, see below |
+| `euicc notifications replay --from FILE [--yes] [--json]` | send dumped notifications to their operators over ES9+ HTTPS; a dry run unless `--yes`, see below |
 
 `scan` flags (`sim-doctor scan --help` is the full contract):
 
@@ -221,7 +223,7 @@ SELECT was refused: `data.error.kind` is `not-an-euicc`), the card refused a log
 ES10 request, the response was malformed, or no reader or card; `129` bad command line; `130`
 interrupted. The swSIM fixture is not an eUICC, so these are tested against synthetic responses
 through the replay transport and still need a live-card check (tracked on #92). The online side
-(download, discovery, notification handling) needs the HTTPS transport (#20) and is not here.
+(download, discovery) is not here; `notifications replay` below is the one command that sends anything.
 
 `euicc nickname ICCID NAME` (lpac `profile nickname`, ES10c SetNickname) is the first command here that
 changes the card, and it is cautious by default. The ICCID (18 to 20 digits) and the name (at most 64
@@ -260,6 +262,22 @@ validation before a reader is opened, each SGP.22 result code its own error kind
   from the card (`confirm-eid-required`, `bad-eid`, `eid-mismatch`; nothing is sent). The dry run lists every
   profile that would be erased (provisioning profiles are never touched). Kinds: `nothing-to-delete`,
   `undefined-error`.
+- `notifications dump [--seq N] [-o FILE]` (lpac `notification dump`, ES10b RetrieveNotificationsList) reads the full
+  signed `PendingNotification`s, not just the metadata `notifications` lists, and writes one JSON document
+  (`format` `sim-doctor-notification-dump/1`, `eid`, `notifications`): per notification the sequence number, operation,
+  address, ICCID, arm (`profile-installation-result` or `other-signed-notification`), transaction id and the signed bytes
+  as `pending_notification_hex`. It is read-only: retrieving removes nothing. Without `-o` and `--json` the document is
+  printed to stdout; `-o FILE` writes it (the file must not exist). `--seq N` asks for one notification (lpac's
+  search-criteria form, `notification-not-found` when the card has none); no pending notification is an empty list.
+- `notifications replay --from FILE` sends each dumped notification to the `notificationAddress` inside its signed
+  bytes (not the decoded field in the file) as ES9+ HandleNotification, `POST
+  https://<address>/gsma/rsp2/es9plus/handleNotification`, through the HTTPS transport and `SIM_DOCTOR_HTTP` /
+  `SIM_DOCTOR_CA_BUNDLE` of #20. **It reaches the network and tells the operator's server about a profile event**, so it
+  is a dry run unless `--yes`: the dry run validates the file and every address and prints each target and request size,
+  sending nothing and opening no connection. It needs no reader and never removes the notification from the eUICC
+  (`notifications remove` stays the explicit step). Kinds: `bad-dump`, `bad-address` (checked before anything is sent),
+  `replay-failed` (stops at the first refusal and reports what was sent). Not exposed over MCP. The tests run the send
+  path against a local TLS test server; a live round trip with a real operator is on #92 and #118.
 - `notifications remove SEQ` reads the notification list first and refuses a sequence number that is not in it
   (`notification-not-found`). The dry run states that a removed notification is never sent to the operator's
   server. Kinds: `nothing-to-delete`, `undefined-error`.

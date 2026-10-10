@@ -332,3 +332,74 @@ fn slow_server_times_out() {
     assert!(t.post(&url(port), &Request::headers(), b"{}").is_err());
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+/// Rewrites the FQDN host of the URL to the local test server, keeping the
+/// path, and remembers the URL it was asked for.
+struct HostRewrite {
+    inner: HttpsTransport,
+    port: u16,
+    asked: Vec<String>,
+}
+
+impl Es9Transport for HostRewrite {
+    fn post(
+        &mut self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<es9::Response, es9::TransportError> {
+        self.asked.push(url.to_owned());
+        let local = url.replace("smdp.example.com", &format!("127.0.0.1:{}", self.port));
+        self.inner.post(&local, headers, body)
+    }
+}
+
+/// A dump of one notification addressed to smdp.example.com
+/// (`30 { BF2F { 80 01, 81 04 80, 0C smdp.example.com } }`).
+fn replay_dump() -> String {
+    let meta = "800105810204800C10736D64702E6578616D706C652E636F6D";
+    let raw = format!(
+        "30{:02X}BF2F{:02X}{meta}",
+        meta.len() / 2 + 3,
+        meta.len() / 2
+    );
+    format!(
+        r#"{{"format":"{}","eid":"89","notifications":[{{"pending_notification_hex":"{raw}"}}]}}"#,
+        sim_doctor::euicc::DUMP_FORMAT
+    )
+}
+
+#[test]
+fn replay_posts_the_notification_to_its_address_over_verified_tls() {
+    let ca = make_ca();
+    let bundle = bundle_file("replay", &ca);
+    let (port, seen) = serve(&ca, 1, |_| http("204 No Content", "", b""));
+    let mut t = HostRewrite {
+        inner: transport(&bundle),
+        port,
+        asked: Vec::new(),
+    };
+    let data = sim_doctor::notif::replay(&replay_dump(), Some(&mut t)).unwrap();
+    assert_eq!(data["notifications"][0]["sent"], true);
+    assert_eq!(
+        t.asked,
+        ["https://smdp.example.com/gsma/rsp2/es9plus/handleNotification"]
+    );
+    let seen = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        seen.head
+            .starts_with("POST /gsma/rsp2/es9plus/handleNotification HTTP/1.1"),
+        "{}",
+        seen.head
+    );
+    let body = String::from_utf8(seen.body).unwrap();
+    assert!(body.starts_with(r#"{"pendingNotification":""#), "{body}");
+}
+
+#[test]
+fn replay_dry_run_opens_no_connection() {
+    // No transport is passed, and nothing listens: a dry run cannot send.
+    let data = sim_doctor::notif::replay(&replay_dump(), None).unwrap();
+    assert_eq!(data["dry_run"], true);
+    assert_eq!(data["notifications"][0]["sent"], false);
+}
