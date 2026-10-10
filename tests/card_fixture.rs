@@ -2106,4 +2106,16 @@ fn card_shell_drives_a_real_card() {
     assert_eq!(records[3]["data"]["path"], "3F00/2FE2");
     assert_eq!(records[3]["data"]["size"], 10, "EF.ICCID is ten octets");
     println!("card shell: select kept the path across commands, EF.ICCID is 10 octets");
+
+    // read_binary: the whole of EF.ICCID, the same bytes in a slice of it, and the length the FCP gave.
+    let (code, records) = run("select 3F00/2FE2; read_binary; read_binary --offset 2 --length 3");
+    assert_eq!(code, Some(0), "{records:?}");
+    let all = records[1]["data"]["data"].as_str().expect("hex");
+    assert_eq!(all.len(), 20, "ten octets");
+    assert_eq!(records[2]["data"]["data"], all[4..10]);
+    // read_record on EF.DIR (record structured): one record, and a transparent file refuses the record read.
+    let (_, records) = run("select 3F00/2F00; read_record 1; select 3F00/2FE2; read_record 1");
+    assert_eq!(records[1]["ok"], true, "{records:?}");
+    assert_eq!(records[3]["ok"], false);
+    println!("card shell: read_binary 10 octets, read_record 1 of EF.DIR");
 }

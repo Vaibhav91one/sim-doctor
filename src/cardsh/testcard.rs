@@ -111,6 +111,12 @@ impl TestCard {
                     vec![0xFF; 0x1C],
                 ],
             ),
+            f(
+                &[mf, 0x7F10, 0x6F99],
+                false,
+                Some(0),
+                vec![(0..300u16).map(|i| (i % 251) as u8).collect()],
+            ),
             f(&[mf, 0x7F20], true, None, vec![]),
             f(
                 &[mf, 0x7F20, 0x6F07],
@@ -427,6 +433,12 @@ pub const FIXTURES: &[(&str, bool, &str)] = &[
         false,
         "select 3F00; select 7F20; select 6F07; select 3F00; select 3F00/7F10/6F3A; select ADF.USIM; \
          select EF.IMSI; select_path 6FAD; select 2FE2",
+    ),
+    (
+        "cardsh_read.jsonl",
+        false,
+        "select 2FE2; read_binary; read_binary --offset 2 --length 3; read_binary --length 20; select 3F00/7F10/6F3A; \
+         read_record 1; read_records; read_record 4; select 3F00/7F10/6F99; read_binary",
     ),
 ];
 

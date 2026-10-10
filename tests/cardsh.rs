@@ -193,3 +193,30 @@ fn select_keeps_the_path_between_commands_in_one_process() {
     assert_eq!(r[4]["data"]["records"], 3);
     assert_eq!(r[8]["ok"], false);
 }
+
+#[test]
+fn read_commands_return_what_the_selected_file_holds() {
+    let out = card(
+        "cardsh_read.jsonl",
+        &[
+            "--json",
+            "-c",
+            "select 2FE2; read_binary; read_binary --offset 2 --length 3; read_binary --length 20; select 3F00/7F10/6F3A; \
+             read_record 1; read_records; read_record 4; select 3F00/7F10/6F99; read_binary",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "read_record 4 is past the last record"
+    );
+    let r = lines(&out);
+    assert_eq!(r[1]["data"]["data"], "98101032547698103254");
+    assert_eq!(r[2]["data"]["data"], "103254");
+    assert_eq!(r[3]["data"]["length"], 10);
+    assert_eq!(r[5]["data"]["length"], 28);
+    assert_eq!(r[6]["data"]["count"], 3);
+    assert_eq!(r[7]["ok"], false);
+    assert!(r[7]["error"].as_str().unwrap().contains("6A83"));
+    assert_eq!(r[9]["data"]["length"], 300);
+}
