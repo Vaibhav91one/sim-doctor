@@ -30,8 +30,8 @@ use clap_complete::aot::generate;
 mod kit;
 
 use sim_doctor::{
-    apdu_fuzz, apdu_scan, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session, skill,
-    tar, trace,
+    apdu_fuzz, apdu_scan, ci, contract, euicc, fix, fuzz, gp, notif, rules, scan, session, tar,
+    trace,
     transport::{
         pcsc::{Pcsc, PcscSession},
         replay, CardSession, Error as TransportError, ReaderName, ReaderProvider,
@@ -1363,7 +1363,7 @@ struct ModulesArgs {
 #[derive(Args)]
 struct InstallArgs {
     /// Install for one agent only; omit for all of them.
-    #[arg(long, value_parser = skill::Agent::NAMES)]
+    #[arg(long, value_parser = ["claude", "cursor", "codex", "opencode"])]
     agent: Option<String>,
 
     /// Print what would be written instead of writing it.
@@ -1456,7 +1456,7 @@ fn dispatch(d: &kit::SimDoctor, command: Command) -> contract::ExitCode {
         Command::Ts48(args) => match args.action {
             Ts48Action::Compare(args) => run_ts48_compare(args),
         },
-        Command::Install(args) => run_install(args),
+        Command::Install(args) => kit::install(d, args),
         Command::Completions(args) => run_completions(args),
         Command::Ci(args) => run_ci(args),
         Command::Rules(args) => match args.action {
@@ -1872,32 +1872,6 @@ fn emit_stdout(text: &str, what: &str) -> Result<(), String> {
         // allowed to hide a flush that did not.
         .and_then(|()| handle.flush())
         .map_err(|e| format!("cannot write {what} to stdout: {e}"))
-}
-
-/// Runs `sim-doctor install`: write the agent guidance, or with `--print-only` show it.
-fn run_install(args: InstallArgs) -> contract::ExitCode {
-    let agent = args.agent.as_deref().and_then(skill::Agent::parse);
-    let mut printed = String::new();
-    for target in skill::targets(agent) {
-        if args.print_only {
-            printed.push_str(&format!("==> {}\n{}\n", target.path(), target.content()));
-        } else {
-            match skill::install(&args.dir, target) {
-                Ok(path) => println!("wrote {}", path.display()),
-                Err(err) => {
-                    eprintln!("sim-doctor: cannot write {}: {err}", target.path());
-                    return contract::ExitCode::Findings;
-                }
-            }
-        }
-    }
-    if args.print_only {
-        if let Err(message) = emit_stdout(printed.trim_end_matches('\n'), "the skill") {
-            eprintln!("sim-doctor: {message}");
-            return contract::ExitCode::Findings;
-        }
-    }
-    contract::ExitCode::Success
 }
 
 /// Runs `sim-doctor ci install`: plain text, no envelope.

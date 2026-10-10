@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use doctor_kit::baseline::Saved;
 use doctor_kit::doctor_core::{BaselineCounts, BaselineState, Envelope, Score, Severity};
+use doctor_kit::install::{plan, rendered, write, Agent, AgentFile, FileMode, Overwrite};
 use doctor_kit::output::Color;
 use doctor_kit::{
     failure_envelope, finish, preflight, Check, Config, Ctx, Doctor, ExtCommand, Extensions, Face,
@@ -30,9 +31,12 @@ use sim_doctor::walk::{Candidates, Limits, Tree};
 use sim_doctor::{access, ef, sarif, scan, session, tar, walk};
 
 use super::{
-    checkpoint, contract, dispatch, emit_stdout, limits_from, open_scan_session, Cli, ScanArgs,
-    INTERRUPT_REPORTED,
+    checkpoint, contract, dispatch, emit_stdout, limits_from, open_scan_session, Cli, InstallArgs,
+    ScanArgs, INTERRUPT_REPORTED,
 };
+
+/// The skill body shared by every agent file.
+const SKILL_BODY: &str = include_str!("skill_body.md");
 
 /// The card scan a `scan` command left behind, for the hooks that run after it.
 struct Outcome {
@@ -336,6 +340,41 @@ impl Doctor for SimDoctor {
         Some(Score::new(0, scan::SCORE_MODEL, 1))
     }
 
+    /// The skill text every agent file carries (`src/skill_body.md`).
+    fn skill_body(&self) -> String {
+        SKILL_BODY.into()
+    }
+
+    /// The files `install` writes, byte for byte what it always wrote.
+    fn agent_files(&self, agent: Agent) -> Vec<AgentFile> {
+        let file = |path: &str, body: String, mode| AgentFile {
+            path: path.into(),
+            body,
+            mode,
+        };
+        match agent {
+            Agent::Claude => vec![file(
+                ".claude/skills/sim-doctor/SKILL.md",
+                format!("---\nname: sim-doctor\ndescription: Scan a SIM/UICC card over PC/SC with `sim-doctor scan --json` and read the result envelope. Use when asked to examine, audit or score a SIM card.\n---\n\n{SKILL_BODY}"),
+                FileMode::Write,
+            )],
+            Agent::Cursor => vec![file(
+                ".cursor/rules/sim-doctor.mdc",
+                format!("---\ndescription: How to run sim-doctor and read its JSON envelope\nalwaysApply: false\n---\n\n{SKILL_BODY}"),
+                FileMode::Write,
+            )],
+            // Codex and opencode both read AGENTS.md: one marked block, the rest of the file untouched.
+            Agent::Codex | Agent::Opencode => vec![file(
+                "AGENTS.md",
+                SKILL_BODY.trim_end().to_owned(),
+                FileMode::Block {
+                    begin: "<!-- sim-doctor:start -->".into(),
+                    end: "<!-- sim-doctor:end -->".into(),
+                },
+            )],
+        }
+    }
+
     fn try_scan(&self, _: &Ctx) -> Result<Envelope, ScanFailure> {
         match self.args.get() {
             Some(args) => self.scan_card(args),
@@ -508,6 +547,42 @@ pub fn scan(d: &SimDoctor, args: ScanArgs) -> contract::ExitCode {
         }
     }
     exit_code(code)
+}
+
+/// `install`: write the agent guidance, or with `--print-only` show it.
+pub fn install(d: &SimDoctor, args: InstallArgs) -> contract::ExitCode {
+    let agent = args
+        .agent
+        .as_deref()
+        .and_then(|a| <Agent as clap::ValueEnum>::from_str(a, true).ok());
+    let files = plan(d, agent);
+    if args.print_only {
+        let printed: String = files
+            .iter()
+            .map(|f| format!("==> {}\n{}\n", f.path.display(), rendered(f)))
+            .collect();
+        return match emit_stdout(printed.trim_end_matches('\n'), "the skill") {
+            Ok(()) => contract::ExitCode::Success,
+            Err(message) => {
+                eprintln!("sim-doctor: {message}");
+                contract::ExitCode::Findings
+            }
+        };
+    }
+    for file in &files {
+        // The project root is created when it is missing, as `install` always did.
+        let written = std::fs::create_dir_all(&args.dir)
+            .map_err(|e| e.to_string())
+            .and_then(|()| write(&args.dir, std::slice::from_ref(file), Overwrite::Always));
+        match written {
+            Ok(paths) => println!("wrote {}", paths[0].display()),
+            Err(err) => {
+                eprintln!("sim-doctor: cannot write {}: {err}", file.path.display());
+                return contract::ExitCode::Findings;
+            }
+        }
+    }
+    contract::ExitCode::Success
 }
 
 /// The contract exit code a process code stands for.
