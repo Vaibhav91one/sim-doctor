@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use sim_doctor::baseline::{Baseline, Diff};
 use sim_doctor::transport::CardSession;
 use sim_doctor::walk::{Candidates, Limits, Tree};
-use sim_doctor::{access, ef, sarif, scan, session, signals, tar, walk};
+use sim_doctor::{access, ef, sarif, scan, session, tar, walk};
 
 use super::{
     checkpoint, contract, dispatch, emit_stdout, limits_from, open_scan_session, Cli, ScanArgs,
@@ -169,14 +169,14 @@ impl SimDoctor {
             return Err(self.interrupted());
         }
 
-        // The TAR audit, over the same live session. It polls signals::interrupted()
+        // The TAR audit, over the same live session. It polls doctor_kit::interrupt::interrupted()
         // before every probe: a Ctrl-C during a full sweep is acted on rather than queued.
         let audit = tar::audit_with(
             session,
             &args.tar,
             &session::Policy::default(),
             args.terminal_profile,
-            &mut || signals::interrupted(),
+            &mut || doctor_kit::interrupt::interrupted(),
         )
         .map_err(|e| refuse("tar-audit-failed", &e))?;
 
