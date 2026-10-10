@@ -3919,6 +3919,27 @@ mod tests {
         );
     }
 
+    /// The local `Severity` and `ExitCode` stay (extra API, the 129 slot), but
+    /// every doctor/1 value must equal `doctor-core`'s.
+    #[test]
+    fn local_enums_agree_with_doctor_core() {
+        let ids: Vec<_> = rules::Severity::LADDER.iter().map(|s| s.id()).collect();
+        let core: Vec<_> = doctor_core::Severity::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(ids, core);
+        for (local, shared) in [
+            (ExitCode::Success, doctor_core::ExitCode::Ok),
+            (ExitCode::Findings, doctor_core::ExitCode::Findings),
+            (ExitCode::Error, doctor_core::ExitCode::Error),
+            (ExitCode::NewFindings, doctor_core::ExitCode::NewFindings),
+            (ExitCode::Interrupted, doctor_core::ExitCode::Interrupted),
+        ] {
+            assert_eq!(local.process_code(), shared.code());
+        }
+    }
+
     /// Contract section 8: an ESC sequence (and a bidi override) in card text
     /// does not reach the human report.
     #[test]

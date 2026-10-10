@@ -748,6 +748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctor-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "517c68a79a895b259ea6fcab789b06127d78884c996b3c41620377355a88bfad"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2233,6 +2244,7 @@ dependencies = [
  "crossterm",
  "der",
  "des",
+ "doctor-core",
  "ecdsa",
  "hex",
  "hmac",
