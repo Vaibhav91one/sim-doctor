@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "properties": {
+        "coverage": "partial",
+        "coverageReasons": [
+          "the TAR scan did not finish, so this TAR is known to be accepted but the card may hold\n     others this scan never probed; this report is a list of what was found, not of everything\n     there is"
+        ],
+        "score": {
+          "coverage_gaps": 9,
+          "label": "critical",
+          "model": "sim/1",
+          "value": 50
+        }
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "kind": "resource",
+                  "name": "tar:00000000"
+                }
+              ]
+            }
+          ],
+          "message": {
+            "text": "TAR 000000 was accepted: the card answered this TAR with 6D00, which is not how it answers TARs it has no opinion about (9404), so MSL is 0 and any command under any TAR may be run without cryptographic verification"
+          },
+          "partialFingerprints": {
+            "doctorFinding/v1": "54b8194c761b114e"
+          },
+          "properties": {
+            "coverage": "partial",
+            "coverageReason": "the TAR scan did not finish, so this TAR is known to be accepted but the card may hold\n     others this scan never probed; this report is a list of what was found, not of everything\n     there is",
+            "severity": "critical"
+          },
+          "ruleId": "gsma/msl-zero-allowed",
+          "ruleIndex": 0
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/doctor-labs/sim-doctor",
+          "name": "sim-doctor",
+          "rules": [
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "raise MSL and load the card's TAR allow-list, then re-scan; a card at MSL 0 accepts any command under any TAR with no cryptographic verification"
+              },
+              "id": "gsma/msl-zero-allowed",
+              "name": "gsma/msl-zero-allowed",
+              "properties": {
+                "security-severity": "9.5",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "the card accepted TAR 000000, so it runs at MSL 0"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "require C-MAC (security level 01 or higher) on EXTERNAL AUTHENTICATE and on every command after it, and configure the security domain to refuse a command without one"
+              },
+              "id": "auth/scp03-missing-mac",
+              "name": "auth/scp03-missing-mac",
+              "properties": {
+                "security-severity": "8.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "the card accepted an SCP03 command that carried no valid C-MAC"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "help": {
+                "text": "enable PIN1 (key reference 01) on the application, or confirm the universal PIN is enabled and in use, then re-scan"
+              },
+              "id": "auth/pin1-disabled",
+              "name": "auth/pin1-disabled",
+              "properties": {
+                "security-severity": "5.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "PIN Appl 1 is disabled, so files protected by PIN1 are open to anyone holding the card"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "set the file's READ and UPDATE access rule (its EF.ARR record) back to the TS 31.102 conditions, PIN for READ and PIN or ADM for UPDATE, then re-scan"
+              },
+              "id": "filesystem/sensitive-ef-always",
+              "name": "filesystem/sensitive-ef-always",
+              "properties": {
+                "security-severity": "8.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "a file holding the IMSI, ciphering keys or location (TS 31.102 gives them PIN or ADM conditions) is readable or updatable under ALWays"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "help": {
+                "text": "set the file's READ access rule (its EF.ARR record) to PIN, then re-scan"
+              },
+              "id": "identity/readable-without-pin",
+              "name": "identity/readable-without-pin",
+              "properties": {
+                "security-severity": "5.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "the MSISDN or a phonebook number list (EF.ADN, EF.FDN) is readable without a PIN (TS 31.102 gives them a PIN READ condition)"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "note"
+              },
+              "help": {
+                "text": "if the operator does not use the service, clear its bit in EF.UST; for service 28 keep the card at a non-zero MSL with a TAR allow-list (run `scan --tar`), then re-scan"
+              },
+              "id": "exposure/risky-service-available",
+              "name": "exposure/risky-service-available",
+              "properties": {
+                "security-severity": "3.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "EF.UST marks SMS-PP data download (service 28) or RUN AT COMMAND (service 32) available (TS 31.102 clause 4.2.8)"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "set the file's UPDATE access rule (its EF.ARR record) back to ADM (PIN2 for EF.EST), then re-scan"
+              },
+              "id": "filesystem/config-ef-updatable-always",
+              "name": "filesystem/config-ef-updatable-always",
+              "properties": {
+                "security-severity": "8.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "a configuration file (EF.UST, EF.EST, EF.SUCI_Calc_Info, EF.AD, EF.ACC, EF.SPN, EF.OPLMNwAcT, EF.Routing_Indicator) can be updated under ALWays (TS 31.102 gives them ADM)"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "help": {
+                "text": "set each listed file's UPDATE access rule (its EF.ARR record) to PIN or ADM as the standard or the operator profile requires; confirm a proprietary file is meant to be world-writable, then re-scan"
+              },
+              "id": "filesystem/ef-updatable-always",
+              "name": "filesystem/ef-updatable-always",
+              "properties": {
+                "security-severity": "5.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "elementary files not judged by a more specific rule can be updated under ALWays, where the standards give PIN, ADM or NEVer"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "provision a Profile A or B protection scheme first in EF.SUCI_Calc_Info with its home network public key (or enable SUCI calculation by the USIM, service 125), then re-scan"
+              },
+              "id": "privacy/suci-null-scheme",
+              "name": "privacy/suci-null-scheme",
+              "properties": {
+                "security-severity": "8.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "EF.SUCI_Calc_Info puts the null scheme first or lists no scheme with a provisioned home network public key, so the IMSI is sent in the clear on 5G"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "help": {
+                "text": "if the operator uses SUPI concealment, set service 124 in EF.UST and provision EF.SUCI_Calc_Info (or set 125 for USIM calculation); otherwise confirm the terminal is configured to conceal the SUPI, then re-scan"
+              },
+              "id": "privacy/suci-not-provisioned",
+              "name": "privacy/suci-not-provisioned",
+              "properties": {
+                "security-severity": "5.0",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "EF.UST marks 5GS services available but not service 124 (Subscription identifier privacy support), so the card offers no SUCI configuration"
+              }
+            }
+          ],
+          "version": "<VERSION>"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}
