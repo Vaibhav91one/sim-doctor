@@ -1513,7 +1513,15 @@ fn the_score_and_severity_flags_reach_the_envelope_against_a_real_card() {
 
     // cannot check is the same defect in a different font.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
-        .args(["scan", "--score", "--reader", reader.as_str()])
+        // The kit's face is the default human output; the formula is in the full report.
+        .args([
+            "scan",
+            "--score",
+            "--face",
+            "legacy",
+            "--reader",
+            reader.as_str(),
+        ])
         .stdin(std::process::Stdio::null())
         .output()
         .expect("the binary should run");
