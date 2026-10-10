@@ -136,7 +136,7 @@ pub fn to_sarif(findings: &[Finding], specs: &[RuleSpec], score: &Value) -> Valu
                 "name": finding.location().to_string(),
                 "kind": "resource",
             }]}],
-            "partialFingerprints": {"doctorFinding/v1": fingerprint(finding)},
+            "partialFingerprints": doctor_core::sarif::partial_fingerprints(&fingerprint(finding)),
             "properties": properties,
         }));
     }
@@ -288,7 +288,7 @@ mod tests {
 
     fn fp(f: &Finding) -> String {
         to_sarif(std::slice::from_ref(f), &specs(), &score())["runs"][0]["results"][0]
-            ["partialFingerprints"]["doctorFinding/v1"]
+            ["partialFingerprints"][doctor_core::sarif::FINGERPRINT_KEY]
             .as_str()
             .unwrap()
             .to_owned()

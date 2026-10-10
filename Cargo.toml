@@ -50,6 +50,7 @@ crossterm = "0.29.0"   # 0.28.0 is YANKED
 owo-colors = "4.4.0"   # zero-alloc, best fit with ratatui
 
 # --- Serialization / errors ---
+doctor-core = "0.1"   # shared doctor/1 contract pieces (score label + score shape, SARIF fingerprint key)
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 anyhow = "1.0.104"

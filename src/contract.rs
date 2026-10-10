@@ -305,32 +305,12 @@ pub enum Error {
 /// The `schema` value of the shared doctor envelope.
 pub const DOCTOR_SCHEMA: &str = "doctor/1";
 
-/// The doctor/1 score label for `value` and `coverage_gaps` (contract section 3).
-///
-/// `good` from 90, `needs work` from 60, `critical` below; `incomplete`
-/// replaces `good` when anything was not covered.
-pub const fn score_label(value: u8, coverage_gaps: usize) -> &'static str {
-    if value >= 90 {
-        if coverage_gaps > 0 {
-            "incomplete"
-        } else {
-            "good"
-        }
-    } else if value >= 60 {
-        "needs work"
-    } else {
-        "critical"
-    }
-}
+pub use doctor_core::score_label;
 
-/// The doctor/1 score object.
+/// The doctor/1 score object (shape and labels from `doctor-core`).
 pub fn doctor_score(value: u8, model: &str, coverage_gaps: usize) -> serde_json::Value {
-    serde_json::json!({
-        "value": value,
-        "label": score_label(value, coverage_gaps),
-        "model": model,
-        "coverage_gaps": coverage_gaps,
-    })
+    serde_json::to_value(doctor_core::Score::new(value, model, coverage_gaps))
+        .expect("score serializes")
 }
 
 /// The doctor/1 envelope as a [`serde_json::Value`] (`serde_json` orders keys,
