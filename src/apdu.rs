@@ -415,6 +415,43 @@ pub const CLA_GET_RESPONSE_ISO: u8 = 0x00;
 /// is the ETSI proprietary class of ETSI TS 102 221 clause 10.1.1.
 pub const CLA_FETCH_ETSI: u8 = 0x80;
 
+/// Highest logical channel number ([`class_on_channel`]).
+pub const MAX_LOGICAL_CHANNEL: u8 = 19;
+
+/// The class byte for `cla` addressed to logical channel `channel` (0 is the
+/// basic channel), keeping whether the command is an ISO (`0x`) or a
+/// GlobalPlatform (`8x`) command and whether secure messaging is indicated.
+/// `None` for a channel above [`MAX_LOGICAL_CHANNEL`] or a class byte that is
+/// neither first nor further interindustry (for example the GSM `A0`).
+///
+/// GlobalPlatform Card Specification v2.3.1 section 11.1.4: channels 0 to 3 use
+/// the first interindustry coding (`b2 b1` is the channel, `b3` or `b4` is secure
+/// messaging, Table 11-11); channels 4 to 19 use the further interindustry
+/// coding (`b7` set, `b6` is secure messaging, `b4..b1` is the channel minus 4,
+/// Table 11-12), so a GlobalPlatform command is `C0..CF` or, with secure
+/// messaging, `E0..EF`. Applying it twice gives the same byte, so it is safe on
+/// a command that was already adjusted (a MAC'd one). pySim
+/// `lchan_nr_to_cla` agrees for channels 1 to 3 and refuses a GlobalPlatform
+/// class above 3, which the specification allows.
+pub const fn class_on_channel(cla: u8, channel: u8) -> Option<u8> {
+    if channel > MAX_LOGICAL_CHANNEL {
+        return None;
+    }
+    let proprietary = cla & 0x80;
+    let secure = if cla & 0x70 == 0x00 {
+        cla & 0x0C != 0
+    } else if cla & 0x50 == 0x40 {
+        cla & 0x20 != 0
+    } else {
+        return None;
+    };
+    Some(if channel < 4 {
+        proprietary | if secure { 0x04 } else { 0 } | channel
+    } else {
+        proprietary | 0x40 | if secure { 0x20 } else { 0 } | (channel - 4)
+    })
+}
+
 /// The NULL procedure byte of ISO/IEC 7816-3 clause 10.3.3 table 11.
 ///
 /// \\\[V] for swICC: `src/apdu.c:swicc_apdu_res_deparse` sizes a response carrying
@@ -1259,6 +1296,35 @@ impl std::error::Error for ParseError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn class_byte_carries_the_logical_channel() {
+        // GP Card Spec v2.3.1 Tables 11-11 and 11-12: GlobalPlatform 8x / Cx / Ex,
+        // ISO 0x / 4x / 6x; secure messaging b3 (first) or b6 (further).
+        let cases: [(u8, u8, u8); 14] = [
+            (0x80, 0, 0x80),
+            (0x80, 1, 0x81),
+            (0x80, 3, 0x83),
+            (0x84, 2, 0x86),
+            (0x00, 3, 0x03),
+            (0x80, 4, 0xC0),
+            (0x80, 19, 0xCF),
+            (0x84, 4, 0xE0),
+            (0x84, 19, 0xEF),
+            (0x00, 4, 0x40),
+            (0x00, 19, 0x4F),
+            (0xC3, 0, 0x80),
+            (0xE1, 1, 0x85),
+            (0x41, 2, 0x02),
+        ];
+        for (cla, ch, want) in cases {
+            assert_eq!(class_on_channel(cla, ch), Some(want), "{cla:02X} on {ch}");
+            // idempotent
+            assert_eq!(class_on_channel(want, ch), Some(want));
+        }
+        assert_eq!(class_on_channel(0x80, 20), None);
+        assert_eq!(class_on_channel(0xA0, 1), None);
+    }
+
     use super::*;
 
     /// Every status word there is, as a two-octet pair.

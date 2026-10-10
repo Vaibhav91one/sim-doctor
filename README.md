@@ -155,6 +155,9 @@ so they need glibc 2.39 or newer (Debian 13 has 2.41; Debian 12 is too old, buil
 | `gp info\|ara\|status [--json] [--reader NAME] [--trace]` | read-only GlobalPlatform reads, see below |
 | `gp status --keys-file PATH \| --keys-env VAR [--key-version HEX]` | registry over an SCP03 secure channel, one authentication attempt, see below |
 | `gp select --aid HEX [--json] [--reader NAME] [--trace]` | SELECT an application by AID, see below |
+| `gp channel open\|close --channel N [--json] [--reader NAME] [--trace]` | MANAGE CHANNEL; every `gp` command takes `--channel N` (0 to 19) to run on that channel, see below |
+| `gp delete --aid HEX [--related] [--keys-file PATH \| --keys-env VAR] [--yes]` | DELETE over SCP03, **changes the card**, dry run unless `--yes`, see below |
+| `gp install --load CAP [--module HEX] [--app HEX] [--params HEX] [--privileges HEX] [--keys-file PATH \| --keys-env VAR] [--yes]` | INSTALL [for load] + LOAD + INSTALL [for install and make selectable] over SCP03, **changes the card**, dry run unless `--yes`, see below |
 | `euicc info\|profiles\|notifications [--json] [--reader NAME] [--aid HEX] [--max-segment BYTES]` | read-only eUICC queries over ES10, see below |
 | `euicc nickname ICCID NAME [--yes] [...]` | set a profile nickname; a dry run unless `--yes`, see below |
 | `euicc enable\|disable ICCID\|AID [--yes] [...]` | enable or disable a profile; a dry run unless `--yes`, see below |
@@ -266,7 +269,8 @@ validation before a reader is opened, each SGP.22 result code its own error kind
 
 ### `gp`
 
-Read-only GlobalPlatform: SELECT, GET DATA and GET STATUS only, no writes, no card content changes.
+Read-only GlobalPlatform reads: SELECT, GET DATA and GET STATUS only (the writes `gp delete` and `gp install`
+are described after the authenticated-read section).
 `gp info` reads the ISD, CPLC, card data, key information and counters. `gp ara` selects the ARA-M
 (`A00000015141434C00`) and reads every access rule (GET DATA `FF40`), decoding applet AID, device
 app hash, APDU filters, NFC rule and permissions; a rule that lets every device app send any APDU to
@@ -302,6 +306,52 @@ UPDATE is checked locally first (GP Amendment D 6.2.2); if it does not verify, t
 counter attempt. A refused EXTERNAL AUTHENTICATE is reported (`data.error`, exit 1) and not retried.
 The card cryptogram proves the MAC key; the ENC key is not exercised at C-MAC level
 (`enc_key_exercised: false`).
+
+**Card writes: `gp channel`, `gp delete`, `gp install` (issues #133, #19).** These change the card.
+
+```
+sim-doctor gp channel open                                    # the card picks N and it is printed
+sim-doctor gp status --channel 1 --keys-file ./isd.keys       # any gp command on that channel
+sim-doctor gp channel close --channel 1
+sim-doctor gp delete --aid A0000000620001                     # dry run, offline: prints the APDU
+sim-doctor gp delete --aid A0000000620001 --keys-file ./isd.keys          # dry run + registry check
+sim-doctor gp delete --aid A0000000620001 --keys-file ./isd.keys --yes    # sends DELETE
+sim-doctor gp install --load applet.cap --keys-file ./isd.keys --yes
+```
+
+`gp channel open` sends MANAGE CHANNEL (`00 70 00 00 01`) and leaves the channel open on the card
+(until `gp channel close` or a power cycle); `--channel N` makes the SELECT, every following command
+and the secure channel's C-MAC use that channel's class byte (GP Card Spec 11.1.4, channels 1 to 19).
+`gp delete` sends `80 E4 00 <P2> .. 4F <len> <AID>` (`--related` sets P2 `80`: a load file and its
+applications). `gp install` reads the CAP, then sends INSTALL [for load] (`80 E6 02 00`), the LOAD
+blocks (`80 E8`, 240 bytes each) and INSTALL [for install and make selectable] (`80 E6 0C 00`),
+into the ISD. `--module` is needed only when the CAP has several applets, `--app` defaults to the
+module AID, `--params` is the Install Parameters TLV (must hold `C9`; default `C900`), `--privileges`
+is 1 or 3 bytes (default `000000`; Card Lock and Card Terminate are refused).
+
+**Safety, all enforced in code:** a write is a **dry run unless `--yes`**, and `--yes` needs
+`--keys-file`/`--keys-env`. The dry run prints the target and the exact APDUs (before the C-MAC is
+added) and sends no write; **without keys it is fully offline** and opens no reader. With keys it also
+makes the one authentication attempt and reads the registry, and **refuses with nothing sent** when
+the AID to delete is not on the card, is the ISD, or the registry cannot be read in full, and when an
+install's load file or application AID is already there. With `--yes` every command is sent once and
+in order, **stopping at the first refusal** (never retried, never skipped past); each GP status word
+has its own `data.error.kind` (`referenced-data-not-found` 6A88, `application-not-found` 6A82,
+`conditions-of-use-not-satisfied` 6985, `security-status-not-satisfied` 6982, `incorrect-command-data`
+6A80, `not-enough-memory-space` 6A84, `memory-failure` 6581, ... and `unlisted-status` for any other),
+and the registry is read again to confirm (`verify-failed` if the card said 9000 but the registry
+does not show the result). The keys are the ISD's SCP03 keys with the same rules as above: one
+attempt, local cryptogram check, file/environment only, never printed. **None of this is exposed over
+MCP.** A partial install (a loaded package without the application) is reported with the step that
+failed; `gp status` shows what the card now holds and `gp delete --aid <package>` removes it.
+
+**Not done:** DAP (Data Authentication Pattern) signing. A DAP block is signed with the Security
+Domain's DAP key, which is not part of the SCP03 set, so it belongs with PUT KEY and key management
+(issue #115); a card that demands a DAP block refuses the LOAD and that status word is reported. The
+channel is C-MAC only (no C-DECRYPTION), which INSTALL, LOAD and DELETE do not need. Tokens
+(delegated management), DELETE [key], other INSTALL kinds, STORE DATA and PUT KEY are not sent.
+Verified by replay against byte vectors from an independent SCP03 model (see `src/gp.rs` tests), not
+on a live card.
 
 `data.secure_channel` gives the key version, the KCV of each supplied key (public, 24 bits), whether
 you stated it, and the card's own key-information entry for that version (type and length). The card
@@ -403,7 +453,7 @@ block. `--print-only` shows what would be written.
 - **A card that answers every ENVELOPE `6F 00` (or `6D 00`, `6E 00`, `69 85`, `6A 81`) was not audited.** `data.tar.blind_spot` says so, no baseline is claimed and no sweep is sent. Many UICCs ignore CAT traffic until a TERMINAL PROFILE arrives; `--terminal-profile` sends one and is the only thing here that changes CAT state.
 - **`--tar` is bounded.** The full TAR space is 16 777 216 values; the tool sends at most 4096.
 - Verified against the swSIM software card in CI and against one live operator USIM (read-only, plus a consented `--tar focused` run).
-- **SCP03 runs against a card in one place only:** `gp status --keys-file/--keys-env`, opt-in, one
+- **SCP03 runs against a card in one place only:** `gp status|delete|install --keys-file/--keys-env`, opt-in, one
   attempt, cryptogram checked locally before EXTERNAL AUTHENTICATE (see `gp` above).
   `src/scp03.rs` stays a library (key derivation, cryptograms, C-MAC, INITIALIZE UPDATE /
   EXTERNAL AUTHENTICATE builders) verified by known-answer vectors. The `auth/scp03-missing-mac`

@@ -1,7 +1,7 @@
-//! GlobalPlatform, read-only: find the issuer security domain, read what it
-//! will say with GET DATA, decode CPLC, the key information template, the
-//! counters, extended card resources and Card Recognition Data, compute key
-//! check values, and build (never send) INSTALL [for load] and LOAD.
+//! GlobalPlatform: find the issuer security domain, read what it will say with
+//! GET DATA, decode CPLC, the key information template, the counters, extended
+//! card resources and Card Recognition Data, compute key check values, list the
+//! registry, and (behind `--yes`, over SCP03) delete, load and install.
 //!
 //! **Owns.** The `gp info` data: SELECT of the ISD by AID, GET DATA for CPLC,
 //! card data, key information, IIN, CIN, the sequence and confirmation counters
@@ -28,16 +28,33 @@
 //! the trace holds wire bytes only (cryptograms and MACs, no key or session key).
 //! This is the one exception to the full-visibility rule in AGENTS.md.
 //!
-//! **Does not own, and never sends.** STORE DATA, INSTALL, LOAD, DELETE, PUT
-//! KEY, SET STATUS, MANAGE CHANNEL (that one is [`session::open_channel`], used
-//! by nothing here). The only instructions [`info`], [`ara`], [`status`] and
-//! [`select`] send are SELECT, GET DATA and GET STATUS, plus, only when keys are
+//! **Card writes (issues #133, #19).** `gp delete` ([`delete`]) and `gp install`
+//! ([`install`]) send DELETE, INSTALL and LOAD over the same C-MAC SCP03 channel,
+//! and `gp channel open|close` ([`channel_open`], [`channel_close`]) send MANAGE
+//! CHANNEL. Every `gp` command can run on a chosen logical channel
+//! ([`OnChannel`], `--channel`). **Binding safety rules (owner decision
+//! 2026-10-10, same spirit as the eUICC writes):** (1) a write is a dry run
+//! unless `--yes`, and `--yes` needs keys: the dry run prints the target and the
+//! exact plain APDUs and sends nothing; (2) the keys are the read path's: ONE
+//! authentication attempt, local card-cryptogram pre-check, no loop, read from a
+//! file or environment variable, never printed; (3) before sending, GET STATUS
+//! over the channel must show the AID (delete) or show no clash (install), else
+//! the run refuses with nothing sent; the ISD is never deleted; a registry that
+//! cannot be read in full refuses; (4) each command is sent once, in order, and
+//! the run stops at the first refusal; (5) after a `90 00` the registry is read
+//! again and must show the intended result (`verify-failed` otherwise); (6) not
+//! exposed over MCP. Without keys a dry run is fully offline (no reader).
+//!
+//! **Does not own, and never sends.** STORE DATA, PUT KEY, SET STATUS, INSTALL
+//! [for extradition / registry update / personalization], DELETE [key], and any
+//! token or DAP signature. DAP needs DAP keys that are not the SCP03 set, so DAP
+//! signing and PUT KEY (with C-DECRYPTION for the key data) belong to issue #115;
+//! [`dap_block`] still only frames bytes. [`info`], [`ara`], [`status`] and
+//! [`select`] send only SELECT, GET DATA and GET STATUS, plus, only when keys are
 //! supplied, one INITIALIZE UPDATE and at most one EXTERNAL AUTHENTICATE (and the
 //! GET RESPONSE that [`session::send`] adds for a `61 xx`). A `91 xx` is
 //! deliberately NOT followed (no FETCH), and a refusal is recorded once, never
-//! retried. The INSTALL / LOAD builders return [`Command`]s and nothing calls
-//! `session::send` with them: sending, DAP signing, PUT KEY and DELETE belong to
-//! issue #115.
+//! retried.
 
 /// This module's name, as recorded in [`crate::MODULES`].
 pub const NAME: &str = "gp";
@@ -45,7 +62,7 @@ pub const NAME: &str = "gp";
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use serde_json::{json, Value};
 
-use crate::apdu::{Command, CorrectedLength, Header, Le, CLA_GET_RESPONSE_ISO};
+use crate::apdu::{class_on_channel, Command, CorrectedLength, Header, Le, CLA_GET_RESPONSE_ISO};
 use crate::scp03;
 use crate::session::{self, PendingFollowUp, Policy};
 use crate::transport::CardSession;
@@ -974,6 +991,10 @@ pub struct Auth<'a> {
     pub key_version: u8,
     /// The 8 random bytes of the host challenge. Fresh per run.
     pub host_challenge: [u8; scp03::CHALLENGE_LEN],
+    /// The logical channel the secure channel is opened on (0 is the basic
+    /// channel). The MAC covers the class byte, which carries it; pair it with
+    /// [`OnChannel`] on the session.
+    pub logical_channel: u8,
 }
 
 /// Why the run stopped before a secure channel existed.
@@ -1069,7 +1090,7 @@ fn authenticate<S: CardSession + ?Sized>(
         &auth.host_challenge,
         &iur.card_challenge,
     );
-    let mut channel = scp03::Channel::new(&session_keys);
+    let mut channel = scp03::Channel::new(&session_keys).on_logical_channel(auth.logical_channel);
     let external =
         match scp03::external_authenticate(&mut channel, scp03::LEVEL_C_MAC, &host_cryptogram) {
             Ok(command) => command,
@@ -1246,6 +1267,60 @@ pub fn registry_findings(data: &Value) -> Vec<Value> {
     out
 }
 
+/// GET STATUS for the four scopes of [`STATUS_SCOPES`], over `channel` when it
+/// is `Some` (MAC'd, in send order) and plain otherwise; `63 10` is followed
+/// up to [`STATUS_MAX_PAGES`] pages. A refusal is data in the scope's object.
+fn read_registry<S: CardSession + ?Sized>(
+    session: &mut S,
+    steps: &mut Vec<Value>,
+    mut channel: Option<&mut scp03::Channel>,
+) -> Result<Vec<Value>, session::Error> {
+    let mut scopes = Vec::new();
+    for (p1, name) in STATUS_SCOPES {
+        let mut collected = Vec::new();
+        let mut p2 = 0x02;
+        let mut pages = 0;
+        let (last, truncated) = loop {
+            let build = |le| Command::case4(Header::new(0x80, 0xF2, p1, p2), vec![0x4F, 0x00], le);
+            let ex = match channel.as_deref_mut() {
+                Some(ch) => send_secure(session, steps, ch, name, &build(Le::Short(0)))?,
+                None => read_once(session, steps, name, build)?,
+            };
+            let sw = sw_hex(&ex);
+            if ex.is_success() || sw.as_deref() == Some("6310") {
+                collected.extend_from_slice(ex.data());
+            }
+            pages += 1;
+            if sw.as_deref() != Some("6310") {
+                break (sw, false);
+            }
+            if pages == STATUS_MAX_PAGES {
+                break (sw, true);
+            }
+            p2 = 0x03;
+        };
+        let mut item = json!({
+            "scope": name,
+            "p1": format!("{p1:02X}"),
+            "status": last,
+            "requires_authentication":
+                last.as_deref().is_some_and(|s| AUTH_REQUIRED.contains(&s)),
+            "entries": [],
+        });
+        if truncated {
+            item["truncated"] = json!(true);
+        }
+        if last.as_deref() == Some("9000") || truncated {
+            match decode_registry(name, &collected) {
+                Ok(v) => item["entries"] = v,
+                Err(e) => item["decode_error"] = json!(e),
+            }
+        }
+        scopes.push(item);
+    }
+    Ok(scopes)
+}
+
 /// `gp status` without keys; see [`status_with`].
 ///
 /// # Errors
@@ -1395,50 +1470,7 @@ fn status_with<S: CardSession + ?Sized>(
                 }
             }
         }
-        let mut scopes = Vec::new();
-        for (p1, name) in STATUS_SCOPES {
-            let mut collected = Vec::new();
-            let mut p2 = 0x02;
-            let mut pages = 0;
-            let (last, truncated) = loop {
-                let build =
-                    |le| Command::case4(Header::new(0x80, 0xF2, p1, p2), vec![0x4F, 0x00], le);
-                let ex = match channel.as_mut() {
-                    Some(ch) => send_secure(session, &mut steps, ch, name, &build(Le::Short(0)))?,
-                    None => read_once(session, &mut steps, name, build)?,
-                };
-                let sw = sw_hex(&ex);
-                if ex.is_success() || sw.as_deref() == Some("6310") {
-                    collected.extend_from_slice(ex.data());
-                }
-                pages += 1;
-                if sw.as_deref() != Some("6310") {
-                    break (sw, false);
-                }
-                if pages == STATUS_MAX_PAGES {
-                    break (sw, true);
-                }
-                p2 = 0x03;
-            };
-            let mut item = json!({
-                "scope": name,
-                "p1": format!("{p1:02X}"),
-                "status": last,
-                "requires_authentication":
-                    last.as_deref().is_some_and(|s| AUTH_REQUIRED.contains(&s)),
-                "entries": [],
-            });
-            if truncated {
-                item["truncated"] = json!(true);
-            }
-            if last.as_deref() == Some("9000") || truncated {
-                match decode_registry(name, &collected) {
-                    Ok(v) => item["entries"] = v,
-                    Err(e) => item["decode_error"] = json!(e),
-                }
-            }
-            scopes.push(item);
-        }
+        let scopes = read_registry(session, &mut steps, channel.as_mut())?;
         data["registry"] = Value::Array(scopes);
         data["registry_findings"] = Value::Array(registry_findings(&data));
     }
@@ -1559,7 +1591,54 @@ pub fn render_text(data: &Value) -> String {
             s(&f["message"])
         ));
     }
+    if let Some(c) = data.get("channel") {
+        out.push(format!(
+            "Logical channel {}: {} (status {})",
+            s(&c["action"]),
+            c["number"],
+            s(&c["status"])
+        ));
+    }
+    if let Some(op) = data.get("operation") {
+        render_write(&mut out, op, data);
+    }
     out.join("\n")
+}
+
+/// The `delete` / `install` part of [`render_text`].
+fn render_write(out: &mut Vec<String>, op: &Value, data: &Value) {
+    let s = |v: &Value| crate::contract::sanitize(v.as_str().unwrap_or("-"));
+    let state = match (data["dry_run"] == true, data["sent"] == true) {
+        (true, _) => "DRY RUN, nothing was written; add --yes to send",
+        (false, true) => "SENT",
+        (false, false) => "refused, nothing was sent",
+    };
+    out.push(format!("{}: {state}", s(op).to_uppercase()));
+    if let Some(t) = data["target"].as_object() {
+        for (k, v) in t {
+            let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            out.push(format!("  {k}: {}", crate::contract::sanitize(&v)));
+        }
+    }
+    if let Some(note) = data["note"].as_str() {
+        out.push(format!("  {}", crate::contract::sanitize(note)));
+    }
+    for a in data["plan"]["apdus"].as_array().into_iter().flatten() {
+        out.push(format!("  APDU {}: {}", s(&a["step"]), s(&a["apdu"])));
+    }
+    if let Some(note) = data["plan"]["note"].as_str() {
+        out.push(format!("  ({})", crate::contract::sanitize(note)));
+    }
+    for r in data["result"]["steps"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "  sent {}: status {}",
+            s(&r["step"]),
+            s(&r["status"])
+        ));
+    }
+    if data["result"]["verified"] == true {
+        out.push("  verified: the registry shows the intended result".into());
+    }
 }
 
 /// Why an INSTALL or LOAD command could not be built.
@@ -1593,6 +1672,15 @@ pub enum BuildError {
     /// More LOAD blocks than P2's 0..=255.
     #[error("{0} LOAD blocks, the block number P2 stops at 256")]
     TooManyBlocks(usize),
+    /// Privileges are not 1 or 3 bytes.
+    #[error("privileges are {0} bytes, GlobalPlatform defines 1 or 3")]
+    Privileges(usize),
+    /// A privilege this tool will not grant.
+    #[error("{0}")]
+    PrivilegeRefused(&'static str),
+    /// The Install Parameters field does not hold the mandatory C9 tag.
+    #[error("install parameters must be TLV that holds the mandatory C9 tag (C900 for none)")]
+    InstallParameters,
 }
 
 /// Default LOAD block size: pySim's, the old GlobalPlatformPro default, leaves
@@ -1719,6 +1807,768 @@ pub fn load_commands(
             )
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Logical channels (issue #19)
+// ---------------------------------------------------------------------------
+
+/// A session whose every command is addressed to logical channel `channel`:
+/// the class byte of each command sent through it is rewritten with
+/// [`class_on_channel`] (GP Card Spec v2.3.1 11.1.4), GET RESPONSE follow-ups
+/// included, so a `61 xx` on the channel is collected on the channel. A command
+/// that already carries the channel (a MAC'd one: [`scp03::Channel::on_logical_channel`]
+/// puts it there before the MAC is computed) comes out unchanged. A class byte
+/// that has no channel coding (the GSM `A0`) is sent as is.
+///
+/// The wire bytes in [`session::Exchange`] are those handed to the session, so a
+/// trace taken through this wrapper is corrected afterwards with
+/// [`retarget_channel`].
+pub struct OnChannel<'a, S: CardSession + ?Sized> {
+    inner: &'a mut S,
+    channel: u8,
+}
+
+impl<'a, S: CardSession + ?Sized> OnChannel<'a, S> {
+    /// Wraps `inner`; channel 0 changes nothing.
+    pub fn new(inner: &'a mut S, channel: u8) -> Self {
+        Self { inner, channel }
+    }
+}
+
+impl<S: CardSession + ?Sized> CardSession for OnChannel<'_, S> {
+    fn reader(&self) -> &crate::transport::ReaderName {
+        self.inner.reader()
+    }
+
+    fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>, crate::transport::Error> {
+        let mut bytes = command.to_vec();
+        if let Some(n) = bytes
+            .first()
+            .and_then(|c| class_on_channel(*c, self.channel))
+        {
+            bytes[0] = n;
+        }
+        self.inner.transmit(&bytes)
+    }
+
+    fn disconnect(&mut self) -> Result<(), crate::transport::Error> {
+        self.inner.disconnect()
+    }
+}
+
+/// Rewrites the class byte of every `data.trace[].command` and
+/// `data.plan.apdus[].apdu` for logical channel `channel`, so the output shows
+/// what [`OnChannel`] put on the wire.
+pub fn retarget_channel(data: &mut Value, channel: u8) {
+    let fix = |v: &mut Value| {
+        if let Some(mut b) = v.as_str().and_then(|h| hex::decode(h).ok()) {
+            if let Some(n) = b.first().and_then(|c| class_on_channel(*c, channel)) {
+                b[0] = n;
+                *v = hex_of(&b);
+            }
+        }
+    };
+    for t in data
+        .get_mut("trace")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        fix(&mut t["command"]);
+    }
+    for t in data
+        .pointer_mut("/plan/apdus")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        fix(&mut t["apdu"]);
+    }
+}
+
+/// What a status word means for the commands this module sends, as
+/// `(kind, meaning)`: the general error conditions of GP Card Spec v2.3.1 Table
+/// 11-10 and the DELETE (11-26), INSTALL (11-55), LOAD (11-60) and MANAGE
+/// CHANNEL (11-62, 11-63) tables. Every word has its own kind; a word those
+/// tables do not list is `unlisted-status`.
+fn status_word(sw: Option<&str>) -> (&'static str, &'static str) {
+    match sw {
+        Some("6200") => ("channel-already-closed", "logical channel already closed"),
+        Some("6400") => ("no-specific-diagnosis", "no specific diagnosis"),
+        Some("6581") => ("memory-failure", "memory failure"),
+        Some("6700") => ("wrong-length", "wrong length in Lc"),
+        Some("6881") => (
+            "channel-not-active",
+            "logical channel not supported or is not active",
+        ),
+        Some("6882") => (
+            "secure-messaging-not-supported",
+            "secure messaging not supported",
+        ),
+        Some("6982") => (
+            "security-status-not-satisfied",
+            "security status not satisfied",
+        ),
+        Some("6985") => (
+            "conditions-of-use-not-satisfied",
+            "conditions of use not satisfied",
+        ),
+        Some("6A80") => (
+            "incorrect-command-data",
+            "incorrect values or parameters in the command data",
+        ),
+        Some("6A81") => (
+            "function-not-supported",
+            "function not supported, for example the card is CARD_LOCKED",
+        ),
+        Some("6A82") => ("application-not-found", "application not found"),
+        Some("6A84") => ("not-enough-memory-space", "not enough memory space"),
+        Some("6A86") => ("incorrect-p1-p2", "incorrect P1 P2"),
+        Some("6A88") => ("referenced-data-not-found", "referenced data not found"),
+        Some("6D00") => ("invalid-instruction", "invalid instruction"),
+        Some("6E00") => ("invalid-class", "invalid class"),
+        _ => (
+            "unlisted-status",
+            "a status word the GlobalPlatform tables for this command do not list",
+        ),
+    }
+}
+
+/// The `data.error` of a command the card refused.
+fn refused(what: &str, ex: &session::Exchange) -> Value {
+    let sw = sw_hex(ex);
+    let (kind, meaning) = status_word(sw.as_deref());
+    json!({
+        "kind": kind,
+        "status": sw,
+        "meaning": meaning,
+        "message": format!("{what} answered {}: {meaning}", sw.as_deref().unwrap_or("none")),
+    })
+}
+
+/// `gp channel open`: MANAGE CHANNEL open (`00 70 00 00 01`, ISO/IEC 7816-4
+/// 11.1.2; GP Card Spec v2.3.1 11.7). The card picks the number and returns it.
+/// The channel stays open on the card until `gp channel close` or a power cycle,
+/// and the next `gp` run can address it with `--channel`. `isd_found` is true
+/// when a channel was opened.
+///
+/// # Errors
+///
+/// Only transport and encoding failures; a refusal is `data.error`.
+pub fn channel_open<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+) -> Result<Report, session::Error> {
+    let (channel, ex) = session::open_channel(session)?;
+    let mut steps = Vec::new();
+    push_steps(&mut steps, "manage_channel_open", &ex);
+    let mut data = json!({
+        "card_touched": true,
+        "channel": { "action": "open", "number": channel, "status": sw_hex(&ex) },
+    });
+    if channel.is_none() {
+        data["error"] = if ex.is_success() {
+            json!({
+                "kind": "channel-number-unreadable",
+                "message": "MANAGE CHANNEL answered 9000 without a channel number in 1 to 19",
+            })
+        } else {
+            refused("MANAGE CHANNEL open", &ex)
+        };
+    }
+    if trace {
+        data["trace"] = Value::Array(steps);
+    }
+    Ok(Report {
+        isd_found: channel.is_some(),
+        data,
+    })
+}
+
+/// `gp channel close --channel N`: MANAGE CHANNEL close (`00 70 80 <N>`, sent on
+/// the basic channel). `isd_found` is true when the card answered `90 00`.
+///
+/// # Errors
+///
+/// Only transport and encoding failures; a refusal is `data.error`.
+pub fn channel_close<S: CardSession + ?Sized>(
+    session: &mut S,
+    channel: u8,
+    trace: bool,
+) -> Result<Report, session::Error> {
+    let mut steps = Vec::new();
+    let Some(ex) = session::close_channel(session, channel)? else {
+        return Ok(Report {
+            isd_found: false,
+            data: json!({
+                "card_touched": false,
+                "channel": { "action": "close", "number": channel },
+                "error": { "kind": "bad-channel", "message": "the channel to close must be 1 to 19" },
+            }),
+        });
+    };
+    push_steps(&mut steps, "manage_channel_close", &ex);
+    let mut data = json!({
+        "card_touched": true,
+        "channel": { "action": "close", "number": channel, "status": sw_hex(&ex) },
+    });
+    if !ex.is_success() {
+        data["error"] = refused("MANAGE CHANNEL close", &ex);
+    }
+    if trace {
+        data["trace"] = Value::Array(steps);
+    }
+    Ok(Report {
+        isd_found: ex.is_success(),
+        data,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Card writes: DELETE and INSTALL/LOAD over the SCP03 channel (issues #133, #19)
+// ---------------------------------------------------------------------------
+
+/// Builds, and does not send, DELETE [card content]: `80 E4 00 <P2> Lc 4F <len>
+/// <AID> 00`. P2 is `80` to delete the object and its related objects (an
+/// Executable Load File and its Applications), `00` for the object alone. GP
+/// Card Spec v2.3.1 section 11.2.2 (Tables 11-20 to 11-23); the data field and P2
+/// are pySim `do_delete_card_content` (`4F` TLV, `0x80` for related objects) and
+/// GlobalPlatformPro `GPSession.deleteAID` (`4F <len> <aid>`, P2 `80` for
+/// dependencies). No token (`B6`, `9E`): delegated management is not supported.
+pub fn delete_command(aid: &[u8], related: bool) -> Result<Command, BuildError> {
+    aid_ok("DELETE target", aid, false)?;
+    let mut data = vec![0x4F];
+    lv(&mut data, "DELETE target", aid)?;
+    Ok(Command::case4(
+        Header::new(0x80, 0xE4, 0x00, if related { 0x80 } else { 0x00 }),
+        data,
+        Le::Short(0),
+    ))
+}
+
+/// Builds, and does not send, INSTALL [for install] (`make_selectable` false,
+/// P1 `04`) or INSTALL [for install and make selectable] (P1 `0C`): `80 E6 <P1>
+/// 00 Lc <data> 00` with data = `LV(load file AID) LV(module AID) LV(application
+/// AID) LV(privileges) BERLV(install parameters) BERLV(install token)`, the token
+/// always empty. GP Card Spec v2.3.1 Table 11-41 (P1: b3 install, b4 make
+/// selectable) and Table 11-43; layout as pySim `do_install_for_install` and
+/// GlobalPlatformPro `GPSession.buildInstallData`. `privileges` is 1 or 3 bytes
+/// (11.1.2), `install_parameters` the whole Install Parameters field, which must
+/// hold the mandatory `C9` tag (Table 11-49).
+pub fn install_for_install(
+    load_file_aid: &[u8],
+    module_aid: &[u8],
+    application_aid: &[u8],
+    privileges: &[u8],
+    install_parameters: &[u8],
+    make_selectable: bool,
+) -> Result<Command, BuildError> {
+    aid_ok("load file", load_file_aid, true)?;
+    aid_ok("module", module_aid, true)?;
+    aid_ok("application", application_aid, false)?;
+    if !matches!(privileges.len(), 1 | 3) {
+        return Err(BuildError::Privileges(privileges.len()));
+    }
+    if !parse_tlvs(install_parameters).is_some_and(|t| t.iter().any(|(tag, _)| *tag == 0xC9)) {
+        return Err(BuildError::InstallParameters);
+    }
+    let mut data = Vec::new();
+    lv(&mut data, "load file AID", load_file_aid)?;
+    lv(&mut data, "module AID", module_aid)?;
+    lv(&mut data, "application AID", application_aid)?;
+    lv(&mut data, "privileges", privileges)?;
+    data.extend(ber_len(install_parameters.len()));
+    data.extend_from_slice(install_parameters);
+    data.push(0x00); // no install token
+    if data.len() > 0xFF {
+        return Err(BuildError::InstallTooLong(data.len()));
+    }
+    let p1 = if make_selectable { 0x0C } else { 0x04 };
+    Ok(Command::case4(
+        Header::new(0x80, 0xE6, p1, 0x00),
+        data,
+        Le::Short(0),
+    ))
+}
+
+/// What `gp delete` removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRequest {
+    /// The application or Executable Load File AID.
+    pub aid: Vec<u8>,
+    /// Also delete the related objects (DELETE P2 `80`).
+    pub related: bool,
+}
+
+/// What `gp install` loads and installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallRequest {
+    /// The load file (the CAP's components, [`crate::cap::Cap::load_file`]).
+    pub load_file: Vec<u8>,
+    /// The Executable Load File AID (the package AID).
+    pub load_file_aid: Vec<u8>,
+    /// The Executable Module AID (the applet class).
+    pub module_aid: Vec<u8>,
+    /// The Application (instance) AID.
+    pub app_aid: Vec<u8>,
+    /// Privileges, 1 or 3 bytes. Card Lock and Card Terminate are refused.
+    pub privileges: Vec<u8>,
+    /// The Install Parameters field, with its `C9` tag; `C9 00` for none.
+    pub params: Vec<u8>,
+}
+
+/// One APDU of a write, as built (before secure messaging).
+struct Planned {
+    step: &'static str,
+    command: Command,
+}
+
+fn delete_plan_steps(req: &DeleteRequest) -> Result<Vec<Planned>, BuildError> {
+    Ok(vec![Planned {
+        step: "delete",
+        command: delete_command(&req.aid, req.related)?,
+    }])
+}
+
+/// INSTALL [for load], the LOAD blocks, INSTALL [for install and make
+/// selectable]: the GP Card Spec v2.3.1 11.5 and 11.6 sequence, which is also
+/// pySim `do_install_cap` and GlobalPlatformPro `GPSession.loadCapFile` followed
+/// by `installAndMakeSelectable`. `sd_aid` is the security domain the load file
+/// goes into (the one that was authenticated).
+fn install_plan_steps(req: &InstallRequest, sd_aid: &[u8]) -> Result<Vec<Planned>, BuildError> {
+    if req.privileges.first().is_some_and(|b| b & 0x18 != 0) {
+        return Err(BuildError::PrivilegeRefused(
+            "Card Lock and Card Terminate are not granted by gp install",
+        ));
+    }
+    let mut plan = vec![Planned {
+        step: "install_for_load",
+        command: install_for_load(&req.load_file_aid, sd_aid, &[], &[], &[])?,
+    }];
+    for command in load_commands(&req.load_file, &[], DEFAULT_LOAD_BLOCK)? {
+        plan.push(Planned {
+            step: "load",
+            command,
+        });
+    }
+    plan.push(Planned {
+        step: "install_for_install",
+        command: install_for_install(
+            &req.load_file_aid,
+            &req.module_aid,
+            &req.app_aid,
+            &req.privileges,
+            &req.params,
+            true,
+        )?,
+    });
+    // Wrapping adds an 8-byte C-MAC to the data; the Lc must still fit.
+    for p in &plan {
+        if p.command.data().len() + scp03::MAC_LEN > 0xFF {
+            return Err(BuildError::InstallTooLong(p.command.data().len()));
+        }
+    }
+    Ok(plan)
+}
+
+fn plan_json(plan: &[Planned]) -> Value {
+    Value::Array(
+        plan.iter()
+            .map(|p| {
+                let wire = p.command.encode().expect("a built command encodes");
+                json!({ "step": p.step, "apdu": hex_of(&wire) })
+            })
+            .collect(),
+    )
+}
+
+/// The `data` of a write that was not sent because no keys were given: the
+/// plan, built offline, and nothing else. The card is not contacted.
+fn offline_dry_run(operation: &str, target: Value, plan: &[Planned], note: &str) -> Value {
+    json!({
+        "card_touched": false,
+        "operation": operation,
+        "dry_run": true,
+        "sent": false,
+        "target": target,
+        "plan": {
+            "apdus": plan_json(plan),
+            "note": "each APDU is sent with the class byte set for secure messaging and an 8-byte C-MAC appended (SCP03, C-MAC); shown here before that",
+        },
+        "note": note,
+    })
+}
+
+/// `gp delete` without keys: the offline dry run. Sends nothing and does not
+/// touch a card.
+///
+/// # Errors
+///
+/// [`BuildError`] for an AID that is not 5 to 16 bytes.
+pub fn delete_dry_run(req: &DeleteRequest) -> Result<Value, BuildError> {
+    let plan = delete_plan_steps(req)?;
+    Ok(offline_dry_run(
+        "delete",
+        json!({ "aid": hex_of(&req.aid), "related": req.related }),
+        &plan,
+        "no keys were given, so the card was not contacted and the registry was not checked; add --keys-file or --keys-env to check that the AID is present, and --yes to send",
+    ))
+}
+
+/// `gp install` without keys: the offline dry run, with the default ISD AID as
+/// the security domain. Sends nothing and does not touch a card.
+///
+/// # Errors
+///
+/// [`BuildError`] for an AID, privileges, parameters or load file that cannot be
+/// built into commands.
+pub fn install_dry_run(req: &InstallRequest) -> Result<Value, BuildError> {
+    let plan = install_plan_steps(req, ISD_AIDS[0])?;
+    let mut data = offline_dry_run(
+        "install",
+        install_target(req),
+        &plan,
+        "no keys were given, so the card was not contacted and the registry was not checked; the security domain is assumed to be the default ISD AID; add --keys-file or --keys-env to check the registry, and --yes to send",
+    );
+    data["target"]["security_domain"] = hex_of(ISD_AIDS[0]);
+    Ok(data)
+}
+
+fn install_target(req: &InstallRequest) -> Value {
+    json!({
+        "load_file_aid": hex_of(&req.load_file_aid),
+        "module_aid": hex_of(&req.module_aid),
+        "app_aid": hex_of(&req.app_aid),
+        "privileges": hex_of(&req.privileges),
+        "install_parameters": hex_of(&req.params),
+        "load_file_bytes": req.load_file.len(),
+    })
+}
+
+/// The entry for `aid_hex` in a [`read_registry`] result, with its scope name.
+fn registry_entry<'a>(registry: &'a [Value], aid_hex: &str) -> Option<(&'a str, &'a Value)> {
+    registry.iter().find_map(|scope| {
+        scope["entries"]
+            .as_array()?
+            .iter()
+            .find(|e| e["aid"] == aid_hex)
+            .map(|e| (scope["scope"].as_str().unwrap_or(""), e))
+    })
+}
+
+/// Whether every scope was read in full: `90 00` and decoded, or `6A 88` (no
+/// entries). Anything else (a refusal, a decode error, a truncated list) means
+/// "not in the registry" cannot be concluded from it.
+fn registry_complete(registry: &[Value]) -> bool {
+    registry.iter().all(|s| {
+        s.get("decode_error").is_none()
+            && s.get("truncated").is_none()
+            && matches!(s["status"].as_str(), Some("9000" | "6A88"))
+    })
+}
+
+/// A selected and authenticated ISD, with the registry read over the channel.
+struct Prepared {
+    channel: scp03::Channel,
+    isd: Vec<u8>,
+    registry: Vec<Value>,
+    steps: Vec<Value>,
+    data: Value,
+}
+
+/// SELECT the ISD, the ONE authentication attempt of [`authenticate`], then
+/// GET STATUS over the channel. `Err(report)` is a run that stopped before any
+/// write could be considered: no ISD, or a refused/failed authentication.
+fn prepare_write<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+    auth: &Auth<'_>,
+) -> Result<Result<Prepared, Report>, session::Error> {
+    let mut steps = Vec::new();
+    let mut attempts = Vec::new();
+    let mut selected = None;
+    for aid in ISD_AIDS {
+        let ex = read_once(session, &mut steps, "select", select_by_aid(aid))?;
+        attempts.push(json!({ "aid": hex_of(aid), "status": sw_hex(&ex) }));
+        if ex.is_success() {
+            selected = Some(aid);
+            break;
+        }
+    }
+    let mut data = json!({
+        "card_touched": true,
+        "isd": selected.map(hex_of),
+        "isd_attempts": attempts,
+        "logical_channel": auth.logical_channel,
+    });
+    let stopped = |mut data: Value, steps: Vec<Value>, found: bool| {
+        if trace {
+            data["trace"] = Value::Array(steps);
+        }
+        Ok(Err(Report {
+            isd_found: found,
+            data,
+        }))
+    };
+    let Some(isd) = selected else {
+        return stopped(data, steps, false);
+    };
+    // Plain read first: after EXTERNAL AUTHENTICATE every command must be MAC'd.
+    let ex = read_once(session, &mut steps, "key_information", |le| {
+        Command::case2(Header::new(0x80, 0xCA, 0x00, 0xE0), le)
+    })?;
+    let card_keys = if ex.is_success() {
+        decode_key_information(ex.data()).ok()
+    } else {
+        None
+    };
+    let mut channel = match authenticate(session, &mut steps, auth)? {
+        Ok(est) => {
+            data["secure_channel"] = channel_report(auth, &est, card_keys.as_ref());
+            est.channel
+        }
+        Err(stop) => {
+            data["secure_channel"] = json!({
+                "protocol": "SCP03",
+                "established": false,
+                "stopped": stop.kind,
+                "key_version": stop.key_version,
+            });
+            data["error"] = json!({ "kind": stop.kind, "message": stop.message });
+            return stopped(data, steps, true);
+        }
+    };
+    let registry = read_registry(session, &mut steps, Some(&mut channel))?;
+    Ok(Ok(Prepared {
+        channel,
+        isd: isd.to_vec(),
+        registry,
+        steps,
+        data,
+    }))
+}
+
+/// The shared flow of `gp delete` and `gp install` with keys: authenticate once,
+/// read the registry, let `check` refuse (nothing sent), stop at a dry run
+/// unless `yes`, otherwise send each planned command MAC'd and in order, stop at
+/// the first refusal (no retry, no skipping ahead), then re-read the registry
+/// and let `verify` confirm the result.
+///
+/// `check` returns the `data.pre_read` object or the refusal `(kind, message)`;
+/// `verify` says whether the registry now shows the intended result.
+#[allow(clippy::too_many_arguments)]
+fn write<S, P, C, V>(
+    session: &mut S,
+    trace: bool,
+    auth: &Auth<'_>,
+    yes: bool,
+    operation: &'static str,
+    target: Value,
+    plan: P,
+    check: C,
+    verify: V,
+) -> Result<Report, session::Error>
+where
+    S: CardSession + ?Sized,
+    P: FnOnce(&[u8]) -> Result<Vec<Planned>, BuildError>,
+    C: FnOnce(&[Value]) -> Result<Value, (&'static str, String)>,
+    V: FnOnce(&[Value]) -> bool,
+{
+    let Prepared {
+        mut channel,
+        isd,
+        registry,
+        mut steps,
+        mut data,
+    } = match prepare_write(session, trace, auth)? {
+        Ok(p) => p,
+        Err(report) => return Ok(report),
+    };
+    data["operation"] = json!(operation);
+    data["target"] = target;
+    data["dry_run"] = json!(!yes);
+    data["sent"] = json!(false);
+    let finish = |mut data: Value, steps: Vec<Value>| {
+        if trace {
+            data["trace"] = Value::Array(steps);
+        }
+        Ok(Report {
+            isd_found: true,
+            data,
+        })
+    };
+    let plan = match plan(&isd) {
+        Ok(plan) => plan,
+        Err(e) => {
+            data["error"] = json!({ "kind": "unbuildable", "message": e.to_string() });
+            return finish(data, steps);
+        }
+    };
+    data["plan"] = json!({ "apdus": plan_json(&plan) });
+    match check(&registry) {
+        Ok(pre_read) => data["pre_read"] = pre_read,
+        Err((kind, message)) => {
+            data["error"] = json!({ "kind": kind, "message": message });
+            return finish(data, steps);
+        }
+    }
+    if !yes {
+        data["note"] = json!(
+            "dry run: the registry was read over the secure channel, nothing was written; add --yes to send the plan"
+        );
+        return finish(data, steps);
+    }
+    let mut results = Vec::new();
+    for p in &plan {
+        let wrapped = match channel.wrap(&p.command) {
+            Ok(w) => w,
+            Err(e) => {
+                data["error"] = json!({ "kind": "unbuildable", "message": e.to_string() });
+                break;
+            }
+        };
+        let ex = session::send(session, &wrapped, &read_policy())?;
+        push_steps(&mut steps, p.step, &ex);
+        data["sent"] = json!(true);
+        results.push(json!({ "step": p.step, "status": sw_hex(&ex) }));
+        if !ex.is_success() {
+            let mut err = refused(&format!("{} ({})", operation.to_uppercase(), p.step), &ex);
+            err["step"] = json!(p.step);
+            err["completed_steps"] = json!(results.len() - 1);
+            err["advice"] = json!(
+                "nothing was retried; read the registry with gp status to see what the card now holds"
+            );
+            data["error"] = err;
+            break;
+        }
+    }
+    data["result"] = json!({ "steps": results });
+    if data.get("error").is_none() {
+        let after = read_registry(session, &mut steps, Some(&mut channel))?;
+        let ok = registry_complete(&after) && verify(&after);
+        data["result"]["verified"] = json!(ok);
+        if !ok {
+            data["error"] = json!({
+                "kind": "verify-failed",
+                "message": "the card answered 9000 to every command but the registry does not show the intended result",
+            });
+        }
+    }
+    finish(data, steps)
+}
+
+/// `gp delete --aid` over SCP03: authenticate once, GET STATUS, refuse when the
+/// AID is not in the registry (`aid-not-present`), is the ISD (`refusing-isd`)
+/// or the registry cannot be read in full (`registry-unreadable`), all with
+/// nothing sent; a dry run unless `yes`; otherwise DELETE MAC'd, every status
+/// word reported with its own kind ([`status_word`]), and a re-read that must no
+/// longer list the AID (`verify-failed`).
+///
+/// # Errors
+///
+/// Only transport and encoding failures; refusals are `data.error`.
+pub fn delete<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+    req: &DeleteRequest,
+    auth: &Auth<'_>,
+    yes: bool,
+) -> Result<Report, session::Error> {
+    let aid_hex = hex::encode_upper(&req.aid);
+    let target = json!({ "aid": aid_hex, "related": req.related });
+    write(
+        session,
+        trace,
+        auth,
+        yes,
+        "delete",
+        target,
+        |_| delete_plan_steps(req),
+        |registry| {
+            if !registry_complete(registry) {
+                return Err((
+                    "registry-unreadable",
+                    "the registry could not be read in full, so the AID cannot be confirmed present; nothing was sent".into(),
+                ));
+            }
+            match registry_entry(registry, &aid_hex) {
+                None => Err((
+                    "aid-not-present",
+                    format!("{aid_hex} is not in the card registry; nothing was sent"),
+                )),
+                Some(("isd", _)) => Err((
+                    "refusing-isd",
+                    format!("{aid_hex} is the issuer security domain; deleting it is refused and nothing was sent"),
+                )),
+                Some((scope, e)) => Ok(json!({
+                    "present": true,
+                    "scope": scope,
+                    "lifecycle": e["lifecycle_name"],
+                    "privileges": e["privilege_names"],
+                })),
+            }
+        },
+        |after| registry_entry(after, &aid_hex).is_none(),
+    )
+}
+
+/// `gp install` over SCP03: authenticate once, GET STATUS, refuse when the load
+/// file or application AID is already in the registry (`package-already-loaded`,
+/// `app-already-installed`) or the registry cannot be read in full; a dry run
+/// unless `yes`; otherwise INSTALL [for load], the LOAD blocks and INSTALL [for
+/// install and make selectable], MAC'd and in order, stopping at the first
+/// refusal, then a re-read that must list the load file and a SELECTABLE
+/// application (`verify-failed`).
+///
+/// # Errors
+///
+/// Only transport and encoding failures; refusals are `data.error`.
+pub fn install<S: CardSession + ?Sized>(
+    session: &mut S,
+    trace: bool,
+    req: &InstallRequest,
+    auth: &Auth<'_>,
+    yes: bool,
+) -> Result<Report, session::Error> {
+    let load_hex = hex::encode_upper(&req.load_file_aid);
+    let app_hex = hex::encode_upper(&req.app_aid);
+    write(
+        session,
+        trace,
+        auth,
+        yes,
+        "install",
+        install_target(req),
+        |sd| install_plan_steps(req, sd),
+        |registry| {
+            if !registry_complete(registry) {
+                return Err((
+                    "registry-unreadable",
+                    "the registry could not be read in full, so a clash cannot be ruled out; nothing was sent".into(),
+                ));
+            }
+            if registry_entry(registry, &load_hex).is_some() {
+                return Err((
+                    "package-already-loaded",
+                    format!("{load_hex} is already in the registry; delete it first with gp delete; nothing was sent"),
+                ));
+            }
+            if registry_entry(registry, &app_hex).is_some() {
+                return Err((
+                    "app-already-installed",
+                    format!("{app_hex} is already in the registry; delete it first with gp delete; nothing was sent"),
+                ));
+            }
+            Ok(json!({ "load_file_present": false, "app_present": false }))
+        },
+        |after| {
+            matches!(registry_entry(after, &load_hex), Some((s, _)) if s.starts_with("load_files"))
+                && registry_entry(after, &app_hex).is_some_and(|(s, e)| {
+                    s == "applications" && e["lifecycle_name"] == "SELECTABLE"
+                })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2472,6 +3322,7 @@ mod tests {
             keys,
             key_version: 0x30,
             host_challenge: HOST_CHALLENGE,
+            logical_channel: 0,
         }
     }
 
@@ -2783,5 +3634,581 @@ mod tests {
         );
         assert_eq!(f[2]["aid"], "A2");
         assert!(registry_findings(&json!({})).is_empty());
+    }
+
+    // ---- writes: DELETE, INSTALL/LOAD, logical channels --------------------
+    //
+    // Plain command layouts: GP Card Spec v2.3.1 11.2 (DELETE), 11.5 (INSTALL),
+    // 11.6 (LOAD), cross-checked against pySim and GlobalPlatformPro (cited on
+    // the builders). The MAC'd bytes below come from the same independent Python
+    // model as the read vectors above (it reproduces pySim's SCP03_Test_AES128_11
+    // and the GET STATUS vectors byte for byte), chained after the very same
+    // INITIALIZE UPDATE / EXTERNAL AUTHENTICATE and the five-command registry
+    // pre-read. Nothing here was produced by the code under test.
+
+    const KI: &str = "80CA00E000";
+    const DELETE_APP1: &str = "84E40000114F07A0000000620001AE095C6F89B477F800";
+    const DEL_POST_ISD: &str = "84F280020A4F009AA63C6B15B45D7000";
+    const DEL_POST_APPS: &str = "84F240020A4F0027A651FE9BD8CF8E00";
+    const DEL_POST_LF: &str = "84F220020A4F00EFCA34D2635D070C00";
+    const DEL_POST_LFM: &str = "84F210020A4F00FA9E6D0D68AEE61700";
+    const INSTALL_FOR_LOAD: &str =
+        "84E602001C07A000000077010008A0000001510000000000000E7BF208CAAB827400";
+    const LOAD_0: &str = "84E80000F8C481FA030A11181F262D343B424950575E656C737A81888F969DA4ABB2B9C0C7CED5DCE3EAF1F8FF060D141B222930373E454C535A61686F767D848B9299A0A7AEB5BCC3CAD1D8DFE6EDF4FB020910171E252C333A41484F565D646B727980878E959CA3AAB1B8BFC6CDD4DBE2E9F0F7FE050C131A21282F363D444B525960676E757C838A91989FA6ADB4BBC2C9D0D7DEE5ECF3FA01080F161D242B323940474E555C636A71787F868D949BA2A9B0B7BEC5CCD3DAE1E8EFF6FD040B121920272E353C434A51585F666D747B828990979EA5ACB3BAC1C8CFD6DDE4EBF2F900070E151C232A31383F464D545B62697077AFA9721E44F29E3B00";
+    const LOAD_1: &str = "84E88001157E858C939AA1A8AFB6BDC4CBD28657FB78BA12619C00";
+    const INSTALL_FOR_INSTALL: &str = "84E60C002A07A000000077010008A00000007701000108A0000000770100020300000002C900005FE64A1219C2C3E500";
+    const INS_POST_ISD: &str = "84F280020A4F0034AFE5CFD7F89B6000";
+    const INS_POST_APPS: &str = "84F240020A4F00A4429FBD5B5FFFC500";
+    const INS_POST_LF: &str = "84F220020A4F00D6C90B1F60A7CB4D00";
+    const INS_POST_LFM: &str = "84F210020A4F004FC58CE93CC6226A00";
+    const CH1_EXT_AUTH: &str = "85820100107D5F5826A993EBC88C90BAFF6826B43F";
+    const CH1_GS_ISD: &str = "85F280020A4F00977C0A2EB91236D800";
+    const CH1_GS_APPS: &str = "85F240020A4F00C4F51A0396EE9F1E00";
+    const CH1_GS_APPS_NEXT: &str = "85F240030A4F00EA3F666F13FAEDAA00";
+    const CH1_GS_LF: &str = "85F220020A4F00D5DE997CD9F3F38F00";
+    const CH1_GS_LFM: &str = "85F210020A4F0051004E46989F5E2B00";
+    const PLAIN_DELETE: &str = "80E40000094F07A000000062000100";
+    const PLAIN_IFL: &str = "80E602001407A000000077010008A00000015100000000000000";
+    const PLAIN_IFI: &str =
+        "80E60C002207A000000077010008A00000007701000108A0000000770100020300000002C9000000";
+
+    const PKG: &str = "A0000000770100";
+    const MODULE: &str = "A000000077010001";
+    const APP: &str = "A000000077010002";
+    const APP1: &str = "A0000000620001";
+    const APP2: &str = "A0000000620002";
+
+    fn load_file_250() -> Vec<u8> {
+        (0..250u32).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect()
+    }
+
+    fn install_request() -> InstallRequest {
+        InstallRequest {
+            load_file: load_file_250(),
+            load_file_aid: hex::decode(PKG).unwrap(),
+            module_aid: hex::decode(MODULE).unwrap(),
+            app_aid: hex::decode(APP).unwrap(),
+            privileges: vec![0, 0, 0],
+            params: vec![0xC9, 0x00],
+        }
+    }
+
+    fn delete_request(aid: &str) -> DeleteRequest {
+        DeleteRequest {
+            aid: hex::decode(aid).unwrap(),
+            related: false,
+        }
+    }
+
+    fn entry(aid: &str, life: &str, privs: &str) -> String {
+        tlv(
+            "E3",
+            &(tlv("4F", aid) + &tlv("9F70", life) + &tlv("C5", privs)),
+        )
+    }
+
+    fn isd_entry() -> String {
+        entry("A000000151000000", "0F", "9E0000")
+    }
+
+    fn set(card: &mut Card, command: &str, response: &str) {
+        card.table
+            .insert(command.into(), hex::decode(response).unwrap());
+    }
+
+    /// The post-write registry of the delete vectors: app 2 only.
+    fn card_after_delete() -> Card {
+        let mut card = secure_card("9000");
+        set(&mut card, DEL_POST_ISD, &(isd_entry() + "9000"));
+        set(
+            &mut card,
+            DEL_POST_APPS,
+            &(entry(APP2, "83", "800000") + "9000"),
+        );
+        set(&mut card, DEL_POST_LF, "6A88");
+        let lfm = tlv(
+            "E3",
+            &(tlv("4F", "A0000000620003") + &tlv("9F70", "01") + &tlv("84", "A000000062000301")),
+        );
+        set(&mut card, DEL_POST_LFM, &(lfm + "9000"));
+        card
+    }
+
+    fn wire(card: &Card) -> Vec<&str> {
+        card.sent.iter().map(String::as_str).collect()
+    }
+
+    fn pre_read_wire() -> Vec<&'static str> {
+        vec![
+            SEL1,
+            KI,
+            INIT_UPDATE,
+            EXT_AUTH_01,
+            GS_ISD,
+            GS_APPS,
+            GS_APPS_NEXT,
+            GS_LF,
+            GS_LFM,
+        ]
+    }
+
+    #[test]
+    fn delete_and_install_for_install_bytes() {
+        // DELETE 80 E4 00 00 Lc 4F len AID 00 (11.2.2; pySim do_delete_card_content).
+        let d = delete_command(&hex::decode(APP1).unwrap(), false).unwrap();
+        assert_eq!(hex::encode_upper(d.encode().unwrap()), PLAIN_DELETE);
+        // related objects: P2 80 (Table 11-22).
+        let d = delete_command(&hex::decode(PKG).unwrap(), true).unwrap();
+        assert_eq!(d.encode().unwrap()[..4], [0x80, 0xE4, 0x00, 0x80]);
+        assert!(matches!(
+            delete_command(&[1, 2, 3], false),
+            Err(BuildError::Aid { .. })
+        ));
+        // INSTALL [for install and make selectable] P1 0C, [for install] P1 04.
+        let req = install_request();
+        let build = |sel, privs: &[u8], params: &[u8]| {
+            install_for_install(
+                &req.load_file_aid,
+                &req.module_aid,
+                &req.app_aid,
+                privs,
+                params,
+                sel,
+            )
+        };
+        assert_eq!(
+            hex::encode_upper(build(true, &[0; 3], &[0xC9, 0]).unwrap().encode().unwrap()),
+            PLAIN_IFI
+        );
+        assert_eq!(
+            build(false, &[0], &[0xC9, 0]).unwrap().encode().unwrap()[2],
+            0x04
+        );
+        assert_eq!(
+            build(true, &[0; 2], &[0xC9, 0]),
+            Err(BuildError::Privileges(2))
+        );
+        // C9 is mandatory (Table 11-49); non-TLV is refused too.
+        assert_eq!(
+            build(true, &[0; 3], &[0xEF, 0]),
+            Err(BuildError::InstallParameters)
+        );
+        assert_eq!(
+            build(true, &[0; 3], &[0xC9]),
+            Err(BuildError::InstallParameters)
+        );
+        // the three-step plan, in order
+        let plan = install_plan_steps(&req, &hex::decode("A000000151000000").unwrap()).unwrap();
+        let steps: Vec<&str> = plan.iter().map(|p| p.step).collect();
+        assert_eq!(
+            steps,
+            ["install_for_load", "load", "load", "install_for_install"]
+        );
+        let plain: Vec<String> = plan
+            .iter()
+            .map(|p| hex::encode_upper(p.command.encode().unwrap()))
+            .collect();
+        assert_eq!(plain[0], PLAIN_IFL);
+        assert!(plain[1].starts_with("80E80000F0C481FA"));
+        assert!(plain[2].starts_with("80E880010D"));
+        assert_eq!(plain[3], PLAIN_IFI);
+        // Card Lock / Card Terminate are not granted.
+        for bad in [0x10u8, 0x08] {
+            let mut r = install_request();
+            r.privileges = vec![bad, 0, 0];
+            assert!(matches!(
+                install_plan_steps(&r, &[0xA0, 0, 0, 1, 0x51]),
+                Err(BuildError::PrivilegeRefused(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn delete_dry_run_sends_no_delete() {
+        let keys = keys();
+        let mut card = secure_card("9000");
+        let r = delete(&mut card, true, &delete_request(APP1), &auth(&keys), false).unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(r.data["dry_run"], true);
+        assert_eq!(r.data["sent"], false);
+        assert_eq!(r.data["target"]["aid"], APP1);
+        assert_eq!(r.data["pre_read"]["present"], true);
+        assert_eq!(r.data["plan"]["apdus"][0]["apdu"], PLAIN_DELETE);
+        assert_eq!(sent_ins(&card, "E4"), 0);
+        assert_eq!(
+            wire(&card),
+            [pre_read_wire(), vec![GS_LFM]].concat()[..9].to_vec()
+        );
+        let text = render_text(&r.data);
+        assert!(text.contains("DRY RUN") && text.contains(APP1), "{text}");
+        assert_no_key_material(&everything(&r, &keys));
+    }
+
+    #[test]
+    fn delete_yes_sends_the_exact_bytes_then_verifies() {
+        let keys = keys();
+        let mut card = card_after_delete();
+        set(&mut card, DELETE_APP1, "9000");
+        let r = delete(&mut card, true, &delete_request(APP1), &auth(&keys), true).unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(
+            wire(&card),
+            [
+                pre_read_wire(),
+                vec![
+                    DELETE_APP1,
+                    DEL_POST_ISD,
+                    DEL_POST_APPS,
+                    DEL_POST_LF,
+                    DEL_POST_LFM
+                ]
+            ]
+            .concat()
+        );
+        assert_eq!(sent_ins(&card, "50"), 1);
+        assert_eq!(sent_ins(&card, "82"), 1);
+        assert_eq!(sent_ins(&card, "E4"), 1);
+        assert_eq!(r.data["sent"], true);
+        assert_eq!(r.data["result"]["steps"][0]["status"], "9000");
+        assert_eq!(r.data["result"]["verified"], true);
+        assert!(render_text(&r.data).contains("sent delete: status 9000"));
+        assert_no_key_material(&everything(&r, &keys));
+    }
+
+    #[test]
+    fn delete_refuses_what_is_not_there_or_not_safe_and_sends_nothing() {
+        let keys = keys();
+        // not on the card
+        let mut card = secure_card("9000");
+        let r = delete(
+            &mut card,
+            false,
+            &delete_request("A0000000620009"),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "aid-not-present");
+        assert_eq!(sent_ins(&card, "E4"), 0);
+        assert_eq!(r.data["sent"], false);
+        // the ISD itself
+        let mut card = secure_card("9000");
+        let r = delete(
+            &mut card,
+            false,
+            &delete_request("A000000151000000"),
+            &auth(&keys),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.data["error"]["kind"], "refusing-isd");
+        assert_eq!(sent_ins(&card, "E4"), 0);
+        // a registry that could not be read cannot prove presence
+        let mut card = secure_card("9000");
+        set(&mut card, GS_ISD, "6982");
+        let r = delete(&mut card, false, &delete_request(APP1), &auth(&keys), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "registry-unreadable");
+        assert_eq!(sent_ins(&card, "E4"), 0);
+        // wrong keys: authentication stops, no DELETE, one INITIALIZE UPDATE only
+        let wrong = Keys::parse(&format!("{ENC_HEX} {}", "FF".repeat(16))).unwrap();
+        let mut card = secure_card("9000");
+        let r = delete(&mut card, false, &delete_request(APP1), &auth(&wrong), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "keys-do-not-match");
+        assert_eq!(
+            (
+                sent_ins(&card, "50"),
+                sent_ins(&card, "82"),
+                sent_ins(&card, "E4")
+            ),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn every_delete_status_word_has_its_own_kind_and_is_not_retried() {
+        let keys = keys();
+        let cases = [
+            ("6A88", "referenced-data-not-found"),
+            ("6A82", "application-not-found"),
+            ("6A80", "incorrect-command-data"),
+            ("6581", "memory-failure"),
+            ("6985", "conditions-of-use-not-satisfied"),
+            ("6982", "security-status-not-satisfied"),
+            ("6700", "wrong-length"),
+            ("6A86", "incorrect-p1-p2"),
+            ("6D00", "invalid-instruction"),
+            ("6E00", "invalid-class"),
+            ("6400", "no-specific-diagnosis"),
+            ("6881", "channel-not-active"),
+            ("6B00", "unlisted-status"),
+        ];
+        let mut kinds = std::collections::HashSet::new();
+        for (sw, kind) in cases {
+            let mut card = secure_card("9000");
+            set(&mut card, DELETE_APP1, sw);
+            let r = delete(&mut card, false, &delete_request(APP1), &auth(&keys), true).unwrap();
+            assert_eq!(r.data["error"]["kind"], kind, "{sw}");
+            assert_eq!(r.data["error"]["status"], sw);
+            assert!(r.data["error"]["message"].as_str().unwrap().contains(sw));
+            assert_eq!(sent_ins(&card, "E4"), 1, "{sw} must not be retried");
+            // nothing after the refused DELETE: no verification read
+            assert_eq!(card.sent.last().unwrap(), DELETE_APP1);
+            kinds.insert(kind);
+        }
+        assert_eq!(kinds.len(), cases.len());
+    }
+
+    #[test]
+    fn delete_that_the_registry_does_not_confirm_is_verify_failed() {
+        let keys = keys();
+        // the card says 9000 but the post-read still lists the app
+        let mut card = secure_card("9000");
+        set(&mut card, DELETE_APP1, "9000");
+        let r = delete(&mut card, false, &delete_request(APP1), &auth(&keys), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "verify-failed");
+        assert_eq!(r.data["result"]["verified"], false);
+    }
+
+    fn card_for_install(after: bool) -> Card {
+        let mut card = secure_card("9000");
+        for (c, r) in [
+            (INSTALL_FOR_LOAD, "9000"),
+            (LOAD_0, "9000"),
+            (LOAD_1, "9000"),
+            (INSTALL_FOR_INSTALL, "9000"),
+        ] {
+            set(&mut card, c, r);
+        }
+        if after {
+            set(&mut card, INS_POST_ISD, &(isd_entry() + "9000"));
+            let apps = entry(APP1, "07", "180000") + &entry(APP, "07", "000000");
+            set(&mut card, INS_POST_APPS, &(apps + "9000"));
+            set(
+                &mut card,
+                INS_POST_LF,
+                &(tlv("E3", &(tlv("4F", PKG) + &tlv("9F70", "01"))) + "9000"),
+            );
+            let lfm = tlv(
+                "E3",
+                &(tlv("4F", PKG) + &tlv("9F70", "01") + &tlv("84", MODULE)),
+            );
+            set(&mut card, INS_POST_LFM, &(lfm + "9000"));
+        }
+        card
+    }
+
+    #[test]
+    fn install_dry_run_sends_nothing() {
+        let keys = keys();
+        let mut card = card_for_install(false);
+        let r = install(&mut card, false, &install_request(), &auth(&keys), false).unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(r.data["dry_run"], true);
+        assert_eq!(r.data["sent"], false);
+        for ins in ["E6", "E8"] {
+            assert_eq!(sent_ins(&card, ins), 0);
+        }
+        let apdus = r.data["plan"]["apdus"].as_array().unwrap();
+        assert_eq!(apdus.len(), 4);
+        assert_eq!(apdus[0]["apdu"], PLAIN_IFL);
+        assert_eq!(apdus[3]["apdu"], PLAIN_IFI);
+        assert_eq!(r.data["target"]["load_file_aid"], PKG);
+        assert_no_key_material(&everything(&r, &keys));
+    }
+
+    #[test]
+    fn install_yes_sends_load_then_install_in_order_and_verifies() {
+        let keys = keys();
+        let mut card = card_for_install(true);
+        let r = install(&mut card, true, &install_request(), &auth(&keys), true).unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(
+            wire(&card),
+            [
+                pre_read_wire(),
+                vec![
+                    INSTALL_FOR_LOAD,
+                    LOAD_0,
+                    LOAD_1,
+                    INSTALL_FOR_INSTALL,
+                    INS_POST_ISD,
+                    INS_POST_APPS,
+                    INS_POST_LF,
+                    INS_POST_LFM
+                ]
+            ]
+            .concat()
+        );
+        let steps: Vec<&str> = r.data["result"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["step"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            steps,
+            ["install_for_load", "load", "load", "install_for_install"]
+        );
+        assert_eq!(r.data["result"]["verified"], true);
+        assert_no_key_material(&everything(&r, &keys));
+    }
+
+    #[test]
+    fn install_stops_at_the_first_refusal() {
+        let keys = keys();
+        let mut card = card_for_install(true);
+        set(&mut card, LOAD_0, "6A84");
+        let r = install(&mut card, false, &install_request(), &auth(&keys), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "not-enough-memory-space");
+        assert_eq!(r.data["error"]["step"], "load");
+        assert_eq!(r.data["error"]["completed_steps"], 1);
+        assert_eq!(
+            sent_ins(&card, "E8"),
+            1,
+            "LOAD block 1 must not follow a refused block 0"
+        );
+        assert_eq!(
+            sent_ins(&card, "E6"),
+            1,
+            "INSTALL [for install] must not follow"
+        );
+        assert_eq!(r.data["sent"], true);
+    }
+
+    #[test]
+    fn install_refuses_clashes_before_sending_anything() {
+        let keys = keys();
+        let mut req = install_request();
+        req.app_aid = hex::decode(APP1).unwrap(); // already installed on the fixture
+        let mut card = secure_card("9000");
+        let r = install(&mut card, false, &req, &auth(&keys), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "app-already-installed");
+        let mut req = install_request();
+        req.load_file_aid = hex::decode("A0000000620003").unwrap(); // a load file on the fixture
+        let mut card = secure_card("9000");
+        let r = install(&mut card, false, &req, &auth(&keys), true).unwrap();
+        assert_eq!(r.data["error"]["kind"], "package-already-loaded");
+        assert_eq!(sent_ins(&card, "E6") + sent_ins(&card, "E8"), 0);
+    }
+
+    #[test]
+    fn offline_dry_runs_touch_no_card_and_show_the_apdus() {
+        let d = delete_dry_run(&delete_request(APP1)).unwrap();
+        assert_eq!(d["card_touched"], false);
+        assert_eq!(d["dry_run"], true);
+        assert_eq!(d["plan"]["apdus"][0]["apdu"], PLAIN_DELETE);
+        let i = install_dry_run(&install_request()).unwrap();
+        assert_eq!(i["card_touched"], false);
+        assert_eq!(i["plan"]["apdus"][0]["apdu"], PLAIN_IFL);
+        assert_eq!(i["target"]["security_domain"], "A000000151000000");
+        let text = render_text(&i);
+        assert!(text.contains("DRY RUN") && text.contains(PKG), "{text}");
+        assert!(delete_dry_run(&delete_request("A000000062")).is_ok());
+        assert!(delete_dry_run(&DeleteRequest {
+            aid: vec![1],
+            related: false
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn logical_channel_open_and_close_replay() {
+        // MANAGE CHANNEL open 00 70 00 00 01 -> channel number then 90 00;
+        // close 00 70 80 <ch> (ISO/IEC 7816-4 11.1.2; GP Card Spec 11.7).
+        let mut card = Card::new(&[("0070000001", "019000")]);
+        let r = channel_open(&mut card, true).unwrap();
+        assert!(r.isd_found);
+        assert_eq!(r.data["channel"]["number"], 1);
+        assert_eq!(r.data["channel"]["status"], "9000");
+        assert_eq!(r.data["trace"][0]["command"], "0070000001");
+        assert!(render_text(&r.data).contains("Logical channel open: 1"));
+        // refusals, each with its own kind
+        for (sw, kind) in [
+            ("6A81", "function-not-supported"),
+            ("6881", "channel-not-active"),
+            ("6882", "secure-messaging-not-supported"),
+        ] {
+            let mut card = Card::new(&[("0070000001", sw)]);
+            let r = channel_open(&mut card, false).unwrap();
+            assert!(!r.isd_found);
+            assert_eq!(r.data["error"]["kind"], kind);
+        }
+        let mut card = Card::new(&[("0070000001", "9000")]);
+        assert_eq!(
+            channel_open(&mut card, false).unwrap().data["error"]["kind"],
+            "channel-number-unreadable"
+        );
+        // close
+        let mut card = Card::new(&[("00708001", "9000"), ("00708003", "6200")]);
+        assert!(channel_close(&mut card, 1, false).unwrap().isd_found);
+        let r = channel_close(&mut card, 3, false).unwrap();
+        assert_eq!(r.data["error"]["kind"], "channel-already-closed");
+        // the basic channel cannot be closed: nothing is sent
+        let r = channel_close(&mut card, 0, false).unwrap();
+        assert_eq!(r.data["error"]["kind"], "bad-channel");
+        assert_eq!(card.sent, ["00708001", "00708003"]);
+    }
+
+    #[test]
+    fn commands_run_on_a_chosen_channel_and_the_mac_covers_it() {
+        // The whole flow on channel 1: plain commands get CLA 01/81, the secure
+        // channel's commands CLA 85 with the MAC computed over that class byte
+        // (vectors from the independent model; a MAC over CLA 84 would not match).
+        let keys = keys();
+        let mut a = auth(&keys);
+        a.logical_channel = 1;
+        let mut card = secure_card("9000");
+        // re-key the fixture's wire commands for channel 1
+        let mut table = std::collections::HashMap::new();
+        for (c, r) in std::mem::take(&mut card.table) {
+            let c = match c.as_str() {
+                x if x == SEL1 => "01A4040008A00000015100000000".to_string(),
+                x if x == KI => "81CA00E000".to_string(),
+                x if x == INIT_UPDATE => "8150300008B13E5F938FC108C400".to_string(),
+                x if x == EXT_AUTH_01 => CH1_EXT_AUTH.to_string(),
+                x if x == GS_ISD => CH1_GS_ISD.to_string(),
+                x if x == GS_APPS => CH1_GS_APPS.to_string(),
+                x if x == GS_APPS_NEXT => CH1_GS_APPS_NEXT.to_string(),
+                x if x == GS_LF => CH1_GS_LF.to_string(),
+                x if x == GS_LFM => CH1_GS_LFM.to_string(),
+                _ => c,
+            };
+            table.insert(c, r);
+        }
+        card.table = table;
+        let mut on = OnChannel::new(&mut card, 1);
+        let mut r = delete(&mut on, true, &delete_request(APP1), &a, false).unwrap();
+        assert!(r.data.get("error").is_none(), "{:?}", r.data);
+        assert_eq!(r.data["pre_read"]["present"], true);
+        retarget_channel(&mut r.data, 1);
+        // the trace, corrected, is exactly what the card was sent
+        let traced: Vec<&str> = r.data["trace"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(traced, wire(&card));
+        assert_eq!(traced[0], "01A4040008A00000015100000000");
+        assert_eq!(traced[3], CH1_EXT_AUTH);
+        // a class with no channel coding passes through
+        let mut card = Card::new(&[("A0C0000000", "9000")]);
+        OnChannel::new(&mut card, 2)
+            .transmit(&[0xA0, 0xC0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(card.sent, ["A0C0000000"]);
+    }
+
+    #[test]
+    fn write_output_never_holds_key_material() {
+        let keys = keys();
+        let mut card = card_after_delete();
+        set(&mut card, DELETE_APP1, "9000");
+        let r = delete(&mut card, true, &delete_request(APP1), &auth(&keys), true).unwrap();
+        let out = everything(&r, &keys);
+        assert_no_key_material(&out);
+        assert!(!out.contains(&hex::encode(keys.enc)) && !out.contains(&hex::encode(keys.mac)));
+        // the ENC key is never exercised by a C-MAC-only write
+        assert_eq!(r.data["secure_channel"]["enc_key_exercised"], false);
     }
 }

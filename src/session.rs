@@ -613,7 +613,7 @@ pub const INS_MANAGE_CHANNEL: u8 = 0x70;
 
 /// Highest logical channel number ISO/IEC 7816-4 can address (basic 1..=3,
 /// further 4..=19).
-pub const MAX_LOGICAL_CHANNEL: u8 = 19;
+pub use crate::apdu::MAX_LOGICAL_CHANNEL;
 
 /// MANAGE CHANNEL, open: `00 70 00 00 01`. The card picks the channel and
 /// answers with its number in one data byte (ISO/IEC 7816-4 clause 11.1.2).
@@ -651,9 +651,9 @@ pub fn parse_opened_channel(data: &[u8]) -> Option<u8> {
 /// Opens a supplementary logical channel. The channel is `None` if the card
 /// refused (the status word is in the returned [`Exchange`]) or answered with
 /// something that is not a channel number. Key-less: it authenticates and
-/// writes nothing, but it does change the card's channel state, so the
-/// live-card rules forbid calling it on a real SIM until a caller is added on
-/// purpose.
+/// writes nothing, but it does change the card's channel state. Callers: `euicc`
+/// (closes the channel on every path) and `gp channel open` (leaves it open on
+/// purpose, for `--channel`).
 ///
 /// # Errors
 ///
