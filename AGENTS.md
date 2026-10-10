@@ -997,8 +997,15 @@ channel (MANAGE CHANNEL), SELECTs the ISD-R (`A0000005591010FFFFFFFF8900000100`,
 sends one ES10 STORE DATA request ([src/euicc.rs](src/euicc.rs) over [src/es10.rs](src/es10.rs)) and
 closes the channel on every path. `euicc info` also reads ES10a GetEuiccConfiguredAddresses (default SM-DP+, root SM-DS); `--max-segment` (1-255, default 120 as lpac) sets the STORE DATA block size. They speak the lpac envelope (`type` `lpa`), human table without
 `--json`. Exit 0 answered; 1 not an eUICC (`data.error.kind` `not-an-euicc`), no channel, ISD-R
-refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Never sent:
-RetrieveNotificationsList (#119).
+refusal, malformed response, no reader or card; 129 bad command line; 130 interrupted. Beyond the read-only three
+(#119): `euicc notifications dump [--seq N] [-o FILE]` (RetrieveNotificationsList `BF2B`, read-only; no filter is `BF2B 00`, a
+sequence number is lpac's `BF2B { A0 { 80 <seq> } }`, the `A0` being the AUTOMATIC TAGS tag of `searchCriteria`; response
+`BF2B { A0 { PendingNotification* } | 81 <1 noResultAvailable|127> }`, `PendingNotification` = `BF37 { BF27 { 80 tid, BF2F .. } .. }` or
+`30 { BF2F .. .. }`, decoded by `es10::decode_pending_notification`; checked 2026-10-10 against lpac `es10b.c` and pySim `rsp.asn`) writes a
+`sim-doctor-notification-dump/1` JSON document with `pending_notification_hex`; and `euicc notifications replay --from FILE`
+([src/notif.rs](src/notif.rs)) sends each dumped notification to the address inside its signed bytes as ES9+ HandleNotification
+(`es9::handle_notification`, `204`). Replay **reaches the network**: dry run by default (no transport is even opened), `--yes` to
+send, never removes the notification from the card, no card needed, not on MCP. Live operator round trip: #92 / #118.
 The writes are `euicc nickname <iccid> <name>` (ES10c SetNickname, `profile nickname`), the first PR of #117 and
 the owner's safeguards, all binding: **dry run by default** (reads EID and profile list, prints EID, ICCID, current and new
 nickname, sends no SetNickname); `--yes` sends it, then re-reads the profile list and fails (`verify-failed`) if the nickname

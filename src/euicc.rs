@@ -16,8 +16,11 @@
 //! [`remove_notification`] (RemoveNotificationFromList, `notification remove`),
 //! under the same rule.
 //!
-//! **Does not own, and never sends.** RetrieveNotificationsList, the download
-//! functions or anything over HTTPS. The only commands on the wire are MANAGE
+//! Also [`dump_notifications`] (RetrieveNotificationsList, `notification dump`
+//! without lpac's per-sequence loop): read-only, it removes nothing.
+//!
+//! **Does not own, and never sends.** The download functions or anything over
+//! HTTPS (sending a dumped notification is [`crate::notif`]). The only commands on the wire are MANAGE
 //! CHANNEL (open, close), SELECT of the ISD-R, and STORE DATA carrying one of
 //! the read requests above, or a write above when applying. The channel is
 //! closed again on every path, a failure included.
@@ -84,7 +87,8 @@ pub struct Failure {
 }
 
 impl Failure {
-    fn new(kind: &'static str, message: String, extra: Value) -> Self {
+    /// A failure of `kind` with `extra` merged into the envelope data.
+    pub fn new(kind: &'static str, message: String, extra: Value) -> Self {
         let mut data = json!({ "error": { "kind": kind, "message": message } });
         if let (Some(into), Some(from)) = (data.as_object_mut(), extra.as_object()) {
             into.extend(from.clone());
@@ -1086,6 +1090,102 @@ pub fn remove_notification<S: CardSession + ?Sized>(
     })
 }
 
+/// The `format` member of a notification dump file.
+pub const DUMP_FORMAT: &str = "sim-doctor-notification-dump/1";
+
+/// One dumped notification: the metadata fields of [`notification_json`], the
+/// arm, the transaction id and the signed bytes as hex.
+fn pending_json(p: &es10::PendingNotification) -> Value {
+    let mut v = notification_json(&p.metadata);
+    v["kind"] = json!(match p.kind {
+        es10::PendingKind::ProfileInstallationResult => "profile-installation-result",
+        es10::PendingKind::OtherSigned => "other-signed-notification",
+    });
+    v["transaction_id"] = json!(p.transaction_id.as_deref().map(hex::encode_upper));
+    v["pending_notification_hex"] = json!(hex::encode_upper(&p.raw));
+    v
+}
+
+/// RetrieveNotificationsList (lpac `notification dump`, ES10b): the full,
+/// signed pending notifications, for every one or just `seq_number`. Read-only:
+/// retrieving does not remove (that stays `notifications remove`). The result
+/// is the dump document (`format`, `eid`, `notifications`) that
+/// [`crate::notif::replay`] reads back. No pending notification is an empty
+/// list; a `seq_number` the card does not have is `notification-not-found`.
+///
+/// # Errors
+///
+/// A [`Failure`]; a notification that does not decode is `decode-failed`.
+pub fn dump_notifications<S: CardSession + ?Sized>(
+    session: &mut S,
+    aid: &[u8],
+    max_segment: usize,
+    seq_number: Option<u32>,
+) -> Result<Value, Failure> {
+    in_channel(session, aid, max_segment, |ask| {
+        let eid = read_eid(ask)?;
+        let frame = es10::retrieve_notifications_request(seq_number);
+        let list =
+            match es10::decode_retrieve_notifications(&ask("RetrieveNotificationsList", frame)?)
+                .map_err(|e| bad("RetrieveNotificationsList", e))?
+            {
+                es10::RetrieveNotificationsResponse::Ok(list) => list,
+                es10::RetrieveNotificationsResponse::Error(1) => match seq_number {
+                    None => Vec::new(),
+                    Some(seq) => {
+                        return Err(Failure::new(
+                            "notification-not-found",
+                            format!("no notification with sequence number {seq} on this eUICC"),
+                            json!({ "eid": eid, "seq_number": seq }),
+                        ))
+                    }
+                },
+                es10::RetrieveNotificationsResponse::Error(code) => {
+                    return Err(Failure::new(
+                        "es10-refused",
+                        format!("RetrieveNotificationsList returned error code {code}"),
+                        json!({ "function": "RetrieveNotificationsList", "code": code }),
+                    ))
+                }
+            };
+        Ok(json!({
+            "command": "notification-dump",
+            "format": DUMP_FORMAT,
+            "eid": eid,
+            "notifications": list.iter().map(pending_json).collect::<Vec<_>>(),
+        }))
+    })
+}
+
+/// The human report for [`dump_notifications`]; the bytes stay in the dump.
+pub fn dump_to_human(data: &Value) -> String {
+    let text = |v: &Value| match v {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => sanitize(s),
+        other => sanitize(&other.to_string()),
+    };
+    let mut out = format!("EID: {}\n", text(&data["eid"]));
+    for n in data["notifications"].as_array().into_iter().flatten() {
+        out += &format!(
+            "{}\t{}\t{}\t{}\t{} bytes\n",
+            text(&n["seq_number"]),
+            n["operation"]
+                .as_array()
+                .map(|a| a.iter().map(&text).collect::<Vec<_>>().join("+"))
+                .unwrap_or_default(),
+            text(&n["iccid"]),
+            text(&n["address"]),
+            n["pending_notification_hex"]
+                .as_str()
+                .map_or(0, |h| h.len() / 2),
+        );
+    }
+    if data["notifications"].as_array().is_none_or(Vec::is_empty) {
+        out += "No pending notifications.\n";
+    }
+    out
+}
+
 fn version(v: [u8; 3]) -> String {
     format!("{}.{}.{}", v[0], v[1], v[2])
 }
@@ -1184,7 +1284,7 @@ fn profile_json(p: &es10::ProfileInfo) -> Value {
     })
 }
 
-fn notification_json(n: &es10::NotificationMetadata) -> Value {
+pub(crate) fn notification_json(n: &es10::NotificationMetadata) -> Value {
     let ops: Vec<&str> = ["install", "enable", "disable", "delete"]
         .iter()
         .enumerate()
@@ -2419,5 +2519,127 @@ mod tests {
         assert_eq!(failure.kind, "notification-not-found");
         assert_eq!(failure.data["seq_numbers"], json!([4, 5]));
         assert_eq!(card.remaining(), 0);
+    }
+
+    // -- notifications dump (RetrieveNotificationsList) ------------------
+
+    /// `PendingNotification`s for `seqs`: the first as an
+    /// otherSignedNotification (`30`), a seq of 9 as a profileInstallationResult.
+    fn pending(seq: u8) -> String {
+        let meta = format!("8001{seq:02X}8102 0480 0C0161 5A0A{ICCID_RAW}").replace(' ', "");
+        let meta = format!("BF2F{:02X}{meta}", meta.len() / 2);
+        let sig = "5F370211 22";
+        let inner = if seq == 9 {
+            let data = format!("8002ABCD{meta}");
+            let pir = format!("BF27{:02X}{data}{sig}", data.len() / 2);
+            format!("BF37{:02X}{pir}", pir.len() / 2)
+        } else {
+            let body = format!("{meta}{sig}");
+            format!("30{:02X}{body}", body.len() / 2)
+        };
+        inner.replace(' ', "")
+    }
+
+    fn retrieve_response(seqs: &[u8]) -> String {
+        let list: String = seqs.iter().map(|s| pending(*s)).collect();
+        let a0 = format!("A0{:02X}{list}", list.len() / 2);
+        ok(&format!("BF2B{:02X}{a0}", a0.len() / 2))
+    }
+
+    #[test]
+    fn dump_retrieves_the_full_notifications_and_removes_nothing() {
+        assert_eq!(es10::retrieve_notifications_request(None), h("BF2B00"));
+        // Only GetEID and the retrieve go out: a RemoveNotificationFromList
+        // (BF30) would find no scripted answer and fail the run.
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (
+                    es10::retrieve_notifications_request(None),
+                    retrieve_response(&[4, 9]),
+                ),
+            ],
+        );
+        let data = dump_notifications(&mut card, &ISDR_AID, 255, None).unwrap();
+        assert_eq!(card.remaining(), 0);
+        assert_eq!(data["format"], DUMP_FORMAT);
+        assert_eq!(data["eid"], EID);
+        let n = &data["notifications"];
+        assert_eq!(n.as_array().unwrap().len(), 2);
+        assert_eq!(n[0]["seq_number"], 4);
+        assert_eq!(n[0]["kind"], "other-signed-notification");
+        assert_eq!(n[0]["operation"], json!(["install"]));
+        assert_eq!(n[0]["address"], "a");
+        assert_eq!(n[0]["iccid"], ICCID);
+        assert_eq!(n[0]["pending_notification_hex"], pending(4));
+        assert_eq!(n[1]["kind"], "profile-installation-result");
+        assert_eq!(n[1]["transaction_id"], "ABCD");
+        assert!(dump_to_human(&data).contains("a\t"));
+        // The dump round-trips: `notif::load` gets the same signed bytes back.
+        let loaded = crate::notif::load(&data.to_string()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(hex::encode_upper(&loaded[1].raw), pending(9));
+    }
+
+    #[test]
+    fn dump_of_one_sequence_number_sends_the_lpac_search_criteria() {
+        assert_eq!(
+            es10::retrieve_notifications_request(Some(5)),
+            h("BF2B05 A003 800105")
+        );
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (
+                    es10::retrieve_notifications_request(Some(5)),
+                    retrieve_response(&[5]),
+                ),
+            ],
+        );
+        let data = dump_notifications(&mut card, &ISDR_AID, 255, Some(5)).unwrap();
+        assert_eq!(data["notifications"][0]["seq_number"], 5);
+        assert_eq!(card.remaining(), 0);
+    }
+
+    #[test]
+    fn dump_with_nothing_pending_is_empty_and_an_unknown_seq_is_not_found() {
+        let none = ok("BF2B03 8101 01");
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (es10::retrieve_notifications_request(None), none.clone()),
+            ],
+        );
+        let data = dump_notifications(&mut card, &ISDR_AID, 255, None).unwrap();
+        assert_eq!(data["notifications"], json!([]));
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (es10::retrieve_notifications_request(Some(7)), none),
+            ],
+        );
+        let f = dump_notifications(&mut card, &ISDR_AID, 255, Some(7)).unwrap_err();
+        assert_eq!(f.kind, "notification-not-found");
+    }
+
+    #[test]
+    fn dump_of_a_malformed_notification_is_decode_failed() {
+        // `30 00`: an otherSignedNotification with no BF2F metadata.
+        let mut card = script(
+            "9000",
+            &[
+                (es10::get_eid_request(), eid_response()),
+                (
+                    es10::retrieve_notifications_request(None),
+                    ok("BF2B04 A002 3000"),
+                ),
+            ],
+        );
+        let f = dump_notifications(&mut card, &ISDR_AID, 255, None).unwrap_err();
+        assert_eq!(f.kind, "decode-failed");
     }
 }
