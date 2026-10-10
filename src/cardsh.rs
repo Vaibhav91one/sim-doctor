@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::apdu::StatusWord;
+use crate::apdu::{self, Command, StatusWord};
 use crate::fcp::{self, TagSet};
 use crate::fs::FileId;
-use crate::session;
+use crate::session::{self, PendingFollowUp, Policy};
 use crate::transport::CardSession;
 
 /// What an [`Opener`] returns: the session, the reader's name and the ATR when the transport has one.
@@ -224,6 +224,24 @@ struct Equipped {
     channel: u8,
 }
 
+impl Equipped {
+    /// The class byte of a command of this profile on the channel in use.
+    #[allow(dead_code)] // the file commands (next change) send with it
+    fn cla(&self) -> u8 {
+        apdu::class_on_channel(self.profile.cla(), self.channel).unwrap_or(self.profile.cla())
+    }
+
+    /// Sends one logical command, following GET RESPONSE. A pending proactive command is never
+    /// fetched on its own: FETCH is a command the operator types.
+    fn send(&mut self, command: &Command) -> Result<session::Exchange, CmdErr> {
+        let policy = Policy {
+            proactive_command: PendingFollowUp::Ignore,
+            ..Policy::default()
+        };
+        Ok(session::send(self.session.as_mut(), command, &policy)?)
+    }
+}
+
 /// The interpreter. Holds the card and everything the commands share.
 pub struct Shell {
     opener: Opener,
@@ -308,6 +326,32 @@ pub fn split_commands(script: &str) -> Vec<String> {
     out
 }
 
+fn yes_arg() -> clap::Arg {
+    clap::Arg::new("yes")
+        .long("yes")
+        .action(clap::ArgAction::SetTrue)
+        .help("Send it; without this a command that changes the card prints what it would send")
+}
+
+/// The instructions the shell sends without `--yes`: they read the card or change only the session
+/// (SELECT, READ BINARY, READ RECORD, GET RESPONSE, STATUS, GET DATA, MANAGE CHANNEL).
+pub const READ_ONLY_INS: [u8; 8] = [0xA4, 0xB0, 0xB2, 0xC0, 0xF2, 0xCA, 0xCB, 0x70];
+
+/// Whether `ins` is one of [`READ_ONLY_INS`].
+pub fn is_read_only(ins: u8) -> bool {
+    READ_ONLY_INS.contains(&ins)
+}
+
+/// pySim's `sw_match`: `pattern` is 4 hex digits in which `x` stands for any digit.
+pub fn sw_match(sw: &str, pattern: &str) -> bool {
+    let (sw, pattern) = (sw.to_ascii_lowercase(), pattern.to_ascii_lowercase());
+    sw.len() == pattern.len()
+        && sw
+            .chars()
+            .zip(pattern.chars())
+            .all(|(a, p)| p == 'x' || a == p)
+}
+
 /// The command grammar, one clap subcommand per shell command (`multicall`: no binary name).
 pub fn grammar() -> clap::Command {
     use clap::{Arg, Command as C};
@@ -347,6 +391,39 @@ pub fn grammar() -> clap::Command {
                     Arg::new("channel")
                         .required(true)
                         .value_parser(clap::value_parser!(u8).range(0..=19)),
+                ),
+        )
+        .subcommand(
+            C::new("apdu")
+                .about(
+                    "Send one APDU (hex). Reads are sent; anything else is a dry run unless --yes",
+                )
+                .arg(
+                    Arg::new("raw")
+                        .long("raw")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Send the class byte as given (no logical channel handling)"),
+                )
+                .arg(
+                    Arg::new("expect_sw")
+                        .long("expect-sw")
+                        .value_name("SW")
+                        .help(
+                        "Fail unless the status word matches (4 hex digits; x is a wildcard, 61xx)",
+                    ),
+                )
+                .arg(
+                    Arg::new("expect_response_regex")
+                        .long("expect-response-regex")
+                        .value_name("RE")
+                        .help("Fail unless the response data (lower-case hex) starts with a match"),
+                )
+                .arg(yes_arg())
+                .arg(
+                    Arg::new("apdu")
+                        .required(true)
+                        .num_args(1..)
+                        .value_name("APDU"),
                 ),
         )
         .subcommand(
@@ -444,6 +521,7 @@ impl Shell {
             }),
             "equip" => self.cmd_equip(args),
             "status" => self.cmd_status(),
+            "apdu" => self.cmd_apdu(args),
             "open_channel" => self.cmd_open_channel(),
             "close_channel" => self.cmd_close_channel(args),
             "channel" => self.cmd_channel(args),
@@ -455,6 +533,90 @@ impl Shell {
         self.card
             .as_mut()
             .ok_or_else(|| CmdErr::new("no card: run `equip` first"))
+    }
+
+    /// Whether a command that changes the card may be sent: `--yes` on it or on the shell.
+    fn may_change_card(&self, args: &clap::ArgMatches) -> bool {
+        self.opts.yes
+            || args
+                .try_get_one::<bool>("yes")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+    }
+
+    fn cmd_apdu(&mut self, args: &clap::ArgMatches) -> CmdResult {
+        let text: Vec<&str> = args
+            .get_many::<String>("apdu")
+            .expect("required")
+            .map(String::as_str)
+            .collect();
+        let bytes = parse_hex(&text.join("")).map_err(CmdErr::new)?;
+        let raw = args.get_flag("raw");
+        let send = self.may_change_card(args);
+        let card = self.equipped()?;
+        let mut command =
+            Command::decode(&bytes).map_err(|e| CmdErr::new(format!("not an APDU: {e}")))?;
+        if !raw && card.channel > 0 {
+            let h = command.header();
+            if let Some(cla) = apdu::class_on_channel(h.class(), card.channel) {
+                command = Command::new(
+                    apdu::Header::new(cla, h.instruction(), h.parameter_1(), h.parameter_2()),
+                    command.body().clone(),
+                );
+            }
+        }
+        let wire = command.encode().map_err(|e| CmdErr::new(e.to_string()))?;
+        let ins = command.header().instruction();
+        if !send && !is_read_only(ins) {
+            return Ok(Reply::ok(
+                format!("dry run: would send {} (INS {ins:02X} changes the card or its state; add --yes to send)", hex_upper(&wire)),
+                json!({ "sent": false, "apdu": hex_upper(&wire) }),
+            ));
+        }
+        let ex = card.send(&command)?;
+        let sw = ex.status().map(|s| s.to_string());
+        let data = hex::encode(ex.data());
+        let steps: Vec<Value> = ex
+            .steps()
+            .iter()
+            .map(|s| json!({ "command": hex_upper(s.command()), "response": hex_upper(s.response()) }))
+            .collect();
+        let record = json!({
+            "sent": true,
+            "apdu": hex_upper(&wire),
+            "sw": sw,
+            "meaning": ex.status().map(crate::trace::sw_meaning),
+            "data": data,
+            "exchanges": steps,
+        });
+        let mut text = format!("sw {}", sw_text(ex.status()));
+        if !data.is_empty() {
+            text.push_str(&format!("\ndata {data}"));
+        }
+        if let Some(want) = args.get_one::<String>("expect_sw") {
+            if !sw.as_deref().is_some_and(|got| sw_match(got, want)) {
+                return Err(CmdErr {
+                    message: format!(
+                        "expected status word {want}, the card answered {}",
+                        sw_text(ex.status())
+                    ),
+                    data: record,
+                });
+            }
+        }
+        if let Some(re) = args.get_one::<String>("expect_response_regex") {
+            let re = regex::Regex::new(&format!("(?i)^(?:{re})"))
+                .map_err(|e| CmdErr::new(format!("--expect-response-regex: {e}")))?;
+            if !re.is_match(&data) {
+                return Err(CmdErr {
+                    message: format!("the response data {data:?} does not match {re}"),
+                    data: record,
+                });
+            }
+        }
+        Ok(Reply::ok(text, record))
     }
 
     fn cmd_equip(&mut self, args: &clap::ArgMatches) -> CmdResult {
@@ -696,6 +858,77 @@ mod tests {
         let r = sh.exec("nonsense");
         assert!(!r.ok);
         assert_eq!(sh.failed, 1);
+    }
+
+    #[test]
+    fn sw_patterns_have_wildcards() {
+        assert!(sw_match("6100", "61xx"));
+        assert!(sw_match("9000", "9000"));
+        assert!(sw_match("9F10", "9f10"));
+        assert!(!sw_match("6A82", "6Axx3"));
+        assert!(!sw_match("6A82", "6A83"));
+    }
+
+    #[test]
+    fn apdu_sends_reads_and_follows_get_response() {
+        let (mut sh, log) = shell_log();
+        let r = sh.exec("apdu 00A40004022FE2");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["sw"], "9000");
+        assert_eq!(
+            r.data["exchanges"].as_array().unwrap().len(),
+            2,
+            "SELECT then GET RESPONSE"
+        );
+        assert!(r.data["data"].as_str().unwrap().starts_with("620f"));
+        let r = sh.exec("apdu 00 B0 00 00 0A --expect-response-regex ^9810");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["data"], "98101032547698103254");
+        assert!(!sh.exec("apdu 00B000000A --expect-response-regex 0000").ok);
+        assert_eq!(log.borrow().len(), 4);
+    }
+
+    #[test]
+    fn apdu_that_changes_the_card_is_a_dry_run_without_yes() {
+        let (mut sh, log) = shell_log();
+        let r = sh.exec("apdu 00D6000001AA");
+        assert!(r.ok && r.data["sent"] == false, "{}", r.text);
+        assert!(r.text.contains("00D6000001AA") && r.text.contains("--yes"));
+        assert!(log.borrow().is_empty(), "nothing reached the card");
+        let r = sh.exec("apdu --yes 00D6000001AA --expect-sw 6Dxx");
+        assert!(r.ok, "{}", r.text);
+        assert_eq!(r.data["sw"], "6D00");
+        assert_eq!(log.borrow().len(), 1);
+        let r = sh.exec("apdu --yes 00D6000001AA --expect-sw 9000");
+        assert!(!r.ok);
+        assert!(r.text.contains("expected status word 9000"), "{}", r.text);
+        assert_eq!(
+            r.data["sw"], "6D00",
+            "the response is kept next to the failure"
+        );
+    }
+
+    #[test]
+    fn apdu_applies_the_channel_unless_raw() {
+        let (mut sh, log) = shell_log();
+        assert!(sh.exec("open_channel").ok);
+        log.borrow_mut().clear();
+        sh.exec("apdu 00A4000C022FE2");
+        sh.exec("apdu --raw 00A4000C022FE2");
+        let sent = log.borrow().clone();
+        assert_eq!(sent[0][0], 0x01, "channel 1 in the class byte");
+        assert_eq!(sent[1][0], 0x00, "--raw leaves it");
+    }
+
+    #[test]
+    fn apdu_rejects_what_is_not_an_apdu() {
+        let (mut sh, _) = shell_log();
+        assert!(!sh.exec("apdu zz").ok);
+        assert!(!sh.exec("apdu 00A4").ok);
+        assert!(
+            !sh.exec("apdu 00A4000C03AA").ok,
+            "an Lc that disagrees with the data"
+        );
     }
 
     #[test]

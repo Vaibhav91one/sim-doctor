@@ -2088,4 +2088,12 @@ fn card_shell_drives_a_real_card() {
         "card shell: status named reader {} on channel 0",
         reader.as_str()
     );
+
+    // apdu: SELECT MF without an FCP, then STATUS; a write is a dry run that never reaches the card.
+    let (code, records) =
+        run("apdu 00A4000C023F00; apdu 80F2000000 --expect-sw 9xxx; apdu 00D6000001AA");
+    assert_eq!(code, Some(0), "{records:?}");
+    assert_eq!(records[0]["data"]["sw"], "9000");
+    assert_eq!(records[2]["data"]["sent"], false);
+    println!("card shell: apdu SELECT MF 9000, a write stayed a dry run");
 }

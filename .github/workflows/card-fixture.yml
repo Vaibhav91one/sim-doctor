@@ -386,6 +386,7 @@ jobs:
           grep -q 'security_rules_agree_with_what_a_real_card_reports' "$log"
           grep -q 'card_shell_drives_a_real_card' "$log"
           grep -q 'card shell: status named reader' "$log"
+          grep -q 'card shell: apdu SELECT MF 9000' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job

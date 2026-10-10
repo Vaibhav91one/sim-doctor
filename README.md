@@ -464,6 +464,7 @@ path and the selected file. (`shell` and `explore` are the doctor-kit browsers o
 | `equip [--reader NAME] [--profile uicc\|sim]` | (re)open the card, possibly on another reader; `sim` is class `A0` (GSM 11.11), `uicc` class `00` |
 | `status` | the reader, ATR, profile, channel, path and selected file |
 | `open_channel`, `close_channel [N]`, `channel N` | MANAGE CHANNEL open and close, and which channel the next commands use (each channel has its own selection) |
+| `apdu [--raw] [--expect-sw SW] [--expect-response-regex RE] [--yes] APDU` | send one APDU (hex, spaces allowed) and print the status word and data; GET RESPONSE is followed. The class byte gets the channel in use unless `--raw`. `--expect-sw` takes 4 hex digits with `x` as wildcard (`61xx`), `--expect-response-regex` is matched at the start of the response data as lower-case hex; a mismatch fails the command (the response stays in `--json` `data`). Reads (SELECT, READ BINARY/RECORD, GET RESPONSE, STATUS, GET DATA, MANAGE CHANNEL) are sent; any other instruction prints `dry run: would send ...` unless `--yes` |
 | `quit` (`exit`, `eof`) | leave |
 
 Reads are sent; **anything that changes the card is a dry run** that prints the APDU it would send, unless `--yes` is
