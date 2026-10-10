@@ -393,7 +393,9 @@ jobs:
           grep -q 'card shell: verify_chv was a dry run' "$log"
           grep -q 'card shell: unblock_chv was a dry run' "$log"
           grep -q 'card shell: run_gsm_algorithm ' "$log"
-          grep -q 'card shell: authenticate ' "$log"
+          grep -q 'card shell: run_gsm_algorithm (sim profile) answered' "$log"
+          grep -q 'card shell: authenticate outcome mac-failure' "$log"
+          grep -q 'card shell: authenticate with the fixture' "$log"
 
           # Issue #6's scan, end to end. These are the lines the test prints on
           # the way to each of the properties issue #6 names, so a green job

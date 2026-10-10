@@ -2216,10 +2216,20 @@ fn card_shell_drives_a_real_card() {
         println!("card shell: run_gsm_algorithm refused: {}", record["error"]);
     }
 
-    // authenticate: a token the card cannot verify. A card that checks AUTN answers a MAC failure; one that does
-    // not may answer anything. Either way the shell must report a clean outcome or a clean error.
+    // run_gsm_algorithm with the GSM command set (swSIM implements RUN GSM ALGORITHM in class A0; its USIM
+    // application refuses the GSM security context with 6700, which the call above reports).
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"))
-        .args(["card", "--json", "--yes", "--reader", reader.as_str(), "-c", "authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --autn 00112233445566778899aabbccddeeff"])
+        .args([
+            "card",
+            "--json",
+            "--yes",
+            "--profile",
+            "sim",
+            "--reader",
+            reader.as_str(),
+            "-c",
+            "run_gsm_algorithm --rand 000102030405060708090a0b0c0d0e0f --repeat 2",
+        ])
         .stdin(std::process::Stdio::null())
         .output()
         .expect("the binary should run");
@@ -2228,15 +2238,74 @@ fn card_shell_drives_a_real_card() {
         .next()
         .and_then(|l| serde_json::from_str(l).ok())
         .expect("one record");
-    if record["ok"] == true {
-        let outcome = record["data"]["outcome"].as_str().expect("an outcome");
-        assert!(
-            ["success", "synchronisation-failure", "mac-failure"].contains(&outcome),
-            "{record}"
+    assert_eq!(
+        record["ok"], true,
+        "RUN GSM ALGORITHM (class A0) is implemented by swSIM: {record}"
+    );
+    assert_eq!(record["data"]["sres"].as_str().map(str::len), Some(8));
+    assert_eq!(record["data"]["kc"].as_str().map(str::len), Some(16));
+    assert_eq!(
+        record["data"]["deterministic"], true,
+        "one RAND, one answer"
+    );
+    println!("card shell: run_gsm_algorithm (sim profile) answered, deterministic");
+
+    // authenticate: a token the card cannot verify is a MAC failure (98 62).
+    let auth = |extra_env: Option<&str>, script: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_sim-doctor"));
+        cmd.args([
+            "card",
+            "--json",
+            "--yes",
+            "--reader",
+            reader.as_str(),
+            "--chv-env",
+            "SIMDOC_FIXTURE_AKA",
+            "-c",
+            script,
+        ])
+        .stdin(std::process::Stdio::null());
+        if let Some(text) = extra_env {
+            cmd.env("SIMDOC_FIXTURE_AKA", text);
+        } else {
+            cmd.env("SIMDOC_FIXTURE_AKA", "pin1=1234");
+        }
+        let output = cmd.output().expect("the binary should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect::<Vec<_>>()
+    };
+    let r = auth(None, "authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --autn 00112233445566778899aabbccddeeff");
+    assert_eq!(r[0]["ok"], true, "{r:?}");
+    assert_eq!(
+        r[0]["data"]["outcome"], "mac-failure",
+        "swSIM checks the MAC: {r:?}"
+    );
+    println!("card shell: authenticate outcome mac-failure for a token it cannot verify");
+
+    // The software card's published default Milenage constants (swsim src/swsim.c at the pinned commit: K ends
+    // in 07, OPc A64A...DC87 - test values of the fixture, not a real card's secrets) let the host build a valid
+    // AUTN. The card must then answer with RES/CK/IK equal to the host's own Milenage, or - if its stored
+    // sequence number is ahead - a synchronisation failure whose AUTS opens with a valid MAC-S.
+    let keys = "ki=hex:ffffffffffffffffffffffffffffff07; opc=hex:a64a507ae1a2a98bb88eb4210135dc87";
+    let r = auth(
+        Some(keys),
+        "authenticate --rand 23553cbe9637a89d218ae64dae47bf35 --sqn 1000 --resync",
+    );
+    assert_eq!(r[0]["ok"], true, "{r:?}");
+    let outcome = r[0]["data"]["outcome"].as_str().expect("an outcome");
+    assert!(
+        ["success", "synchronisation-failure"].contains(&outcome),
+        "{r:?}"
+    );
+    if outcome == "success" {
+        assert_eq!(
+            r[0]["data"]["matches_expected"], true,
+            "swSIM and the host disagree on Milenage: {r:?}"
         );
-        println!("card shell: authenticate outcome {outcome}");
     } else {
-        assert!(record["error"].is_string(), "{record}");
-        println!("card shell: authenticate refused: {}", record["error"]);
+        assert_eq!(r[0]["data"]["mac_s_valid"], true, "{r:?}");
     }
+    println!("card shell: authenticate with the fixture's keys: {outcome}");
 }
