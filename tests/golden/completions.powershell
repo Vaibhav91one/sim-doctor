@@ -37,6 +37,7 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('fix', 'fix', [CompletionResultType]::ParameterValue, 'Hand one finding from a saved scan to a coding agent')
             [CompletionResult]::new('gp', 'gp', [CompletionResultType]::ParameterValue, 'Read-only GlobalPlatform queries')
             [CompletionResult]::new('trace', 'trace', [CompletionResultType]::ParameterValue, 'Decode a captured APDU trace offline (no card, no reader)')
+            [CompletionResult]::new('cat', 'cat', [CompletionResultType]::ParameterValue, 'Decode Card Application Toolkit data offline (no card, no reader)')
             [CompletionResult]::new('fuzz', 'fuzz', [CompletionResultType]::ParameterValue, 'APDU discovery and the OTA/SMS fuzz sweep')
             [CompletionResult]::new('euicc', 'euicc', [CompletionResultType]::ParameterValue, 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
@@ -403,6 +404,30 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
             break
         }
+        'sim-doctor;cat' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('decode', 'decode', [CompletionResultType]::ParameterValue, 'Decode CAT data given as hex arguments, or one object per line on stdin')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;cat;decode' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit one JSON envelope of kind "cat" on stdout')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'sim-doctor;cat;help' {
+            [CompletionResult]::new('decode', 'decode', [CompletionResultType]::ParameterValue, 'Decode CAT data given as hex arguments, or one object per line on stdin')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'sim-doctor;cat;help;decode' {
+            break
+        }
+        'sim-doctor;cat;help;help' {
+            break
+        }
         'sim-doctor;fuzz' {
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
@@ -678,6 +703,7 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             [CompletionResult]::new('fix', 'fix', [CompletionResultType]::ParameterValue, 'Hand one finding from a saved scan to a coding agent')
             [CompletionResult]::new('gp', 'gp', [CompletionResultType]::ParameterValue, 'Read-only GlobalPlatform queries')
             [CompletionResult]::new('trace', 'trace', [CompletionResultType]::ParameterValue, 'Decode a captured APDU trace offline (no card, no reader)')
+            [CompletionResult]::new('cat', 'cat', [CompletionResultType]::ParameterValue, 'Decode Card Application Toolkit data offline (no card, no reader)')
             [CompletionResult]::new('fuzz', 'fuzz', [CompletionResultType]::ParameterValue, 'APDU discovery and the OTA/SMS fuzz sweep')
             [CompletionResult]::new('euicc', 'euicc', [CompletionResultType]::ParameterValue, 'eUICC queries over ES10 (lpac: chip info, profile list, notification list), and the profile and notification writes')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
@@ -773,6 +799,13 @@ Register-ArgumentCompleter -Native -CommandName 'sim-doctor' -ScriptBlock {
             break
         }
         'sim-doctor;help;trace' {
+            break
+        }
+        'sim-doctor;help;cat' {
+            [CompletionResult]::new('decode', 'decode', [CompletionResultType]::ParameterValue, 'Decode CAT data given as hex arguments, or one object per line on stdin')
+            break
+        }
+        'sim-doctor;help;cat;decode' {
             break
         }
         'sim-doctor;help;fuzz' {

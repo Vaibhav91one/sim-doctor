@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `cat decode`: an offline Card Application Toolkit decoder (#198). Proactive commands, envelopes, terminal responses and
+  bare comprehension TLVs; 44 command types, 14 envelope tags and 90 information elements named from pySim's tables, command
+  qualifiers spelled out, about 40 elements decoded to fields, the rest kept as named hex. `--json` prints a `cat` envelope.
+
 ## [0.4.0]
 
 sim-doctor now runs on [doctor-kit](https://crates.io/crates/doctor-kit) 0.2.2, the CLI skeleton shared by the doctor

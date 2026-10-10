@@ -195,6 +195,7 @@ exit codes do not change. `scan --tui` is still the findings view described abov
 | `completions <shell>` | shell completion script for the whole flag surface |
 | `rules list\|explain <id>`, `why <rule-id\|FILE>` | what a rule means and how to fix it, from the catalog or a saved `scan --json` envelope; no card needed |
 | `fix <rule-id> --from FILE [--agent claude\|codex\|cursor] [--skip-approvals]` | print a prompt for one finding of a saved `scan --json` envelope; `fix` strips zero-width joiners (U+200C/U+200D), the combining grapheme joiner and variation selectors from agent-bound text, so emoji ZWJ sequences and Persian/Indic shaping marks are removed; unassigned code points and some other Cf characters (e.g. U+0600-0605, U+06DD) are NOT stripped. card text is fenced as untrusted data; with `--agent` it starts that coding agent, which keeps its own approval prompts unless `--skip-approvals`; nothing is launched when already inside an agent; `SIM_DOCTOR_HANDOFF_SKIP_APPROVALS=1` is the same as `--skip-approvals`; an agent that is not installed exits 1, and one killed by a signal exits 128+signal. The skip flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--force`) are copied from the sibling tool android-doctor and are not verified against every CLI version |
+| `cat decode [HEX...] [--json]` | decode Card Application Toolkit data offline: proactive commands, envelopes, terminal responses, comprehension TLVs; see below |
 | `gp info\|ara\|status [--json] [--reader NAME] [--trace]` | read-only GlobalPlatform reads, see below |
 | `gp status --keys-file PATH \| --keys-env VAR [--key-version HEX]` | registry over an SCP03 secure channel, one authentication attempt, see below |
 | `gp select --aid HEX [--json] [--reader NAME] [--trace]` | SELECT an application by AID, see below |
@@ -449,6 +450,30 @@ Reset, Global Delete, Global Lock or Global Registry). They are entries in the l
 SCP02/SCP11, a secure channel to a
 supplementary security domain, C-DECRYPTION and R-MAC. Replay tests only
 (pySim and GlobalPlatformPro vectors); no live card has been authenticated yet.
+
+### `cat decode`
+
+Decodes CAT data without a card or a reader: a **proactive command** (the data of a FETCH response, starts with `D0`), an
+**ENVELOPE** (`D1`..`DF`), a **TERMINAL RESPONSE** (starts with Command details `81 03`) or any run of comprehension TLVs
+(TS 102 223 clause 8, TS 31.111). Hex comes from the arguments (spaces and `0x` allowed) or, one object per line, from stdin
+(`-`); `--json` prints one `cat` envelope with `data.objects[]`.
+
+    sim-doctor cat decode "D0 0F 81 03 01 21 80 82 02 81 02 8D 04 04 48 49 21"
+    proactive-command: DISPLAY TEXT
+      81 Command Details: ... qualifier_meaning=[wait for user to clear message], type_name=DISPLAY TEXT
+      82 Device Identities: destination=display, source=uicc
+      8D Text String: coding=8-bit data, text=HI!
+
+What it knows: the **44 types of proactive command** (REFRESH to ENCAPSULATED SESSION CONTROL), the **14 envelope tags**, the
+**90 information elements** pySim's `cat.py` defines (two pairs share a tag - ECAT and later additions reuse numbers - and are
+listed as `alternatives`), the general result codes and the device identities. The command **qualifier is spelled out** for
+REFRESH, SET UP CALL, LAUNCH BROWSER, DISPLAY TEXT, GET INKEY / INPUT, SELECT ITEM, SET UP MENU, PROVIDE LOCAL INFORMATION,
+TIMER MANAGEMENT, SEND SHORT MESSAGE and OPEN CHANNEL, and **the fields of about 40 elements are decoded** (command details,
+device identities, result with success / terminal-problem / error, alpha identifier, text string in GSM 7-bit / 8-bit /
+UCS2, address, item, tone, duration, location information, IMEI, event list, URL, bearer description, channel data and
+status, transport level, other address, network access name, timer value ...). An element without a field decoder is kept as
+its named hex with `"decoded": false` and counted in `undecoded_elements`; nothing is dropped. Truncated input is an error
+(exit 1, a sentence), never a partial result. Not done: building a TERMINAL RESPONSE, and executing any command.
 
 ### `trace`
 
