@@ -105,6 +105,7 @@
 pub mod access;
 pub mod aka;
 pub mod apdu;
+pub mod apdu_fuzz;
 pub mod apdu_scan;
 pub mod backend;
 pub mod baseline;
@@ -251,6 +252,11 @@ pub const MODULES: &[ModuleInfo] = &[
         name: apdu_scan::NAME,
         owns: "CLA discovery and CLA+INS discovery over a session: bounded CASE 1 probes classified by status word, a quick mode, and the apdu/undocumented-cla-accepted and apdu/undocumented-ins-accepted rules.",
         depends_on: &[apdu::NAME, transport::NAME, session::NAME, rules::NAME],
+    },
+    ModuleInfo {
+        name: apdu_fuzz::NAME,
+        owns: "The allowlist-only APDU mutation fuzzer: structurally read-only case generation (SELECT, READ BINARY/RECORD, STATUS, GET DATA, GET RESPONSE, unassigned INS), a send guard with a denylist, a seeded plan, a mock card, and the fuzz/malformed-command-accepted rule.",
+        depends_on: &[apdu::NAME, transport::NAME, rules::NAME],
     },
     ModuleInfo {
         name: fuzz::NAME,

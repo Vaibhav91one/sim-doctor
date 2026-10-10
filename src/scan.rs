@@ -1144,6 +1144,7 @@ pub fn all_specs() -> Vec<rules::RuleSpec> {
     all.extend(crate::ts48::specs());
     all.extend(crate::apdu_scan::specs());
     all.extend(crate::fuzz::specs());
+    all.extend(crate::apdu_fuzz::specs());
     all
 }
 
